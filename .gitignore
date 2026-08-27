@@ -1,0 +1,17 @@
+# Executables / installer
+*.exe
+
+# Recovery temporary data
+work/
+recovery_staging/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Virtual env
+.venv/
+venv/
+
+# Misc
+*.log
