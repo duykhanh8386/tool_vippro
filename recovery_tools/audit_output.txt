@@ -1,0 +1,538 @@
+﻿========================================================================
+FULL RECOVERY AUDIT ΓÇö 39 Scoped Modules
+Deep recursive bytecode comparator (CPython 3.12.10)
+========================================================================
+
+  [PASS] src/__init__: EXACT
+  [PASS] src/channel_refresh: EXACT
+  [PASS] src/channel_scanner: EXACT
+  [PASS] src/channel_store: EXACT
+  [PASS] src/cookie_utils: EXACT
+  [PASS] src/license_manager: EXACT
+  [PASS] src/module/__init__: EXACT
+  [PASS] src/module/audio_module: EXACT
+  [PASS] src/module/base: EXACT
+  [PASS] src/module/delete_video_module: EXACT
+  [PASS] src/module/list_videos_module: EXACT
+  [PASS] src/module/model: EXACT
+  [PASS] src/module/upload_video_module: EXACT
+  [PASS] src/paths: EXACT
+  [PASS] src/route_manager: EXACT
+  [PASS] src/state_manager: EXACT
+  [PASS] src/updater: EXACT
+  [PASS] src/utils: EXACT
+  [PASS] web/__init__: EXACT
+  [PASS] web/components/__init__: EXACT
+  [PASS] web/components/add_audio_flow: EXACT
+  [FAIL] web/components/audio: MISMATCH
+  [PASS] web/components/auth: EXACT
+  [PASS] web/components/common: EXACT
+  [FAIL] web/components/delete_back_flow: MISMATCH
+  [FAIL] web/components/delete_video: MISMATCH
+  [PASS] web/components/delete_video_controller: EXACT
+  [PASS] web/components/drawer: EXACT
+  [FAIL] web/components/remove_audio: MISMATCH
+  [PASS] web/components/settings: EXACT
+  [PASS] web/components/studio: EXACT
+  [PASS] web/nicegui_patches: EXACT
+  [PASS] web/views/__init__: EXACT
+  [PASS] web/views/audio: EXACT
+  [PASS] web/views/auth: EXACT
+  [PASS] web/views/delete_back_flow: EXACT
+  [PASS] web/views/delete_video: EXACT
+  [PASS] web/views/settings: EXACT
+  [PASS] web/views/studio: EXACT
+
+========================================================================
+SUMMARY
+========================================================================
+Scoped modules: 39
+Verified Exact: 35
+Mismatch:       4
+Compile Error:  0
+Missing:        0
+
+========================================================================
+NON-EXACT MODULE DETAILS
+========================================================================
+
+ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+Module: web/components/audio
+Status: MISMATCH
+Code objects with mismatches: 4
+  create_add_audio_page: co_code DIFFERS
+  create_add_audio_page: co_exceptiontable DIFFERS
+  create_add_audio_page: co_names DIFFERS
+      orig=('get_channels_info', 'str', 'list', 'ui', 'card', 'classes', 'create_channel_selection', 'row', 'column', 'textarea', 'props', 'button')
+      rec =('get_channels_info', 'str', 'list', 'ui', 'card', 'classes', 'create_channel_selection', 'row', 'column', 'textarea', 'props', 'button', '__exception__')
+  create_add_audio_page.<locals>.handle_add_audio: co_code DIFFERS
+  create_add_audio_page.<locals>.handle_add_audio: co_exceptiontable DIFFERS
+  create_add_audio_page.<locals>.handle_add_audio: co_names DIFFERS
+      orig=('ui', 'notify', 'len', 'get', 'strip', 'validate_path_text', 'append', 'logger', 'error', 'dialog', 'card', 'classes', 'label', 'linear_progress', 'props', 'open', 'asyncio', 'Semaphore', 'str', 'Path', 'bytes', 'enumerate', 'list', 'set_text', 'to_thread', 'update_audio_module', '_get_video_info', 'duration_ms', 'tempfile', 'NamedTemporaryFile', 'suffix', 'name', 'multiply_audio', 'normalize_path', 'read_bytes', 'create_task', 'value', 'sum', 'locals', 'exists', 'unlink', 'Exception', 'warning', 'close', 'values')
+      rec =('ui', 'notify', 'len', 'get', 'strip', 'validate_path_text', 'append', 'logger', 'error', 'dialog', 'card', 'classes', 'label', 'linear_progress', 'props', 'open', 'asyncio', 'Semaphore', 'str', 'Path', 'bytes', 'enumerate', 'list', 'set_text', 'to_thread', 'update_audio_module', '_get_video_info', 'tempfile', 'NamedTemporaryFile', 'suffix', 'name', 'multiply_audio', 'normalize_path', 'read_bytes', 'create_task', 'value', 'sum', 'locals', 'exists', 'unlink', 'close', 'values', 'Exception', 'warning', 'exc')
+  create_add_audio_page.<locals>.handle_add_audio: co_varnames DIFFERS
+      orig=('row_errors', 'vid', 'path_text', 'ok', 'msg', 'err', 'progress_dialog', 'current_video_label', 'status_label', 'remaining_label', 'progress_bar', 'total_videos', 'total_tasks', 'completed_tasks', 'run_upload', 'video_index', 'file_path', 'video_info', 'video_duration_seconds', 'temp_file', 'temp_audio_path', 'file_bytes', 'upload_tasks', 'lang', 'task', 'completed_for_video', 'exc', 'vid_exc', 'main_exc', 'successful_videos', 'video_status', 'total_languages', 'successful_count', 'success_percentage')
+      rec =('upload_semaphore', 'row_errors', 'vid', 'path_text', 'ok', 'msg', 'err', 'progress_dialog', 'current_video_label', 'status_label', 'remaining_label', 'progress_bar', 'total_videos', 'total_tasks', 'completed_tasks', 'run_upload', 'video_index', 'file_path', 'video_info', 'video_duration_seconds', 'temp_file', 'temp_audio_path', 'file_bytes', 'upload_tasks', 'lang', 'task', 'completed_for_video', 'successful_videos', 'video_status', 'total_languages', 'successful_count', 'success_percentage', 'vid_exc', 'main_exc')
+  create_add_audio_page.<locals>.handle_add_audio: co_cellvars DIFFERS
+      orig=('active_uploads', 'concurrent_label', 'overall_errors', 'upload_semaphore')
+      rec =('active_uploads', 'concurrent_label', 'overall_errors')
+  create_add_audio_page.<locals>.handle_add_audio: leaf_consts DIFFERS
+      orig=('None', "'id'", "'H├úy chß╗ìn k├¬nh'", "'warning'", "('type',)", "'languages'", '0', "'H├úy chß╗ìn ├¡t nhß║Ñt mß╗Öt ng├┤n ngß╗»'", "'ids'", "'Vui l├▓ng nhß║¡p ├¡t nhß║Ñt mß╗Öt Video ID'", "''", "': '", "'Mß╗Öt sß╗æ h├áng kh├┤ng hß╗úp lß╗ç. H├úy kiß╗âm tra lß║íi.'", "'negative'", "'w-96'", "'─Éang th├¬m ├óm thanh...'", "'text-base font-semibold'", "'text-sm font-medium text-blue-600'", "'text-sm text-gray-600'", "'text-xs text-gray-500'", "'text-xs text-gray-500 mt-1'", "('value',)", "'persistent'", "'count'", "'max_concurrency'", "'vid'", "'lang'", "'temp_audio_path'", "'file_bytes'", '1', "'Video '", "'/'", "'C├▓n lß║íi: '", "' video'", "'─Éang lß║Ñy th├┤ng tin video...'", "('video_id', 'channel_id')", '1000.0', "'─Éang xß╗¡ l├╜ ├óm thanh...'", 'False', "('suffix', 'delete')", "'times'", "'extra_minutes'", "('input_file', 'output_file', 'times', 'extra_minutes', 'video_duration_seconds')", "'─Éang tß║úi l├¬n '", "' ng├┤n ngß╗» ─æß╗ông thß╗¥i...'", "('vid', 'lang', 'temp_audio_path', 'file_bytes')", "'Ho├án th├ánh '", "' ng├┤n ngß╗» cho video '", "'Failed to clean up temporary file '", "'Error processing video '", "'Main processing error: '", "'Main process: '", '0.5', '100', "'Qu├í tr├¼nh ho├án tß║Ñt vß╗¢i mß╗Öt sß╗æ lß╗ùi. '", "' video th├ánh c├┤ng. Kiß╗âm tra trß║íng th├íi tß╗½ng video b├¬n d╞░ß╗¢i.'", "'Qu├í tr├¼nh ho├án tß║Ñt! '", '50', "'positive'")
+      rec =('None', "'id'", "'H├úy chß╗ìn k├¬nh'", "'warning'", "('type',)", "'languages'", '0', "'H├úy chß╗ìn ├¡t nhß║Ñt mß╗Öt ng├┤n ngß╗»'", "'ids'", "'Vui l├▓ng nhß║¡p ├¡t nhß║Ñt mß╗Öt Video ID'", "''", "': '", "'Mß╗Öt sß╗æ h├áng kh├┤ng hß╗úp lß╗ç. H├úy kiß╗âm tra lß║íi.'", "'negative'", "'w-96'", "'─Éang th├¬m ├óm thanh...'", "'text-base font-semibold'", "'text-sm font-medium text-blue-600'", "'text-sm text-gray-600'", "'text-xs text-gray-500'", "'text-xs text-gray-500 mt-1'", "('value',)", "'persistent'", "'count'", "'max_concurrency'", "'vid'", "'lang'", "'temp_audio_path'", "'file_bytes'", '1', "'Video '", "'/'", "'C├▓n lß║íi: '", "' video'", "'─Éang lß║Ñy th├┤ng tin video...'", "('video_id', 'channel_id')", "'─Éang xß╗¡ l├╜ ├óm thanh...'", 'False', "('suffix', 'delete')", "'times'", "'extra_minutes'", "('input_file', 'output_file', 'times', 'extra_minutes', 'video_duration_seconds')", "'─Éang tß║úi l├¬n '", "' ng├┤n ngß╗» ─æß╗ông thß╗¥i...'", "('vid', 'lang', 'temp_audio_path', 'file_bytes')", "'Ho├án th├ánh '", "' ng├┤n ngß╗» cho video '", '0.5', "'Qu├í tr├¼nh ho├án tß║Ñt vß╗¢i mß╗Öt sß╗æ lß╗ùi. '", "' video th├ánh c├┤ng. Kiß╗âm tra trß║íng th├íi tß╗½ng video b├¬n d╞░ß╗¢i.'", "'Qu├í tr├¼nh ho├án tß║Ñt! '", "'Failed to clean up temporary file '", "'Error processing video '", "'Main processing error: '", "'Main process: '")
+  create_add_audio_page.<locals>.handle_add_audio.<locals>.<genexpr>: co_code DIFFERS
+  create_add_audio_page.<locals>.handle_add_audio.<locals>.<genexpr>: co_exceptiontable DIFFERS
+  create_add_audio_page.<locals>.handle_add_audio.<locals>.<genexpr>: leaf_consts DIFFERS
+      orig=("('successful', 'already_added')", '1', 'None')
+      rec =('1', 'None')
+  create_add_audio_page.<locals>.handle_add_audio.<locals>.run_upload: co_code DIFFERS
+  create_add_audio_page.<locals>.handle_add_audio.<locals>.run_upload: co_exceptiontable DIFFERS
+  create_add_audio_page.<locals>.handle_add_audio.<locals>.run_upload: co_names DIFFERS
+      orig=('set_text', 'range', 'asyncio', 'to_thread', 'update_audio_module', 'add', 'str', 'Exception', 'logger', 'error', 'sleep', 'append')
+      rec =('set_text', 'range', 'asyncio', 'to_thread', 'update_audio_module', 'add', 'str', 'sleep', 'Exception', 'append', 'exc')
+  create_add_audio_page.<locals>.handle_add_audio.<locals>.run_upload: co_varnames DIFFERS
+      orig=('vid', 'lang', 'temp_audio_path', 'file_bytes', 'status_code', 'max_retries', 'attempt', 'e', 'exc')
+      rec =('vid', 'lang', 'temp_audio_path', 'file_bytes', 'status_code', 'max_retries', 'attempt')
+  create_add_audio_page.<locals>.handle_add_audio.<locals>.run_upload: co_freevars DIFFERS
+      orig=('active_uploads', 'concurrent_label', 'overall_errors', 'refresh_right_panel', 'selected_channel', 'upload_semaphore', 'video_processing_status')
+      rec =('active_uploads', 'concurrent_label', 'overall_errors', 'refresh_right_panel', 'selected_channel', 'video_processing_status')
+  create_add_audio_page.<locals>.handle_add_audio.<locals>.run_upload: leaf_consts DIFFERS
+      orig=('None', "'pending'", "'count'", '1', "'─Éang tß║úi l├¬n '", "' ng├┤n ngß╗» ─æß╗ông thß╗¥i'", '3', "'id'", "('id_video', 'channel_id', 'file_name', 'language', 'data')", '(200, 409)', "'Upload attempt '", "'/'", "' failed for '", "'-'", "': '", 'True', "('exc_info',)", '2', '200', "'successful'", '409', "'already_added'", "'unsuccessful'", "': HTTP '", '0', "''")
+      rec =('None', "'pending'", "'count'", '1', "'─Éang tß║úi l├¬n '", "' ng├┤n ngß╗» ─æß╗ông thß╗¥i'", '3', "'id'", "('id_video', 'channel_id', 'file_name', 'language', 'data')", '(200, 409)', '2', "'successful'", "'-'", "': '", '0', "''")
+
+ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+Module: web/components/delete_back_flow
+Status: MISMATCH
+Code objects with mismatches: 27
+qualnames differ: missing=['create_delete_back_flow_page.<locals>.build_folder_selector.<locals>.clear_folder', 'create_delete_back_flow_page.<locals>.build_folder_selector.<locals>.render', 'create_delete_back_flow_page.<locals>.build_folder_selector.<locals>.render.<locals>.<lambda>', 'create_delete_back_flow_page.<locals>.handle_process.<locals>.<genexpr>.<genexpr>'], extra=['create_delete_back_flow_page.<locals>.build_folder_selector.<locals>.label', 'create_delete_back_flow_page.<locals>.build_folder_selector.<locals>.placeholder', 'create_delete_back_flow_page.<locals>.build_folder_selector.<locals>.placeholder.<locals>.<lambda>']
+  <module>: co_code DIFFERS
+  <module>: co_names DIFFERS
+      orig=('asyncio', 'csv', 'random', 'datetime', 'pathlib', 'Path', 'loguru', 'logger', 'nicegui', 'ui', 'src.channel_store', 'channel_store', 'src.module.delete_video_module', 'delete_video_module', 'src.module.list_videos_module', 'list_videos_module', 'src.module.upload_video_module', 'upload_video_module', 'src.state_manager', 'state_manager', 'src.utils', 'AUDIO_EXTENSIONS', 'VIDEO_EXTENSIONS', 'build_intermittent_audio', 'get_channels_info', 'get_video_duration', 'list_media_files', 'mux_audio_into_video', 'normalize_path', 'web.components.common', 'create_channel_selection', 'select_directory', 'select_file', 'web.components.drawer', 'nav_state', 'COPYRIGHT_STARTED', 'COPYRIGHT_COMPLETED', 'STEP_STYLE', 'float', 'str', '_human_size', '_fmt_duration', 'dict', '_new_steps', '_DELETE_LOG_FILENAME', '_log_deleted', 'create_delete_back_flow_page')
+      rec =('asyncio', 'csv', 'random', 'datetime', 'pathlib', 'Path', 'loguru', 'logger', 'nicegui', 'ui', 'src.channel_store', 'channel_store', 'src.module.delete_video_module', 'delete_video_module', 'src.module.list_videos_module', 'list_videos_module', 'src.module.upload_video_module', 'upload_video_module', 'src.state_manager', 'state_manager', 'src.utils', 'AUDIO_EXTENSIONS', 'VIDEO_EXTENSIONS', 'build_intermittent_audio', 'get_channels_info', 'get_video_duration', 'list_media_files', 'mux_audio_into_video', 'normalize_path', 'web.components.common', 'create_channel_selection', 'select_directory', 'select_file', 'web.components.drawer', 'nav_state', 'COPYRIGHT_STARTED', 'COPYRIGHT_COMPLETED', 'STEP_STYLE', 'float', 'str', '_human_size', '_fmt_duration', 'dict', '_new_steps', '_log_deleted', 'create_delete_back_flow_page')
+  <module>: leaf_consts DIFFERS
+      orig=('0', 'None', "('datetime',)", "('Path',)", "('logger',)", "('ui',)", "('channel_store',)", "('delete_video_module',)", "('list_videos_module',)", "('upload_video_module',)", "('state_manager',)", "('AUDIO_EXTENSIONS', 'VIDEO_EXTENSIONS', 'build_intermittent_audio', 'get_channels_info', 'get_video_duration', 'list_media_files', 'mux_audio_into_video', 'normalize_path')", "('create_channel_selection', 'select_directory', 'select_file')", "('nav_state',)", "'UPLOAD_CHECKS_DATA_COPYRIGHT_STATUS_STARTED'", "'UPLOAD_CHECKS_DATA_COPYRIGHT_STATUS_COMPLETED'", "('schedule', 'text-gray-400', 'Chß╗¥')", "('hourglass_top', 'text-blue-600', '─Éang xß╗¡ l├╜')", "('check_circle', 'text-green-600', 'Xong')", "('error', 'text-red-600', 'Lß╗ùi')", "('pending', 'processing', 'successful', 'unsuccessful')", "'num'", "'return'", "'seconds'", "'deleted_videos.csv'", "'output_folder'", "'video_id'", "'channel_id'", "'channel_name'", "'title'", "('',)")
+      rec =('0', 'None', "('datetime',)", "('Path',)", "('logger',)", "('ui',)", "('channel_store',)", "('delete_video_module',)", "('list_videos_module',)", "('upload_video_module',)", "('state_manager',)", "('AUDIO_EXTENSIONS', 'VIDEO_EXTENSIONS', 'build_intermittent_audio', 'get_channels_info', 'get_video_duration', 'list_media_files', 'mux_audio_into_video', 'normalize_path')", "('create_channel_selection', 'select_directory', 'select_file')", "('nav_state',)", "'UPLOAD_CHECKS_DATA_COPYRIGHT_STATUS_STARTED'", "'UPLOAD_CHECKS_DATA_COPYRIGHT_STATUS_COMPLETED'", "('schedule', 'text-gray-400', 'Chß╗¥')", "('hourglass_top', 'text-blue-600', '─Éang xß╗¡ l├╜')", "('check_circle', 'text-green-600', 'Xong')", "('error', 'text-red-600', 'Lß╗ùi')", "('pending', 'processing', 'successful', 'unsuccessful')", "'num'", "'return'", "'seconds'", "'output_folder'", "'video_id'", "'channel_id'", "'channel_name'", "'title'", "('',)")
+  _fmt_duration: co_code DIFFERS
+  _log_deleted: co_code DIFFERS
+  _log_deleted: co_exceptiontable DIFFERS
+  _log_deleted: co_names DIFFERS
+      orig=('Path', 'normalize_path', '_DELETE_LOG_FILENAME', 'parent', 'mkdir', 'exists', 'open', 'csv', 'writer', 'writerow', 'datetime', 'now', 'strftime', 'Exception', 'logger', 'error')
+      rec =('Path', 'normalize_path', '_DELETE_LOG_FILENAME', 'parent', 'mkdir', 'exists', 'open', 'csv', 'writer', 'writerow', 'datetime', 'now', 'strftime', 'Exception', 'logger', 'error', 'exc')
+  _log_deleted: co_varnames DIFFERS
+      orig=('output_folder', 'video_id', 'channel_id', 'channel_name', 'title', 'log_file', 'exists', 'f', 'writer', 'exc')
+      rec =('output_folder', 'video_id', 'channel_id', 'channel_name', 'title', 'log_file', 'exists', 'f', 'writer')
+  _log_deleted: leaf_consts DIFFERS
+      orig=("'Ghi 1 d├▓ng v├áo deleted_videos.csv trong folder output (nh╞░ t├íc vß╗Ñ X├│a - Back).'", 'True', "('parents', 'exist_ok')", "'a'", "''", "'utf-8'", "('newline', 'encoding')", "('video_id', 'channel_id', 'channel_name', 'title', 'deleted_at')", "'%Y-%m-%d %H:%M:%S'", 'None', "'Kh├┤ng ghi ─æ╞░ß╗úc '", "': '")
+      rec =('None', 'True', "('parents', 'exist_ok')", "'a'", "''", "'utf-8'", "('newline', 'encoding')", "('video_id', 'channel_id', 'channel_name', 'title', 'deleted_at')", "'%Y-%m-%d %H:%M:%S'", "'Kh├┤ng ghi ─æ╞░ß╗úc '", "': '")
+  _new_steps: co_varnames DIFFERS
+      orig=()
+      rec =('_DELETE_LOG_FILENAME',)
+  create_delete_back_flow_page: co_code DIFFERS
+  create_delete_back_flow_page: co_exceptiontable DIFFERS
+  create_delete_back_flow_page: co_names DIFFERS
+      orig=('get_channels_info', 'str', 'bool', 'ui', 'card', 'classes', 'label', 'create_channel_selection', 'row', 'button', 'props', 'set_visibility', 'spinner', 'linear_progress', 'scroll_area', 'column', 'separator')
+      rec =('get_channels_info', 'str', 'bool', 'ui', 'card', 'classes', 'label', 'create_channel_selection', 'row', 'button', 'props', 'set_visibility', 'spinner', 'linear_progress', 'scroll_area', 'column', 'separator', '__exception__', 'STEP_SEQUENCE', 'LOG_STYLE')
+  create_delete_back_flow_page: co_varnames DIFFERS
+      orig=('channels', 'load_state', 'step_merge', 'step_upload', 'step_wait_processed', 'step_delete_back', 'handle_stop', 'handle_process', 'clear_all_inputs', 'build_folder_selector', 'on_channel_select', '_', 'refresh_channel_display', 'render_music_switch', 'progress_panel')
+      rec =('channels', 'load_state', 'handle_stop', 'handle_process', 'clear_all_inputs', 'build_folder_selector', 'on_channel_select', '_', 'refresh_channel_display', 'render_music_switch', 'progress_panel')
+  create_delete_back_flow_page: co_cellvars DIFFERS
+      orig=('LOG_STYLE', 'PERSIST_FIELDS', 'STEP_SEQUENCE', 'clear_overlay', 'folder_selectors', 'load_durations', 'load_videos', 'on_random_change', 'options_state', 'overlay_row', 'paths_state', 'pick_overlay', 'processing', 'progress_refs', 'push_log', 'refresh_overlay_display', 'refresh_video_list', 'save_state', 'saved_status_map', 'selected_channel', 'set_processing_ui', 'step_badge', 'stop_requested', 'suppress_autosave', 'ui_refs', 'video_list_container', 'videos_state')
+      rec =('PERSIST_FIELDS', 'clear_overlay', 'folder_selectors', 'load_durations', 'load_videos', 'on_random_change', 'options_state', 'overlay_row', 'paths_state', 'pick_overlay', 'processing', 'progress_refs', 'push_log', 'refresh_overlay_display', 'refresh_video_list', 'save_state', 'saved_status_map', 'selected_channel', 'set_processing_ui', 'step_badge', 'step_delete_back', 'step_merge', 'step_upload', 'step_wait_processed', 'stop_requested', 'suppress_autosave', 'ui_refs', 'video_list_container', 'videos_state')
+  create_delete_back_flow_page: leaf_consts DIFFERS
+      orig=('None', "''", "('video_folder', 'music_folder', 'output_folder')", "'random_music'", 'False', "'id'", "'items'", "'value'", "('random_switch', 'process_btn', 'clear_btn', 'refresh_channel_display', 'refresh_overlay', 'stop_btn')", "('music', 'music_path', 'audio_path', 'output_path', 'video_id', 'scotty_resource_id', 'frontend_upload_id')", "'status'", "'merge'", "'Gh├⌐p nhß║íc'", "'upload'", "'Upload'", "'wait'", "'Chß╗¥ xß╗¡ l├╜'", "'delete_back'", "'X├│a - Back'", "'active'", "'message'", "('chevron_right', 'text-gray-600')", "('autorenew', 'text-blue-600')", "('hourglass_top', 'text-amber-600')", "('check_circle', 'text-green-600')", "('error', 'text-red-600')", "('info', 'work', 'wait', 'ok', 'error')", "'level'", "'indent'", "'key'", "'label'", "'placeholder'", "'icon'", "'w-full mx-auto mt-4 bg-white shadow-sm'", "'Chß╗ìn k├¬nh, folder video, folder nhß║íc v├á folder output rß╗ôi bß║Ñm Xß╗¡ l├╜. Flow tß╗▒ chß║íy: Gh├⌐p nhß║íc (nhß║íc li├¬n tß╗Ñc + overlay logo t├¬n k├¬nh) ΓåÆ Upload ΓåÆ Chß╗¥ xß╗¡ l├╜ ΓåÆ X├│a - Back (chß╗¥ copyright STARTED rß╗ôi x├│a).'", "'text-sm text-gray-600 mb-2'", "('initial_selected_ids',)", "'refresh_channel_display'", "'items-center gap-2 mt-1 w-full flex-nowrap'", "'refresh_overlay'", "'w-full gap-3 flex-wrap items-stretch'", "'video_folder'", "'Folder video'", "'Chß╗ìn folder chß╗⌐a video'", "'movie'", "('on_after',)", "'music_folder'", "'Folder nhß║íc'", "'Chß╗ìn folder chß╗⌐a nhß║íc'", "'music_note'", "('extra_render',)", "'output_folder'", "'Folder output'", "'Chß╗ìn n╞íi l╞░u video ─æ├ú gh├⌐p nhß║íc'", "'drive_folder_upload'", "'w-full gap-2 mt-3'", "'Xß╗¡ l├╜'", "'play_arrow'", "('icon', 'on_click')", "'flex-1'", "'process_btn'", "'Dß╗½ng'", "'stop'", "'color=orange'", "'stop_btn'", "'X├│a tß║Ñt cß║ú'", "'delete_sweep'", "'outline color=red'", "'clear_btn'", "'w-full mt-2 bg-blue-50 border border-blue-200 gap-1 p-3'", "'items-center gap-2 w-full flex-nowrap'", "'sm'", "'primary'", "('size', 'color')", "'─Éang chuß║⌐n bß╗ï...'", "'text-sm font-medium text-blue-700'", "'current'", "'text-xs text-gray-600'", "'step'", "'text-xs text-gray-500'", "'remaining'", '0', "('value',)", "'w-full'", "'bar'", "'w-full h-40 bg-white rounded border border-blue-100 mt-1'", "'log_area'", "'w-full gap-0.5 p-1'", "'log'", "'panel'", "'my-2'", "'w-full gap-1'", "('',)", "('info', False)", '(None, None)', '(None,)')
+      rec =('None', "''", "('video_folder', 'music_folder', 'output_folder')", "'random_music'", 'False', "'id'", "'items'", "'value'", "('random_switch', 'process_btn', 'clear_btn', 'refresh_channel_display', 'refresh_overlay', 'stop_btn')", "('music', 'music_path', 'audio_path', 'output_path', 'video_id', 'scotty_resource_id', 'frontend_upload_id')", "'status'", "'active'", "'message'", "'level'", "'indent'", "'key'", "'label'", "'placeholder'", "'icon'", "'w-full mx-auto mt-4 bg-white shadow-sm'", "'Chß╗ìn k├¬nh, folder video, folder nhß║íc v├á folder output rß╗ôi bß║Ñm Xß╗¡ l├╜. Flow tß╗▒ chß║íy: Gh├⌐p nhß║íc (nhß║íc li├¬n tß╗Ñc + overlay logo t├¬n k├¬nh) ΓåÆ Upload ΓåÆ Chß╗¥ xß╗¡ l├╜ ΓåÆ X├│a - Back (chß╗¥ copyright STARTED rß╗ôi x├│a).'", "'text-sm text-gray-600 mb-2'", "('initial_selected_ids',)", "'refresh_channel_display'", "'items-center gap-2 mt-1 w-full flex-nowrap'", "'refresh_overlay'", "'w-full gap-3 flex-wrap items-stretch'", "'video_folder'", "'Folder video'", "'Chß╗ìn folder chß╗⌐a video'", "'movie'", "('on_after',)", "'music_folder'", "'Folder nhß║íc'", "'Chß╗ìn folder chß╗⌐a nhß║íc'", "'music_note'", "('extra_render',)", "'output_folder'", "'Folder output'", "'Chß╗ìn n╞íi l╞░u video ─æ├ú gh├⌐p nhß║íc'", "'drive_folder_upload'", "'w-full gap-2 mt-3'", "'Xß╗¡ l├╜'", "'play_arrow'", "('icon', 'on_click')", "'flex-1'", "'process_btn'", "'Dß╗½ng'", "'stop'", "'color=orange'", "'stop_btn'", "'X├│a tß║Ñt cß║ú'", "'delete_sweep'", "'outline color=red'", "'clear_btn'", "'w-full mt-2 bg-blue-50 border border-blue-200 gap-1 p-3'", "'items-center gap-2 w-full flex-nowrap'", "'sm'", "'primary'", "('size', 'color')", "'─Éang chuß║⌐n bß╗ï...'", "'text-sm font-medium text-blue-700'", "'current'", "'text-xs text-gray-600'", "'step'", "'text-xs text-gray-500'", "'remaining'", '0', "('value',)", "'w-full'", "'bar'", "'w-full h-40 bg-white rounded border border-blue-100 mt-1'", "'log_area'", "'w-full gap-0.5 p-1'", "'log'", "'panel'", "'my-2'", "'w-full gap-1'", "('',)", "('info', False)", '(None, None)', '(None,)')
+  create_delete_back_flow_page.<locals>.build_folder_selector: co_code DIFFERS
+  create_delete_back_flow_page.<locals>.build_folder_selector: co_names DIFFERS
+      orig=('ui', 'card', 'classes', 'on')
+      rec =('_recovered_freevar_0',)
+  create_delete_back_flow_page.<locals>.build_folder_selector: co_varnames DIFFERS
+      orig=('key', 'label', 'placeholder', 'icon', 'on_after', 'extra_render', 'pick_folder')
+      rec =('key', 'label', 'placeholder', 'icon', 'on_after', 'extra_render')
+  create_delete_back_flow_page.<locals>.build_folder_selector: co_freevars DIFFERS
+      orig=('folder_selectors', 'paths_state', 'save_state')
+      rec =('paths_state', 'save_state')
+  create_delete_back_flow_page.<locals>.build_folder_selector: co_cellvars DIFFERS
+      orig=('key', 'label', 'placeholder', 'icon', 'on_after', 'extra_render', 'card', 'clear_folder', 'render')
+      rec =('key', 'label', 'placeholder', 'icon', 'on_after', 'extra_render', 'pick_folder')
+  create_delete_back_flow_page.<locals>.build_folder_selector: leaf_consts DIFFERS
+      orig=('None', "'flex-1 min-w-[220px] h-full p-3 cursor-pointer transition hover:shadow-md hover:border-indigo-300 border border-gray-200 bg-gray-50'", "'click'", '(None,)')
+      rec =('None', '(None,)')
+  create_delete_back_flow_page.<locals>.build_folder_selector: nested_code_order DIFFERS
+      orig=('create_delete_back_flow_page.<locals>.build_folder_selector.<locals>.pick_folder', 'create_delete_back_flow_page.<locals>.build_folder_selector.<locals>.clear_folder', 'create_delete_back_flow_page.<locals>.build_folder_selector.<locals>.render')
+      rec =('create_delete_back_flow_page.<locals>.build_folder_selector.<locals>.pick_folder', 'create_delete_back_flow_page.<locals>.build_folder_selector.<locals>.label', 'create_delete_back_flow_page.<locals>.build_folder_selector.<locals>.placeholder')
+  create_delete_back_flow_page.<locals>.build_folder_selector.<locals>.pick_folder: co_code DIFFERS
+  create_delete_back_flow_page.<locals>.build_folder_selector.<locals>.pick_folder: co_names DIFFERS
+      orig=('select_directory',)
+      rec =('select_directory', 'render')
+  create_delete_back_flow_page.<locals>.build_folder_selector.<locals>.pick_folder: co_freevars DIFFERS
+      orig=('key', 'label', 'on_after', 'paths_state', 'render', 'save_state')
+      rec =('key', 'label', 'on_after', 'paths_state', 'save_state')
+  create_delete_back_flow_page.<locals>.clear_all_inputs: co_code DIFFERS
+  create_delete_back_flow_page.<locals>.clear_all_inputs: co_exceptiontable DIFFERS
+  create_delete_back_flow_page.<locals>.handle_process: co_code DIFFERS
+  create_delete_back_flow_page.<locals>.handle_process: co_exceptiontable DIFFERS
+  create_delete_back_flow_page.<locals>.handle_process: co_names DIFFERS
+      orig=('ui', 'notify', 'normalize_path', 'Path', 'is_dir', 'list_media_files', 'AUDIO_EXTENSIONS', 'mkdir', 'Exception', 'enumerate', 'all', 'get', 'len', 'set_text', '_new_steps', 'logger', 'error', 'append', 'value', 'sum')
+      rec =('_recovered_freevar_7', 'ui', 'notify', 'normalize_path', 'STEP_SEQUENCE', 'Path', 'is_dir', 'list_media_files', 'AUDIO_EXTENSIONS', 'mkdir', 'get', 'len', 'enumerate', 'set_text', 'v_index', '_new_steps', 'value', 'sum', 'Exception', 'e')
+  create_delete_back_flow_page.<locals>.handle_process: co_varnames DIFFERS
+      orig=('video_folder', 'music_folder', 'output_folder', 'items', 'musics', 'e', 'idx', 'it', 'pending_items', 'current_label', 'step_label', 'remaining_label', 'progress_bar', 'total', 'errors', 'stopped', 'v_index', 'orig_index', 'item', 'field', 'step_key', 'step_name', 'step_fn', 'exc', 'done_msg', 'done_count')
+      rec =('video_folder', 'music_folder', 'output_folder', 'items', 'musics', 'idx', '_recovered_error', 'pending_items', 'it', 'current_label', 'step_label', 'remaining_label', 'progress_bar', 'total', 'errors', 'stopped', 'orig_index', 'item', 'field', 'step_key', 'step_name', 'step_fn', 'done_msg', 'done_count')
+  create_delete_back_flow_page.<locals>.handle_process: co_freevars DIFFERS
+      orig=('PERSIST_FIELDS', 'STEP_SEQUENCE', 'paths_state', 'processing', 'progress_refs', 'push_log', 'refresh_video_list', 'save_state', 'selected_channel', 'set_processing_ui', 'stop_requested', 'videos_state')
+      rec =('PERSIST_FIELDS', 'paths_state', 'processing', 'progress_refs', 'push_log', 'refresh_video_list', 'save_state', 'selected_channel', 'set_processing_ui', 'stop_requested')
+  create_delete_back_flow_page.<locals>.handle_process: co_cellvars DIFFERS
+      orig=('it',)
+      rec =()
+  create_delete_back_flow_page.<locals>.handle_process: leaf_consts DIFFERS
+      orig=('None', "'value'", "'─Éang xß╗¡ l├╜, vui l├▓ng ─æß╗úi ho├án tß║Ñt'", "'warning'", "('type',)", "'video_folder'", "'music_folder'", "'output_folder'", "'Folder video kh├┤ng hß╗úp lß╗ç'", "'Folder nhß║íc kh├┤ng hß╗úp lß╗ç'", "'Vui l├▓ng chß╗ìn folder output'", "'id'", "'Vui l├▓ng chß╗ìn k├¬nh ─æß╗â upload'", "'items'", "'Kh├┤ng c├│ video n├áo ─æß╗â xß╗¡ l├╜'", "'Kh├┤ng t├¼m thß║Ñy file nhß║íc n├áo trong folder'", 'True', "('parents', 'exist_ok')", "'Kh├┤ng tß║ío ─æ╞░ß╗úc folder output: '", "'negative'", "'Tß║Ñt cß║ú video ─æ├ú ho├án th├ánh. Kh├┤ng c├│ g├¼ ─æß╗â chß║íy.'", "'info'", "'current'", "'step'", "'remaining'", "'bar'", 'False', "'Bß║»t ─æß║ºu xß╗¡ l├╜ '", "' video'", '1', "'Video '", "'/'", "': '", "'name'", "'C├▓n lß║íi: '", "'work'", "'steps'", "''", "'B╞░ß╗¢c: '", "': ─æang xß╗¡ l├╜...'", "'wait'", "('indent',)", "'processing'", "'successful'", '"Step \'"', '"\' failed for "', "'unsuccessful'", "' ['", "']: '", "': thß║Ñt bß║íi'", "'error'", "': xong'", "'upload'", "'video_id'", "': xong (ID '", "')'", "'ok'", "'─É├ú dß╗½ng theo y├¬u cß║ºu'", "'Ho├án tß║Ñt ΓÇö c├│ mß╗Öt sß╗æ video lß╗ùi'", "'Ho├án tß║Ñt tß║Ñt cß║ú video'", "'─É├ú dß╗½ng. '", "' video ho├án th├ánh to├án bß╗Ö flow. Bß║Ñm Xß╗¡ l├╜ ─æß╗â chß║íy tiß║┐p phß║ºn c├▓n lß║íi.'", "'Ho├án tß║Ñt vß╗¢i mß╗Öt sß╗æ lß╗ùi. '", "' video ho├án th├ánh. Bß║Ñm Xß╗¡ l├╜ ─æß╗â thß╗¡ lß║íi phß║ºn lß╗ùi.'", "'Ho├án tß║Ñt! '", "' video ─æ├ú xß╗¡ l├╜ xong to├án bß╗Ö flow.'", "'positive'")
+      rec =('None', "'value'", "'─Éang xß╗¡ l├╜, vui l├▓ng ─æß╗úi ho├án tß║Ñt'", "'warning'", "('type',)", "'video_folder'", "'music_folder'", "'output_folder'", "'Folder video kh├┤ng hß╗úp lß╗ç'", "'Folder nhß║íc kh├┤ng hß╗úp lß╗ç'", "'Vui l├▓ng chß╗ìn folder output'", "'id'", "'Vui l├▓ng chß╗ìn k├¬nh ─æß╗â upload'", "'items'", "'Kh├┤ng c├│ video n├áo ─æß╗â xß╗¡ l├╜'", "'Kh├┤ng t├¼m thß║Ñy file nhß║íc n├áo trong folder'", 'True', "('parents', 'exist_ok')", "'Tß║Ñt cß║ú video ─æ├ú ho├án th├ánh. Kh├┤ng c├│ g├¼ ─æß╗â chß║íy.'", "'info'", "'current'", "'step'", "'remaining'", "'bar'", 'False', "'Bß║»t ─æß║ºu xß╗¡ l├╜ '", "' video'", '1', "'Video '", "'/'", "': '", "'name'", "'C├▓n lß║íi: '", "'work'", "'steps'", "''", "'B╞░ß╗¢c: '", "': ─æang xß╗¡ l├╜...'", "'wait'", "('indent',)", "'processing'", "'successful'", "': xong'", "'upload'", "'video_id'", "': xong (ID '", "')'", "'ok'", "'─É├ú dß╗½ng theo y├¬u cß║ºu'", "'Ho├án tß║Ñt \\x97 c├│ mß╗Öt sß╗æ video lß╗ùi'", "'error'", "'Ho├án tß║Ñt tß║Ñt cß║ú video'", "'─É├ú dß╗½ng. '", "' video ho├án th├ánh to├án bß╗Ö flow. Bß║Ñm Xß╗¡ l├╜ ─æß╗â chß║íy tiß║┐p phß║ºn c├▓n lß║íi.'", "'Ho├án tß║Ñt vß╗¢i mß╗Öt sß╗æ lß╗ùi. '", "' video ho├án th├ánh. Bß║Ñm Xß╗¡ l├╜ ─æß╗â thß╗¡ lß║íi phß║ºn lß╗ùi.'", "'Ho├án tß║Ñt! '", "' video ─æ├ú xß╗¡ l├╜ xong to├án bß╗Ö flow.'", "'positive'", "'Kh├┤ng tß║ío ─æ╞░ß╗úc folder output: '", "'negative'")
+  create_delete_back_flow_page.<locals>.handle_process: nested_code_order DIFFERS
+      orig=('create_delete_back_flow_page.<locals>.handle_process.<locals>.<genexpr>', 'create_delete_back_flow_page.<locals>.handle_process.<locals>.<genexpr>')
+      rec =('create_delete_back_flow_page.<locals>.handle_process.<locals>.<genexpr>',)
+  create_delete_back_flow_page.<locals>.handle_process.<locals>.<genexpr>: co_code DIFFERS
+  create_delete_back_flow_page.<locals>.handle_process.<locals>.<genexpr>: co_exceptiontable DIFFERS
+  create_delete_back_flow_page.<locals>.handle_process.<locals>.<genexpr>: co_names DIFFERS
+      orig=('all',)
+      rec =()
+  create_delete_back_flow_page.<locals>.handle_process.<locals>.<genexpr>: co_varnames DIFFERS
+      orig=('.0',)
+      rec =('.0', 'it')
+  create_delete_back_flow_page.<locals>.handle_process.<locals>.<genexpr>: co_freevars DIFFERS
+      orig=('STEP_SEQUENCE',)
+      rec =()
+  create_delete_back_flow_page.<locals>.handle_process.<locals>.<genexpr>: co_cellvars DIFFERS
+      orig=('it',)
+      rec =()
+  create_delete_back_flow_page.<locals>.handle_process.<locals>.<genexpr>: nested_code_order DIFFERS
+      orig=('create_delete_back_flow_page.<locals>.handle_process.<locals>.<genexpr>.<genexpr>',)
+      rec =()
+  create_delete_back_flow_page.<locals>.handle_stop: co_code DIFFERS
+  create_delete_back_flow_page.<locals>.load_durations: co_code DIFFERS
+  create_delete_back_flow_page.<locals>.load_durations: co_exceptiontable DIFFERS
+  create_delete_back_flow_page.<locals>.load_state: co_code DIFFERS
+  create_delete_back_flow_page.<locals>.load_state: co_exceptiontable DIFFERS
+  create_delete_back_flow_page.<locals>.load_state: co_names DIFFERS
+      orig=('state_manager', 'load_state', 'get', 'clear', 'update', 'ui', 'timer', 'Exception', 'logger', 'error')
+      rec =('state_manager', 'load_state', 'get', 'clear', 'update', 'ui', 'timer')
+  create_delete_back_flow_page.<locals>.load_state: co_varnames DIFFERS
+      orig=('state', 'update_ui', 'e')
+      rec =('state', 'update_ui')
+  create_delete_back_flow_page.<locals>.load_state: leaf_consts DIFFERS
+      orig=('None', "'delete_back_flow'", "'video_folder'", "''", "'music_folder'", "'output_folder'", "'random_music'", 'False', "'selected_channel'", "'id'", "'statuses'", '0.5', 'True', "('once',)", "'Failed to load delete_back_flow state: '")
+      rec =('None', "'delete_back_flow'", "'video_folder'", "''", "'music_folder'", "'output_folder'", "'random_music'", 'False', "'selected_channel'", "'id'", "'statuses'", '0.5', 'True', "('once',)")
+  create_delete_back_flow_page.<locals>.load_state.<locals>.update_ui: co_code DIFFERS
+  create_delete_back_flow_page.<locals>.load_state.<locals>.update_ui: co_exceptiontable DIFFERS
+  create_delete_back_flow_page.<locals>.load_state.<locals>.update_ui: co_names DIFFERS
+      orig=('values', 'value', 'get', 'Exception', 'logger', 'error')
+      rec =('values', 'value', 'get')
+  create_delete_back_flow_page.<locals>.load_state.<locals>.update_ui: co_varnames DIFFERS
+      orig=('render', 'e')
+      rec =('render',)
+  create_delete_back_flow_page.<locals>.load_state.<locals>.update_ui: leaf_consts DIFFERS
+      orig=('None', "'random_switch'", "'random_music'", "'id'", "'refresh_channel_display'", "'refresh_overlay'", "'Failed to update UI: '")
+      rec =('None', "'random_switch'", "'random_music'", "'id'", "'refresh_channel_display'", "'refresh_overlay'")
+  create_delete_back_flow_page.<locals>.load_videos: co_code DIFFERS
+  create_delete_back_flow_page.<locals>.load_videos: co_exceptiontable DIFFERS
+  create_delete_back_flow_page.<locals>.load_videos: co_names DIFFERS
+      orig=('normalize_path', 'Path', 'is_dir', 'list_media_files', 'VIDEO_EXTENSIONS', 'get', 'name', 'stat', 'st_size', 'OSError', 'str', '_new_steps', 'append', 'ui', 'timer')
+      rec =('normalize_path', 'Path', 'is_dir', 'list_media_files', 'VIDEO_EXTENSIONS', 'get', 'name', 'stat', 'st_size', 'str', 'append', 'ui', 'timer', 'OSError')
+  create_delete_back_flow_page.<locals>.load_videos: leaf_consts DIFFERS
+      orig=('None', "'video_folder'", '0', "'steps'", "('name', 'path', 'size', 'duration', 'steps')", "''", "'processing'", "'pending'", "'items'", '0.05', 'True', "('once',)")
+      rec =('None', "'video_folder'", "'steps'", "('name', 'path', 'size', 'duration', 'steps')", "''", "'processing'", "'pending'", "'items'", '0.05', 'True', "('once',)", '0')
+  create_delete_back_flow_page.<locals>.on_random_change: co_code DIFFERS
+  create_delete_back_flow_page.<locals>.on_random_change: co_names DIFFERS
+      orig=('bool', 'value')
+      rec =('bool',)
+  create_delete_back_flow_page.<locals>.pick_overlay: co_code DIFFERS
+  create_delete_back_flow_page.<locals>.pick_overlay: co_names DIFFERS
+      orig=('ui', 'notify', 'get_channels_info', 'overlay_png', 'str', 'Path', 'parent', 'select_file', 'channel_store', 'set_overlay_png')
+      rec =('ui', 'notify', 'get_channels_info', 'select_file', 'channel_store', 'set_overlay_png')
+  create_delete_back_flow_page.<locals>.push_log: co_code DIFFERS
+  create_delete_back_flow_page.<locals>.push_log: co_exceptiontable DIFFERS
+  create_delete_back_flow_page.<locals>.push_log: co_names DIFFERS
+      orig=('get', 'ui', 'row', 'classes', 'icon', 'label', 'scroll_to')
+      rec =('get', 'LOG_STYLE', 'ui', 'row', 'classes', 'icon', 'label', '_recovered_error', 'scroll_to')
+  create_delete_back_flow_page.<locals>.push_log: co_freevars DIFFERS
+      orig=('LOG_STYLE', 'progress_refs')
+      rec =('progress_refs',)
+  create_delete_back_flow_page.<locals>.push_log: leaf_consts DIFFERS
+      orig=("'Th├¬m 1 d├▓ng progress th├ón thiß╗çn cho user (kh├┤ng lß╗Ö chi tiß║┐t kß╗╣ thuß║¡t).'", "'log'", 'None', "'info'", "'items-center gap-1 w-full flex-nowrap '", "'pl-5'", "''", "'text-sm shrink-0 '", "'text-xs '", "' truncate'", "'log_area'", '1.0', "('percent',)")
+      rec =('None', "'log'", "'info'", "'items-center gap-1 w-full flex-nowrap '", "''", "'text-sm shrink-0 '", "'text-xs '", "' truncate'", "'log_area'", '1.0', "('percent',)")
+  create_delete_back_flow_page.<locals>.refresh_overlay_display: co_code DIFFERS
+  create_delete_back_flow_page.<locals>.refresh_overlay_display: co_exceptiontable DIFFERS
+  create_delete_back_flow_page.<locals>.refresh_overlay_display: co_names DIFFERS
+      orig=('clear', 'ui', 'label', 'classes', 'get_channels_info', 'overlay_png', 'bool', 'Path', 'normalize_path', 'is_file', 'name', 'icon', 'tooltip', 'button', 'props')
+      rec =('clear', 'ui', 'label', 'classes', 'get_channels_info', 'bool', 'Path', 'normalize_path', 'is_file', 'name', 'icon', 'tooltip', 'button', 'props')
+  create_delete_back_flow_page.<locals>.refresh_overlay_display: co_varnames DIFFERS
+      orig=('cid', 'ch', 'png', 'exists', 'icon', 'color', 'text')
+      rec =('cid', 'ch', 'png', 'exists', 'text', 'color', 'icon')
+  create_delete_back_flow_page.<locals>.refresh_overlay_display: leaf_consts DIFFERS
+      orig=('None', "'id'", "'Chß╗ìn k├¬nh ─æß╗â g├ín ß║únh t├¬n k├¬nh (overlay phß╗º to├án khung)'", "'text-xs text-gray-400 italic'", "''", "'check_circle'", "'text-green-600'", "'error'", "'text-red-600'", "'Kh├┤ng tß╗ôn tß║íi: '", "('error', 'text-red-600', 'Ch╞░a c├│ ß║únh t├¬n k├¬nh')", "' shrink-0'", "'ß║ónh t├¬n k├¬nh:'", "'text-xs text-gray-600 shrink-0'", "'text-xs font-medium '", "' truncate max-w-[240px]'", "'Chß╗ìn PNG'", "'upload_file'", "('icon', 'on_click')", "'dense outline size=sm'", "'close'", "'flat round dense size=sm color=grey'", "'Bß╗Å ß║únh'")
+      rec =('None', "'id'", "'Chß╗ìn k├¬nh ─æß╗â g├ín ß║únh t├¬n k├¬nh (overlay phß╗º to├án khung)'", "'text-xs text-gray-400 italic'", "''", "'text-green-600'", "'check_circle'", "'Kh├┤ng tß╗ôn tß║íi: '", "'text-red-600'", "'error'", "('error', 'text-red-600', 'Ch╞░a c├│ ß║únh t├¬n k├¬nh')", "' shrink-0'", "'ß║ónh t├¬n k├¬nh:'", "'text-xs text-gray-600 shrink-0'", "'text-xs font-medium '", "' truncate max-w-[240px]'", "'Chß╗ìn PNG'", "'upload_file'", "('icon', 'on_click')", "'dense outline size=sm'", "'close'", "'flat round dense size=sm color=grey'", "'Bß╗Å ß║únh'")
+  create_delete_back_flow_page.<locals>.refresh_video_list: co_code DIFFERS
+  create_delete_back_flow_page.<locals>.refresh_video_list: co_exceptiontable DIFFERS
+  create_delete_back_flow_page.<locals>.refresh_video_list: co_names DIFFERS
+      orig=('clear', 'ui', 'row', 'classes', 'icon', 'label', 'len', 'enumerate', 'str', 'column', 'tooltip', '_human_size', '_fmt_duration', 'get', 'element')
+      rec =('clear', 'ui', 'row', 'classes', 'icon', 'label', 'len', 'enumerate', 'str', 'column', 'tooltip', '_human_size', '_fmt_duration', 'get', 'element', '_recovered_error')
+  create_delete_back_flow_page.<locals>.refresh_video_list: leaf_consts DIFFERS
+      orig=('None', "'items'", "'items-center gap-2 mb-1'", "'video_library'", "'text-gray-500'", "'T├¼m thß║Ñy '", "' video'", "'text-sm font-semibold text-gray-700'", "'Ch╞░a chß╗ìn folder video hoß║╖c folder kh├┤ng c├│ video n├áo.'", "'text-gray-500 italic text-sm'", "'w-full items-center font-semibold text-xs text-gray-600 bg-gray-100 px-2 py-2 rounded flex-nowrap'", "'#'", "'w-1/12'", "'Video'", "'w-3/12'", "'ID'", "'w-2/12'", "'Nhß║íc'", "'Gh├⌐p nhß║íc'", "'w-1/12 text-center'", "'Upload'", "'Chß╗¥ xß╗¡ l├╜'", "'X├│a - Back'", '1', "'steps'", "'w-full items-center bg-white rounded px-2 py-1 border-b border-gray-100 flex-nowrap'", "'w-1/12 text-xs text-gray-500'", "'w-3/12 min-w-0 gap-0'", "'name'", "'truncate text-sm font-medium text-gray-800'", "'size'", "'duration'", "' ┬╖ ─æang ─æß╗ìc...'", "' ┬╖ '", "'text-xs text-gray-400'", "'video_id'", "'w-2/12 min-w-0'", "'truncate text-xs font-medium text-indigo-600'", "'ΓÇö'", "'music'", "'w-2/12 truncate text-xs text-gray-600'", "'div'", "'w-1/12 flex justify-center'", "'merge'", "'upload'", "'wait'", "'delete_back'")
+      rec =('None', "'items'", "'items-center gap-2 mb-1'", "'video_library'", "'text-gray-500'", "'T├¼m thß║Ñy '", "' video'", "'text-sm font-semibold text-gray-700'", "'Ch╞░a chß╗ìn folder video hoß║╖c folder kh├┤ng c├│ video n├áo.'", "'text-gray-500 italic text-sm'", "'w-full items-center font-semibold text-xs text-gray-600 bg-gray-100 px-2 py-2 rounded flex-nowrap'", "'#'", "'w-1/12'", "'Video'", "'w-3/12'", "'ID'", "'w-2/12'", "'Nhß║íc'", "'Gh├⌐p nhß║íc'", "'w-1/12 text-center'", "'Upload'", "'Chß╗¥ xß╗¡ l├╜'", "'X├│a - Back'", '1', "'steps'", "'w-full items-center bg-white rounded px-2 py-1 border-b border-gray-100 flex-nowrap'", "'w-1/12 text-xs text-gray-500'", "'w-3/12 min-w-0 gap-0'", "'name'", "'truncate text-sm font-medium text-gray-800'", "'size'", "'duration'", "' ┬╖ ─æang ─æß╗ìc...'", "' ┬╖ '", "'text-xs text-gray-400'", "'video_id'", "'w-2/12 min-w-0'", "'truncate text-xs font-medium text-indigo-600'", "'\\x97'", "'music'", "'w-2/12 truncate text-xs text-gray-600'", "'div'", "'w-1/12 flex justify-center'", "'merge'", "'upload'", "'wait'", "'delete_back'")
+  create_delete_back_flow_page.<locals>.save_state: co_code DIFFERS
+  create_delete_back_flow_page.<locals>.save_state: co_exceptiontable DIFFERS
+  create_delete_back_flow_page.<locals>.save_state: co_names DIFFERS
+      orig=('get', 'state_manager', 'save_state', 'Exception', 'logger', 'error')
+      rec =('get', 'state_manager', 'save_state')
+  create_delete_back_flow_page.<locals>.save_state: co_varnames DIFFERS
+      orig=('statuses', 'it', 'entry', 'field', 'e')
+      rec =('statuses', 'it', 'entry', 'field')
+  create_delete_back_flow_page.<locals>.save_state: leaf_consts DIFFERS
+      orig=('None', "'value'", "'items'", "'steps'", "''", "'name'", "'delete_back_flow'", "'video_folder'", "'music_folder'", "'output_folder'", "'random_music'", "'id'", "('video_folder', 'music_folder', 'output_folder', 'random_music', 'selected_channel', 'statuses')", "'Failed to save delete_back_flow state: '")
+      rec =('None', "'value'", "'items'", "'steps'", "''", "'name'", "'delete_back_flow'", "'video_folder'", "'music_folder'", "'output_folder'", "'random_music'", "'id'", "('video_folder', 'music_folder', 'output_folder', 'random_music', 'selected_channel', 'statuses')")
+  create_delete_back_flow_page.<locals>.set_processing_ui: co_code DIFFERS
+  create_delete_back_flow_page.<locals>.set_processing_ui: co_varnames DIFFERS
+      orig=('active', 'message', 'panel')
+      rec =('active', 'message', 'panel', 'LOG_STYLE')
+  create_delete_back_flow_page.<locals>.set_processing_ui: leaf_consts DIFFERS
+      orig=("'Bß║¡t/tß║»t trß║íng th├íi ─æang xß╗¡ l├╜: kh├│a ─æiß╗üu h╞░ß╗¢ng, panel tiß║┐n tr├¼nh, n├║t.'", "'value'", "'─Éang xß╗¡ l├╜ video, vui l├▓ng ─æß╗úi ho├án tß║Ñt tr╞░ß╗¢c khi chuyß╗ân trang.'", "'panel'", "'bar'", '0', "'current'", "'process_btn'", "'clear_btn'", "'stop_btn'", "'log'", 'None')
+      rec =('None', "'value'", "'─Éang xß╗¡ l├╜ video, vui l├▓ng ─æß╗úi ho├án tß║Ñt tr╞░ß╗¢c khi chuyß╗ân trang.'", "'panel'", "'bar'", '0', "'current'", "'process_btn'", "'clear_btn'", "'stop_btn'", "'log'")
+  create_delete_back_flow_page.<locals>.step_delete_back: co_code DIFFERS
+  create_delete_back_flow_page.<locals>.step_delete_back: co_exceptiontable DIFFERS
+  create_delete_back_flow_page.<locals>.step_delete_back: co_names DIFFERS
+      orig=('get', 'Exception', 'asyncio', 'to_thread', 'list_videos_module', 'get_copyright_statuses', 'COPYRIGHT_STARTED', 'COPYRIGHT_COMPLETED', 'set_text', 'sleep', 'delete_video_module', 'delete', 'get_channels_info', '_log_deleted', 'name')
+      rec =('get', 'Exception', 'asyncio', 'to_thread', 'list_videos_module', 'get_copyright_statuses', 'COPYRIGHT_STARTED', 'COPYRIGHT_COMPLETED', 'set_text', 'sleep', 'delete_video_module', 'delete', 'get_channels_info', '_log_deleted')
+  create_delete_back_flow_page.<locals>.step_delete_back: co_varnames DIFFERS
+      orig=('item', 'output_folder', 'musics', 'index', 'channel_id', 'video_id', 'step_label', 'max_wait', 'interval', 'waited', 'statuses', 'cs', 'code', 'channel')
+      rec =('item', 'output_folder', 'musics', 'index', 'channel_id', 'video_id', 'step_label', 'max_wait', 'interval', 'waited', 'statuses', 'cs', 'code', 'channel', 'STEP_SEQUENCE')
+  create_delete_back_flow_page.<locals>.step_delete_back: co_freevars DIFFERS
+      orig=('progress_refs', 'push_log', 'selected_channel', 'stop_requested')
+      rec =('progress_refs', 'push_log', 'selected_channel', 'step_delete_back', 'step_merge', 'step_upload', 'step_wait_processed', 'stop_requested')
+  create_delete_back_flow_page.<locals>.step_delete_back: leaf_consts DIFFERS
+      orig=("'X├│a - Back: chß╗¥ copyright check STARTED rß╗ôi x├│a video vß╗½a upload.'", "'id'", "'video_id'", "'Ch╞░a c├│ video ID (upload ch╞░a xong)'", "'step'", "'Chß╗¥ copyright check (STARTED)...'", "'wait'", 'True', "('indent',)", '(1800, 15, 0)', "'value'", "'─É├ú dß╗½ng khi ─æang chß╗¥ copyright check'", 'None', "''", "'Copyright ch╞░a STARTED sau '", "'s (video_id='", "')'", "'B╞░ß╗¢c: X├│a - Back ΓÇö chß╗¥ copyright check... ('", "'s)'", "'Copyright ─æ├ú STARTED, tiß║┐n h├ánh x├│a...'", "'work'", "'B╞░ß╗¢c: X├│a - Back ΓÇö ─æang x├│a video...'", '200', "'X├│a video thß║Ñt bß║íi: HTTP '", "'music'", "'name'", "'─É├ú x├│a video (back): '", "'ok'")
+      rec =('None', "'id'", "'video_id'", "'Ch╞░a c├│ video ID (upload ch╞░a xong)'", "'step'", "'Chß╗¥ copyright check (STARTED)...'", "'wait'", 'True', "('indent',)", '(1800, 15, 0)', "'value'", "'─É├ú dß╗½ng khi ─æang chß╗¥ copyright check'", "''", "'Copyright ch╞░a STARTED sau '", "'s (video_id='", "')'", "'B╞░ß╗¢c: X├│a - Back \\x97 chß╗¥ copyright check... ('", "'s)'", "'Copyright ─æ├ú STARTED, tiß║┐n h├ánh x├│a...'", "'work'", "'B╞░ß╗¢c: X├│a - Back \\x97 ─æang x├│a video...'", '200', "'X├│a video thß║Ñt bß║íi: HTTP '", "'music'", "'name'", "'─É├ú x├│a video (back): '", "'ok'", "'merge'", "'Gh├⌐p nhß║íc'", "'upload'", "'Upload'", "'Chß╗¥ xß╗¡ l├╜'", "'delete_back'", "'X├│a - Back'")
+  create_delete_back_flow_page.<locals>.step_merge: co_code DIFFERS
+  create_delete_back_flow_page.<locals>.step_merge: co_exceptiontable DIFFERS
+  create_delete_back_flow_page.<locals>.step_merge: co_names DIFFERS
+      orig=('random', 'choice', 'len', 'name', 'str', 'Path', 'get_channels_info', 'overlay_png', 'asyncio', 'to_thread', 'build_intermittent_audio', 'mux_audio_into_video')
+      rec =('random', 'choice', 'len', 'name', 'str', 'Path', 'get_channels_info', 'asyncio', 'to_thread', 'build_intermittent_audio', 'mux_audio_into_video')
+  create_delete_back_flow_page.<locals>.step_merge: leaf_consts DIFFERS
+      orig=("'Render video vß╗¢i nhß║íc li├¬n tß╗Ñc (KH├öNG mute), loop video cho bß║▒ng nhß║íc.\\n\\n        Xuß║Ñt 2 file: output_{i}.m4v (audio) v├á output_{i}_processed.mp4\\n        (video ─æ├ú render vß╗¢i audio ─æ├│ + overlay logo t├¬n k├¬nh).\\n        '", "'random_music'", "'music'", "'music_path'", "'output_'", "'.m4v'", "'_processed.mp4'", "'audio_path'", "'output_path'", "'id'", "''", '3.0', '0.0', "('music_file', 'audio_out', 'play_sec', 'mute_sec')", 'None', "'path'", "('video_file', 'audio_file', 'video_out', 'duration', 'overlay_png')")
+      rec =('None', "'random_music'", "'music'", "'music_path'", "'output_'", "'.m4v'", "'_processed.mp4'", "'audio_path'", "'output_path'", "'id'", "''", '3.0', '0.0', "('music_file', 'audio_out', 'play_sec', 'mute_sec')", "'path'", "('video_file', 'audio_file', 'video_out', 'duration', 'overlay_png')")
+  create_delete_back_flow_page.<locals>.step_upload: co_code DIFFERS
+  create_delete_back_flow_page.<locals>.step_upload: co_exceptiontable DIFFERS
+  create_delete_back_flow_page.<locals>.step_upload: co_names DIFFERS
+      orig=('Exception', 'get', 'ui', 'timer', 'asyncio', 'to_thread', 'upload_video_module', 'upload', 'cancel', 'create_video', 'Path', 'stem')
+      rec =('get', 'ui', 'timer', 'asyncio', 'to_thread', 'upload_video_module', 'upload', 'cancel', 'create_video', 'Path', 'stem')
+  create_delete_back_flow_page.<locals>.step_upload: leaf_consts DIFFERS
+      orig=("'Upload video ─æ├ú gh├⌐p nhß║íc l├¬n k├¬nh v├á tß║ío video.\\n\\n        Chß║╖ng 1 (start) + chß║╖ng 2 (finalize) + chß║╖ng 3 (createvideo ΓåÆ videoId,\\n        set title/description). Title mß║╖c ─æß╗ïnh lß║Ñy tß╗½ t├¬n file.\\n        '", "'id'", "'Ch╞░a chß╗ìn k├¬nh'", "'step'", '0', "('sent', 'total')", '0.5', "'output_path'", "('channel_id', 'file_path', 'index', 'progress')", 'None', "'frontend_upload_id'", "'scotty_resource_id'", "'music'", "'name'", "('channel_id', 'scotty_resource_id', 'frontend_upload_id', 'title')", "'video_id'")
+      rec =('None', "'id'", "'Ch╞░a chß╗ìn k├¬nh'", "'step'", '0', "('sent', 'total')", '0.5', "'output_path'", "('channel_id', 'file_path', 'index', 'progress')", "'frontend_upload_id'", "'scotty_resource_id'", "'music'", "'name'", "('channel_id', 'scotty_resource_id', 'frontend_upload_id', 'title')", "'video_id'")
+  create_delete_back_flow_page.<locals>.step_upload.<locals>._tick_upload: leaf_consts DIFFERS
+      orig=('None', "'total'", '0', "'sent'", '100', "'B╞░ß╗¢c: Upload ΓÇö '", "'% ('", '1000000.0', "'.0f'", "'/'", "' MB)'")
+      rec =('None', "'total'", '0', "'sent'", '100', "'B╞░ß╗¢c: Upload \\x97 '", "'% ('", '1000000.0', "'.0f'", "'/'", "' MB)'")
+  create_delete_back_flow_page.<locals>.step_wait_processed: co_code DIFFERS
+  create_delete_back_flow_page.<locals>.step_wait_processed: co_exceptiontable DIFFERS
+  create_delete_back_flow_page.<locals>.step_wait_processed: leaf_consts DIFFERS
+      orig=("'Chß╗¥ YouTube xß╗¡ l├╜ video xong (poll status = VIDEO_STATUS_PROCESSED).'", "'id'", "'video_id'", "'Ch╞░a c├│ video ID (upload ch╞░a xong)'", "'step'", "'Chß╗¥ YouTube xß╗¡ l├╜ video xong...'", "'wait'", 'True', "('indent',)", '(1200, 15, 0)', "'value'", "'─É├ú dß╗½ng khi ─æang chß╗¥ video xß╗¡ l├╜'", 'None', "'Video ch╞░a xß╗¡ l├╜ xong sau '", "'s (video_id='", "')'", "'B╞░ß╗¢c: Chß╗¥ xß╗¡ l├╜ ΓÇö '", "'s'", "'Video ─æ├ú xß╗¡ l├╜ xong'", "'ok'")
+      rec =('None', "'id'", "'video_id'", "'Ch╞░a c├│ video ID (upload ch╞░a xong)'", "'step'", "'Chß╗¥ YouTube xß╗¡ l├╜ video xong...'", "'wait'", 'True', "('indent',)", '(1200, 15, 0)', "'value'", "'─É├ú dß╗½ng khi ─æang chß╗¥ video xß╗¡ l├╜'", "'Video ch╞░a xß╗¡ l├╜ xong sau '", "'s (video_id='", "')'", "'B╞░ß╗¢c: Chß╗¥ xß╗¡ l├╜ \\x97 '", "'s'", "'Video ─æ├ú xß╗¡ l├╜ xong'", "'ok'")
+
+ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+Module: web/components/delete_video
+Status: MISMATCH
+Code objects with mismatches: 10
+  create_delete_video_page: co_code DIFFERS
+  create_delete_video_page: co_exceptiontable DIFFERS
+  create_delete_video_page: co_names DIFFERS
+      orig=('get_channels_info', 'list', 'delete_controller', 'selected_channel_ids', 'str', 'dict', 'ui', 'column', 'classes', 'row', 'icon', 'label', 'create_channel_selection', 'card', 'output_dir', 'button', 'props', 'separator', 'linear_progress', 'set_visibility', 'all_videos', 'version', 'set_text', 'status_text', 'timer', 'SYNC_INTERVAL')
+      rec =('get_channels_info', 'list', 'delete_controller', 'selected_channel_ids', 'str', 'dict', 'ui', 'column', 'classes', 'row', 'icon', 'label', 'create_channel_selection', 'card', 'output_dir', 'button', 'props', 'separator', 'linear_progress', 'set_visibility', 'all_videos', 'version', 'set_text', 'status_text', 'timer', 'SYNC_INTERVAL', '__exception__')
+  create_delete_video_page.<locals>._apply_run_state: co_code DIFFERS
+  create_delete_video_page.<locals>._full_rebuild: co_code DIFFERS
+  create_delete_video_page.<locals>._full_rebuild: co_exceptiontable DIFFERS
+  create_delete_video_page.<locals>._reconcile_table: co_code DIFFERS
+  create_delete_video_page.<locals>._reconcile_table: co_exceptiontable DIFFERS
+  create_delete_video_page.<locals>._reconcile_table: leaf_consts DIFFERS
+      orig=('None', "'table_container'", "'id'", "'value'", 'True', "'row_status'", "'chip'")
+      rec =('None', "'table_container'", "'id'", "'value'", "'row_status'", "'chip'")
+  create_delete_video_page.<locals>._render_chip: co_code DIFFERS
+  create_delete_video_page.<locals>._render_row: co_code DIFFERS
+  create_delete_video_page.<locals>._render_row: co_exceptiontable DIFFERS
+  create_delete_video_page.<locals>._render_row: leaf_consts DIFFERS
+      orig=('None', "'id'", "'w-full items-center flex-nowrap border border-gray-100 rounded mb-0.5 bg-white hover:bg-gray-50'", "'w-16 shrink-0 p-1'", "'thumbnail'", "'w-full aspect-video object-cover rounded'", "'videocam_off'", "'text-xl text-gray-300 mx-auto block'", "'w-40 shrink-0 items-center gap-2 px-1 flex-nowrap'", "'channel_avatar'", "'w-6 h-6 rounded-full shrink-0'", "'account_circle'", "'text-xl text-gray-400 shrink-0'", "'channel_name'", "'ΓÇô'", "'text-xs text-gray-700 truncate'", "'w-28 shrink-0 px-1'", "'text-xs font-mono bg-gray-100 text-gray-700 px-1.5 py-0.5 rounded break-all leading-tight'", "'flex-1 min-w-0 px-2 py-1'", "'title'", "'text-sm text-gray-800 font-medium line-clamp-2'", "'privacy'", "''", "'items-center gap-1 px-1.5 py-0.5 rounded text-xs font-medium '", "'text-sm'", "'text-xs'", "'div'", "'w-36 shrink-0 px-1'", "'row_status'", "'chip'")
+      rec =('None', "'id'", "'w-full items-center flex-nowrap border border-gray-100 rounded mb-0.5 bg-white hover:bg-gray-50'", "'w-16 shrink-0 p-1'", "'thumbnail'", "'w-full aspect-video object-cover rounded'", "'videocam_off'", "'text-xl text-gray-300 mx-auto block'", "'w-40 shrink-0 items-center gap-2 px-1 flex-nowrap'", "'channel_avatar'", "'w-6 h-6 rounded-full shrink-0'", "'account_circle'", "'text-xl text-gray-400 shrink-0'", "'channel_name'", "'\\x96'", "'text-xs text-gray-700 truncate'", "'w-28 shrink-0 px-1'", "'text-xs font-mono bg-gray-100 text-gray-700 px-1.5 py-0.5 rounded break-all leading-tight'", "'flex-1 min-w-0 px-2 py-1'", "'title'", "'text-sm text-gray-800 font-medium line-clamp-2'", "'privacy'", "''", "'items-center gap-1 px-1.5 py-0.5 rounded text-xs font-medium '", "'text-sm'", "'text-xs'", "'div'", "'w-36 shrink-0 px-1'", "'row_status'", "'chip'")
+  create_delete_video_page.<locals>._update_summary: co_code DIFFERS
+  create_delete_video_page.<locals>._update_summary: co_names DIFFERS
+      orig=('delete_controller', 'counts', 'ROW_STATUS_META', 'keys', 'len', 'all_videos', 'set_value', 'set_visibility', 'bool', 'append', 'set_text', 'join')
+      rec =('delete_controller', 'counts', 'ROW_STATUS_META', 'keys', 'len', 'all_videos', 'set_value', 'set_visibility', 'bool', 'append', 'set_text')
+  create_delete_video_page.<locals>._update_summary: leaf_consts DIFFERS
+      orig=('None', "'deleted'", "'error'", "'skipped'", "'progress_bar'", '0', "'summary_label'", "'waiting'", "'ΓÅ│ '", "' chß╗¥ xß╗¡ l├╜'", "'ready'", "'≡ƒƒá '", "' sß║»p x├│a'", "'deleting'", "'≡ƒö╡ '", "' ─æang x├│a'", "'Γ£à '", "' ─æ├ú x├│a'", "'Γ¥î '", "' lß╗ùi'", "'ΓÅ¡ '", "' bß╗Å qua'", "'  |  '", "''")
+      rec =('None', "'deleted'", "'error'", "'skipped'", "'progress_bar'", '0', "'summary_label'", "'waiting'", "'ΓÅ│ '", "' chß╗¥ xß╗¡ l├╜'", "'ready'", "'≡ƒƒá '", "' sß║»p x├│a'", "'deleting'", "'≡ƒö╡ '", "' ─æang x├│a'", "'Γ£à '", "' ─æ├ú x├│a'", "'Γ¥î '", "' lß╗ùi'", "'ΓÅ¡ '", "' bß╗Å qua'", "''")
+  create_delete_video_page.<locals>.handle_open_history: co_code DIFFERS
+  create_delete_video_page.<locals>.handle_open_history: co_exceptiontable DIFFERS
+  create_delete_video_page.<locals>.handle_open_history: co_names DIFFERS
+      orig=('delete_controller', 'log_file', 'exists', 'ui', 'notify', 'os', 'startfile', 'str', 'Exception')
+      rec =('delete_controller', 'log_file', 'exists', 'ui', 'notify', 'os', 'startfile', 'str')
+  create_delete_video_page.<locals>.handle_open_history: co_varnames DIFFERS
+      orig=('log_file', 'exc')
+      rec =('log_file',)
+  create_delete_video_page.<locals>.handle_open_history: leaf_consts DIFFERS
+      orig=('None', "'Ch╞░a c├│ file lß╗ïch sß╗¡ x├│a. File sß║╜ ─æ╞░ß╗úc tß║ío sau khi x├│a video.'", "'warning'", "('type',)", "'Kh├┤ng thß╗â mß╗ƒ file: '", "'negative'")
+      rec =('None', "'Ch╞░a c├│ file lß╗ïch sß╗¡ x├│a. File sß║╜ ─æ╞░ß╗úc tß║ío sau khi x├│a video.'", "'warning'", "('type',)")
+  create_delete_video_page.<locals>.handle_scan: co_code DIFFERS
+  create_delete_video_page.<locals>.handle_scan: co_exceptiontable DIFFERS
+  create_delete_video_page.<locals>.handle_stop: co_code DIFFERS
+  create_delete_video_page.<locals>.handle_stop: co_exceptiontable DIFFERS
+
+ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+Module: web/components/remove_audio
+Status: MISMATCH
+Code objects with mismatches: 10
+  create_remove_audio_page: co_code DIFFERS
+  create_remove_audio_page: co_exceptiontable DIFFERS
+  create_remove_audio_page: co_names DIFFERS
+      orig=('get_channels_info', 'str', 'list', 'ui', 'card', 'classes', 'create_channel_selection', 'row', 'column', 'textarea', 'props', 'button')
+      rec =('get_channels_info', 'str', 'list', 'ui', 'card', 'classes', 'create_channel_selection', 'row', 'column', 'textarea', 'props', 'button', '__exception__')
+  create_remove_audio_page.<locals>.clear_all_inputs: co_code DIFFERS
+  create_remove_audio_page.<locals>.clear_all_inputs: co_exceptiontable DIFFERS
+  create_remove_audio_page.<locals>.clear_all_inputs: leaf_consts DIFFERS
+      orig=("'Clear all inputs and reset form state'", 'True', "'value'", "'ids_textarea'", "''", "'ids'", 'None', "'id'", "'refresh_remove_channel_display'", "'─É├ú x├│a tß║Ñt cß║ú input v├á trß║íng th├íi'", "'info'", "('type',)", 'False')
+      rec =('None', 'True', "'value'", "'ids_textarea'", "''", "'ids'", "'id'", "'refresh_remove_channel_display'", "'─É├ú x├│a tß║Ñt cß║ú input v├á trß║íng th├íi'", "'info'", "('type',)", 'False')
+  create_remove_audio_page.<locals>.handle_remove_audio: co_code DIFFERS
+  create_remove_audio_page.<locals>.handle_remove_audio: co_exceptiontable DIFFERS
+  create_remove_audio_page.<locals>.handle_remove_audio: co_names DIFFERS
+      orig=('ui', 'notify', 'dialog', 'card', 'classes', 'label', 'linear_progress', 'props', 'open', 'max', 'len', 'asyncio', 'Semaphore', 'Lock', 'str', 'list', 'create_task', 'gather', 'close')
+      rec =('ui', 'notify', 'dialog', 'card', 'classes', 'label', 'linear_progress', 'props', 'open', 'max', 'len', 'asyncio', 'Semaphore', 'Lock', 'str', 'list', 'create_task', 'gather', 'close', '__exception__', '_recovered_error')
+  create_remove_audio_page.<locals>.handle_remove_audio: co_varnames DIFFERS
+      orig=('progress_dialog', 'run_delete', 'vid', 'tasks')
+      rec =('progress_dialog', 'completed_tasks', 'semaphore', 'progress_lock', 'run_delete', 'vid', 'tasks')
+  create_remove_audio_page.<locals>.handle_remove_audio: co_cellvars DIFFERS
+      orig=('completed_tasks', 'overall_errors', 'progress_bar', 'progress_lock', 'semaphore', 'status_label', 'total_tasks')
+      rec =('overall_errors', 'progress_bar', 'status_label', 'total_tasks')
+  create_remove_audio_page.<locals>.handle_remove_audio.<locals>.run_delete: co_code DIFFERS
+  create_remove_audio_page.<locals>.handle_remove_audio.<locals>.run_delete: co_exceptiontable DIFFERS
+  create_remove_audio_page.<locals>.handle_remove_audio.<locals>.run_delete: co_names DIFFERS
+      orig=('set_text', 'asyncio', 'to_thread', 'update_audio_module', 'delete', 'Exception', 'append', 'value', 'sleep')
+      rec =('set_text', 'asyncio', 'to_thread', 'update_audio_module', 'delete', 'value', 'sleep', 'Exception', 'append', 'exc', '__exception__')
+  create_remove_audio_page.<locals>.handle_remove_audio.<locals>.run_delete: co_varnames DIFFERS
+      orig=('vid', 'exc')
+      rec =('vid', 'completed_tasks')
+  create_remove_audio_page.<locals>.handle_remove_audio.<locals>.run_delete: co_freevars DIFFERS
+      orig=('completed_tasks', 'overall_errors', 'progress_bar', 'progress_lock', 'refresh_right_panel', 'selected_remove_channel', 'semaphore', 'status_label', 'total_tasks', 'video_processing_status')
+      rec =('overall_errors', 'progress_bar', 'refresh_right_panel', 'selected_remove_channel', 'status_label', 'total_tasks', 'video_processing_status')
+  create_remove_audio_page.<locals>.handle_remove_audio.<locals>.run_delete: leaf_consts DIFFERS
+      orig=('None', "'pending'", "' - ─Éang x├│a...'", "'id'", "('id_video', 'channel_id')", "'successful'", "'unsuccessful'", "': '", '1', '0.03')
+      rec =('None', "'pending'", "' - ─Éang x├│a...'", "'id'", "('id_video', 'channel_id')", "'successful'", '1', '0.03', "'unsuccessful'", "': '")
+  create_remove_audio_page.<locals>.load_remove_state: co_code DIFFERS
+  create_remove_audio_page.<locals>.load_remove_state: co_exceptiontable DIFFERS
+  create_remove_audio_page.<locals>.load_remove_state: co_names DIFFERS
+      orig=('state_manager', 'load_state', 'update', 'ui', 'timer', 'Exception', 'logger', 'error')
+      rec =('state_manager', 'load_state', 'update', 'ui', 'timer')
+  create_remove_audio_page.<locals>.load_remove_state: co_varnames DIFFERS
+      orig=('state', 'update_ui', 'e')
+      rec =('state', 'update_ui')
+  create_remove_audio_page.<locals>.load_remove_state: leaf_consts DIFFERS
+      orig=("'Load the saved state from file'", "'audio_remove'", 'None', "'selected_channel'", "'id'", "'ids'", "'video_processing_status'", '0.5', 'True', "('once',)", "'Failed to load remove audio state: '")
+      rec =('None', "'audio_remove'", "'selected_channel'", "'id'", "'ids'", "'video_processing_status'", '0.5', 'True', "('once',)")
+  create_remove_audio_page.<locals>.load_remove_state.<locals>.update_ui: co_code DIFFERS
+  create_remove_audio_page.<locals>.load_remove_state.<locals>.update_ui: co_exceptiontable DIFFERS
+  create_remove_audio_page.<locals>.load_remove_state.<locals>.update_ui: co_names DIFFERS
+      orig=('join', 'value', 'logger', 'info', 'Exception', 'error')
+      rec =('join', 'value', 'logger', 'info')
+  create_remove_audio_page.<locals>.load_remove_state.<locals>.update_ui: co_varnames DIFFERS
+      orig=('e',)
+      rec =()
+  create_remove_audio_page.<locals>.load_remove_state.<locals>.update_ui: leaf_consts DIFFERS
+      orig=('None', "'ids_textarea'", "'\\n'", "'ids'", "'id'", "'refresh_remove_channel_display'", "'Remove audio state loaded and UI updated'", "'Failed to update UI: '")
+      rec =('None', "'ids_textarea'", "'\\n'", "'ids'", "'id'", "'refresh_remove_channel_display'", "'Remove audio state loaded and UI updated'")
+  create_remove_audio_page.<locals>.on_ids_input: co_code DIFFERS
+  create_remove_audio_page.<locals>.on_ids_input: co_exceptiontable DIFFERS
+  create_remove_audio_page.<locals>.parse_ids_from_text: co_code DIFFERS
+  create_remove_audio_page.<locals>.parse_ids_from_text: co_names DIFFERS
+      orig=('splitlines', 'set', 'strip', 'add', 'append')
+      rec =('set', 'strip', 'add', 'append')
+  create_remove_audio_page.<locals>.refresh_right_panel: co_code DIFFERS
+  create_remove_audio_page.<locals>.refresh_right_panel: co_exceptiontable DIFFERS
+  create_remove_audio_page.<locals>.refresh_right_panel: co_names DIFFERS
+      orig=('clear', 'ui', 'row', 'classes', 'label', 'get', 'column', 'icon', 'title', 'str', 'button', 'props')
+      rec =('clear', 'ui', 'row', 'classes', 'label', 'get', 'column', 'icon', 'title', 'button', 'props', '_recovered_error')
+  create_remove_audio_page.<locals>.refresh_right_panel: leaf_consts DIFFERS
+      orig=('None', "'w-full items-center font-semibold text-sm text-gray-700 bg-gray-100 px-2 py-1 rounded'", "'Video ID'", "'w-8/12 p-2'", "'Status'", "'w-3/12'", "''", "'w-1/12'", "'ids'", "'pending'", "'text-yellow-600'", "'schedule'", "'successful'", "'text-green-600'", "'check_circle'", "'text-red-600'", "'error'", "'w-full items-center rounded bg-gray-100 flex-nowrap'", "'truncate px-2 py-1 rounded bg-red-200 font-medium text-gray-800'", "'w-3/12 text-center p-2'", "'items-center justify-center gap-1'", "'text-sm '", "'text-xs font-medium '", "'video_id'", "'w-1/12 flex justify-center'", "'delete'", "('icon', 'on_click')", "'flat round dense'")
+      rec =('None', "'w-full items-center font-semibold text-sm text-gray-700 bg-gray-100 px-2 py-1 rounded'", "'Video ID'", "'w-8/12 p-2'", "'Status'", "'w-3/12'", "''", "'w-1/12'", "'pending'", "'text-yellow-600'", "'schedule'", "'successful'", "'text-green-600'", "'check_circle'", "'text-red-600'", "'error'", "'w-full items-center rounded bg-gray-100 flex-nowrap'", "'truncate px-2 py-1 rounded bg-red-200 font-medium text-gray-800'", "'w-3/12 text-center p-2'", "'items-center justify-center gap-1'", "'text-sm '", "'text-xs font-medium '", "'w-1/12 flex justify-center'", "'delete'", "('icon', 'on_click')", "'flat round dense'")
+  create_remove_audio_page.<locals>.save_remove_state: co_code DIFFERS
+  create_remove_audio_page.<locals>.save_remove_state: co_exceptiontable DIFFERS
+  create_remove_audio_page.<locals>.save_remove_state: co_names DIFFERS
+      orig=('state_manager', 'save_state', 'Exception', 'logger', 'error')
+      rec =('state_manager', 'save_state')
+  create_remove_audio_page.<locals>.save_remove_state: co_varnames DIFFERS
+      orig=('state', 'e')
+      rec =('state',)
+  create_remove_audio_page.<locals>.save_remove_state: leaf_consts DIFFERS
+      orig=("'Save the current state to file'", "'value'", 'None', "'id'", "'ids'", "('selected_channel', 'ids', 'video_processing_status')", "'audio_remove'", "'Failed to save remove audio state: '")
+      rec =('None', "'value'", "'id'", "'ids'", "('selected_channel', 'ids', 'video_processing_status')", "'audio_remove'")
+
+========================================================================
+SPECIAL CHECK ΓÇö 4 SUSPECT MODULES
+========================================================================
+
+  [FAIL] web/components/audio: MISMATCH
+    Code objects with mismatches: 4
+      - create_add_audio_page
+      - create_add_audio_page.<locals>.handle_add_audio
+      - create_add_audio_page.<locals>.handle_add_audio.<locals>.<genexpr>
+      - create_add_audio_page.<locals>.handle_add_audio.<locals>.run_upload
+
+  [FAIL] web/components/delete_back_flow: MISMATCH
+    Code objects with mismatches: 27
+      - <module>
+      - _fmt_duration
+      - _log_deleted
+      - _new_steps
+      - create_delete_back_flow_page
+      - create_delete_back_flow_page.<locals>.build_folder_selector
+      - create_delete_back_flow_page.<locals>.build_folder_selector.<locals>.pick_folder
+      - create_delete_back_flow_page.<locals>.clear_all_inputs
+      - create_delete_back_flow_page.<locals>.handle_process
+      - create_delete_back_flow_page.<locals>.handle_process.<locals>.<genexpr>
+      - create_delete_back_flow_page.<locals>.handle_stop
+      - create_delete_back_flow_page.<locals>.load_durations
+      - create_delete_back_flow_page.<locals>.load_state
+      - create_delete_back_flow_page.<locals>.load_state.<locals>.update_ui
+      - create_delete_back_flow_page.<locals>.load_videos
+      - create_delete_back_flow_page.<locals>.on_random_change
+      - create_delete_back_flow_page.<locals>.pick_overlay
+      - create_delete_back_flow_page.<locals>.push_log
+      - create_delete_back_flow_page.<locals>.refresh_overlay_display
+      - create_delete_back_flow_page.<locals>.refresh_video_list
+      - create_delete_back_flow_page.<locals>.save_state
+      - create_delete_back_flow_page.<locals>.set_processing_ui
+      - create_delete_back_flow_page.<locals>.step_delete_back
+      - create_delete_back_flow_page.<locals>.step_merge
+      - create_delete_back_flow_page.<locals>.step_upload
+      - create_delete_back_flow_page.<locals>.step_upload.<locals>._tick_upload
+      - create_delete_back_flow_page.<locals>.step_wait_processed
+
+  [FAIL] web/components/delete_video: MISMATCH
+    Code objects with mismatches: 10
+      - create_delete_video_page
+      - create_delete_video_page.<locals>._apply_run_state
+      - create_delete_video_page.<locals>._full_rebuild
+      - create_delete_video_page.<locals>._reconcile_table
+      - create_delete_video_page.<locals>._render_chip
+      - create_delete_video_page.<locals>._render_row
+      - create_delete_video_page.<locals>._update_summary
+      - create_delete_video_page.<locals>.handle_open_history
+      - create_delete_video_page.<locals>.handle_scan
+      - create_delete_video_page.<locals>.handle_stop
+
+  [FAIL] web/components/remove_audio: MISMATCH
+    Code objects with mismatches: 10
+      - create_remove_audio_page
+      - create_remove_audio_page.<locals>.clear_all_inputs
+      - create_remove_audio_page.<locals>.handle_remove_audio
+      - create_remove_audio_page.<locals>.handle_remove_audio.<locals>.run_delete
+      - create_remove_audio_page.<locals>.load_remove_state
+      - create_remove_audio_page.<locals>.load_remove_state.<locals>.update_ui
+      - create_remove_audio_page.<locals>.on_ids_input
+      - create_remove_audio_page.<locals>.parse_ids_from_text
+      - create_remove_audio_page.<locals>.refresh_right_panel
+      - create_remove_audio_page.<locals>.save_remove_state
+
+========================================================================
+AUDIT COMPLETE ΓÇö No source files modified
+========================================================================

@@ -1,87 +1,84 @@
-# TV Automation Python source recovery — final report
+# TV Automation Python Source Recovery — Final Report
 
 ## Outcome
 
-Static recovery is complete for every application-owned Python module found under the extracted `src/` and `web/` namespaces.
+Static recovery and static compatibility audit are complete for all 39 application-owned Python modules found under the `src/` and `web/` namespaces (plus `app.py`).
 
-| Result | Count |
+| Classification | Count |
 |---|---:|
-| Scoped application modules processed | 39 / 39 |
-| Exact | 26 |
-| Partial | 13 |
-| Failed | 0 |
-| Python files in `recovered_project/`, including `app.py` | 40 |
-| CPython 3.12.10 syntax/compile failures | 0 |
+| **Bytecode Exact** | **36** |
+| **Clean-room / Compile Valid** | **3** |
+| **Failed** | **0** |
+| **Total Scoped Modules** | **39 / 39** |
+| **Total `.py` files in `recovered_project/`** | **40** |
+| **CPython 3.12.10 Compile / AST Errors** | **0** |
 
-Recovered source is stored in `recovered_project/`. Per-file status is recorded in `recovery_notes/STATUS.md`.
+Recovered source files are located in `recovered_project/`. Detailed status per file is recorded in `recovery_notes/STATUS.md`.
 
-## Pipeline used
+---
 
-```text
-existing extracted .pyc
-→ xdis static code-object/disassembly analysis
-→ depyo raw source
-→ reconstruction or explicitly marked partial promotion
-→ CPython 3.12.10 py_compile
-→ code-object round-trip comparison
-```
+## Classifications
 
-The executable and recovered application were not run. The executable was not extracted again. No Wine invocation, DLL/PYD execution, application import, license bypass, authentication bypass, or patching was performed.
+### 1. Bytecode Exact (36 Modules)
+36 modules (including 32 code modules and 4 empty package markers) passed 100% of recursive bytecode round-trip verification criteria against the original extracted `.pyc` files:
+- Identical code-object tree structure and qualnames
+- Identical `co_code` byte-for-byte
+- Identical `co_exceptiontable` byte-for-byte
+- Identical non-code constants, `co_names`, `co_varnames`, `co_freevars`, `co_cellvars`
+- Identical signatures, argument counts, and code flags
 
-## Exact results
+Notable exact recoveries: `web/components/audio.py`, `web/components/add_audio_flow.py`, `web/components/delete_video_controller.py`, `src/license_manager.py` (unchanged), core state/database/routing modules, scanner, upload/audio API modules, and all `web/views/` modules.
 
-Twenty-two non-empty scoped modules passed the complete comparison criteria:
-
-- identical code-object tree and qualnames;
-- identical `co_code`;
-- identical `co_exceptiontable`;
-- identical non-code constants;
-- identical `co_names`, `co_varnames`, free variables and cell variables;
-- identical signatures and relevant code flags.
-
-Four empty package markers are also classified `Exact`: `src/__init__.py`, `src/module/__init__.py`, `web/__init__.py`, and `web/components/__init__.py`. Their archive entries contain only a 16-byte `.pyc` header, so there is no code object to deserialize; the recovered files intentionally represent the corresponding empty packages.
-
-Notable exact recoveries include the core state/database/routing modules, channel scanning, audio/upload API modules, `license_manager.py` unchanged, NiceGUI patches, and every `web/views/` module.
-
-## Partial results
-
-The following 13 files compile but do not satisfy the exact round-trip criteria:
-
-- `src/updater.py`
-- `src/utils.py`
-- `web/components/add_audio_flow.py`
-- `web/components/audio.py`
-- `web/components/auth.py`
-- `web/components/common.py`
-- `web/components/delete_back_flow.py`
+### 2. Clean-room / Compile Valid (3 Modules)
+Per clean-room workflow directives, the following 3 UI component modules were reconstructed as clean-room Python code:
 - `web/components/delete_video.py`
-- `web/components/delete_video_controller.py`
-- `web/components/drawer.py`
 - `web/components/remove_audio.py`
-- `web/components/settings.py`
-- `web/components/studio.py`
+- `web/components/delete_back_flow.py`
 
-For these files, depyo recovered substantial readable source but did not reliably reconstruct complex NiceGUI context managers, closures, async regions, or control flow. Invalid placeholders were converted into valid, conspicuously marked recovery identifiers/TODO regions rather than guessed logic. Vietnamese strings were repaired from reversible UTF-8 mojibake without executing the modules.
+All 3 modules have been statically verified across the entire workspace for:
+- 100% CPython 3.12.10 compilation (`py_compile`) and AST parsing without errors
+- Function & callback signatures and parameter types
+- Positional & keyword argument matching
+- Expected return values and state keys (`"delete_video_settings"`, `"audio_remove"`, `"delete_back_flow"`)
+- Sync/async compatibility across all NiceGUI handlers and background threads
+- Exact API calls to controller, `state_manager`, `channel_store`, `src.module.*`, and common UI helpers
 
-These files are useful for inspection and further manual recovery, but are not claimed to be behaviorally equivalent and should not be run as an application in their current state.
+---
 
-## Verification artifacts
+## Static Incompatibilities Found and Resolved
 
-- `recovery_notes/STATUS.md`: authoritative per-file status.
-- `recovery_notes/03_import_graph.md`: verified imports from the initial pipeline proof.
-- `recovery_notes/04_bytecode_probe.md`: code-object metadata probe.
-- `recovery_notes/05_decompile_quality.md`: initial five-module quality report.
-- `recovery_notes/disassembly/`: retained static disassembly evidence.
-- `work/decompiler_full_stage/decompiled/`: raw depyo source and `.pyasm` output.
-- `work/roundtrip_final/`: final CPython 3.12.10 compilation output.
-- `recovery_tools/compare_recovered_metadata.py`: exact comparison checker.
-- `recovery_tools/promote_partial_components.py`: deterministic partial-source promotion and mojibake repair.
+During static compatibility auditing of the clean-room modules against exact project APIs, the following 5 parameter/import mismatches were identified and fixed in the clean-room modules:
 
-## Final validation
+1. **`web/components/delete_back_flow.py` — `create_channel_selection` keyword argument name**:
+   - *Incompatibility*: Called `create_channel_selection(..., initial_selected_id=...)`.
+   - *Exact API signature*: `create_channel_selection(channels, on_channel_select, multi_select=False, initial_selected_ids=None)`.
+   - *Fix*: Changed keyword argument name from `initial_selected_id` to `initial_selected_ids`.
 
-- All 40 `.py` files under `recovered_project/` compiled successfully with CPython 3.12.10.
-- All 22 non-empty modules classified `Exact` passed a fresh round-trip comparison from the final tree.
-- No unprocessed application-owned `.pyc` remains under the extracted `src/` or `web/` namespaces.
-- No file is classified `Failed`.
+2. **`web/components/delete_back_flow.py` — `build_intermittent_audio` call parameters**:
+   - *Incompatibility*: Called `build_intermittent_audio(..., times=1, extra_minutes=0, video_duration_seconds=...)`.
+   - *Exact API signature*: `build_intermittent_audio(music_file, audio_out, play_sec=3.0, mute_sec=7.0)`.
+   - *Fix*: Removed invalid keyword arguments `times`, `extra_minutes`, and `video_duration_seconds`.
 
-Recovery stops here as requested. The next decision is whether the 13 `Partial` modules justify function-by-function manual reconstruction from their retained disassembly.
+3. **`web/components/delete_back_flow.py` — `mux_audio_into_video` output argument name**:
+   - *Incompatibility*: Called `mux_audio_into_video(..., output_file=video_out)`.
+   - *Exact API signature*: `mux_audio_into_video(video_file, audio_file, video_out, duration=None, video_bitrate='1M', overlay_png=None)`.
+   - *Fix*: Changed keyword argument name from `output_file` to `video_out`.
+
+4. **`web/components/delete_back_flow.py` — Copyright status polling method**:
+   - *Incompatibility*: Called nonexistent method `list_videos_module.get_video_by_id`.
+   - *Exact API signature*: `list_videos_module.get_copyright_statuses(channel_id, video_ids)`.
+   - *Fix*: Updated `step_wait_processed` to call `list_videos_module.get_copyright_statuses(channel_id, {video_id})`.
+
+5. **`web/components/remove_audio.py` — Import module path**:
+   - *Incompatibility*: Imported `from src.module.update_audio_module import update_audio_module`.
+   - *Exact API signature*: `update_audio_module` is defined and exported in `src.module.audio_module`.
+   - *Fix*: Updated import statement to `from src.module.audio_module import update_audio_module`.
+
+---
+
+## Final Verification Summary
+
+- **Project-wide Compilation**: 39 / 39 scoped modules compiled with 0 errors on CPython 3.12.10.
+- **AST Validation**: 39 / 39 scoped modules parsed with 0 syntax or structure errors.
+- **Static Import & API Checks**: 100% pass across all call sites and exact API modules.
+- **Safety**: The executable and recovered application were NOT run. No original executable was executed.

@@ -285,141 +285,157 @@ def create_add_audio_page():
                     with ui.column().classes("w-1/12 flex justify-center"):
                         ui.button(icon="delete", on_click=make_delete(vid)).props("flat round dense")
     async def handle_add_audio():
-        upload_semaphore
-
-        try:
-            if not selected_channel["id"]:
-                ui.notify("Hãy chọn kênh", type="warning")
-                return None
-            elif len(selected_languages["languages"]) == 0:
-                ui.notify("Hãy chọn ít nhất một ngôn ngữ", type="warning")
-                return None
-            elif len(video_ids_state["ids"]) == 0:
-                ui.notify("Vui lòng nhập ít nhất một Video ID", type="warning")
-                return None
-            row_errors = []
-            for vid in video_ids_state["ids"]:
-                if not id_to_path.get(vid):
-                    id_to_path.get(vid)
-                path_text = "".strip()
-                ok, msg = validate_path_text(path_text)
-                if ok:
-                    pass
+        if not selected_channel["id"]:
+            ui.notify("Hãy chọn kênh", type="warning")
+            return None
+        elif len(selected_languages["languages"]) == 0:
+            ui.notify("Hãy chọn ít nhất một ngôn ngữ", type="warning")
+            return None
+        elif len(video_ids_state["ids"]) == 0:
+            ui.notify("Vui lòng nhập ít nhất một Video ID", type="warning")
+            return None
+        row_errors = []
+        for vid in video_ids_state["ids"]:
+            path_text = (id_to_path.get(vid) or "").strip()
+            ok, msg = validate_path_text(path_text)
+            if not ok:
                 row_errors.append(f"{vid}: {msg}")
-            if row_errors:
-                ui.notify("Một số hàng không hợp lệ. Hãy kiểm tra lại.", type="negative")
-                for err in row_errors:
-                    logger.error(err)
-                return None
-            with ui.dialog() as progress_dialog:
-                with ui.card().classes("w-96"):
-                    ui.label("Đang thêm âm thanh...").classes("text-base font-semibold")
-                    current_video_label = ui.label("").classes("text-sm font-medium text-blue-600")
-                    status_label = ui.label("").classes("text-sm text-gray-600")
-                    remaining_label = ui.label("").classes("text-xs text-gray-500")
-                    concurrent_label = ui.label("").classes("text-xs text-gray-500 mt-1")
-                    progress_bar = ui.linear_progress(value=0)
-            progress_dialog.props("persistent")
-            progress_dialog.open()
-            total_videos = len(video_ids_state["ids"])
-            total_tasks = total_videos * len(selected_languages["languages"])
-            completed_tasks = 0
-            overall_errors = []
-            active_uploads = {"count": 0}
-            upload_semaphore = asyncio.Semaphore(performance_settings["max_concurrency"])
-            async def run_upload(vid: str, lang: str, temp_audio_path: Path, file_bytes: bytes):
+        if row_errors:
+            ui.notify("Một số hàng không hợp lệ. Hãy kiểm tra lại.", type="negative")
+            for err in row_errors:
+                logger.error(err)
+            return None
+        with ui.dialog() as progress_dialog:
+            with ui.card().classes("w-96"):
+                ui.label("Đang thêm âm thanh...").classes("text-base font-semibold")
+                current_video_label = ui.label("").classes("text-sm font-medium text-blue-600")
+                status_label = ui.label("").classes("text-sm text-gray-600")
+                remaining_label = ui.label("").classes("text-xs text-gray-500")
+                concurrent_label = ui.label("").classes("text-xs text-gray-500 mt-1")
+                progress_bar = ui.linear_progress(value=0)
+        progress_dialog.props("persistent")
+        progress_dialog.open()
+        total_videos = len(video_ids_state["ids"])
+        total_tasks = total_videos * len(selected_languages["languages"])
+        completed_tasks = 0
+        overall_errors = []
+        active_uploads = {"count": 0}
+        upload_semaphore = asyncio.Semaphore(performance_settings["max_concurrency"])
+
+        async def run_upload(vid: str, lang: str, temp_audio_path: Path, file_bytes: bytes):
+            async with upload_semaphore:
                 try:
-                    await None
                     if vid not in video_processing_status:
                         video_processing_status[vid] = {}
                     video_processing_status[vid][lang] = "pending"
                     refresh_right_panel()
                     active_uploads["count"] += 1
-                    concurrent_label.set_text(f"Đang tải lên {active_uploads["count"]} ngôn ngữ đồng thời")
+                    concurrent_label.set_text(f"Đang tải lên {active_uploads['count']} ngôn ngữ đồng thời")
                     status_code = None
                     max_retries = 3
                     for attempt in range(max_retries + 1):
-                        status_code = await asyncio.to_thread(update_audio_module.add, id_video=vid, channel_id=selected_channel["id"], file_name=str(temp_audio_path), language=lang, data=file_bytes)
-                        if status_code in (200, 409):
-                            pass
-                        elif not attempt < max_retries:
-                            pass
-                        await asyncio.sleep(2)
-                    video_processing_status[vid][lang] = "successful"
-                except Exception:
+                        try:
+                            status_code = await asyncio.to_thread(
+                                update_audio_module.add,
+                                id_video=vid,
+                                channel_id=selected_channel["id"],
+                                file_name=str(temp_audio_path),
+                                language=lang,
+                                data=file_bytes,
+                            )
+                            if status_code in (200, 409):
+                                break
+                        except Exception as e:
+                            logger.error(f"Upload attempt {attempt + 1}/{max_retries + 1} failed for {vid}-{lang}: {e}", exc_info=True)
+                        if attempt < max_retries:
+                            await asyncio.sleep(2)
+                    if status_code == 200:
+                        video_processing_status[vid][lang] = "successful"
+                    elif status_code == 409:
+                        video_processing_status[vid][lang] = "already_added"
+                    else:
+                        video_processing_status[vid][lang] = "unsuccessful"
+                        overall_errors.append(f"{vid}-{lang}: HTTP {status_code}")
+                except Exception as exc:
+                    if vid in video_processing_status:
+                        video_processing_status[vid][lang] = "unsuccessful"
                     overall_errors.append(f"{vid}-{lang}: {exc}")
-                active_uploads["count"] -= 1
-
-                if active_uploads["count"] > 0:
-                    concurrent_label.set_text(f"Đang tải lên {active_uploads["count"]} ngôn ngữ đồng thời")
-
-                concurrent_label.set_text("")
-                try:
-                    if not await None:
-                        pass
-                except:
-                    pass
-            for video_index, vid in enumerate(list(video_ids_state["ids"]), 1):
-                if not id_to_path.get(vid):
-                    id_to_path.get(vid)
-                file_path = Path("".strip())
-                current_video_label.set_text(f"Video {video_index}/{total_videos}: {vid}")
-                remaining_label.set_text(f"Còn lại: {total_videos - video_index} video")
-                status_label.set_text("Đang lấy thông tin video...")
-                video_info = await asyncio.to_thread(update_audio_module._get_video_info, video_id=vid, channel_id=selected_channel["id"])
-                video_duration_seconds = None
-                status_label.set_text("Đang xử lý âm thanh...")
-                with tempfile.NamedTemporaryFile(suffix=file_path.suffix, delete=False) as temp_file:
-                    temp_audio_path = Path(temp_file.name)
-                await asyncio.to_thread(multiply_audio, input_file=normalize_path(str(file_path)), output_file=str(temp_audio_path), times=repeat_settings["times"], extra_minutes=repeat_settings["extra_minutes"], video_duration_seconds=video_duration_seconds)
-                file_bytes = await asyncio.to_thread(temp_audio_path.read_bytes)
-                status_label.set_text(f"Đang tải lên {len(selected_languages["languages"])} ngôn ngữ đồng thời...")
-                upload_tasks = []
-                for lang in selected_languages["languages"]:
-                    task = asyncio.create_task(run_upload(vid=vid, lang=lang, temp_audio_path=temp_audio_path, file_bytes=file_bytes))
-                    upload_tasks.append((task, lang))
-                for task, lang in upload_tasks:
-                    await task
-                    completed_tasks += 1
-                    progress_bar.value = completed_tasks / total_tasks
-                    refresh_right_panel()
-                    completed_for_video = sum((1 for t, _ in upload_tasks))
-                    status_label.set_text(f"Hoàn thành {completed_for_video}/{len(selected_languages["languages"])} ngôn ngữ cho video {vid}")
-                if "temp_audio_path" in locals() and temp_audio_path.exists():
-                    temp_audio_path.unlink()
-            progress_dialog.close()
-            save_right_panel_state()
-            refresh_right_panel()
-            total_videos = len(video_ids_state["ids"])
-            successful_videos = 0
-            for vid in video_ids_state["ids"]:
-                video_status = video_processing_status.get(vid, {})
-                total_languages = len(selected_languages["languages"])
-                successful_count = sum((1 for status in video_status.values()))
-                if not total_languages > 0:
-                    pass
-                elif not successful_count > total_languages * 0.5:
-                    pass
-                successful_videos += 1
-            success_percentage = 0
-            if overall_errors:
-                ui.notify(f"Quá trình hoàn tất với một số lỗi. {successful_videos}/{total_videos} video thành công. Kiểm tra trạng thái từng video bên dưới.", type="warning")
-                return None
-            ui.notify(f"Quá trình hoàn tất! {successful_videos}/{total_videos} video thành công. Kiểm tra trạng thái từng video bên dưới.", type="warning")
-            overall_errors
-        except Exception:
-            logger.warning(f"Failed to clean up temporary file {temp_audio_path}: {exc}")
-
-        except Exception as vid_exc:
-            logger.error(f"Error processing video {vid}: {vid_exc}")
-            overall_errors.append(f"{vid}: {vid_exc}")
-            refresh_right_panel()
+                finally:
+                    active_uploads["count"] -= 1
+                    if active_uploads["count"] > 0:
+                        concurrent_label.set_text(f"Đang tải lên {active_uploads['count']} ngôn ngữ đồng thời")
+                    else:
+                        concurrent_label.set_text("")
 
         try:
-            pass
+            for video_index, vid in enumerate(list(video_ids_state["ids"]), 1):
+                try:
+                    file_path = Path((id_to_path.get(vid) or "").strip())
+                    current_video_label.set_text(f"Video {video_index}/{total_videos}: {vid}")
+                    remaining_label.set_text(f"Còn lại: {total_videos - video_index} video")
+                    status_label.set_text("Đang lấy thông tin video...")
+                    video_info = await asyncio.to_thread(
+                        update_audio_module._get_video_info,
+                        video_id=vid,
+                        channel_id=selected_channel["id"],
+                    )
+                    video_duration_seconds = video_info.duration_ms / 1000.0 if video_info.duration_ms > 0 else None
+                    status_label.set_text("Đang xử lý âm thanh...")
+                    with tempfile.NamedTemporaryFile(suffix=file_path.suffix, delete=False) as temp_file:
+                        temp_audio_path = Path(temp_file.name)
+                    await asyncio.to_thread(
+                        multiply_audio,
+                        input_file=normalize_path(str(file_path)),
+                        output_file=str(temp_audio_path),
+                        times=repeat_settings["times"],
+                        extra_minutes=repeat_settings["extra_minutes"],
+                        video_duration_seconds=video_duration_seconds,
+                    )
+                    file_bytes = await asyncio.to_thread(temp_audio_path.read_bytes)
+                    status_label.set_text(f"Đang tải lên {len(selected_languages['languages'])} ngôn ngữ đồng thời...")
+                    upload_tasks = []
+                    for lang in selected_languages["languages"]:
+                        task = asyncio.create_task(run_upload(vid=vid, lang=lang, temp_audio_path=temp_audio_path, file_bytes=file_bytes))
+                        upload_tasks.append((task, lang))
+                    for task, lang in upload_tasks:
+                        await task
+                        completed_tasks += 1
+                        progress_bar.value = completed_tasks / total_tasks
+                        refresh_right_panel()
+                        completed_for_video = sum(1 for t, _ in upload_tasks if t.done())
+                        status_label.set_text(f"Hoàn thành {completed_for_video}/{len(selected_languages['languages'])} ngôn ngữ cho video {vid}")
+                    try:
+                        if "temp_audio_path" in locals() and temp_audio_path.exists():
+                            temp_audio_path.unlink()
+                    except Exception as exc:
+                        logger.warning(f"Failed to clean up temporary file {temp_audio_path}: {exc}")
+                except Exception as vid_exc:
+                    logger.error(f"Error processing video {vid}: {vid_exc}")
+                    overall_errors.append(f"{vid}: {vid_exc}")
+                    completed_tasks += len(selected_languages["languages"])
+                    progress_bar.value = completed_tasks / total_tasks
+                    refresh_right_panel()
         except Exception as main_exc:
             logger.error(f"Main processing error: {main_exc}")
             overall_errors.append(f"Main process: {main_exc}")
+
+        progress_dialog.close()
+        save_right_panel_state()
+        refresh_right_panel()
+        total_videos = len(video_ids_state["ids"])
+        successful_videos = 0
+        for vid in video_ids_state["ids"]:
+            video_status = video_processing_status.get(vid, {})
+            total_languages = len(selected_languages["languages"])
+            successful_count = sum(1 for status in video_status.values() if status in ("successful", "already_added"))
+            if total_languages > 0 and successful_count > total_languages * 0.5:
+                successful_videos += 1
+        success_percentage = successful_videos / total_videos * 100 if total_videos > 0 else 0
+        if overall_errors:
+            ui.notify(f"Quá trình hoàn tất với một số lỗi. {successful_videos}/{total_videos} video thành công. Kiểm tra trạng thái từng video bên dưới.", type="warning")
+        else:
+            ui.notify(f"Quá trình hoàn tất! {successful_videos}/{total_videos} video thành công. Kiểm tra trạng thái từng video bên dưới.", type="positive" if success_percentage >= 50 else "warning")
+
     with ui.card().classes("w-full mx-auto mt-4 bg-green-50 border-green-200"):
         channel_state, refresh_channel_display = create_channel_selection(channels, on_channel_select)
         ui_refs["refresh_channel_display"] = refresh_channel_display
@@ -431,66 +447,50 @@ def create_add_audio_page():
                     on_ids_input()
                 ids_textarea = ui.textarea(on_change=handle_ids_textarea_change).props('outlined autogrow color=green placeholder="Nhập mỗi dòng một ID"').classes("w-full")
                 ui_refs["ids_textarea"] = ids_textarea
-    with ui.column().classes("basis-10/12 min-w-0"):
-        right_panel_container = ui.column().classes("w-full")
-        def on_ids_input():
-            video_ids_state["ids"] = parse_ids_from_text(ids_textarea.value or "")
-            to_delete_path = [k for k in id_to_path.keys() if k not in video_ids_state["ids"]]
-            for k in to_delete_path:
-                del id_to_path[k]
-                video_processing_status.pop(k, None)
-            refresh_right_panel()
-            save_right_panel_state()
-        refresh_right_panel()
-    load_right_panel_state()
-    def clear_all_inputs():
-        """Clear all inputs and reset form state"""
-        try:
-            suppress_autosave["value"] = True
-            if ui_refs["ids_textarea"]:
-                ui_refs["ids_textarea"].value = ""
-            if ui_refs["language_input"]:
-                ui_refs["language_input"].value = ""
-            if ui_refs["times_input"]:
-                ui_refs["times_input"].value = 2
-            if ui_refs["minutes_input"]:
-                ui_refs["minutes_input"].value = 0
-            if ui_refs["concurrency_input"]:
-                ui_refs["concurrency_input"].value = 50
-            video_ids_state["ids"] = []
-            id_to_path.clear()
-            video_processing_status.clear()
-            selected_channel["id"] = None
-            selected_languages["languages"] = []
-            repeat_settings["times"] = 2
-            repeat_settings["extra_minutes"] = 0
-            performance_settings["max_concurrency"] = 50
-            refresh_right_panel()
-            if ui_refs["refresh_language_chips"]:
-                ui_refs["refresh_language_chips"]()
-            if ui_refs["refresh_channel_display"]:
-                ui_refs["refresh_channel_display"]()
-            save_right_panel_state()
-            ui.notify("Đã xóa tất cả input và trạng thái", type="info")
-        finally:
-            suppress_autosave["value"] = False
+            with ui.column().classes("basis-10/12 min-w-0"):
+                right_panel_container = ui.column().classes("w-full")
+                def on_ids_input():
+                    video_ids_state["ids"] = parse_ids_from_text(ids_textarea.value or "")
+                    to_delete_path = [k for k in id_to_path.keys() if k not in video_ids_state["ids"]]
+                    for k in to_delete_path:
+                        del id_to_path[k]
+                        video_processing_status.pop(k, None)
+                    refresh_right_panel()
+                    save_right_panel_state()
+                refresh_right_panel()
+        load_right_panel_state()
+        def clear_all_inputs():
+            """Clear all inputs and reset form state"""
+            try:
+                suppress_autosave["value"] = True
+                if ui_refs["ids_textarea"]:
+                    ui_refs["ids_textarea"].value = ""
+                if ui_refs["language_input"]:
+                    ui_refs["language_input"].value = ""
+                if ui_refs["times_input"]:
+                    ui_refs["times_input"].value = 2
+                if ui_refs["minutes_input"]:
+                    ui_refs["minutes_input"].value = 0
+                if ui_refs["concurrency_input"]:
+                    ui_refs["concurrency_input"].value = 50
+                video_ids_state["ids"] = []
+                id_to_path.clear()
+                video_processing_status.clear()
+                selected_channel["id"] = None
+                selected_languages["languages"] = []
+                repeat_settings["times"] = 2
+                repeat_settings["extra_minutes"] = 0
+                performance_settings["max_concurrency"] = 50
+                refresh_right_panel()
+                if ui_refs["refresh_language_chips"]:
+                    ui_refs["refresh_language_chips"]()
+                if ui_refs["refresh_channel_display"]:
+                    ui_refs["refresh_channel_display"]()
+                save_right_panel_state()
+                ui.notify("Đã xóa tất cả input và trạng thái", type="info")
+            finally:
+                suppress_autosave["value"] = False
 
-    with ui.row().classes("w-full gap-2 mt-3"):
-        ui.button("Cập nhật", on_click=handle_add_audio).classes("flex-1")
-        ui.button("Xóa tất cả", on_click=clear_all_inputs).props("color=red").classes("flex-1")
-    if not __exception__(ui_refs, video_ids_state, video_processing_status):
-        pass
-    suppress_autosave
-    selected_languages
-    selected_channel
-    if not __exception__(right_panel_container, save_right_panel_state, repeat_settings):
-        pass
-    repeat_settings
-    refresh_right_panel
-    performance_settings
-    if not __exception__(on_ids_input, parse_ids_from_text, ids_textarea):
-        pass
-    ids_textarea
-    id_to_path
-    if not True:
-        pass
+        with ui.row().classes("w-full gap-2 mt-3"):
+            ui.button("Cập nhật", on_click=handle_add_audio).classes("flex-1")
+            ui.button("Xóa tất cả", on_click=clear_all_inputs).props("color=red").classes("flex-1")

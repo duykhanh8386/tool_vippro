@@ -1,0 +1,13 @@
+# Reconstructed from application imports and static package metadata in the
+# extracted PyInstaller environment. No package was downloaded or installed.
+nicegui==2.23.3
+fastapi==0.116.1
+loguru==0.7.3
+requests==2.32.5
+getmac==0.9.2
+psutil==7.0.0
+selenium==4.35.0
+webdriver-manager==4.0.2
+# Optional in src.updater's direct import path, but also required by NiceGUI.
+# Embedded certifi.__version__ is "2025.08.03" (PEP 440 canonical: 2025.8.3).
+certifi==2025.8.3

@@ -14,8 +14,16 @@ def main() -> None:
     parser.add_argument("output_root", type=Path)
     args = parser.parse_args()
 
+    sources = [
+        source
+        for source in sorted(args.source_root.rglob("*.py"))
+        if not any(
+            part.startswith(".venv")
+            for part in source.relative_to(args.source_root).parts
+        )
+    ]
     failures = 0
-    for source in sorted(args.source_root.rglob("*.py")):
+    for source in sources:
         relative = source.relative_to(args.source_root).with_suffix(".pyc")
         output = args.output_root / relative
         output.parent.mkdir(parents=True, exist_ok=True)
@@ -26,6 +34,7 @@ def main() -> None:
             print(f"FAIL {relative}: {exc.msg}")
         else:
             print(f"PASS {relative}")
+    print(f"SUMMARY total={len(sources)} passed={len(sources) - failures} failed={failures}")
     raise SystemExit(1 if failures else 0)
 
 
