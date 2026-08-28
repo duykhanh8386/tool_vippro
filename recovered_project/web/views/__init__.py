@@ -3,5 +3,4 @@ from .audio import *
 from .auth import *
 from .delete_back_flow import *
 from .delete_video import *
-from .settings import *
 from .studio import *

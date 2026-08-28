@@ -2,7 +2,6 @@
 from contextlib import contextmanager
 from typing import Optional
 from nicegui import ui
-from src.updater import updater_service
 
 
 class NavigationState:
@@ -63,17 +62,7 @@ def nav_item(route: str, label_text: str, icon_name: str):
         yield
 
 
-def _goto_settings():
-    if nav_state.locked:
-        ui.notify(nav_state.lock_message, type="warning")
-        return
-    nav_state.set_active_route("/settings")
-    ui.navigate.to("/settings")
-
-
 def create_drawer():
-    refs = {"badge": None, "hint": None, "hint_label": None}
-
     with ui.left_drawer(
         top_corner=True,
         fixed=True,
@@ -132,78 +121,5 @@ def create_drawer():
                             "delete_forever",
                         ):
                             pass
-
-                    with nav_item("/settings", "Cài đặt", "settings"):
-                        refs["badge"] = (
-                            ui.badge("Mới", color="red")
-                            .props("floating rounded")
-                            .classes("text-[10px]")
-                        )
-                        refs["badge"].set_visibility(False)
-
-            with ui.column().classes("w-full px-4 pb-4 gap-2 mt-auto"):
-                ui.separator().classes("opacity-50")
-
-                hint = (
-                    ui.row()
-                    .classes(
-                        "items-center gap-2 w-full bg-green-50 border border-green-200 rounded-lg px-2 py-1.5 cursor-pointer hover:bg-green-100 transition-colors"
-                    )
-                    .on("click", _goto_settings)
-                )
-
-                with hint:
-                    ui.icon("system_update").classes(
-                        "text-green-600 text-base shrink-0"
-                    )
-
-                    with ui.column().classes("gap-0 flex-1 min-w-0"):
-                        refs["hint_label"] = ui.label(
-                            "Có bản cập nhật mới"
-                        ).classes("text-xs font-semibold text-green-700 truncate")
-
-                        ui.label("Nhấn để cập nhật").classes(
-                            "text-[10px] text-green-600"
-                        )
-
-                hint.set_visibility(False)
-                refs["hint"] = hint
-
-                with ui.row().classes("items-center gap-1.5"):
-                    ui.icon("verified").classes(
-                        "text-gray-400 text-sm shrink-0"
-                    )
-                    ui.label("Phiên bản").classes("text-xs text-gray-400")
-                    ui.label(updater_service.current_version).classes(
-                        "text-xs font-mono font-medium text-gray-600 bg-gray-200 px-1.5 py-0.5 rounded"
-                    )
-
-    def _sync_update_indicator():
-        show = updater_service.update_available()
-        if refs["badge"]:
-            refs["badge"].set_visibility(show)
-        if refs["hint"]:
-            refs["hint"].set_visibility(show)
-        if show and refs["hint_label"] and updater_service.release_info:
-            refs["hint_label"].set_text(
-                f"Đã có v{updater_service.release_info['version']}"
-            )
-
-    _sync_update_indicator()
-    ui.timer(2.0, _sync_update_indicator)
-
-    ui.timer(0.3, updater_service.auto_check_once, once=True)
-
-    @ui.page("/")
-    def index():
-        nav_state.reset_to_default()
-
-    @ui.page("/{path}")
-    def on_page(path: str = ""):
-        route = f"/{path}"
-        if not path:
-            nav_state.reset_to_default()
-            return
-        nav_state.set_active_route(route)
 
     return drawer

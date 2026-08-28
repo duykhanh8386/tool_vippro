@@ -8,7 +8,7 @@ from fastapi import Request
 from loguru import logger
 from nicegui import ui
 
-#from src.license_manager import is_licensed, verify_license
+from src.license_manager import is_licensed, verify_license
 
 
 @dataclass
@@ -93,11 +93,11 @@ class RouterManager:
 
     def is_authenticated(self) -> bool:
         """Check if user has a valid license."""
-        return True
+        return is_licensed()
 
     def verify_activation_key(self, license_key: str) -> tuple[bool, str]:
-        """Verify a license key via Licensify API."""
-        return True
+        """Validate and activate a Keygen license for this device."""
+        return verify_license(license_key)
 
     def handle_unauthorized(self):
         """Handle unauthorized access attempts"""

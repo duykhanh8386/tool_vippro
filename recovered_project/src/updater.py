@@ -23,9 +23,9 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 from loguru import logger
 
-REPO_OWNER = "bmtuan"
-REPO_NAME = "TV-Automation-Release"
-DEFAULT_INSTALLER_NAME = "TVAutomation_Setup.exe"
+REPO_OWNER = "duykhanh8386"
+REPO_NAME = "tool_vippro"
+DEFAULT_INSTALLER_NAME = "TVAutomation_Isolated_Setup.exe"
 FALLBACK_DOWNLOAD_URL: str | None = f"https://github.com/{REPO_OWNER}/{REPO_NAME}/releases/latest/download/{DEFAULT_INSTALLER_NAME}"
 _USER_AGENT = "TV-Automation-Updater"
 
@@ -75,8 +75,18 @@ def _version_newer(latest: str, current: str) -> bool:
 
 def _find_platform_asset(assets: list[dict]) -> dict | None:
     system = platform.system().lower()
+    if system == "windows":
+        expected = DEFAULT_INSTALLER_NAME.lower()
+        for asset in assets:
+            if (
+                isinstance(asset, dict)
+                and str(asset.get("name") or "").lower() == expected
+            ):
+                return asset
+        # Never install another Windows executable from this release: it may
+        # belong to the legacy tool with a different AppId and data namespace.
+        return None
     patterns = {
-        "windows": [".exe", ".msi", "windows", "win"],
         "darwin": [".dmg", ".pkg", "macos", "mac", "darwin"],
         "linux": [".appimage", ".deb", ".rpm", ".tar.gz", "linux"],
     }

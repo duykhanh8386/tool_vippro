@@ -3,7 +3,7 @@ import asyncio, tempfile
 from pathlib import Path
 from loguru import logger
 from nicegui import ui
-from src.module.audio_module import update_audio_module
+from src.module.audio_module import AudioUpdateError, update_audio_module
 from src.state_manager import state_manager
 from src.utils import get_channels_info, multiply_audio, normalize_path, validate_path_text
 def create_channel_selection(channels, on_channel_select):
@@ -58,13 +58,13 @@ def create_channel_selection(channels, on_channel_select):
         refresh_channel_display()
     return selected_channel, refresh_channel_display
 def create_add_audio_page():
-    selected_channel = {"id": None}; selected_languages = {"languages": []}; channels = get_channels_info(); video_ids_state = {"ids": []}; id_to_path = {}; video_processing_status = {}; repeat_settings = {"times": 2, "extra_minutes": 0}; performance_settings = {"max_concurrency": 50}; right_panel_container = None; suppress_autosave = {"value": False}; ui_refs = {"ids_textarea": None, "language_input": None, "times_input": None, "minutes_input": None, "refresh_channel_display": None, "refresh_language_chips": None, "concurrency_input": None}
+    selected_channel = {"id": None}; selected_languages = {"languages": []}; channels = get_channels_info(); video_ids_state = {"ids": []}; id_to_path = {}; video_processing_status = {}; video_processing_errors = {}; repeat_settings = {"times": 2, "extra_minutes": 0}; performance_settings = {"max_concurrency": 50}; right_panel_container = None; suppress_autosave = {"value": False}; ui_refs = {"ids_textarea": None, "language_input": None, "times_input": None, "minutes_input": None, "refresh_channel_display": None, "refresh_language_chips": None, "concurrency_input": None}
     def save_right_panel_state():
         """Save the current state of right_panel_container to file"""
         try:
             if suppress_autosave["value"]:
                 return
-            state = {"video_ids": video_ids_state["ids"], "id_to_path": id_to_path, "video_processing_status": video_processing_status, "selected_languages": selected_languages["languages"], "repeat_settings": repeat_settings, "selected_channel": selected_channel["id"], "performance_settings": performance_settings}
+            state = {"video_ids": video_ids_state["ids"], "id_to_path": id_to_path, "video_processing_status": video_processing_status, "video_processing_errors": video_processing_errors, "selected_languages": selected_languages["languages"], "repeat_settings": repeat_settings, "selected_channel": selected_channel["id"], "performance_settings": performance_settings}
             state_manager.save_state("audio_add", state)
         except Exception as e:
             logger.error(f"Failed to save right panel state: {e}")
@@ -80,6 +80,8 @@ def create_add_audio_page():
                 id_to_path.update(state["id_to_path"])
             if "video_processing_status" in state:
                 video_processing_status.update(state["video_processing_status"])
+            if "video_processing_errors" in state:
+                video_processing_errors.update(state["video_processing_errors"])
             if "selected_languages" in state:
                 selected_languages["languages"] = state["selected_languages"]
             if "repeat_settings" in state:
@@ -219,6 +221,7 @@ def create_add_audio_page():
             for vid in video_ids_state["ids"]:
                 current_path_value = id_to_path.get(vid, "")
                 video_status = video_processing_status.get(vid, {})
+                video_errors = video_processing_errors.get(vid, {})
                 total_languages = len(selected_languages["languages"])
                 successful_count = sum(1 for status in video_status.values() if status == "successful")
                 already_added_count = sum(1 for status in video_status.values() if status == "already_added")
@@ -241,6 +244,11 @@ def create_add_audio_page():
                     overall_status = "pending"
                     status_color = "text-yellow-600"
                     status_icon = "schedule"
+                status_text = {
+                    "pending": "Chờ xử lý",
+                    "successful": "Thành công",
+                    "unsuccessful": "Thất bại",
+                }[overall_status]
 
                 with ui.row().classes("w-full items-center rounded bg-gray-100 flex-nowrap"):
                     with ui.column().classes("w-2/12 p-2"):
@@ -266,7 +274,7 @@ def create_add_audio_page():
                     with ui.column().classes("w-2/12 text-center p-2"):
                         with ui.row().classes("items-center justify-center gap-1"):
                             ui.icon(status_icon).classes(f"text-sm {status_color}")
-                            ui.label(overall_status.title()).classes(f"text-xs font-medium {status_color}")
+                            ui.label(status_text).classes(f"text-xs font-medium {status_color}")
 
                     def make_delete(video_id: str):
                         def _delete():
@@ -274,6 +282,7 @@ def create_add_audio_page():
                                 video_ids_state["ids"].remove(video_id)
                             id_to_path.pop(video_id, None)
                             video_processing_status.pop(video_id, None)
+                            video_processing_errors.pop(video_id, None)
                             refresh_right_panel()
                             if video_ids_state["ids"]:
                                 ids_textarea.value = "\n".join(video_ids_state["ids"])
@@ -284,6 +293,14 @@ def create_add_audio_page():
 
                     with ui.column().classes("w-1/12 flex justify-center"):
                         ui.button(icon="delete", on_click=make_delete(vid)).props("flat round dense")
+
+                if video_errors:
+                    with ui.card().classes("w-full bg-red-50 border border-red-300 px-4 py-2 mt-1"):
+                        with ui.row().classes("items-center gap-2"):
+                            ui.icon("error").classes("text-red-600")
+                            ui.label(f"Không thể cập nhật audio cho video {vid}").classes("font-semibold text-red-700")
+                        for error_lang, error_message in video_errors.items():
+                            ui.label(f"Ngôn ngữ {error_lang}: {error_message}").classes("text-sm text-red-700 whitespace-normal break-words")
     async def handle_add_audio():
         if not selected_channel["id"]:
             ui.notify("Hãy chọn kênh", type="warning")
@@ -305,6 +322,7 @@ def create_add_audio_page():
             for err in row_errors:
                 logger.error(err)
             return None
+        video_processing_errors.clear()
         with ui.dialog() as progress_dialog:
             with ui.card().classes("w-96"):
                 ui.label("Đang thêm âm thanh...").classes("text-base font-semibold")
@@ -332,6 +350,7 @@ def create_add_audio_page():
                     active_uploads["count"] += 1
                     concurrent_label.set_text(f"Đang tải lên {active_uploads['count']} ngôn ngữ đồng thời")
                     status_code = None
+                    last_error = None
                     max_retries = 3
                     for attempt in range(max_retries + 1):
                         try:
@@ -346,7 +365,10 @@ def create_add_audio_page():
                             if status_code in (200, 409):
                                 break
                         except Exception as e:
+                            last_error = str(e)
                             logger.error(f"Upload attempt {attempt + 1}/{max_retries + 1} failed for {vid}-{lang}: {e}", exc_info=True)
+                            if isinstance(e, AudioUpdateError) and not e.retryable:
+                                break
                         if attempt < max_retries:
                             await asyncio.sleep(2)
                     if status_code == 200:
@@ -355,11 +377,14 @@ def create_add_audio_page():
                         video_processing_status[vid][lang] = "already_added"
                     else:
                         video_processing_status[vid][lang] = "unsuccessful"
-                        overall_errors.append(f"{vid}-{lang}: HTTP {status_code}")
+                        error_message = last_error or f"YouTube trả về HTTP {status_code}"
+                        video_processing_errors.setdefault(vid, {})[lang] = error_message
+                        overall_errors.append(f"{vid}-{lang}: {error_message}")
                 except Exception as exc:
                     if vid in video_processing_status:
                         video_processing_status[vid][lang] = "unsuccessful"
                     overall_errors.append(f"{vid}-{lang}: {exc}")
+                    video_processing_errors.setdefault(vid, {})[lang] = str(exc)
                 finally:
                     active_uploads["count"] -= 1
                     if active_uploads["count"] > 0:
@@ -412,6 +437,7 @@ def create_add_audio_page():
                 except Exception as vid_exc:
                     logger.error(f"Error processing video {vid}: {vid_exc}")
                     overall_errors.append(f"{vid}: {vid_exc}")
+                    video_processing_errors.setdefault(vid, {})["xử lý"] = str(vid_exc)
                     completed_tasks += len(selected_languages["languages"])
                     progress_bar.value = completed_tasks / total_tasks
                     refresh_right_panel()
@@ -432,7 +458,7 @@ def create_add_audio_page():
                 successful_videos += 1
         success_percentage = successful_videos / total_videos * 100 if total_videos > 0 else 0
         if overall_errors:
-            ui.notify(f"Quá trình hoàn tất với một số lỗi. {successful_videos}/{total_videos} video thành công. Kiểm tra trạng thái từng video bên dưới.", type="warning")
+            ui.notify(f"Cập nhật thất bại: {overall_errors[0]}. Xem chi tiết trong khung màu đỏ bên dưới.", type="negative")
         else:
             ui.notify(f"Quá trình hoàn tất! {successful_videos}/{total_videos} video thành công. Kiểm tra trạng thái từng video bên dưới.", type="positive" if success_percentage >= 50 else "warning")
 
@@ -455,6 +481,7 @@ def create_add_audio_page():
                     for k in to_delete_path:
                         del id_to_path[k]
                         video_processing_status.pop(k, None)
+                        video_processing_errors.pop(k, None)
                     refresh_right_panel()
                     save_right_panel_state()
                 refresh_right_panel()
@@ -476,6 +503,7 @@ def create_add_audio_page():
                 video_ids_state["ids"] = []
                 id_to_path.clear()
                 video_processing_status.clear()
+                video_processing_errors.clear()
                 selected_channel["id"] = None
                 selected_languages["languages"] = []
                 repeat_settings["times"] = 2

@@ -28,6 +28,7 @@ from loguru import logger
 
 from src.module.delete_video_module import delete_video_module
 from src.module.list_videos_module import list_videos_module
+from src.paths import get_history_dir
 from src.state_manager import state_manager
 from src.utils import get_channels_info
 
@@ -37,7 +38,7 @@ COPYRIGHT_NOT_STARTED = "UPLOAD_CHECKS_DATA_COPYRIGHT_STATUS_NOT_STARTED"
 COPYRIGHT_COMPLETED = "UPLOAD_CHECKS_DATA_COPYRIGHT_STATUS_COMPLETED"
 POLL_INTERVAL = 10
 CSV_FILENAME = "deleted_videos.csv"
-DEFAULT_OUTPUT_DIR = Path.home() / "Desktop" / "history_delete"
+DEFAULT_OUTPUT_DIR = get_history_dir() / "delete_video"
 _SETTINGS_KEY = "delete_video_settings"
 _TERMINAL = ("deleted", "deleting", "error")
 

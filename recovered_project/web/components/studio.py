@@ -56,7 +56,8 @@ def create_studio_content():
                 channel_fetcher.run, email=email, password=password
             )
         except Exception as e:
-            logger.error(f"Error fetching channels: {e}")
+            logger.exception(f"Error fetching channels: {e}")
+            ui.notify(f"Không thể lấy dữ liệu kênh: {e}", type="negative")
         finally:
             processing_popup.close()
             refresh_channel_list()

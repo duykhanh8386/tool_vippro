@@ -6,6 +6,7 @@ import time
 
 import requests
 from loguru import logger
+from selenium.common.exceptions import TimeoutException
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
@@ -30,25 +31,64 @@ class ChannelFetcher:
         self.driver = None
 
     def run(self, email, password):
+        try:
+            self._run(email, password)
+        finally:
+            if self.driver is not None:
+                self.driver.quit()
+                self.driver = None
+
+    def _run(self, email, password):
         logger.info("*** Fetching channel info ***")
         self.driver = create_driver(enable_performance_log=True)
         self._login(email, password)
-        channel_selection_button = WebDriverWait(self.driver, 60).until(
-            EC.element_to_be_clickable((By.XPATH, self.CHANNEL_SELECTION_XPATH))
+
+        # Google may show a channel chooser, but accounts with one/default
+        # channel are redirected straight to /channel/<id>. Accept either
+        # state instead of waiting only for the chooser until it times out.
+        initial_state = WebDriverWait(self.driver, 60).until(
+            lambda driver: (
+                "channel"
+                if self._extract_channel_id(driver.current_url)
+                else "chooser"
+                if driver.find_elements(By.XPATH, self.CHANNEL_SELECTION_XPATH)
+                else False
+            )
         )
-        channel_selection_button.click()
+        if initial_state == "chooser":
+            channel_selection_button = WebDriverWait(self.driver, 10).until(
+                EC.element_to_be_clickable(
+                    (By.XPATH, self.CHANNEL_SELECTION_XPATH)
+                )
+            )
+            channel_selection_button.click()
+            WebDriverWait(self.driver, 30).until(
+                lambda driver: self._extract_channel_id(driver.current_url)
+                is not None
+            )
+
         self._get_channel_info()
 
-        account_menu_btn = self.driver.find_element(By.XPATH, self.AVATAR_BUTTON_XPATH)
-        account_menu_btn.click()
-        switch_acocunt_button = WebDriverWait(self.driver, 5).until(
-            EC.element_to_be_clickable((By.XPATH, self.SWTICH_ACCOUNT_BUTTON_XPATH))
-        )
-        switch_acocunt_button.click()
-        time.sleep(1)
-        WebDriverWait(self.driver, 5).until(
-            EC.element_to_be_clickable((By.XPATH, self.NEXT_CHANNEL_SELECTION_XPATH))
-        )
+        try:
+            account_menu_btn = WebDriverWait(self.driver, 10).until(
+                EC.element_to_be_clickable((By.XPATH, self.AVATAR_BUTTON_XPATH))
+            )
+            account_menu_btn.click()
+            switch_acocunt_button = WebDriverWait(self.driver, 5).until(
+                EC.element_to_be_clickable(
+                    (By.XPATH, self.SWTICH_ACCOUNT_BUTTON_XPATH)
+                )
+            )
+            switch_acocunt_button.click()
+            time.sleep(1)
+            WebDriverWait(self.driver, 5).until(
+                EC.element_to_be_clickable(
+                    (By.XPATH, self.NEXT_CHANNEL_SELECTION_XPATH)
+                )
+            )
+        except TimeoutException:
+            logger.info("Current channel saved; no additional channel found")
+            return
         next_account_button = self.driver.find_elements(
             By.XPATH, self.NEXT_CHANNEL_SELECTION_XPATH
         )
@@ -89,8 +129,6 @@ class ChannelFetcher:
             next_account_button = self.driver.find_elements(
                 By.XPATH, self.NEXT_CHANNEL_SELECTION_XPATH
             )
-
-        self.driver.quit()
 
     def _login(self, email: str, password: str):
         self.driver.get(self.LOGIN_URL)
@@ -133,6 +171,8 @@ class ChannelFetcher:
         current_url = self.driver.current_url
         next_url = current_url + "/analytics/tab-overview/period-default"
         self.driver.get(next_url)
+        challenge = None
+        botguardResponse = None
         try:
             payload = get_request_payload_from_performance_log(
                 self.driver, "youtubei/v1/att/esr?alt=json", timeout=20.0
@@ -151,7 +191,7 @@ class ChannelFetcher:
             "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
             "Cookie": cookie_string,
         }
-        res = requests.get(url, headers=header)
+        res = requests.get(url, headers=header, timeout=30)
         delegated_session_id = self._extract_datasync_id(res.text)
         role = self._get_role_type(res.text)
         channel_store.upsert_channel(

@@ -1,5 +1,5 @@
 # RECOVERED: reconstructed from CPython 3.12 bytecode
-import json, math, re, subprocess, tempfile, time, unicodedata
+import json, math, os, re, subprocess, sys, tempfile, time, unicodedata
 from pathlib import Path
 from loguru import logger
 from selenium import webdriver
@@ -74,7 +74,7 @@ def multiply_audio(input_file: str, output_file: str, times: int, extra_minutes=
         total_seconds = times * (dur + extra_seconds)
     needed_copies = math.ceil(total_seconds / dur)
     stream_loop = max(0, needed_copies - 1)
-    base_cmd = ["ffmpeg", "-v", "quiet", "-stats", "-y", "-stream_loop", str(stream_loop), "-i", src, "-t", f"{total_seconds:.6f}"]
+    base_cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-stats", "-y", "-stream_loop", str(stream_loop), "-i", src, "-t", f"{total_seconds:.6f}"]
     try:
         cmd_copy = base_cmd + ["-c", "copy", dst]
         subprocess.run(cmd_copy, check=True)
@@ -123,7 +123,7 @@ def build_intermittent_audio(music_file: str, audio_out: str, play_sec: float = 
     volume_expr = f"if(lt(mod(t,{cycle}),{play_sec}),1,if(gte(t,{tail_start}),1,0))"
     filter_complex = f"[0:a]volume=volume='{volume_expr}':eval=frame[aud]"
     cmd = [
-        "ffmpeg", "-v", "quiet", "-stats", "-y", "-stream_loop", "-1", "-i", music_file,
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-stats", "-y", "-stream_loop", "-1", "-i", music_file,
         "-filter_complex", filter_complex, "-map", "[aud]", "-t", f"{dur:.6f}",
         "-c:a", "aac", "-b:a", "192k", audio_out,
     ]
@@ -152,7 +152,7 @@ def mux_audio_into_video(video_file: str, audio_file: str, video_out: str, durat
     with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tf:
         compressed_clip = tf.name
     try:
-        compress_cmd = ["ffmpeg", "-v", "quiet", "-stats", "-y", "-i", video_file]
+        compress_cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-stats", "-y", "-i", video_file]
         if use_overlay:
             compress_cmd += ["-loop", "1", "-i", normalize_path(overlay_png)]
             compress_cmd += ["-filter_complex", "[1:v][0:v]scale2ref[ovl][base];[base][ovl]overlay=0:0[outv]", "-map", "[outv]", "-shortest"]
@@ -162,7 +162,7 @@ def mux_audio_into_video(video_file: str, audio_file: str, video_out: str, durat
         ]
         subprocess.run(compress_cmd, check=True)
         base_cmd = [
-            "ffmpeg", "-v", "quiet", "-stats", "-y", "-stream_loop", "-1", "-i", compressed_clip,
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-stats", "-y", "-stream_loop", "-1", "-i", compressed_clip,
             "-i", audio_file, "-map", "0:v:0", "-map", "1:a:0", "-t", f"{dur:.6f}",
         ]
         try:
@@ -222,6 +222,47 @@ def get_channels_info(channel_id: str | None = None) -> list[ChannelInfo] | Chan
     return channels
 
 
+def _bundled_chromedriver() -> Path | None:
+    if getattr(sys, "frozen", False):
+        candidate = Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent)) / "tools" / "chromedriver.exe"
+    else:
+        candidate = Path(__file__).resolve().parent.parent / "vendor" / "chromedriver" / "chromedriver.exe"
+    return candidate if candidate.is_file() else None
+
+
+def _chrome_major_version() -> int | None:
+    if os.name != "nt":
+        return None
+    try:
+        import winreg
+
+        locations = (
+            (winreg.HKEY_CURRENT_USER, r"SOFTWARE\Google\Chrome\BLBeacon"),
+            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Google\Chrome\BLBeacon"),
+        )
+        for hive, key_path in locations:
+            try:
+                with winreg.OpenKey(hive, key_path) as key:
+                    version, _ = winreg.QueryValueEx(key, "version")
+                return int(str(version).split(".", 1)[0])
+            except OSError:
+                continue
+    except (ImportError, ValueError):
+        pass
+    return None
+
+
+def _driver_major_version(driver_path: Path) -> int | None:
+    try:
+        output = subprocess.check_output(
+            [str(driver_path), "--version"], stderr=subprocess.STDOUT, text=True
+        )
+        match = re.search(r"ChromeDriver\s+(\d+)", output)
+        return int(match.group(1)) if match else None
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+
+
 pass
 def create_driver(enable_performance_log: bool = False, *, start_offscreen: bool = False):
     options = webdriver.ChromeOptions()
@@ -237,7 +278,30 @@ def create_driver(enable_performance_log: bool = False, *, start_offscreen: bool
         options.add_argument("--window-position=-32000,-32000")
     if enable_performance_log:
         options.set_capability("goog:loggingPrefs", {"performance": "ALL"})
-    return webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
+    bundled_driver = _bundled_chromedriver()
+    chrome_major = _chrome_major_version()
+    driver_major = _driver_major_version(bundled_driver) if bundled_driver else None
+    if bundled_driver and (chrome_major is None or driver_major == chrome_major):
+        try:
+            logger.info("Using bundled ChromeDriver {}", bundled_driver)
+            return webdriver.Chrome(service=Service(str(bundled_driver)), options=options)
+        except Exception as exc:
+            logger.warning("Bundled ChromeDriver failed; trying managed driver: {}", exc)
+    elif bundled_driver:
+        logger.warning(
+            "Bundled ChromeDriver major {} does not match Chrome {}; downloading a compatible driver.",
+            driver_major,
+            chrome_major,
+        )
+    try:
+        return webdriver.Chrome(
+            service=Service(ChromeDriverManager().install()), options=options
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "Không thể khởi động ChromeDriver. Hãy cập nhật Chrome hoặc kết nối "
+            "Internet để ứng dụng tải driver tương thích."
+        ) from exc
 
 
 def normalize_path(path_text: str) -> str:

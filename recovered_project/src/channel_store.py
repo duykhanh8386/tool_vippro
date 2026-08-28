@@ -7,7 +7,6 @@ SQLite database stored in the platform-specific application data directory.
 """
 
 import json
-import os
 import sqlite3
 import threading
 import time
@@ -98,9 +97,9 @@ class ChannelStore:
     """Thin wrapper around an SQLite database for channel CRUD."""
 
     def __init__(self, db_path: Optional[Path] = None):
-        self._db_path = db_path or Path(
-            os.environ.get("CHANNEL_DB_PATH", str(_default_db_path()))
-        )
+        # Production always uses this build's isolated AppData namespace.
+        # An explicit path remains available only for unit tests.
+        self._db_path = Path(db_path) if db_path is not None else _default_db_path()
         self._conn = None
         self._lock = threading.RLock()
 
@@ -181,6 +180,17 @@ class ChannelStore:
                 (channel_id,),
             ).fetchone()
         return _row_to_record(row) if row else None
+
+    def get_overlay_png(self, channel_id: str) -> str:
+        """Đọc đường dẫn PNG overlay của kênh; trả chuỗi rỗng nếu chưa có."""
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT overlay_png FROM channels WHERE id = ?",
+                (channel_id,),
+            ).fetchone()
+        if not row:
+            return ""
+        return row["overlay_png"] or ""
 
     def set_overlay_png(self, channel_id: str, path: str) -> None:
         """Lưu đường dẫn PNG tên kênh cho một kênh."""
