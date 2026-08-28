@@ -4,6 +4,7 @@ from loguru import logger
 
 from src.module.base import IModule
 from src.utils import get_channels_info
+from src.task_runtime import check_stopped, post_with_stop
 
 
 class DeleteVideoModule(IModule):
@@ -18,6 +19,7 @@ class DeleteVideoModule(IModule):
         Returns:
             HTTP status code (200 = success).
         """
+        check_stopped()
         channel_info = get_channels_info(channel_id)
         if channel_info is None:
             raise ValueError(f"Channel '{channel_id}' not found in database")
@@ -74,7 +76,7 @@ class DeleteVideoModule(IModule):
             "videoId": video_id,
         }
 
-        response = requests.post(
+        response = post_with_stop(
             url, headers=headers, json=payload, params={"alt": "json"}
         )
         logger.info(f"Delete video {video_id} response: {response.status_code}")

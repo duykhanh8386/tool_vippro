@@ -5,6 +5,7 @@ from tkinter import filedialog
 
 from loguru import logger
 from nicegui import ui
+from web.theme import app_card
 
 
 _tkinter_root = None
@@ -150,11 +151,9 @@ def create_channel_selection(
                     else selected_channel["id"] == cid
                 )
 
-                card_classes = "w-32 p-2 transition rounded-md shadow-sm cursor-pointer"
+                card_classes = "app-channel-card"
                 if is_selected:
-                    card_classes += " bg-blue-200 border-2 border-blue-500"
-                else:
-                    card_classes += " bg-gray-100 hover:bg-gray-200"
+                    card_classes += " app-channel-card--selected"
 
                 def create_channel_click_handler(channel_id):
                     def channel_click_handler():
@@ -169,8 +168,8 @@ def create_channel_selection(
                         if avatar:
                             ui.image(avatar).classes("w-6 h-6 rounded-full")
                         else:
-                            ui.icon("account_circle").classes(
-                                "text-xl text-gray-500"
+                            ui.icon("o_account_circle").classes(
+                                "text-xl text-gray-400"
                             )
                         ui.label(name).classes(
                             "text-xs font-medium text-gray-900 flex-1 truncate"
@@ -178,17 +177,21 @@ def create_channel_selection(
 
                         if is_selected:
                             ui.icon("check_circle").classes(
-                                "text-green-600 text-sm"
+                                "text-emerald-600 text-sm"
                             )
 
-    with ui.card().classes("w-full"):
+    with app_card(compact=True):
         with ui.row().classes("items-center justify-between mb-2"):
-            ui.label("Chọn kênh").classes("text-base font-semibold")
+            with ui.column().classes("gap-0"):
+                ui.label("Chọn kênh").classes("app-section-title")
+                ui.label("Chọn kênh sẽ được sử dụng cho tác vụ này.").classes(
+                    "app-section-copy"
+                )
             if multi_select:
                 with ui.row().classes("gap-1"):
                     ui.button("Tất cả", on_click=select_all).props(
                         "dense flat size=sm"
-                    ).classes("text-blue-600 text-xs")
+                    ).classes("text-emerald-600 text-xs")
                     ui.label("·").classes("text-gray-300 self-center")
                     ui.button("Bỏ chọn", on_click=deselect_all).props(
                         "dense flat size=sm"

@@ -13,6 +13,7 @@ from loguru import logger
 from src.channel_store import channel_store
 from src.cookie_utils import inject_cookies_via_cdp
 from src.utils import create_driver, get_request_payload_from_performance_log
+from src.task_runtime import unregister_driver
 
 
 def refresh_challenge_and_botguard(
@@ -65,4 +66,7 @@ def refresh_challenge_and_botguard(
         logger.info(f"Refreshed challenge/botguard for {channel_id}")
         return {"challenge": challenge, "botguardResponse": botguardResponse}
     finally:
-        driver.quit()
+        try:
+            driver.quit()
+        finally:
+            unregister_driver(driver)

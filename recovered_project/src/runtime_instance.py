@@ -78,7 +78,7 @@ def choose_available_port(
     preferred: int = APP_PORT_START,
     max_port: int = APP_PORT_END,
 ) -> int:
-    """Use only the dedicated TV Automation port range."""
+    """Use only the dedicated Tuất Videos port range."""
     if not APP_PORT_START <= preferred <= APP_PORT_END:
         preferred = APP_PORT_START
     max_port = min(max(max_port, preferred), APP_PORT_END)
@@ -86,7 +86,7 @@ def choose_available_port(
         if _can_bind(host, port):
             return port
     raise RuntimeError(
-        f"No free TV Automation port in range {preferred}-{max_port}."
+        f"No free Tuất Videos port in range {preferred}-{max_port}."
     )
 
 
@@ -154,7 +154,7 @@ def start_runtime_publisher(
     def _publish() -> None:
         if not _wait_for_runtime_url(url, wait_seconds):
             logger.error(
-                "TV Automation server failed to become ready at {}; browser not opened.",
+                "Tuất Videos server failed to become ready at {}; browser not opened.",
                 url,
             )
             return
@@ -165,7 +165,7 @@ def start_runtime_publisher(
 
     thread = threading.Thread(
         target=_publish,
-        name="tv-automation-runtime-publisher",
+        name="tuat-videos-runtime-publisher",
         daemon=True,
     )
     thread.start()

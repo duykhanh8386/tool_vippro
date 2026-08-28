@@ -6,19 +6,32 @@ from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from webdriver_manager.chrome import ChromeDriverManager
 from src.module.model import ChannelInfo
+from src.task_runtime import (
+    TaskStopped,
+    current_run_context,
+    register_driver,
+    run_owned_process,
+)
 
 
 def get_video_duration(input_file):
     """Get duration of video file in seconds using ffprobe"""
     try:
         cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "json", input_file]
-        result = subprocess.check_output(cmd, stderr=subprocess.DEVNULL).decode("utf-8")
+        completed = run_owned_process(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+        result = completed.stdout.decode("utf-8")
         data = json.loads(result)
         duration = float(data["format"]["duration"])
         if duration <= 0:
             logger.warning(f"Invalid duration for {input_file}: {duration}")
             return None
         return duration
+    except TaskStopped:
+        raise
     except FileNotFoundError:
         logger.error("FFprobe not found. Please install FFmpeg to use video processing features.")
         return None
@@ -77,12 +90,12 @@ def multiply_audio(input_file: str, output_file: str, times: int, extra_minutes=
     base_cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-stats", "-y", "-stream_loop", str(stream_loop), "-i", src, "-t", f"{total_seconds:.6f}"]
     try:
         cmd_copy = base_cmd + ["-c", "copy", dst]
-        subprocess.run(cmd_copy, check=True)
+        run_owned_process(cmd_copy, check=True)
         return
     except subprocess.CalledProcessError:
         pass
     cmd_reencode = base_cmd + ["-c:a", "libmp3lame", "-q:a", "2", dst]
-    subprocess.run(cmd_reencode, check=True)
+    run_owned_process(cmd_reencode, check=True)
 
 
 VIDEO_EXTENSIONS = {".avi", ".flv", ".m4v", ".mkv", ".mov", ".webm", ".mp4"}
@@ -127,7 +140,7 @@ def build_intermittent_audio(music_file: str, audio_out: str, play_sec: float = 
         "-filter_complex", filter_complex, "-map", "[aud]", "-t", f"{dur:.6f}",
         "-c:a", "aac", "-b:a", "192k", audio_out,
     ]
-    subprocess.run(cmd, check=True)
+    run_owned_process(cmd, check=True)
     return dur
 
 
@@ -151,6 +164,9 @@ def mux_audio_into_video(video_file: str, audio_file: str, video_out: str, durat
     use_overlay = bool(overlay_png and Path(normalize_path(overlay_png)).is_file())
     with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tf:
         compressed_clip = tf.name
+    run_context = current_run_context()
+    if run_context is not None:
+        run_context.register_cleanup_path(compressed_clip)
     try:
         compress_cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-stats", "-y", "-i", video_file]
         if use_overlay:
@@ -160,17 +176,17 @@ def mux_audio_into_video(video_file: str, audio_file: str, video_out: str, durat
             "-an", "-c:v", "libx264", "-preset", "veryfast", "-b:v", video_bitrate,
             "-maxrate", "1400k", "-bufsize", "2M", "-pix_fmt", "yuv420p", compressed_clip,
         ]
-        subprocess.run(compress_cmd, check=True)
+        run_owned_process(compress_cmd, check=True)
         base_cmd = [
             "ffmpeg", "-hide_banner", "-loglevel", "error", "-stats", "-y", "-stream_loop", "-1", "-i", compressed_clip,
             "-i", audio_file, "-map", "0:v:0", "-map", "1:a:0", "-t", f"{dur:.6f}",
         ]
         try:
-            subprocess.run(base_cmd + ["-c:v", "copy", "-c:a", "copy", video_out], check=True)
+            run_owned_process(base_cmd + ["-c:v", "copy", "-c:a", "copy", video_out], check=True)
             return
         except subprocess.CalledProcessError:
             pass
-        subprocess.run(base_cmd + ["-c:v", "libx264", "-preset", "veryfast", "-c:a", "aac", "-b:a", "192k", video_out], check=True)
+        run_owned_process(base_cmd + ["-c:v", "libx264", "-preset", "veryfast", "-c:a", "aac", "-b:a", "192k", video_out], check=True)
     finally:
         try:
             if Path(compressed_clip).exists():
@@ -254,9 +270,12 @@ def _chrome_major_version() -> int | None:
 
 def _driver_major_version(driver_path: Path) -> int | None:
     try:
-        output = subprocess.check_output(
-            [str(driver_path), "--version"], stderr=subprocess.STDOUT, text=True
-        )
+        output = run_owned_process(
+            [str(driver_path), "--version"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        ).stdout
         match = re.search(r"ChromeDriver\s+(\d+)", output)
         return int(match.group(1)) if match else None
     except (OSError, subprocess.SubprocessError, ValueError):
@@ -284,7 +303,14 @@ def create_driver(enable_performance_log: bool = False, *, start_offscreen: bool
     if bundled_driver and (chrome_major is None or driver_major == chrome_major):
         try:
             logger.info("Using bundled ChromeDriver {}", bundled_driver)
-            return webdriver.Chrome(service=Service(str(bundled_driver)), options=options)
+            return register_driver(
+                webdriver.Chrome(
+                    service=Service(str(bundled_driver)),
+                    options=options,
+                )
+            )
+        except TaskStopped:
+            raise
         except Exception as exc:
             logger.warning("Bundled ChromeDriver failed; trying managed driver: {}", exc)
     elif bundled_driver:
@@ -294,9 +320,14 @@ def create_driver(enable_performance_log: bool = False, *, start_offscreen: bool
             chrome_major,
         )
     try:
-        return webdriver.Chrome(
-            service=Service(ChromeDriverManager().install()), options=options
+        return register_driver(
+            webdriver.Chrome(
+                service=Service(ChromeDriverManager().install()),
+                options=options,
+            )
         )
+    except TaskStopped:
+        raise
     except Exception as exc:
         raise RuntimeError(
             "Không thể khởi động ChromeDriver. Hãy cập nhật Chrome hoặc kết nối "

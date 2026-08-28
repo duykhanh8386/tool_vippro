@@ -28,6 +28,7 @@ def collect_chromedriver():
 
 datas = [
     (str(project_root / "VERSION"), "."),
+    (str(project_root / "assets" / "logo.png"), "assets"),
     (str(project_root / "vendor" / "ffmpeg" / "LICENSE"), "licenses/ffmpeg"),
     (str(project_root / "vendor" / "ffmpeg" / "README.txt"), "licenses/ffmpeg"),
     (str(project_root / "vendor" / "chromedriver" / "LICENSE.chromedriver"), "licenses/chromedriver"),
@@ -72,7 +73,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name="TV Automation",
+    name="Tuat Videos",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -94,5 +95,5 @@ coll = COLLECT(
     strip=False,
     upx=False,
     upx_exclude=[],
-    name="TV Automation",
+    name="Tuat Videos",
 )

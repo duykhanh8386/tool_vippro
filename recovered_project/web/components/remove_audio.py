@@ -8,6 +8,7 @@ from src.module.audio_module import update_audio_module
 from src.state_manager import state_manager
 from src.utils import get_channels_info
 from web.components.common import create_channel_selection
+from web.theme import app_card, empty_state, page_header, page_shell, section_header
 
 STATE_KEY = "audio_remove"
 
@@ -82,15 +83,15 @@ def create_remove_audio_page():
         right_panel_container.clear()
         with right_panel_container:
             if not ids_state["ids"]:
-                with ui.column().classes(
-                    "w-full items-center justify-center py-12 text-gray-400 gap-2"
-                ):
-                    ui.icon("layers_clear").classes("text-4xl")
-                    ui.label("Chưa có Video ID nào.").classes("text-sm")
+                empty_state(
+                    "Chưa có Video ID",
+                    "Nhập danh sách ID ở cột bên trái để bắt đầu.",
+                    icon="o_layers_clear",
+                )
                 return
 
             with ui.row().classes(
-                "w-full items-center font-semibold text-sm text-gray-700 bg-gray-100 px-2 py-1 rounded"
+                "w-full min-h-[42px] items-center font-semibold text-xs text-gray-500 bg-gray-50 border-b border-gray-200 px-3"
             ):
                 ui.label("Video ID").classes("w-8/12 p-2")
                 ui.label("Status").classes("w-3/12 p-2 text-center")
@@ -106,11 +107,11 @@ def create_remove_audio_page():
                     status_icon, status_color = "schedule", "text-yellow-600"
 
                 with ui.row().classes(
-                    "w-full items-center rounded bg-gray-100 flex-nowrap mb-1"
+                    "w-full min-h-[52px] items-center bg-white border-b border-gray-100 flex-nowrap px-1"
                 ):
                     with ui.column().classes("w-8/12 p-2"):
                         ui.label(vid).classes(
-                            "truncate px-2 py-1 rounded bg-red-200 font-medium text-gray-800 text-xs"
+                            "truncate px-2 py-1 font-medium text-gray-800 text-xs"
                         )
                     with ui.column().classes("w-3/12 text-center p-2"):
                         with ui.row().classes("items-center justify-center gap-1"):
@@ -162,7 +163,7 @@ def create_remove_audio_page():
             return
 
         with ui.dialog() as progress_dialog:
-            with ui.card().classes("w-96"):
+            with ui.card().classes("app-card w-96"):
                 ui.label("Đang xóa âm thanh...").classes("text-base font-semibold")
                 status_label = ui.label("").classes("text-sm text-gray-600")
                 progress_bar = ui.linear_progress(value=0)
@@ -234,32 +235,50 @@ def create_remove_audio_page():
         ui.notify("Đã xóa tất cả input và trạng thái", type="info")
 
     # Page layout
-    with ui.card().classes("w-full mx-auto mt-4 bg-red-50 border-red-200"):
+    with page_shell():
+        with page_header(
+            "Xóa audio",
+            "Xóa audio track đã thêm khỏi danh sách video trên kênh được chọn.",
+            eyebrow="Tác vụ",
+        ):
+            ui.button(
+                "Xóa dữ liệu",
+                icon="delete_sweep",
+                on_click=clear_all_inputs,
+            ).classes("app-button-secondary")
+            ui.button(
+                "Bắt đầu xóa",
+                icon="play_arrow",
+                on_click=handle_remove_audio,
+            ).classes("app-button-primary")
+
         (
             remove_channel_state,
             refresh_remove_channel_display,
         ) = create_channel_selection(channels, on_channel_select)
         ui_refs["refresh_remove_channel_display"] = refresh_remove_channel_display
 
-        with ui.row().classes("w-full items-start gap-3 flex-nowrap"):
-            with ui.column().classes("basis-2/12 min-w-64"):
-                ui.label("Danh sách Video ID:").classes(
-                    "text-sm font-semibold text-gray-700 mt-2"
-                )
-                ids_textarea = ui.textarea(
-                    on_change=lambda e: on_ids_input()
-                ).props("outlined autocomplete=off rows=10 placeholder=Mỗi Video ID một dòng")
-                ui_refs["ids_textarea"] = ids_textarea
-
-                with ui.row().classes("w-full gap-2 mt-3"):
-                    ui.button("Cập nhật", on_click=handle_remove_audio).classes(
-                        "flex-1"
+        with app_card():
+            with section_header(
+                "Video cần xử lý",
+                "Mỗi dòng là một Video ID. Trạng thái được cập nhật ở bảng bên phải.",
+            ):
+                pass
+            with ui.row().classes("w-full items-start gap-5 flex-wrap"):
+                with ui.column().classes("w-72 shrink-0 gap-2"):
+                    ui.label("Danh sách Video ID").classes(
+                        "text-sm font-semibold text-gray-700"
                     )
-                    ui.button("Xóa tất cả", on_click=clear_all_inputs).props(
-                        "color=red"
-                    ).classes("flex-1")
+                    ids_textarea = ui.textarea(
+                        on_change=lambda e: on_ids_input()
+                    ).props(
+                        'outlined autocomplete=off rows=10 placeholder="Mỗi Video ID một dòng"'
+                    ).classes("w-full")
+                    ui_refs["ids_textarea"] = ids_textarea
 
-            with ui.column().classes("basis-10/12 min-w-0"):
-                right_panel_container = ui.column().classes("w-full")
+                with ui.column().classes("flex-1 min-w-[420px]"):
+                    right_panel_container = ui.column().classes(
+                        "w-full border border-gray-200 rounded-lg overflow-hidden gap-0"
+                    )
 
     load_remove_state()

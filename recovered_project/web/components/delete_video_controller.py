@@ -31,6 +31,11 @@ from src.module.list_videos_module import list_videos_module
 from src.paths import get_history_dir
 from src.state_manager import state_manager
 from src.utils import get_channels_info
+from src.task_runtime import (
+    TaskStopped,
+    bind_run_context,
+    create_run_context,
+)
 
 
 COPYRIGHT_STARTED = "UPLOAD_CHECKS_DATA_COPYRIGHT_STATUS_STARTED"
@@ -75,6 +80,7 @@ class DeleteVideoController:
         self.status_text = "Chọn kênh và nhấn Quét & Xóa để bắt đầu."
         self.version = 0
         self._task = None
+        self._run_context = None
         self._channel_name_map = {}
         self._channel_avatar_map = {}
         self.output_dir = _load_output_dir()
@@ -104,7 +110,9 @@ class DeleteVideoController:
         self._channel_avatar_map = {ch.id: ch.img_src for ch in channels}
 
     def is_running(self) -> bool:
-        return self.running and self._task is not None and not self._task.done()
+        # Keep the UI locked during the short "stopping" phase as well, so a
+        # second run cannot overlap resources owned by the first run.
+        return self._task is not None and not self._task.done()
 
     def counts(self, status_keys) -> dict[str, int]:
         c = {k: 0 for k in status_keys}
@@ -128,39 +136,56 @@ class DeleteVideoController:
             f"Đang theo dõi & xóa {len(channel_ids)} kênh ({self.max_workers} luồng)..."
         )
         self._bump()
-        self._task = asyncio.create_task(self._run_loop())
+        self._run_context = create_run_context("delete_video_scan")
+        self._task = asyncio.create_task(self._run_loop(self._run_context))
 
-    def stop(self):
-        """Ask the loop to stop after the current in-flight work settles."""
-        if not self.running:
+    async def stop(self):
+        """Stop this controller's own scan and wait for its loop to settle."""
+        task = self._task
+        if task is None or task.done():
             return
         self.running = False
-        self.status_text = "Đã dừng theo dõi."
+        self.status_text = "Đang dừng tác vụ quét hiện tại..."
         self._bump()
-
-    async def _run_loop(self):
+        if self._run_context is not None:
+            self._run_context.request_stop()
         try:
-            while self.running:
-                self.polling = True
-                self._bump()
+            await task
+        except (TaskStopped, asyncio.CancelledError):
+            pass
 
-                sem = asyncio.Semaphore(self.max_workers)
-                await asyncio.gather(
-                    *[
-                        self._process_channel(cid, sem)
-                        for cid in self.selected_channel_ids
-                    ],
-                    return_exceptions=True,
-                )
+    async def _run_loop(self, run_context):
+        try:
+            with bind_run_context(run_context):
+                while self.running:
+                    run_context.checkpoint()
+                    self.polling = True
+                    self._bump()
 
-                self.polling = False
-                self.next_poll_at = time.time() + POLL_INTERVAL
-                self._bump()
+                    sem = asyncio.Semaphore(self.max_workers)
+                    results = await asyncio.gather(
+                        *[
+                            self._process_channel(cid, sem)
+                            for cid in self.selected_channel_ids
+                        ],
+                        return_exceptions=True,
+                    )
+                    for result in results:
+                        if isinstance(result, TaskStopped):
+                            raise result
 
-                for _ in range(POLL_INTERVAL * 10):
-                    if not self.running:
-                        break
-                    await asyncio.sleep(0.1)
+                    run_context.checkpoint()
+                    self.polling = False
+                    self.next_poll_at = time.time() + POLL_INTERVAL
+                    self._bump()
+
+                    for _ in range(POLL_INTERVAL * 10):
+                        if not self.running:
+                            break
+                        run_context.checkpoint()
+                        await asyncio.sleep(0.1)
+        except TaskStopped:
+            pass
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -168,6 +193,11 @@ class DeleteVideoController:
         finally:
             self.polling = False
             self.running = False
+            self.next_poll_at = 0.0
+            self.status_text = "Đã dừng theo dõi."
+            run_context.cleanup()
+            if self._run_context is run_context:
+                self._run_context = None
             self._bump()
 
     def _video_dict(self, v, channel_id: str) -> dict:
@@ -252,7 +282,13 @@ class DeleteVideoController:
                 return
             logger.info(f"Deleted {vid_id} ✓")
             self._log_deleted(video)
+        except TaskStopped:
+            self._set_row_status(vid_id, "stopped")
+            raise
         except Exception as exc:
+            if self._run_context is not None and self._run_context.stopped:
+                self._set_row_status(vid_id, "stopped")
+                raise TaskStopped() from exc
             self._set_row_status(vid_id, "error")
             logger.error(f"Delete error {vid_id}: {exc}")
 
@@ -261,7 +297,11 @@ class DeleteVideoController:
             return
         try:
             videos = await self._scan_channel(cid)
+        except TaskStopped:
+            raise
         except Exception as exc:
+            if self._run_context is not None and self._run_context.stopped:
+                raise TaskStopped() from exc
             logger.error(f"Scan error {cid}: {exc}")
             return
 

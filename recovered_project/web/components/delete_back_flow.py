@@ -13,6 +13,13 @@ from src.module.delete_video_module import delete_video_module
 from src.module.list_videos_module import list_videos_module
 from src.module.upload_video_module import upload_video_module
 from src.state_manager import state_manager
+from src.task_runtime import (
+    TaskStopped,
+    activate_run_context,
+    create_run_context,
+    current_run_context,
+    reset_run_context,
+)
 from src.utils import (
     AUDIO_EXTENSIONS,
     VIDEO_EXTENSIONS,
@@ -25,6 +32,7 @@ from src.utils import (
 )
 from web.components.common import create_channel_selection, select_directory, select_file
 from web.components.drawer import nav_state
+from web.theme import app_card, page_header, section_header, workflow_steps
 
 STATE_KEY = "delete_back_flow"
 _DELETE_LOG_FILENAME = "deleted_back_videos.csv"
@@ -42,6 +50,7 @@ STEP_STYLE = {
     "pending": ("hourglass_empty", "text-gray-400", "Chờ"),
     "processing": ("autorenew", "text-blue-600", "Đang xử lý..."),
     "successful": ("check_circle", "text-green-600", "Thành công"),
+    "stopped": ("stop_circle", "text-amber-600", "Đã dừng"),
     "error": ("error", "text-red-600", "Lỗi"),
     "skipped": ("skip_next", "text-gray-400", "Bỏ qua"),
 }
@@ -123,6 +132,7 @@ def create_delete_back_flow_page():
     suppress_autosave = {"value": False}
     stop_requested = {"value": False}
     processing = {"value": False}
+    active_run = {"context": None}
 
     ui_refs = {
         "refresh_channel_display": None,
@@ -236,7 +246,7 @@ def create_delete_back_flow_page():
 
     def step_badge(status: str):
         icon, color, label = STEP_STYLE.get(status, STEP_STYLE["pending"])
-        with ui.row().classes("items-center justify-center gap-1 w-full flex-nowrap"):
+        with ui.row().classes(f"app-step-chip app-step-chip--{status} items-center justify-center gap-1 flex-nowrap"):
             ui.icon(icon).classes(f"text-sm shrink-0 {color}")
             ui.label(label).classes(f"text-xs font-medium whitespace-nowrap {color}")
 
@@ -259,7 +269,7 @@ def create_delete_back_flow_page():
                 return
 
             with ui.row().classes(
-                "w-full items-center font-semibold text-xs text-gray-600 bg-gray-100 px-2 py-1 rounded"
+                "w-full min-h-[42px] items-center font-semibold text-xs text-gray-500 bg-gray-50 border-b border-gray-200 px-3"
             ):
                 ui.label("#").classes("w-1/12")
                 ui.label("Video").classes("w-3/12")
@@ -273,7 +283,7 @@ def create_delete_back_flow_page():
             for idx, item in enumerate(items, 1):
                 steps = item["steps"]
                 with ui.row().classes(
-                    "w-full items-center bg-white rounded px-2 py-1 border-b border-gray-100 flex-nowrap hover:bg-gray-50"
+                    "w-full min-h-[54px] items-center bg-white px-3 py-1 border-b border-gray-100 flex-nowrap hover:bg-gray-50"
                 ):
                     ui.label(str(idx)).classes("w-1/12 text-xs text-gray-500")
                     with ui.column().classes("w-3/12 min-w-0 gap-0"):
@@ -328,6 +338,7 @@ def create_delete_back_flow_page():
                 ui_refs["process_btn"].set_visibility(False)
             if ui_refs["stop_btn"]:
                 ui_refs["stop_btn"].set_visibility(True)
+                ui_refs["stop_btn"].set_enabled(True)
             if ui_refs["clear_btn"]:
                 ui_refs["clear_btn"].set_enabled(False)
             if progress_refs["panel"]:
@@ -354,6 +365,10 @@ def create_delete_back_flow_page():
         video_out = f"{base}_processed.mp4"
         item["audio_path"] = audio_out
         item["output_path"] = video_out
+        run_context = current_run_context()
+        if run_context is not None:
+            run_context.register_cleanup_path(audio_out)
+            run_context.register_cleanup_path(video_out)
 
         cid = selected_channel["id"]
         overlay_png = channel_store.get_overlay_png(cid) if cid else ""
@@ -370,6 +385,9 @@ def create_delete_back_flow_page():
             video_out=video_out,
             overlay_png=overlay_png,
         )
+        if run_context is not None:
+            run_context.keep_path(audio_out)
+            run_context.keep_path(video_out)
 
     async def step_upload(item, output_folder, index):
         channel_id = selected_channel["id"]
@@ -419,8 +437,11 @@ def create_delete_back_flow_page():
         step_label = progress_refs.get("step")
         max_attempts = 60
         for attempt in range(1, max_attempts + 1):
+            run_context = current_run_context()
+            if run_context is not None:
+                run_context.checkpoint()
             if stop_requested["value"]:
-                raise RuntimeError("Người dùng đã dừng")
+                raise TaskStopped()
             if step_label:
                 step_label.set_text(
                     f"Bước: Chờ xử lý — Thử lần {attempt}/{max_attempts}..."
@@ -434,7 +455,10 @@ def create_delete_back_flow_page():
                 "UPLOAD_CHECKS_DATA_COPYRIGHT_STATUS_STARTED",
             ):
                 return
-            await asyncio.sleep(5)
+            for _ in range(50):
+                if run_context is not None:
+                    run_context.checkpoint()
+                await asyncio.sleep(0.1)
 
     async def step_delete_back(item, output_folder, index):
         channel_id = selected_channel["id"]
@@ -490,13 +514,18 @@ def create_delete_back_flow_page():
             return
 
         stop_requested["value"] = False
+        stopped = False
+        run_context = create_run_context("delete_back_flow")
+        active_run["context"] = run_context
+        run_token = activate_run_context(run_context)
         set_processing_ui(True)
         push_log("Bắt đầu Delete-Back Flow...", "info")
 
         total_items = len(pending_items)
         try:
             for idx, item in enumerate(pending_items, 1):
-                if stop_requested["value"]:
+                if stop_requested["value"] or run_context.stopped:
+                    stopped = True
                     push_log("Đã nhận yêu cầu dừng từ người dùng.", "warning")
                     break
 
@@ -523,7 +552,21 @@ def create_delete_back_flow_page():
                         )
                         steps["merge"] = "successful"
                         push_log(f"{item['name']} - Ghép nhạc thành công", "success")
+                    except TaskStopped:
+                        steps["merge"] = "stopped"
+                        stopped = True
+                        push_log(f"{item['name']} - Ghép nhạc đã dừng", "warning")
+                        refresh_video_list()
+                        save_state()
+                        break
                     except Exception as exc:
+                        if run_context.stopped or stop_requested["value"]:
+                            steps["merge"] = "stopped"
+                            stopped = True
+                            push_log(f"{item['name']} - Ghép nhạc đã dừng", "warning")
+                            refresh_video_list()
+                            save_state()
+                            break
                         steps["merge"] = "error"
                         push_log(f"{item['name']} - Ghép nhạc lỗi: {exc}", "error")
                         refresh_video_list()
@@ -542,7 +585,21 @@ def create_delete_back_flow_page():
                             f"{item['name']} - Upload thành công (ID: {item.get('video_id')})",
                             "success",
                         )
+                    except TaskStopped:
+                        steps["upload"] = "stopped"
+                        stopped = True
+                        push_log(f"{item['name']} - Upload đã dừng", "warning")
+                        refresh_video_list()
+                        save_state()
+                        break
                     except Exception as exc:
+                        if run_context.stopped or stop_requested["value"]:
+                            steps["upload"] = "stopped"
+                            stopped = True
+                            push_log(f"{item['name']} - Upload đã dừng", "warning")
+                            refresh_video_list()
+                            save_state()
+                            break
                         steps["upload"] = "error"
                         push_log(f"{item['name']} - Upload lỗi: {exc}", "error")
                         refresh_video_list()
@@ -563,7 +620,21 @@ def create_delete_back_flow_page():
                             f"{item['name']} - Xử lý bản quyền hoàn tất",
                             "success",
                         )
+                    except TaskStopped:
+                        steps["wait"] = "stopped"
+                        stopped = True
+                        push_log(f"{item['name']} - Chờ xử lý đã dừng", "warning")
+                        refresh_video_list()
+                        save_state()
+                        break
                     except Exception as exc:
+                        if run_context.stopped or stop_requested["value"]:
+                            steps["wait"] = "stopped"
+                            stopped = True
+                            push_log(f"{item['name']} - Chờ xử lý đã dừng", "warning")
+                            refresh_video_list()
+                            save_state()
+                            break
                         steps["wait"] = "error"
                         push_log(f"{item['name']} - Chờ xử lý lỗi: {exc}", "error")
                         refresh_video_list()
@@ -584,20 +655,50 @@ def create_delete_back_flow_page():
                             f"{item['name']} - Xóa - Back thành công!",
                             "success",
                         )
+                    except TaskStopped:
+                        steps["delete_back"] = "stopped"
+                        stopped = True
+                        push_log(f"{item['name']} - Xóa - Back đã dừng", "warning")
+                        refresh_video_list()
+                        save_state()
+                        break
                     except Exception as exc:
+                        if run_context.stopped or stop_requested["value"]:
+                            steps["delete_back"] = "stopped"
+                            stopped = True
+                            push_log(f"{item['name']} - Xóa - Back đã dừng", "warning")
+                            refresh_video_list()
+                            save_state()
+                            break
                         steps["delete_back"] = "error"
                         push_log(f"{item['name']} - Xóa - Back lỗi: {exc}", "error")
 
                 refresh_video_list()
                 save_state()
 
-            ui.notify("Quá trình xử lý kết thúc.", type="info")
+            if stopped:
+                if progress_refs.get("step"):
+                    progress_refs["step"].set_text("Đã dừng")
+                push_log("Đã dừng theo yêu cầu. Có thể bấm Xử lý để chạy lại.", "warning")
+                ui.notify("Đã dừng. Bạn có thể chạy lại phần chưa hoàn thành.", type="info")
+            else:
+                ui.notify("Quá trình xử lý kết thúc.", type="info")
         finally:
             set_processing_ui(False)
+            reset_run_context(run_token)
+            run_context.cleanup()
+            active_run["context"] = None
 
     def handle_stop():
         stop_requested["value"] = True
-        push_log("Đã nhấn Dừng. Đang đợi task hiện tại kết thúc...", "warning")
+        run_context = active_run.get("context")
+        if run_context is not None:
+            run_context.request_stop()
+        if ui_refs.get("stop_btn"):
+            ui_refs["stop_btn"].set_enabled(False)
+        if progress_refs.get("step"):
+            progress_refs["step"].set_text("Đang dừng tác vụ hiện tại...")
+        push_log("Đã nhấn Dừng. Đang kết thúc tài nguyên của tác vụ hiện tại...", "warning")
 
     def clear_all_inputs():
         try:
@@ -625,7 +726,7 @@ def create_delete_back_flow_page():
 
     def build_folder_selector(key: str, label: str, placeholder: str, icon: str):
         card = ui.card().classes(
-            "flex-1 min-w-[280px] p-3 border border-gray-200 cursor-pointer hover:border-blue-400 transition-colors"
+            "app-flow-folder flex-1 min-w-[280px] p-3 cursor-pointer transition-colors"
         )
 
         def pick_folder():
@@ -653,10 +754,10 @@ def create_delete_back_flow_page():
             card.clear()
             with card:
                 with ui.row().classes("items-center gap-3 w-full flex-nowrap"):
-                    ui.icon(icon).classes("text-2xl shrink-0 text-blue-500")
+                    ui.icon(icon).classes("text-2xl shrink-0 text-emerald-600")
                     with ui.column().classes("gap-0 min-w-0 flex-1"):
                         ui.label(label).classes(
-                            "text-xs font-semibold text-gray-500 uppercase tracking-wider"
+                            "text-xs font-semibold text-gray-600"
                         )
                         if path:
                             ui.label(path).classes(
@@ -677,10 +778,30 @@ def create_delete_back_flow_page():
 
     channels = get_channels_info() or []
 
-    with ui.card().classes("w-full mx-auto mt-4 bg-white shadow-sm"):
-        ui.label(
-            "Chọn kênh, folder video, folder nhạc và folder output rồi bấm Xử lý. Flow tự chạy: Ghép nhạc → Upload → Chờ xử lý → Xóa - Back."
-        ).classes("text-sm text-gray-600 mb-3")
+    page = ui.column().classes("app-page")
+    with page:
+        with page_header(
+            "Xóa Back flow",
+            "Ghép nhạc, upload, chờ YouTube xử lý và chạy bước Xóa - Back tự động.",
+            eyebrow="Quy trình",
+        ):
+            pass
+        workflow_steps(
+            [
+                {"title": "Ghép nhạc", "description": "Tạo video đầu ra", "state": "current"},
+                {"title": "Upload", "description": "Đăng video lên kênh", "state": "pending"},
+                {"title": "Chờ xử lý", "description": "Đợi trạng thái YouTube", "state": "pending"},
+                {"title": "Xóa - Back", "description": "Hoàn tất quy trình", "state": "pending"},
+            ]
+        )
+        main_container = ui.column().classes("w-full gap-4")
+    with main_container:
+        with app_card(compact=True):
+            with section_header(
+                "Thiết lập quy trình",
+                "Chọn kênh, nguồn video, nguồn nhạc và nơi lưu file đầu ra.",
+            ):
+                pass
 
         def on_channel_select(channel_id: str):
             selected_channel["id"] = channel_id
@@ -787,22 +908,20 @@ def create_delete_back_flow_page():
         with ui.row().classes("w-full gap-2 mt-3"):
             ui_refs["process_btn"] = (
                 ui.button("Xử lý", icon="play_arrow", on_click=handle_process)
-                .classes("flex-1 bg-blue-600 text-white")
+                .classes("app-button-primary flex-1")
             )
             ui_refs["stop_btn"] = (
                 ui.button("Dừng", icon="stop", on_click=handle_stop)
-                .props("color=orange")
-                .classes("flex-1")
+                .classes("app-button-secondary flex-1")
             )
             ui_refs["stop_btn"].set_visibility(False)
             ui_refs["clear_btn"] = (
                 ui.button("Xóa tất cả", icon="delete_sweep", on_click=clear_all_inputs)
-                .props("color=red")
-                .classes("flex-1")
+                .classes("app-button-secondary flex-1")
             )
 
         progress_panel = ui.card().classes(
-            "w-full mt-2 bg-blue-50 border border-blue-200 gap-1 p-3"
+            "app-progress-panel w-full mt-2 gap-1 p-3"
         )
         with progress_panel:
             with ui.row().classes("items-center gap-2 w-full flex-nowrap"):
@@ -823,8 +942,13 @@ def create_delete_back_flow_page():
         progress_panel.set_visibility(False)
         progress_refs["panel"] = progress_panel
 
-        ui.separator().classes("my-2")
-        video_list_container = ui.column().classes("w-full gap-1")
+        with app_card():
+            with section_header(
+                "Hàng đợi video",
+                "Theo dõi trạng thái của từng video trong toàn bộ quy trình.",
+            ):
+                pass
+            video_list_container = ui.column().classes("w-full gap-1")
         refresh_video_list()
 
     load_state()

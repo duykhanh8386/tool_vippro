@@ -14,6 +14,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 from src.channel_store import channel_store
 from src.cookie_utils import normalize_cookies_for_storage
 from src.utils import create_driver, get_request_payload_from_performance_log
+from src.task_runtime import unregister_driver
 
 
 class ChannelFetcher:
@@ -35,8 +36,12 @@ class ChannelFetcher:
             self._run(email, password)
         finally:
             if self.driver is not None:
-                self.driver.quit()
+                driver = self.driver
                 self.driver = None
+                try:
+                    driver.quit()
+                finally:
+                    unregister_driver(driver)
 
     def _run(self, email, password):
         logger.info("*** Fetching channel info ***")

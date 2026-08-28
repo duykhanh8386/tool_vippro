@@ -1,7 +1,7 @@
-#define MyAppName "TV Automation"
+#define MyAppName "Tuất Videos"
 #define MyAppVersion "1.1.0"
-#define MyAppExeName "TV Automation.exe"
-#define MyAppInstallName "TV Automation 7F47B95D"
+#define MyAppExeName "Tuat Videos.exe"
+#define MyAppInstallName "Tuat Videos 7F47B95D"
 
 [Setup]
 AppId={{7F47B95D-6FD8-4A87-B2F8-9B0CE6A91D42}
@@ -15,10 +15,10 @@ PrivilegesRequired=lowest
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 OutputDir=installer_dist
-OutputBaseFilename=TVAutomation_Isolated_Setup
+OutputBaseFilename=TuatVideos_Setup
 SetupIconFile=assets\logo.ico
 UninstallDisplayIcon={app}\{#MyAppExeName}
-UninstallDisplayName={#MyAppInstallName}
+UninstallDisplayName={#MyAppName}
 Compression=lzma2/ultra64
 SolidCompression=yes
 WizardStyle=modern
@@ -35,7 +35,7 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Additional shortcuts:"; Flags: unchecked
 
 [Files]
-Source: "dist\TV Automation\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "dist\Tuat Videos\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{group}\{#MyAppInstallName}"; Filename: "{app}\{#MyAppExeName}"; WorkingDir: "{app}"

@@ -4,6 +4,7 @@ from loguru import logger
 from src.module.base import IModule
 from src.module.model import Video, VideoType
 from src.utils import get_channels_info
+from src.task_runtime import check_stopped, post_with_stop
 class ListVideosModule(IModule):
     """Public wrapper around IModule._list_videos for use in UI pages."""
     pass
@@ -40,6 +41,7 @@ class ListVideosModule(IModule):
         Returns:
             (videos, next_page_token) — next_page_token is None on the last page.
         """
+        check_stopped()
         channel_info = get_channels_info(channel_id)
         if channel_info is None:
             raise ValueError(f"Channel '{channel_id}' not found in database")
@@ -62,7 +64,7 @@ class ListVideosModule(IModule):
         if page_token:
             payload["pageToken"] = page_token
         url = "https://studio.youtube.com/youtubei/v1/creator/list_creator_videos?alt=json"
-        response = requests.post(url=url, headers=headers, json=payload)
+        response = post_with_stop(url, headers=headers, json=payload)
         res = response.json()
         next_page_token = res.get("nextPageToken") or None
         videos = []
@@ -95,6 +97,7 @@ class ListVideosModule(IModule):
         result = {}
         page_token = None
         while remaining:
+            check_stopped()
             videos, next_token = self.list_all_videos(channel_id, 50, page_token)
             for v in videos:
                 if v.id in remaining:

@@ -4,11 +4,12 @@ from datetime import datetime
 from loguru import logger
 from nicegui import ui
 
-from src.channel_scanner import channel_fetcher
+from src.channel_scanner import ChannelFetcher
 from src.channel_store import channel_store
 from src.license_manager import get_license_info
 from src.state_manager import state_manager
 from src.utils import get_channels_info
+from src.task_runtime import TaskStopped, bind_run_context, create_run_context
 from web.theme import (
     app_card,
     app_table,
@@ -17,7 +18,6 @@ from web.theme import (
     page_shell,
     section_header,
     status_badge,
-    workflow_steps,
 )
 
 
@@ -61,17 +61,24 @@ def create_studio_content():
             logger.error(f"Failed to load credentials: {exc}")
 
     async def fetch_channel_data(email, password):
+        run_context = create_run_context("studio_channel_scan")
+        channel_fetcher = ChannelFetcher()
         try:
             logger.info("Fetching channel data...")
-            await asyncio.to_thread(
-                channel_fetcher.run,
-                email=email,
-                password=password,
-            )
+            with bind_run_context(run_context):
+                await asyncio.to_thread(
+                    channel_fetcher.run,
+                    email=email,
+                    password=password,
+                )
+        except TaskStopped:
+            logger.info("Channel scan stopped")
+            ui.notify("Đã dừng quét kênh.", type="info")
         except Exception as exc:
             logger.exception(f"Error fetching channels: {exc}")
             ui.notify(f"Không thể lấy dữ liệu kênh: {exc}", type="negative")
         finally:
+            run_context.cleanup()
             processing_popup.close()
             refresh_channel_list()
 
@@ -241,138 +248,113 @@ def create_studio_content():
     with page_shell():
         with page_header(
             "Tài khoản & kênh",
-            "Quản lý kết nối YouTube và kiểm tra trạng thái workspace trước khi chạy tác vụ.",
+            "Quản lý các kênh YouTube được sử dụng trong tác vụ tự động hóa.",
             eyebrow="Workspace",
         ):
-            ui.button(
-                "Làm mới",
-                icon="refresh",
-                on_click=lambda: refresh_channel_list(),
-            ).classes("app-button-secondary")
             ui.button(
                 "Thêm kênh",
                 icon="add",
                 on_click=login_dialog.open,
             ).classes("app-button-primary")
 
-        workflow_container = ui.column().classes("w-full gap-0")
-
-        with app_card():
-            with section_header(
-                "Trạng thái workspace",
-                "Thông tin kích hoạt và mức độ sẵn sàng của ứng dụng.",
-            ):
-                status_badge(
-                    "Đã kích hoạt" if license_info else "Chưa kích hoạt",
-                    "success" if license_info else "warning",
-                )
-
-            with ui.element("div").classes("app-metrics mt-2"):
-                with ui.column().classes("app-metric gap-1"):
-                    ui.label("Giấy phép").classes("app-metric-label")
-                    ui.label(
-                        "Đang hoạt động" if license_info else "Chưa có dữ liệu"
-                    ).classes("app-metric-value")
-                with ui.column().classes("app-metric gap-1"):
-                    ui.label("Thời hạn").classes("app-metric-label")
-                    ui.label(expiry_text).classes("app-metric-value")
-                with ui.column().classes("app-metric gap-1"):
-                    ui.label("Kênh đã kết nối").classes("app-metric-label")
-                    channel_count_label = ui.label("0 kênh").classes("app-metric-value")
-
         with app_card():
             with section_header(
                 "Kênh YouTube",
-                "Các kênh được lưu riêng cho phiên bản ứng dụng này.",
+                "Danh sách kênh được lưu riêng cho phiên bản ứng dụng này.",
             ):
-                delete_all_button = ui.button(
-                    "Xóa tất cả",
-                    icon="delete_sweep",
-                    on_click=confirm_delete_all,
-                ).classes("app-button-danger")
+                channel_count_label = ui.label("0 kênh").classes(
+                    "text-xs font-medium text-gray-500"
+                )
+                ui.button(
+                    icon="refresh",
+                    on_click=lambda: refresh_channel_list(),
+                ).props("flat round dense").classes("app-icon-button").tooltip(
+                    "Làm mới danh sách"
+                )
+                with ui.button(icon="more_horiz").props(
+                    "flat round dense"
+                ).classes("app-icon-button") as more_actions_button:
+                    with ui.menu().props("auto-close"):
+                        ui.menu_item(
+                            "Xóa tất cả kênh",
+                            on_click=confirm_delete_all,
+                        ).classes("text-red-600")
 
-            with app_table("minmax(240px, 1.5fr) minmax(220px, 1fr) 140px 44px"):
-                with ui.element("div").classes("app-table-header"):
-                    ui.label("Kênh")
-                    ui.label("Channel ID")
-                    ui.label("Trạng thái")
-                    ui.label("")
-                channels_container = ui.column().classes("w-full gap-0")
+            channels_container = ui.column().classes("w-full gap-0")
 
-    def refresh_workflow(channels) -> None:
-        workflow_container.clear()
-        has_license = bool(license_info)
-        has_channels = bool(channels)
-        with workflow_container:
-            workflow_steps(
-                [
-                    {
-                        "title": "Kích hoạt ứng dụng",
-                        "description": "Xác nhận giấy phép sử dụng",
-                        "state": "complete" if has_license else "current",
-                    },
-                    {
-                        "title": "Kết nối kênh",
-                        "description": "Đăng nhập và đồng bộ YouTube",
-                        "state": (
-                            "complete"
-                            if has_channels
-                            else "current"
-                            if has_license
-                            else "pending"
-                        ),
-                    },
-                    {
-                        "title": "Sẵn sàng vận hành",
-                        "description": "Chọn tác vụ từ thanh điều hướng",
-                        "state": "current" if has_channels else "pending",
-                    },
-                ]
-            )
+        with app_card(compact=True):
+            with ui.row().classes("w-full items-center gap-3"):
+                with ui.element("div").classes(
+                    "w-9 h-9 rounded-lg bg-emerald-50 text-emerald-600 grid place-items-center shrink-0"
+                ):
+                    ui.icon("o_verified_user").classes("text-xl")
+                with ui.column().classes("gap-0 flex-1 min-w-0"):
+                    ui.label("Giấy phép ứng dụng").classes(
+                        "text-sm font-semibold text-gray-800"
+                    )
+                    ui.label(
+                        f"{'Đang hoạt động' if license_info else 'Chưa kích hoạt'} · "
+                        f"Thời hạn: {expiry_text}"
+                    ).classes("text-xs text-gray-500 truncate")
+                status_badge(
+                    "Đã kích hoạt" if license_info else "Cần kiểm tra",
+                    "success" if license_info else "warning",
+                )
 
     def refresh_channel_list():
         channels = get_channels_info()
         channels_container.clear()
         channel_count_label.set_text(f"{len(channels)} kênh")
-        delete_all_button.set_enabled(bool(channels))
-        refresh_workflow(channels)
+        more_actions_button.set_visibility(bool(channels))
 
         with channels_container:
             if not channels:
                 empty_state(
                     "Chưa có kênh YouTube",
-                    "Chọn “Thêm kênh” để đăng nhập và đồng bộ kênh đầu tiên.",
-                    icon="video_library",
+                    "Đăng nhập để đồng bộ kênh đầu tiên và bắt đầu chạy tác vụ.",
+                    icon="o_video_library",
+                    action_label="Thêm kênh",
+                    on_action=login_dialog.open,
                 )
                 return
 
-            for channel_data in channels:
-                name = channel_data.name
-                avatar = channel_data.img_src
-                channel_id = channel_data.id
-                with ui.element("div").classes("app-table-row"):
-                    with ui.row().classes("items-center gap-3 min-w-0"):
-                        if avatar:
-                            ui.image(avatar).classes(
-                                "w-8 h-8 rounded-lg object-cover shrink-0"
-                            )
-                        else:
-                            with ui.element("div").classes("app-account-avatar shrink-0"):
-                                ui.icon("smart_display").classes("text-base")
-                        with ui.column().classes("gap-0 min-w-0"):
-                            ui.label(name).classes(
-                                "text-sm font-semibold text-gray-800 truncate"
-                            )
-                            ui.label("YouTube channel").classes(
-                                "text-[11px] text-gray-400"
-                            )
-                    ui.label(channel_id).classes(
-                        "text-xs text-gray-500 truncate"
-                    ).tooltip(channel_id)
-                    status_badge("Đã kết nối", "success")
-                    ui.button(
-                        icon="delete_outline",
-                        on_click=create_delete_click_handler(channel_id, name),
-                    ).props("flat round dense").classes("app-icon-button")
+            with app_table(
+                "minmax(240px, 1.5fr) minmax(220px, 1fr) 140px 44px"
+            ):
+                with ui.element("div").classes("app-table-header"):
+                    ui.label("Kênh")
+                    ui.label("Channel ID")
+                    ui.label("Trạng thái")
+                    ui.label("")
+                for channel_data in channels:
+                    name = channel_data.name
+                    avatar = channel_data.img_src
+                    channel_id = channel_data.id
+                    with ui.element("div").classes("app-table-row"):
+                        with ui.row().classes("items-center gap-3 min-w-0"):
+                            if avatar:
+                                ui.image(avatar).classes(
+                                    "w-8 h-8 rounded-lg object-cover shrink-0"
+                                )
+                            else:
+                                with ui.element("div").classes(
+                                    "app-account-avatar shrink-0"
+                                ):
+                                    ui.icon("smart_display").classes("text-base")
+                            with ui.column().classes("gap-0 min-w-0"):
+                                ui.label(name).classes(
+                                    "text-sm font-semibold text-gray-800 truncate"
+                                )
+                                ui.label("YouTube channel").classes(
+                                    "text-[11px] text-gray-400"
+                                )
+                        ui.label(channel_id).classes(
+                            "text-xs text-gray-500 truncate"
+                        ).tooltip(channel_id)
+                        status_badge("Đã kết nối", "success")
+                        ui.button(
+                            icon="delete_outline",
+                            on_click=create_delete_click_handler(channel_id, name),
+                        ).props("flat round dense").classes("app-icon-button")
 
     refresh_channel_list()

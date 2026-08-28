@@ -1,4 +1,4 @@
-"""Keygen-backed licensing for TV Automation.
+"""Keygen-backed licensing for Tuất Videos.
 
 Only public Keygen resource identifiers are embedded here. Administrative,
 environment, and product tokens must never be shipped with the application.

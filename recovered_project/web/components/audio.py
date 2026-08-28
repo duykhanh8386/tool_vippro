@@ -6,6 +6,7 @@ from nicegui import ui
 from src.module.audio_module import AudioUpdateError, update_audio_module
 from src.state_manager import state_manager
 from src.utils import get_channels_info, multiply_audio, normalize_path, validate_path_text
+from web.theme import app_card, page_header, section_header
 def create_channel_selection(channels, on_channel_select):
     """Create a channel selection interface similar to studio page"""
     selected_channel = {"id": None}
@@ -30,11 +31,9 @@ def create_channel_selection(channels, on_channel_select):
                 avatar = channel_data.img_src
                 cid = channel_data.id
                 is_selected = selected_channel["id"] == cid
-                card_classes = "w-32 p-2 transition rounded-md shadow-sm cursor-pointer"
+                card_classes = "app-channel-card"
                 if is_selected:
-                    card_classes += " bg-blue-200 border-2 border-blue-500"
-                else:
-                    card_classes += " bg-gray-100 hover:bg-gray-200"
+                    card_classes += " app-channel-card--selected"
 
                 def create_channel_click_handler(channel_id):
                     def channel_click_handler():
@@ -47,13 +46,14 @@ def create_channel_selection(channels, on_channel_select):
                         if avatar:
                             ui.image(avatar).classes("w-6 h-6 rounded-full")
                         else:
-                            ui.icon("account_circle").classes("text-xl text-gray-500")
+                            ui.icon("o_account_circle").classes("text-xl text-gray-400")
                         ui.label(name).classes("text-xs font-medium text-gray-900 flex-1 truncate")
                         if is_selected:
                             ui.icon("check_circle").classes("text-green-600 text-sm")
 
-    with ui.card().classes("w-full"):
-        ui.label("Chọn kênh").classes("text-base font-semibold mb-2")
+    with app_card(classes="audio-add-section"):
+        ui.label("Chọn kênh").classes("app-section-title")
+        ui.label("Kênh sở hữu các video cần cập nhật audio.").classes("app-section-copy")
         channels_container = ui.row().classes("gap-2 flex-wrap")
         refresh_channel_display()
     return selected_channel, refresh_channel_display
@@ -135,7 +135,7 @@ def create_add_audio_page():
             language_chips_container.clear()
             with language_chips_container:
                 for language in list(selected_languages["languages"]):
-                    chip_classes = "px-2 py-1 rounded-full text-xs font-medium cursor-pointer transition-all duration-200 border bg-blue-500 text-white border-blue-500 hover:bg-blue-600"
+                    chip_classes = "px-2 py-1 rounded-full text-xs font-medium cursor-pointer transition-all duration-200 border bg-emerald-50 text-emerald-700 border-emerald-200 hover:bg-emerald-100"
                     def create_remove_handler(lang: str):
                         def _remove():
                             if lang in selected_languages["languages"]:
@@ -156,10 +156,10 @@ def create_add_audio_page():
 
             language_input.value = ""; refresh_language_chips()
 
-        with ui.card().classes("w-full mt-2"):
+        with app_card(classes="audio-add-section"):
             with ui.row().classes("items-center justify-between mb-2"):
-                ui.label("Nhập ngôn ngữ").classes("text-base font-semibold")
-                ui.button("Đặt lại", on_click=reset_languages).props("dense color=red").classes("text-xs")
+                ui.label("Nhập ngôn ngữ").classes("app-section-title")
+                ui.button("Đặt lại", on_click=reset_languages).props("dense flat").classes("text-xs text-gray-500")
             language_input = ui.input(label="Mã ngôn ngữ, cách nhau bởi khoảng trắng").props('outlined clearable placeholder="en vi ja ..."').classes("w-full")
             ui_refs["language_input"] = language_input
             language_input.on("input", on_language_input_change)
@@ -171,8 +171,8 @@ def create_add_audio_page():
         return refresh_language_chips
     def create_repeat_settings():
         """Create repeat settings interface"""
-        with ui.card().classes("w-full mt-2"):
-            ui.label("Cài đặt lặp lại âm thanh").classes("text-base font-semibold mb-2")
+        with app_card(classes="audio-add-section"):
+            ui.label("Cài đặt lặp lại âm thanh").classes("app-section-title mb-2")
             with ui.row().classes("gap-4 items-end"):
                 times_input = ui.number(label="Số lần lặp lại (n)", value=repeat_settings["times"], min=1, max=10, step=1).props("outlined").classes("w-32")
                 ui_refs["times_input"] = times_input
@@ -190,7 +190,7 @@ def create_add_audio_page():
 
                     minutes_input.value = value; save_right_panel_state()
                 minutes_input.on("change", update_minutes)
-                ui.label("Âm thanh sẽ được lặp lại n lần, với m phút bổ sung từ đầu âm thanh gốc").classes("text-xs text-gray-600 flex-1")
+                ui.label("Âm thanh sẽ được lặp lại n lần, với m phút bổ sung từ đầu âm thanh gốc").classes("app-section-copy flex-1")
 
     def parse_ids_from_text(text: str) -> list[str]:
         """Parse newline-separated IDs, strip, deduplicate preserving order."""
@@ -212,11 +212,11 @@ def create_add_audio_page():
         right_panel_container.clear()
 
         with right_panel_container:
-            with ui.row().classes("w-full items-center font-semibold text-sm text-gray-700 bg-gray-100 px-2 py-1 rounded"):
+            with ui.row().classes("audio-add-table-header w-full min-h-[42px] items-center font-semibold text-xs text-gray-500 bg-gray-50 border-b border-gray-200 px-2"):
                 ui.label("Video ID").classes("w-2/12 p-2")
                 ui.label("Audio Path").classes("w-5/12")
-                ui.label("Languages").classes("w-2/12")
-                ui.label("Status").classes("w-2/12")
+                ui.label("Ngôn ngữ").classes("w-2/12")
+                ui.label("Trạng thái").classes("w-2/12")
                 ui.label("").classes("w-1/12")
             for vid in video_ids_state["ids"]:
                 current_path_value = id_to_path.get(vid, "")
@@ -250,9 +250,9 @@ def create_add_audio_page():
                     "unsuccessful": "Thất bại",
                 }[overall_status]
 
-                with ui.row().classes("w-full items-center rounded bg-gray-100 flex-nowrap"):
+                with ui.row().classes("audio-add-table-row w-full min-h-[56px] items-center bg-white border-b border-gray-100 flex-nowrap"):
                     with ui.column().classes("w-2/12 p-2"):
-                        ui.label(vid).classes("truncate px-2 py-1 rounded bg-green-200 font-medium text-gray-800")
+                        ui.label(vid).classes("truncate px-2 py-1 font-medium text-gray-800")
 
                     def make_path_on_change(video_id: str, input_ref):
                         def _on_change(e=None):
@@ -272,7 +272,12 @@ def create_add_audio_page():
                             ui.label(f"{already_added_count} đã có").classes("text-xs text-orange-500")
 
                     with ui.column().classes("w-2/12 text-center p-2"):
-                        with ui.row().classes("items-center justify-center gap-1"):
+                        status_tone = {
+                            "pending": "warning",
+                            "successful": "success",
+                            "unsuccessful": "danger",
+                        }[overall_status]
+                        with ui.row().classes(f"app-status app-status--{status_tone} items-center justify-center gap-1 mx-auto"):
                             ui.icon(status_icon).classes(f"text-sm {status_color}")
                             ui.label(status_text).classes(f"text-xs font-medium {status_color}")
 
@@ -324,7 +329,7 @@ def create_add_audio_page():
             return None
         video_processing_errors.clear()
         with ui.dialog() as progress_dialog:
-            with ui.card().classes("w-96"):
+            with ui.card().classes("app-card w-96"):
                 ui.label("Đang thêm âm thanh...").classes("text-base font-semibold")
                 current_video_label = ui.label("").classes("text-sm font-medium text-blue-600")
                 status_label = ui.label("").classes("text-sm text-gray-600")
@@ -462,19 +467,37 @@ def create_add_audio_page():
         else:
             ui.notify(f"Quá trình hoàn tất! {successful_videos}/{total_videos} video thành công. Kiểm tra trạng thái từng video bên dưới.", type="positive" if success_percentage >= 50 else "warning")
 
-    with ui.card().classes("w-full mx-auto mt-4 bg-green-50 border-green-200"):
+    page = ui.column().classes("app-page audio-add-page")
+    with page:
+        with page_header(
+            "Thêm audio",
+            "Thêm audio track theo ngôn ngữ vào video YouTube đã có trên kênh.",
+            eyebrow="Tác vụ",
+        ):
+            pass
+    with page:
         channel_state, refresh_channel_display = create_channel_selection(channels, on_channel_select)
         ui_refs["refresh_channel_display"] = refresh_channel_display
+    with page:
         refresh_language_chips = create_language_input_and_chips()
+    with page:
         create_repeat_settings()
-        with ui.row().classes("w-full items-start gap-3 flex-nowrap"):
-            with ui.column().classes("basis-2/12 min-w-64"):
+    with page:
+        main_card = ui.card().classes("app-card audio-add-main-card")
+    with main_card:
+        with section_header(
+            "Video và file audio",
+            "Nhập Video ID, sau đó cung cấp đường dẫn audio tương ứng trong bảng.",
+        ):
+            pass
+        with ui.row().classes("w-full items-start gap-5 flex-wrap"):
+            with ui.column().classes("w-72 shrink-0"):
                 def handle_ids_textarea_change(e=None):
                     on_ids_input()
                 ids_textarea = ui.textarea(on_change=handle_ids_textarea_change).props('outlined autogrow color=green placeholder="Nhập mỗi dòng một ID"').classes("w-full")
                 ui_refs["ids_textarea"] = ids_textarea
-            with ui.column().classes("basis-10/12 min-w-0"):
-                right_panel_container = ui.column().classes("w-full")
+            with ui.column().classes("flex-1 min-w-[560px]"):
+                right_panel_container = ui.column().classes("audio-add-table w-full gap-1")
                 def on_ids_input():
                     video_ids_state["ids"] = parse_ids_from_text(ids_textarea.value or "")
                     to_delete_path = [k for k in id_to_path.keys() if k not in video_ids_state["ids"]]
@@ -520,5 +543,5 @@ def create_add_audio_page():
                 suppress_autosave["value"] = False
 
         with ui.row().classes("w-full gap-2 mt-3"):
-            ui.button("Cập nhật", on_click=handle_add_audio).classes("flex-1")
-            ui.button("Xóa tất cả", on_click=clear_all_inputs).props("color=red").classes("flex-1")
+            ui.button("Cập nhật audio", icon="play_arrow", on_click=handle_add_audio).classes("app-button-primary flex-1")
+            ui.button("Xóa dữ liệu", icon="delete_sweep", on_click=clear_all_inputs).classes("audio-add-destructive flex-1")

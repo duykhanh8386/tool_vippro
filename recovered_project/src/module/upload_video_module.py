@@ -5,6 +5,12 @@ import requests
 from loguru import logger
 from src.module.base import IModule
 from src.utils import get_channels_info
+from src.task_runtime import (
+    TaskStopped,
+    check_stopped,
+    post_with_stop,
+    wait_interruptibly,
+)
 
 _USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
 
@@ -25,7 +31,9 @@ class UploadVideoModule(IModule):
 
     Chặng 3 (tạo video + set title/description) sẽ được bổ sung sau.
     """
-    _CHUNK_TARGET = 67_108_864
+    # Smaller chunks give the Stop button a frequent cancellation checkpoint
+    # without changing the resumable upload protocol.
+    _CHUNK_TARGET = 8_388_608
     _MAX_CHUNK_RETRIES = 5
 
     pass
@@ -38,6 +46,7 @@ class UploadVideoModule(IModule):
 
         Trả về dict gồm frontend_upload_id, scotty_resource_id (dùng cho chặng 3).
         """
+        check_stopped()
         channel_info = get_channels_info(channel_id)
         if not channel_info:
             raise Exception(f"Không tìm thấy kênh: {channel_id}")
@@ -72,7 +81,7 @@ class UploadVideoModule(IModule):
             "Referer": "https://studio.youtube.com/",
         }
         body = json.dumps({"frontendUploadId": frontend_upload_id})
-        response = requests.post(url, headers=headers, data=body)
+        response = post_with_stop(url, headers=headers, data=body)
         if response.status_code != 200:
             raise Exception(f"Upload start thất bại: HTTP {response.status_code}")
         status = response.headers.get("X-Goog-Upload-Status")
@@ -100,9 +109,11 @@ class UploadVideoModule(IModule):
         try:
             headers = dict(base_headers)
             headers["X-Goog-Upload-Command"] = "query"
-            resp = requests.post(upload_url, headers=headers, data=b"", timeout=60)
+            resp = post_with_stop(upload_url, headers=headers, data=b"")
             recv = resp.headers.get("X-Goog-Upload-Size-Received")
             return int(recv) if recv is not None else None
+        except TaskStopped:
+            raise
         except Exception as e:
             logger.warning(f"Query upload offset lỗi: {e}")
             return None
@@ -121,6 +132,7 @@ class UploadVideoModule(IModule):
         retries = 0
         with open(file_path, "rb") as f:
             while offset < file_size:
+                check_stopped()
                 f.seek(offset)
                 chunk = f.read(chunk_size)
                 is_last = offset + len(chunk) >= file_size
@@ -128,7 +140,12 @@ class UploadVideoModule(IModule):
                 headers["X-Goog-Upload-Command"] = "upload, finalize" if is_last else "upload"
                 headers["X-Goog-Upload-Offset"] = str(offset)
                 try:
-                    resp = requests.post(upload_url, headers=headers, data=chunk, timeout=600)
+                    resp = post_with_stop(
+                        upload_url,
+                        headers=headers,
+                        data=chunk,
+                        timeout=(15, 60),
+                    )
                     if resp.status_code == 200:
                         offset += len(chunk)
                         retries = 0
@@ -140,6 +157,8 @@ class UploadVideoModule(IModule):
                                 logger.warning(f"Trạng thái finalize bất thường: {status}")
                         continue
                     raise Exception(f"HTTP {resp.status_code}")
+                except TaskStopped:
+                    raise
                 except Exception as e:
                     retries += 1
                     logger.warning(f"Upload chunk lỗi tại offset {offset} (lần {retries}/{self._MAX_CHUNK_RETRIES}): {e}")
@@ -150,7 +169,7 @@ class UploadVideoModule(IModule):
                         offset = srv
                         if progress is not None:
                             progress["sent"] = offset
-                    time.sleep(2)
+                    wait_interruptibly(2)
 
     pass
     pass
@@ -161,6 +180,7 @@ class UploadVideoModule(IModule):
 
         Trả về videoId. Metadata được set ngay khi tạo (không cần call update).
         """
+        check_stopped()
         channel_info = get_channels_info(channel_id)
         if not channel_info:
             raise Exception(f"Không tìm thấy kênh: {channel_id}")
@@ -195,7 +215,7 @@ class UploadVideoModule(IModule):
             "X-Youtube-Client-Name": "62", "X-Youtube-Client-Version": "1.20260708.06.00",
         }
         url = "https://studio.youtube.com/youtubei/v1/upload/createvideo?alt=json"
-        response = requests.post(url, headers=headers, json=payload)
+        response = post_with_stop(url, headers=headers, json=payload)
         if response.status_code != 200:
             raise Exception(f"createvideo thất bại: HTTP {response.status_code}: {response.text[:300]}")
         data = response.json()
@@ -210,8 +230,11 @@ class UploadVideoModule(IModule):
 
         Trả True khi video.status == "VIDEO_STATUS_PROCESSED".
         """
+        check_stopped()
         try:
             info = self._get_video_info(video_id=video_id, channel_id=channel_id)
+        except TaskStopped:
+            raise
         except Exception as e:
             logger.warning(f"Không lấy được trạng thái video {video_id}: {e}")
             return False

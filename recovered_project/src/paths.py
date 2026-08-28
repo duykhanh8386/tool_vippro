@@ -1,5 +1,5 @@
 # RECOVERED: reconstructed from CPython 3.12 bytecode
-"""Isolated platform-specific storage for this TV Automation build."""
+"""Isolated platform-specific storage for this Tuất Videos build."""
 
 import os
 import platform

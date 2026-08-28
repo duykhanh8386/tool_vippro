@@ -7,9 +7,17 @@ from src.channel_store import channel_store
 from src.module.audio_module import update_audio_module
 from src.module.upload_video_module import upload_video_module
 from src.state_manager import state_manager
+from src.task_runtime import (
+    TaskStopped,
+    activate_run_context,
+    create_run_context,
+    current_run_context,
+    reset_run_context,
+)
 from src.utils import AUDIO_EXTENSIONS, VIDEO_EXTENSIONS, build_intermittent_audio, get_channels_info, get_video_duration, list_media_files, multiply_audio, mux_audio_into_video, normalize_path
 from web.components.common import create_channel_selection, select_directory, select_file
-from web.components.drawer import nav_state; STEP_STYLE = {"pending": ("schedule", "text-gray-400", "Chờ"), "processing": ("hourglass_top", "text-blue-600", "Đang xử lý"), "successful": ("check_circle", "text-green-600", "Xong"), "unsuccessful": ("error", "text-red-600", "Lỗi")}
+from web.components.drawer import nav_state; STEP_STYLE = {"pending": ("schedule", "text-gray-400", "Chờ"), "processing": ("hourglass_top", "text-blue-600", "Đang xử lý"), "successful": ("check_circle", "text-green-600", "Xong"), "stopped": ("stop_circle", "text-amber-600", "Đã dừng"), "unsuccessful": ("error", "text-red-600", "Lỗi")}
+from web.theme import app_card, page_header, section_header, workflow_steps
 def _human_size(num: float) -> str:
     for unit in ("B", "KB", "MB", "GB"):
         if num < 1024:
@@ -30,7 +38,7 @@ def _fmt_duration(seconds: float | None) -> str:
 def _new_steps() -> dict:
     return {"merge": "pending", "upload": "pending", "wait": "pending", "add_audio": "pending"}
 def create_add_audio_flow_page():
-    paths_state = {"video_folder": "", "music_folder": "", "output_folder": ""}; options_state = {"random_music": False, "audio_language": "en"}; selected_channel = {"id": None}; channels = get_channels_info(); videos_state = {"items": []}; saved_status_map = {}; video_list_container = None; suppress_autosave = {"value": False}; ui_refs = {"random_switch": None, "lang_input": None, "process_btn": None, "clear_btn": None, "refresh_channel_display": None, "refresh_overlay": None, "stop_btn": None}; folder_selectors = {}; progress_refs = {}; processing = {"value": False}; stop_requested = {"value": False}; PERSIST_FIELDS = ("music", "music_path", "audio_path", "output_path", "video_id", "scotty_resource_id", "frontend_upload_id")
+    paths_state = {"video_folder": "", "music_folder": "", "output_folder": ""}; options_state = {"random_music": False, "audio_language": "en"}; selected_channel = {"id": None}; channels = get_channels_info(); videos_state = {"items": []}; saved_status_map = {}; video_list_container = None; suppress_autosave = {"value": False}; ui_refs = {"random_switch": None, "lang_input": None, "process_btn": None, "clear_btn": None, "refresh_channel_display": None, "refresh_overlay": None, "stop_btn": None}; folder_selectors = {}; progress_refs = {}; processing = {"value": False}; stop_requested = {"value": False}; active_run = {"context": None}; PERSIST_FIELDS = ("music", "music_path", "audio_path", "output_path", "video_id", "scotty_resource_id", "frontend_upload_id")
     def save_state():
         try:
             if suppress_autosave["value"]:
@@ -115,7 +123,7 @@ def create_add_audio_flow_page():
 
     def step_badge(status: str):
         icon, color, label = STEP_STYLE.get(status, STEP_STYLE["pending"])
-        with ui.row().classes("items-center justify-center gap-1 w-full flex-nowrap"):
+        with ui.row().classes(f"app-step-chip app-step-chip--{status} items-center justify-center gap-1 flex-nowrap"):
             ui.icon(icon).classes(f"text-sm shrink-0 {color}")
             ui.label(label).classes(f"text-xs font-medium whitespace-nowrap {color}")
     def refresh_video_list():
@@ -131,7 +139,7 @@ def create_add_audio_flow_page():
                 ui.label("Chưa chọn folder video hoặc folder không có video nào.").classes("text-gray-500 italic text-sm")
                 return
 
-            with ui.row().classes("w-full items-center font-semibold text-xs text-gray-600 bg-gray-100 px-2 py-2 rounded flex-nowrap"):
+            with ui.row().classes("w-full min-h-[42px] items-center font-semibold text-xs text-gray-500 bg-gray-50 border-b border-gray-200 px-3 flex-nowrap"):
                 ui.label("#").classes("w-1/12")
                 ui.label("Video").classes("w-3/12")
                 ui.label("ID").classes("w-2/12")
@@ -143,7 +151,7 @@ def create_add_audio_flow_page():
 
             for idx, item in enumerate(items, 1):
                 steps = item["steps"]
-                with ui.row().classes("w-full items-center bg-white rounded px-2 py-1 border-b border-gray-100 flex-nowrap"):
+                with ui.row().classes("w-full min-h-[54px] items-center bg-white px-3 py-1 border-b border-gray-100 flex-nowrap hover:bg-gray-50"):
                     ui.label(str(idx)).classes("w-1/12 text-xs text-gray-500")
                     with ui.column().classes("w-3/12 min-w-0 gap-0"):
                         ui.label(item["name"]).classes("truncate text-sm font-medium text-gray-800").tooltip(item["name"])
@@ -188,6 +196,10 @@ def create_add_audio_flow_page():
         video_out = f"{base}_processed.mp4"
         item["audio_path"] = audio_out
         item["output_path"] = video_out
+        run_context = current_run_context()
+        if run_context is not None:
+            run_context.register_cleanup_path(audio_out)
+            run_context.register_cleanup_path(video_out)
 
         channel = get_channels_info(selected_channel["id"])
         overlay_png = channel.overlay_png if channel else ""
@@ -207,6 +219,9 @@ def create_add_audio_flow_page():
             duration=dur,
             overlay_png=overlay_png or None,
         )
+        if run_context is not None:
+            run_context.keep_path(audio_out)
+            run_context.keep_path(video_out)
     async def step_upload(item, output_folder, musics, index):
         """Upload video đã ghép nhạc lên kênh và tạo video.
 
@@ -256,8 +271,11 @@ def create_add_audio_flow_page():
         push_log("Chờ YouTube xử lý video xong...", "wait", indent=True)
         max_wait, interval, waited = 1200, 15, 0
         while True:
+            run_context = current_run_context()
+            if run_context is not None:
+                run_context.checkpoint()
             if stop_requested["value"]:
-                raise Exception("Đã dừng khi đang chờ video xử lý")
+                raise TaskStopped()
             ready = await asyncio.to_thread(upload_video_module.is_processed, channel_id, video_id)
             if ready:
                 break
@@ -265,7 +283,10 @@ def create_add_audio_flow_page():
                 raise Exception(f"Video chưa xử lý xong sau {max_wait}s (video_id={video_id})")
             if step_label:
                 step_label.set_text(f"Bước: Chờ xử lý — {waited}s")
-            await asyncio.sleep(interval)
+            for _ in range(interval * 10):
+                if run_context is not None:
+                    run_context.checkpoint()
+                await asyncio.sleep(0.1)
             waited += interval
         push_log("Video đã xử lý xong", "ok", indent=True)
     async def step_add_audio(item, output_folder, musics, index):
@@ -304,6 +325,9 @@ def create_add_audio_flow_page():
         suffix = Path(audio_path).suffix or ".mp3"
         with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tf:
             matched_path = tf.name
+        run_context = current_run_context()
+        if run_context is not None:
+            run_context.register_cleanup_path(matched_path)
 
         try:
             if video_dur:
@@ -396,12 +420,15 @@ def create_add_audio_flow_page():
         if not processing["value"]:
             return None
         stop_requested["value"] = True
+        run_context = active_run.get("context")
+        if run_context is not None:
+            run_context.request_stop()
 
         if ui_refs.get("stop_btn"):
             ui_refs["stop_btn"].set_enabled(False)
         if progress_refs.get("step"):
-            progress_refs["step"].set_text("Đang dừng sau khi xong bước hiện tại...")
-        ui.notify("Sẽ dừng sau khi hoàn tất bước đang chạy", type="info")
+            progress_refs["step"].set_text("Đang dừng tác vụ hiện tại...")
+        ui.notify("Đang dừng tác vụ hiện tại...", type="info")
 
     async def handle_process():
         if processing["value"]:
@@ -455,6 +482,9 @@ def create_add_audio_flow_page():
         errors = []
         stop_requested["value"] = False
         stopped = False
+        run_context = create_run_context("add_audio_flow")
+        active_run["context"] = run_context
+        run_token = activate_run_context(run_context)
         set_processing_ui(True)
         push_log(f"Bắt đầu xử lý {total} video", "info")
         try:
@@ -467,14 +497,18 @@ def create_add_audio_flow_page():
                 if remaining_label:
                     remaining_label.set_text(f"Còn lại: {total - v_index} video")
                 push_log(f"Video {v_index}/{total}: {item['name']}", "work")
-                item["steps"] = _new_steps()
-                for field in PERSIST_FIELDS:
-                    item[field] = ""
+                # Preserve successful steps so a stopped run can continue
+                # without uploading or adding audio a second time.
+                for step_key in _new_steps():
+                    if item["steps"].get(step_key) == "processing":
+                        item["steps"][step_key] = "pending"
                 refresh_video_list()
                 for step_key, step_name, step_fn in STEP_SEQUENCE:
-                    if stop_requested["value"]:
+                    if stop_requested["value"] or run_context.stopped:
                         stopped = True
                         break
+                    if item["steps"].get(step_key) == "successful":
+                        continue
                     if step_label:
                         step_label.set_text(f"Bước: {step_name}")
                     push_log(f"{step_name}: đang xử lý...", "wait", indent=True)
@@ -483,7 +517,21 @@ def create_add_audio_flow_page():
                     try:
                         await step_fn(item, output_folder, musics, orig_index)
                         item["steps"][step_key] = "successful"
+                    except TaskStopped:
+                        item["steps"][step_key] = "stopped"
+                        stopped = True
+                        push_log(f"{step_name}: đã dừng", "wait", indent=True)
+                        refresh_video_list()
+                        save_state()
+                        break
                     except Exception as exc:
+                        if run_context.stopped or stop_requested["value"]:
+                            item["steps"][step_key] = "stopped"
+                            stopped = True
+                            push_log(f"{step_name}: đã dừng", "wait", indent=True)
+                            refresh_video_list()
+                            save_state()
+                            break
                         logger.error(f"Step '{step_key}' failed for {item['name']}: {exc}")
                         item["steps"][step_key] = "unsuccessful"
                         errors.append(f"{item['name']} [{step_name}]: {exc}")
@@ -504,8 +552,13 @@ def create_add_audio_flow_page():
         finally:
             set_processing_ui(False)
             save_state()
+            reset_run_context(run_token)
+            run_context.cleanup()
+            active_run["context"] = None
 
         if stopped:
+            if progress_refs.get("step"):
+                progress_refs["step"].set_text("Đã dừng")
             push_log("Đã dừng theo yêu cầu", "info")
         elif errors:
             push_log("Hoàn tất — có một số video lỗi", "error")
@@ -576,7 +629,7 @@ def create_add_audio_flow_page():
 
         card = (
             ui.card()
-            .classes("flex-1 min-w-[220px] h-full p-3 cursor-pointer transition hover:shadow-md hover:border-indigo-300 border border-gray-200 bg-gray-50")
+            .classes("app-flow-folder flex-1 min-w-[220px] h-full p-3 cursor-pointer transition")
             .on("click", pick_folder)
         )
 
@@ -587,9 +640,9 @@ def create_add_audio_flow_page():
             with card:
                 with ui.column().classes("w-full h-full justify-center"):
                     with ui.row().classes("items-center gap-3 w-full flex-nowrap"):
-                        ui.icon(icon).classes("text-2xl shrink-0 " + ("text-indigo-500" if path else "text-gray-400"))
+                        ui.icon(icon).classes("text-2xl shrink-0 " + ("text-emerald-600" if path else "text-gray-400"))
                         with ui.column().classes("gap-0 min-w-0 flex-1"):
-                            ui.label(label).classes("text-xs font-semibold text-gray-500 uppercase tracking-wide")
+                            ui.label(label).classes("text-xs font-semibold text-gray-600")
                             if path:
                                 ui.label(path).classes("text-sm text-gray-800 truncate").tooltip(path)
                             else:
@@ -602,8 +655,30 @@ def create_add_audio_flow_page():
 
         render()
         folder_selectors[key] = render
-    with ui.card().classes("w-full mx-auto mt-4 bg-white shadow-sm"):
-        ui.label("Chọn kênh, folder video, folder nhạc và folder output rồi bấm Xử lý. Flow tự chạy: Ghép nhạc (phát 3s / tắt 7s, 3s cuối luôn có tiếng) → Upload → Add audio và cập nhật trạng thái từng bước trong bảng.").classes("text-sm text-gray-600 mb-2")
+    page = ui.column().classes("app-page")
+    with page:
+        with page_header(
+            "Thêm audio flow",
+            "Chuẩn bị video, ghép nhạc, upload và thêm audio track trong một quy trình.",
+            eyebrow="Quy trình",
+        ):
+            pass
+        workflow_steps(
+            [
+                {"title": "Ghép nhạc", "description": "Tạo video đầu ra", "state": "current"},
+                {"title": "Upload", "description": "Đăng video lên kênh", "state": "pending"},
+                {"title": "Chờ xử lý", "description": "Đợi YouTube sẵn sàng", "state": "pending"},
+                {"title": "Add audio", "description": "Thêm audio theo ngôn ngữ", "state": "pending"},
+            ]
+        )
+        main_container = ui.column().classes("w-full gap-4")
+    with main_container:
+        with app_card(compact=True):
+            with section_header(
+                "Thiết lập quy trình",
+                "Chọn kênh, nguồn video, nguồn nhạc và nơi lưu file đầu ra.",
+            ):
+                pass
         def on_channel_select(channel_id):
             selected_channel["id"] = channel_id
 
@@ -694,12 +769,12 @@ def create_add_audio_flow_page():
             ui.label("Mã ngôn ngữ của audio track thêm ở Bước 3 (vd: en, vi, ja).").classes("text-xs text-gray-500")
 
         with ui.row().classes("w-full gap-2 mt-3"):
-            ui_refs["process_btn"] = ui.button("Xử lý", icon="play_arrow", on_click=handle_process).classes("flex-1")
-            ui_refs["stop_btn"] = ui.button("Dừng", icon="stop", on_click=handle_stop).props("color=orange").classes("flex-1")
+            ui_refs["process_btn"] = ui.button("Xử lý", icon="play_arrow", on_click=handle_process).classes("app-button-primary flex-1")
+            ui_refs["stop_btn"] = ui.button("Dừng", icon="stop", on_click=handle_stop).classes("app-button-secondary flex-1")
             ui_refs["stop_btn"].set_visibility(False)
-            ui_refs["clear_btn"] = ui.button("Xóa tất cả", icon="delete_sweep", on_click=clear_all_inputs).props("outline color=red").classes("flex-1")
+            ui_refs["clear_btn"] = ui.button("Xóa dữ liệu", icon="delete_sweep", on_click=clear_all_inputs).classes("app-button-secondary flex-1")
 
-        progress_panel = ui.card().classes("w-full mt-2 bg-blue-50 border border-blue-200 gap-1 p-3")
+        progress_panel = ui.card().classes("app-progress-panel w-full mt-2 gap-1 p-3")
         with progress_panel:
             with ui.row().classes("items-center gap-2 w-full flex-nowrap"):
                 ui.spinner(size="sm", color="primary")
@@ -713,8 +788,13 @@ def create_add_audio_flow_page():
         progress_panel.set_visibility(False)
         progress_refs["panel"] = progress_panel
 
-        ui.separator().classes("my-2")
-        video_list_container = ui.column().classes("w-full gap-1")
+        with app_card():
+            with section_header(
+                "Hàng đợi video",
+                "Theo dõi trạng thái của từng video trong toàn bộ quy trình.",
+            ):
+                pass
+            video_list_container = ui.column().classes("w-full gap-1")
         refresh_video_list()
 
     load_state()

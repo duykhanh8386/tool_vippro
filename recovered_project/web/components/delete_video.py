@@ -7,6 +7,7 @@ from src.utils import get_channels_info
 from web.components.common import create_channel_selection, select_directory
 from web.components.delete_video_controller import delete_controller
 from web.components.drawer import nav_state
+from web.theme import app_card, empty_state, page_header, page_shell, section_header
 
 PRIVACY_BADGE: dict[str, tuple[str, str]] = {
     "VIDEO_PRIVACY_PRIVATE": ("lock", "bg-gray-200 text-gray-600"),
@@ -27,6 +28,7 @@ ROW_STATUS_META: dict[str, tuple[str, str, str]] = {
     "deleted": ("check_circle", "bg-green-100 text-green-700", "Đã xóa ✓"),
     "error": ("error", "bg-red-100 text-red-700", "Lỗi ✗"),
     "skipped": ("skip_next", "bg-gray-100 text-gray-500", "Bỏ qua"),
+    "stopped": ("stop_circle", "bg-amber-50 text-amber-700", "Đã dừng"),
 }
 
 NAV_LOCK_MSG = "Đang xử lý Xóa - Back, hãy bấm Dừng trước khi chuyển trang."
@@ -65,7 +67,7 @@ def create_delete_video_page():
 
     def _render_header():
         with ui.row().classes(
-            "w-full items-center font-semibold text-xs text-gray-600 bg-gray-100 px-2 py-1 rounded mb-1"
+            "w-full min-h-[42px] items-center font-semibold text-xs text-gray-500 bg-gray-50 border-b border-gray-200 px-3"
         ):
             ui.label("Thumb").classes("w-16 shrink-0")
             ui.label("Kênh").classes("w-40 shrink-0")
@@ -77,7 +79,7 @@ def create_delete_video_page():
     def _render_row(video: dict):
         vid_id = video["id"]
         with ui.row().classes(
-            "w-full items-center flex-nowrap border border-gray-100 rounded mb-0.5 bg-white hover:bg-gray-50"
+            "w-full min-h-[54px] items-center flex-nowrap border-b border-gray-100 bg-white hover:bg-gray-50"
         ):
             # Thumb
             with ui.column().classes("w-16 shrink-0 p-1"):
@@ -148,13 +150,11 @@ def create_delete_video_page():
                 for v in video_list:
                     _render_row(v)
             else:
-                with ui.column().classes(
-                    "w-full items-center justify-center py-8 text-gray-400 gap-2"
-                ):
-                    ui.icon("inbox").classes("text-4xl")
-                    ui.label("Chưa có video nào trong danh sách.").classes(
-                        "text-sm"
-                    )
+                empty_state(
+                    "Chưa có video trong danh sách",
+                    "Chọn kênh và bấm “Quét & Xóa” để bắt đầu theo dõi.",
+                    icon="o_inbox",
+                )
 
     def _reconcile_table():
         tc = ui_refs["table_container"]
@@ -266,7 +266,7 @@ def create_delete_video_page():
 
     async def handle_stop():
         try:
-            delete_controller.stop()
+            await delete_controller.stop()
             last_version["v"] = -1
             _sync_tick()
         except Exception as exc:
@@ -299,15 +299,13 @@ def create_delete_video_page():
             ui.notify(f"Không thể mở file lịch sử: {exc}", type="negative")
 
     # Main UI Layout
-    with ui.column().classes("w-full max-w-5xl mx-auto p-4 gap-4"):
-        # Header
-        with ui.row().classes("items-center gap-3 mb-2"):
-            ui.icon("delete_sweep").classes("text-3xl text-red-500")
-            with ui.column().classes("gap-0"):
-                ui.label("Xóa - Back").classes("text-2xl font-bold text-gray-800")
-                ui.label("Tự động theo dõi bản quyền & xóa video vi phạm").classes(
-                    "text-xs text-gray-500"
-                )
+    with page_shell():
+        with page_header(
+            "Xóa - Back",
+            "Theo dõi trạng thái bản quyền và tự động xóa video theo quy tắc hiện tại.",
+            eyebrow="Tác vụ",
+        ):
+            pass
 
         # Channel selection widget
         create_channel_selection(
@@ -318,9 +316,9 @@ def create_delete_video_page():
         )
 
         # Output dir settings card
-        with ui.card().classes("w-full p-3"):
+        with app_card(compact=True):
             with ui.row().classes("items-center gap-2 w-full flex-nowrap"):
-                ui.icon("folder").classes("text-amber-500 shrink-0")
+                ui.icon("o_folder").classes("text-emerald-600 shrink-0")
                 ui.label("Thư mục lưu lịch sử xóa:").classes(
                     "text-sm text-gray-600 shrink-0"
                 )
@@ -329,24 +327,27 @@ def create_delete_video_page():
                 ).classes("text-sm font-mono text-gray-800 truncate flex-1")
                 ui.button(
                     "Chọn thư mục", icon="folder_open", on_click=handle_pick_folder
-                ).props("outline dense").classes("text-xs")
+                ).props("dense").classes("app-button-secondary text-xs")
                 ui.button(
                     "Mở file lịch sử", icon="description", on_click=handle_open_history
-                ).props("outline dense").classes("text-xs")
+                ).props("dense").classes("app-button-secondary text-xs")
 
         # Controls card (Scan / Stop)
-        with ui.card().classes("w-full p-4"):
+        with app_card():
+            with section_header(
+                "Điều khiển quét",
+                "Ứng dụng tiếp tục kiểm tra cho đến khi bạn bấm Dừng.",
+            ):
+                pass
             with ui.row().classes("items-center gap-3 flex-wrap"):
                 scan_btn = (
                     ui.button("Quét & Xóa", icon="auto_delete", on_click=handle_scan)
-                    .props("outline")
-                    .classes("bg-red-50 text-red-600 border-red-200")
+                    .classes("app-button-primary")
                 )
                 ui_refs["scan_btn"] = scan_btn
                 stop_btn = (
                     ui.button("Dừng", icon="stop", on_click=handle_stop)
-                    .props("outline")
-                    .classes("text-gray-600")
+                    .classes("app-button-secondary")
                 )
                 ui_refs["stop_btn"] = stop_btn
             ui.separator().classes("my-2 opacity-40")
@@ -355,7 +356,12 @@ def create_delete_video_page():
             )
 
         # Video status list card
-        with ui.card().classes("w-full p-4"):
+        with app_card():
+            with section_header(
+                "Danh sách theo dõi",
+                "Trạng thái video được đồng bộ tự động trong quá trình quét.",
+            ):
+                pass
             pb = ui.linear_progress(value=0).classes("w-full mb-1")
             pb.set_visibility(False)
             ui_refs["progress_bar"] = pb

@@ -70,9 +70,11 @@ def create_drawer():
         with ui.column().classes("app-sidebar-shell w-full h-full gap-0"):
             with ui.row().classes("app-brand w-full items-center gap-3"):
                 with ui.element("div").classes("app-brand-mark"):
-                    ui.icon("play_arrow").classes("text-xl")
+                    ui.image("/tuat-videos-assets/logo.png").classes(
+                        "w-full h-full object-cover"
+                    )
                 with ui.column().classes("gap-0 min-w-0"):
-                    ui.label("TV Automation").classes("app-brand-title")
+                    ui.label("Tuất Videos").classes("app-brand-title")
                     ui.label("Operations workspace").classes("app-brand-copy")
 
             with ui.column().classes("w-full gap-0 flex-1"):
@@ -104,15 +106,6 @@ def create_drawer():
                 .classes("app-account w-full items-center gap-2 cursor-pointer")
                 .on("click", lambda: _navigate("/studio"))
             ):
-                with ui.element("div").classes("app-account-avatar"):
-                    ui.label("TV")
-                with ui.column().classes("gap-0 flex-1 min-w-0"):
-                    ui.label("TV Automation").classes(
-                        "text-xs font-semibold text-gray-800 truncate"
-                    )
-                    ui.label("Workspace cục bộ").classes(
-                        "text-[11px] text-gray-400 truncate"
-                    )
-                ui.icon("more_vert").classes("text-lg text-gray-400")
+                pass
 
     return drawer

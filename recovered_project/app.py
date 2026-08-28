@@ -1,6 +1,7 @@
 # RECOVERED: reconstructed from CPython 3.12 bytecode
 import os
 import sys
+from pathlib import Path
 
 from src.paths import initialize_first_run
 from src.runtime_instance import (
@@ -46,13 +47,20 @@ if _is_first_run:
 from nicegui import app, ui
 
 from src.route_manager import router
+from src.task_runtime import stop_all_runs
 from web.nicegui_patches import apply_patches
 from web.theme import install_theme
 from web.views import *
 
 apply_patches()
 install_theme()
+_resource_root = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+_brand_assets = _resource_root / "assets"
+_brand_icon = _brand_assets / "logo.png"
+if _brand_assets.is_dir():
+    app.add_static_files("/tuat-videos-assets", str(_brand_assets))
 router.setup_routes()
+app.on_shutdown(stop_all_runs)
 
 
 @app.get(RUNTIME_HEALTH_PATH, include_in_schema=False)
@@ -75,7 +83,7 @@ if _is_frozen:
 if _port != _requested_port:
     _browser_host = "127.0.0.1" if _host in {"0.0.0.0", "::"} else _host
     print(
-        f"Port {_requested_port} is busy; TV Automation will use "
+        f"Port {_requested_port} is busy; Tuất Videos will use "
         f"http://{_browser_host}:{_port}",
         flush=True,
     )
@@ -90,8 +98,8 @@ if _is_frozen:
 
 try:
     ui.run(
-        title="TV Automation",
-        favicon="🎬",
+        title="Tuất Videos",
+        favicon=_brand_icon if _brand_icon.is_file() else "🐶",
         host=_host,
         port=_port,
         show=False if _is_frozen else _show_browser,
@@ -103,5 +111,5 @@ except Exception as exc:
         from src.runtime_instance import clear_runtime_file
 
         clear_runtime_file()
-    print(f"TV Automation server failed to start: {exc}", flush=True)
+    print(f"Tuất Videos server failed to start: {exc}", flush=True)
     raise

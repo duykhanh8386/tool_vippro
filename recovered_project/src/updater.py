@@ -1,5 +1,5 @@
 # RECOVERED: reconstructed from CPython 3.12 bytecode
-"""GitHub Release auto-updater for TV Automation (NiceGUI / asyncio).
+"""GitHub Release auto-updater for Tuất Videos (NiceGUI / asyncio).
 
 Adapted from the Qt/PySide6 updater pattern to NiceGUI's single asyncio event
 loop. Instead of QThreads + signals, the blocking network work runs in worker
@@ -25,9 +25,9 @@ from loguru import logger
 
 REPO_OWNER = "duykhanh8386"
 REPO_NAME = "tool_vippro"
-DEFAULT_INSTALLER_NAME = "TVAutomation_Isolated_Setup.exe"
+DEFAULT_INSTALLER_NAME = "TuatVideos_Setup.exe"
 FALLBACK_DOWNLOAD_URL: str | None = f"https://github.com/{REPO_OWNER}/{REPO_NAME}/releases/latest/download/{DEFAULT_INSTALLER_NAME}"
-_USER_AGENT = "TV-Automation-Updater"
+_USER_AGENT = "Tuat-Videos-Updater"
 
 
 def get_current_version() -> str:
