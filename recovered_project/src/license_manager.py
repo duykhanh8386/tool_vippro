@@ -54,79 +54,82 @@ def _load_license() -> Optional[dict]:
         return None
 
 
-def verify_license(license_key: str) -> tuple[bool, str]:
-    """Verify a license key against the Licensify API.
+# def verify_license(license_key: str) -> tuple[bool, str]:
+#     """Verify a license key against the Licensify API.
 
-    Returns (success, message).
-    """
-    try:
-        resp = requests.post(
-            f"{BASE_URL}/licenses/verify",
-            json={
-                "license_key": license_key,
-                "product_id": PRODUCT_ID,
-                "device_fingerprint": _device_fingerprint(),
-                "device_name": _device_name(),
-                "os_info": _os_info(),
-            },
-            timeout=15,
-        )
-        body = resp.json()
-        data = body.get("data", {})
+#     Returns (success, message).
+#     """
+#     try:
+#         resp = requests.post(
+#             f"{BASE_URL}/licenses/verify",
+#             json={
+#                 "license_key": license_key,
+#                 "product_id": PRODUCT_ID,
+#                 "device_fingerprint": _device_fingerprint(),
+#                 "device_name": _device_name(),
+#                 "os_info": _os_info(),
+#             },
+#             timeout=15,
+#         )
+#         body = resp.json()
+#         data = body.get("data", {})
 
-        if data.get("valid"):
-            _save_license(license_key, data)
-            expires = data.get("expires_at") or "Vinh vien"
-            logger.info("License activated -- expires: {}", expires)
-            return True, "Kich hoat thanh cong!"
+#         if data.get("valid"):
+#             _save_license(license_key, data)
+#             expires = data.get("expires_at") or "Vinh vien"
+#             logger.info("License activated -- expires: {}", expires)
+#             return True, "Kich hoat thanh cong!"
 
-        reason = data.get("reason", "Khong xac dinh")
-        logger.warning("License rejected: {}", reason)
-        return False, f"License khong hop le: {reason}"
-    except requests.ConnectionError:
-        logger.error("Khong the ket noi den server license")
-        return False, "Khong co ket noi internet!"
-    except Exception as e:
-        logger.error("License verification error: {}", e)
-        return False, f"Loi xac thuc: {e}"
+#         reason = data.get("reason", "Khong xac dinh")
+#         logger.warning("License rejected: {}", reason)
+#         return False, f"License khong hop le: {reason}"
+#     except requests.ConnectionError:
+#         logger.error("Khong the ket noi den server license")
+#         return False, "Khong co ket noi internet!"
+#     except Exception as e:
+#         logger.error("License verification error: {}", e)
+#         return False, f"Loi xac thuc: {e}"
 
 
-def is_licensed() -> bool:
-    """Check whether a valid license exists locally, then re-verify online."""
-    stored = _load_license()
-    if not stored or not stored.get("license_key"):
-        return False
+# def is_licensed() -> bool:
+#     """Check whether a valid license exists locally, then re-verify online."""
+#     stored = _load_license()
+#     if not stored or not stored.get("license_key"):
+#         return False
 
-    try:
-        resp = requests.post(
-            f"{BASE_URL}/licenses/verify",
-            json={
-                "license_key": stored["license_key"],
-                "product_id": PRODUCT_ID,
-                "device_fingerprint": _device_fingerprint(),
-                "device_name": _device_name(),
-                "os_info": _os_info(),
-            },
-            timeout=10,
-        )
-        data = resp.json().get("data", {})
-        if data.get("valid"):
-            _save_license(stored["license_key"], data)
-            return True
-        _LICENSE_FILE.unlink(missing_ok=True)
-        return False
-    except requests.ConnectionError:
-        logger.warning("Offline -- trusting cached license")
-        return True
-    except Exception as e:
-        logger.error("License check error: {}", e)
-        return False
+#     try:
+#         resp = requests.post(
+#             f"{BASE_URL}/licenses/verify",
+#             json={
+#                 "license_key": stored["license_key"],
+#                 "product_id": PRODUCT_ID,
+#                 "device_fingerprint": _device_fingerprint(),
+#                 "device_name": _device_name(),
+#                 "os_info": _os_info(),
+#             },
+#             timeout=10,
+#         )
+#         data = resp.json().get("data", {})
+#         if data.get("valid"):
+#             _save_license(stored["license_key"], data)
+#             return True
+#         _LICENSE_FILE.unlink(missing_ok=True)
+#         return False
+#     except requests.ConnectionError:
+#         logger.warning("Offline -- trusting cached license")
+#         return True
+#     except Exception as e:
+#         logger.error("License check error: {}", e)
+#         return False
 
+
+# def get_license_info() -> Optional[dict]:
+#     """Return cached license info or None."""
+#     return _load_license()
 
 def get_license_info() -> Optional[dict]:
     """Return cached license info or None."""
-    return _load_license()
-
+    return None
 
 def deactivate() -> None:
     """Remove stored license."""
