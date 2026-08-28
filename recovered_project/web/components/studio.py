@@ -1,5 +1,5 @@
-# RECOVERED: reconstructed from CPython 3.12 bytecode
 import asyncio
+from datetime import datetime
 
 from loguru import logger
 from nicegui import ui
@@ -9,26 +9,38 @@ from src.channel_store import channel_store
 from src.license_manager import get_license_info
 from src.state_manager import state_manager
 from src.utils import get_channels_info
+from web.theme import (
+    app_card,
+    app_table,
+    empty_state,
+    page_header,
+    page_shell,
+    section_header,
+    status_badge,
+    workflow_steps,
+)
 
 
 def create_studio_content():
     ui_refs = {"email_input": None, "password_input": None}
 
     def save_credentials():
-        """Save login credentials to file (remember me functionality)"""
+        """Save login credentials to file (remember me functionality)."""
         try:
             if ui_refs["email_input"] and ui_refs["password_input"]:
-                state = {
-                    "email": ui_refs["email_input"].value,
-                    "password": ui_refs["password_input"].value,
-                    "remember_me": True,
-                }
-                state_manager.save_state("studio_credentials", state)
-        except Exception as e:
-            logger.error(f"Failed to save credentials: {e}")
+                state_manager.save_state(
+                    "studio_credentials",
+                    {
+                        "email": ui_refs["email_input"].value,
+                        "password": ui_refs["password_input"].value,
+                        "remember_me": True,
+                    },
+                )
+        except Exception as exc:
+            logger.error(f"Failed to save credentials: {exc}")
 
     def load_credentials():
-        """Load saved credentials from file"""
+        """Load saved credentials into the existing dialog inputs."""
         try:
             state = state_manager.load_state("studio_credentials")
             if not state or not state.get("remember_me"):
@@ -41,29 +53,29 @@ def create_studio_content():
                     if ui_refs["password_input"] and "password" in state:
                         ui_refs["password_input"].value = state["password"]
                     logger.info("Credentials loaded")
-                except Exception as e:
-                    logger.error(f"Failed to update UI: {e}")
+                except Exception as exc:
+                    logger.error(f"Failed to update UI: {exc}")
 
             ui.timer(0.5, update_ui, once=True)
-        except Exception as e:
-            logger.error(f"Failed to load credentials: {e}")
+        except Exception as exc:
+            logger.error(f"Failed to load credentials: {exc}")
 
     async def fetch_channel_data(email, password):
-        """Asynchronous function to fetch channel data."""
         try:
             logger.info("Fetching channel data...")
             await asyncio.to_thread(
-                channel_fetcher.run, email=email, password=password
+                channel_fetcher.run,
+                email=email,
+                password=password,
             )
-        except Exception as e:
-            logger.exception(f"Error fetching channels: {e}")
-            ui.notify(f"Không thể lấy dữ liệu kênh: {e}", type="negative")
+        except Exception as exc:
+            logger.exception(f"Error fetching channels: {exc}")
+            ui.notify(f"Không thể lấy dữ liệu kênh: {exc}", type="negative")
         finally:
             processing_popup.close()
             refresh_channel_list()
 
     def on_login():
-        """Handler for login button click."""
         email = email_input.value
         password = password_input.value
         if remember_checkbox.value:
@@ -73,239 +85,294 @@ def create_studio_content():
         asyncio.create_task(fetch_channel_data(email, password))
 
     def delete_channel_from_db(channel_id: str):
-        """Delete a channel from the SQLite database."""
         try:
             deleted = channel_store.delete_channel(channel_id)
             if not deleted:
                 ui.notify(f"Không tìm thấy kênh: {channel_id}", type="warning")
                 return False
-
             ui.notify("Xóa kênh thành công!", type="positive")
             return True
-        except Exception as e:
-            logger.exception(e)
-            ui.notify(f"Lỗi khi xóa kênh: {e}", type="negative")
+        except Exception as exc:
+            logger.exception(exc)
+            ui.notify(f"Lỗi khi xóa kênh: {exc}", type="negative")
             return False
 
     def delete_all_channels():
-        """Delete all channels from the SQLite database."""
         try:
             channels = get_channels_info()
             if not channels:
                 ui.notify("Không có kênh nào để xóa", type="info")
                 return
-
-            count = 0
-            for ch in channels:
-                if channel_store.delete_channel(ch.id):
-                    count += 1
-
+            count = sum(
+                1 for channel in channels if channel_store.delete_channel(channel.id)
+            )
             ui.notify(f"Đã xóa {count} kênh thành công!", type="positive")
             refresh_channel_list()
-        except Exception as e:
-            logger.exception(e)
-            ui.notify(f"Lỗi khi xóa tất cả kênh: {e}", type="negative")
+        except Exception as exc:
+            logger.exception(exc)
+            ui.notify(f"Lỗi khi xóa tất cả kênh: {exc}", type="negative")
 
     def create_delete_click_handler(channel_id: str, channel_name: str):
-        """Create a delete click handler that opens a confirm dialog and deletes the channel."""
-
         def handler():
             def confirm_delete():
                 confirm_dialog.close()
                 if delete_channel_from_db(channel_id):
                     refresh_channel_list()
 
-            def cancel_delete():
-                confirm_dialog.close()
-
             with ui.dialog() as confirm_dialog:
-                with ui.card().classes("w-full max-w-sm p-4"):
-                    ui.label("Xác nhận xóa kênh").classes(
-                        "text-h6 mb-2 text-gray-800"
-                    )
+                with ui.card().classes("app-card w-full max-w-sm"):
+                    ui.label("Xác nhận xóa kênh").classes("app-section-title")
                     ui.label(
-                        f"Bạn có chắc chắn muốn xóa kênh '{channel_name}'? Thao tác này sẽ xóa toàn bộ dữ liệu kênh trên máy."
-                    ).classes("text-sm text-gray-600")
-                    with ui.row().classes("justify-end gap-2 w-full mt-4"):
-                        ui.button("Hủy", on_click=cancel_delete).classes(
-                            "bg-gray-200 text-gray-800"
-                        )
-                        ui.button("Xóa", on_click=confirm_delete).classes(
-                            "bg-red-600 text-white"
-                        )
+                        f"Bạn có chắc chắn muốn xóa kênh “{channel_name}”? "
+                        "Dữ liệu kênh lưu trên máy sẽ bị xóa."
+                    ).classes("app-section-copy")
+                    with ui.row().classes("justify-end gap-2 w-full mt-3"):
+                        ui.button(
+                            "Hủy",
+                            icon="close",
+                            on_click=confirm_dialog.close,
+                        ).classes("app-button-secondary")
+                        ui.button(
+                            "Xóa kênh",
+                            icon="delete_outline",
+                            on_click=confirm_delete,
+                        ).classes("app-button-danger")
             confirm_dialog.open()
 
         return handler
 
+    def confirm_delete_all():
+        def confirm():
+            dialog.close()
+            delete_all_channels()
+
+        with ui.dialog() as dialog:
+            with ui.card().classes("app-card w-full max-w-sm"):
+                ui.label("Xóa toàn bộ kênh?").classes("app-section-title")
+                ui.label(
+                    "Thao tác này xóa toàn bộ dữ liệu kênh của ứng dụng trên máy "
+                    "và không thể hoàn tác."
+                ).classes("app-section-copy")
+                with ui.row().classes("justify-end gap-2 w-full mt-3"):
+                    ui.button(
+                        "Hủy",
+                        icon="close",
+                        on_click=dialog.close,
+                    ).classes("app-button-secondary")
+                    ui.button(
+                        "Xóa tất cả",
+                        icon="delete_sweep",
+                        on_click=confirm,
+                    ).classes("app-button-danger")
+        dialog.open()
+
+    def format_expiry(license_info) -> str:
+        raw_expiry = license_info.get("expires_at") if license_info else None
+        if not raw_expiry:
+            return "Vĩnh viễn" if license_info else "Chưa xác định"
+        try:
+            expiry = datetime.fromisoformat(raw_expiry.replace("Z", "+00:00"))
+            return expiry.strftime("%d/%m/%Y · %H:%M")
+        except Exception:
+            return str(raw_expiry)
+
     with ui.dialog().props(
-        'backdrop-filter="blur(4px) saturate(150%)" persistent'
+        'backdrop-filter="blur(3px)" persistent'
     ) as processing_popup:
-        with ui.card().classes(
-            "p-8 rounded-lg shadow-lg bg-white flex flex-col items-center justify-center space-y-4"
-        ):
-            ui.spinner(size="lg", color="primary").classes("mb-4")
-            ui.label("Đang xử lý...").classes(
-                "text-lg font-semibold text-center text-gray-700"
+        with ui.card().classes("app-card w-full max-w-sm items-center text-center"):
+            ui.spinner(size="lg", color="primary")
+            ui.label("Đang lấy thông tin kênh").classes("app-section-title")
+            ui.label(
+                "Hãy hoàn tất đăng nhập trong cửa sổ Chrome. Dữ liệu sẽ tự động "
+                "cập nhật khi quá trình kết thúc."
+            ).classes("app-section-copy")
+
+    with ui.dialog() as login_dialog:
+        with ui.card().classes("app-card w-full max-w-md"):
+            with ui.column().classes("gap-1 mb-2"):
+                ui.label("Thêm kênh YouTube").classes(
+                    "text-xl font-semibold leading-snug text-gray-900"
+                )
+                ui.label(
+                    "Nhập tài khoản để mở phiên đăng nhập và đồng bộ danh sách kênh."
+                ).classes("app-section-copy")
+
+            email_input = ui.input("Email").props("outlined").classes("w-full")
+            ui_refs["email_input"] = email_input
+            password_input = (
+                ui.input("Mật khẩu", password=True, password_toggle_button=True)
+                .props("outlined")
+                .classes("w-full")
             )
-            ui.label("Vui lòng theo dõi quá trình ở cửa sổ chrome.").classes(
-                "text-sm text-gray-500 text-center"
-            )
+            ui_refs["password_input"] = password_input
+            remember_checkbox = ui.checkbox(
+                "Ghi nhớ thông tin đăng nhập",
+                value=True,
+            ).classes("text-sm text-gray-600")
 
-    with ui.column().style("min-height: 95vh;").classes(
-        "w-full h-full bg-[#fcf7ff]"
-    ):
-        with ui.dialog() as login_dialog:
-            with ui.card().classes("w-full max-w-sm p-4"):
-                ui.label("Đăng nhập").classes(
-                    "text-h4 mb-4 text-gray-800 text-center"
-                )
-                email_input = (
-                    ui.input("Email")
-                    .props("outlined")
-                    .classes("w-full mb-3 p-2 text-black rounded")
-                )
-                ui_refs["email_input"] = email_input
+            def clear_login_inputs():
+                email_input.value = ""
+                password_input.value = ""
+                ui.notify("Đã xóa thông tin trong biểu mẫu", type="info")
 
-                password_input = (
-                    ui.input("Password", password=True)
-                    .props("outlined")
-                    .classes("w-full mb-3 p-2 text-black rounded")
-                )
-                ui_refs["password_input"] = password_input
-
-                remember_checkbox = ui.checkbox(
-                    "Nhớ thông tin đăng nhập", value=True
-                ).classes("mb-3")
-
-                def clear_login_inputs():
-                    email_input.value = ""
-                    password_input.value = ""
-                    ui.notify("Đã xóa tất cả input", type="info")
-
-                with ui.row().classes("w-full gap-2"):
-                    ui.button(
-                        "Xác nhận", on_click=on_login, color="#f8edff"
-                    ).classes(
-                        "flex-1 bg-blue-600 text-gray-900 px-4 py-2 rounded hover:bg-blue-700 transition"
-                    )
-                    ui.button(
-                        "Xóa tất cả", on_click=clear_login_inputs
-                    ).props("color=red").classes("flex-1")
-
-                load_credentials()
-
-        with ui.card().classes("w-full p-4 text-black"):
-            with ui.row().classes("w-full justify-between items-center"):
-                ui.label("Tài khoản").classes("text-h6 text-gray-900")
-                _lic = get_license_info()
-                _raw = _lic.get("expires_at") if _lic else None
-                if _raw:
-                    try:
-                        from datetime import datetime
-
-                        _dt = datetime.fromisoformat(
-                            _raw.replace("Z", "+00:00")
-                        )
-                        _expires = _dt.strftime("%d/%m/%Y %H:%M")
-                    except Exception:
-                        _expires = _raw
-                else:
-                    _expires = "Vinh vien" if _lic else "N/A"
-                ui.label(f"Hết hạn: {_expires}").classes(
-                    "text-base font-semibold text-red-600 dark:text-red-400 bg-red-50 dark:bg-red-900/20 rounded-md px-3 py-1.5 border border-red-200 dark:border-red-800"
-                )
-
+            with ui.row().classes("w-full justify-between items-center mt-2"):
                 ui.button(
-                    "Lấy thông tin kênh",
-                    on_click=login_dialog.open,
-                    color="#F2DDDC",
-                ).classes("bg-[#F2DDDC] text-gray-900 transition")
-
-        with ui.card().props("square").style("min-height: 85vh;").classes(
-            "w-full mx-auto mt-4 p-4"
-        ):
-            with ui.row().classes("items-center justify-between w-full mb-3"):
-                ui.label("YouTube Channels").classes("text-h6 text-black")
-
-                def handle_refresh_click():
-                    refresh_channel_list()
-
-                def handle_delete_all_click():
-                    def confirm():
-                        dlg.close()
-                        delete_all_channels()
-
-                    with ui.dialog() as dlg:
-                        with ui.card().classes("w-full max-w-sm p-4"):
-                            ui.label("Xác nhận xóa tất cả").classes(
-                                "text-h6 mb-2 text-gray-800"
-                            )
-                            ui.label(
-                                "Bạn có chắc chắn muốn xóa toàn bộ kênh? Thao tác này không thể hoàn tác."
-                            ).classes("text-sm text-gray-600")
-                            with ui.row().classes(
-                                "justify-end gap-2 w-full mt-4"
-                            ):
-                                ui.button("Hủy", on_click=dlg.close).classes(
-                                    "bg-gray-200 text-gray-800"
-                                )
-                                ui.button(
-                                    "Xóa tất cả", on_click=confirm
-                                ).classes("bg-red-600 text-white")
-                    dlg.open()
-
+                    "Xóa nội dung",
+                    icon="backspace",
+                    on_click=clear_login_inputs,
+                ).props("flat").classes("text-gray-500")
                 with ui.row().classes("gap-2"):
                     ui.button(
-                        "Làm mới", on_click=handle_refresh_click
-                    ).classes("bg-gray-200 text-gray-800")
+                        "Đóng",
+                        icon="close",
+                        on_click=login_dialog.close,
+                    ).classes("app-button-secondary")
                     ui.button(
-                        "Xóa tất cả kênh",
-                        icon="delete_sweep",
-                        on_click=handle_delete_all_click,
-                    ).props("outline").classes(
-                        "text-red-600 border-red-400 hover:bg-red-50 transition"
-                    )
+                        "Tiếp tục",
+                        icon="arrow_forward",
+                        on_click=on_login,
+                    ).classes("app-button-primary")
 
-            channels_container = ui.row().classes("gap-2 flex-wrap")
+            load_credentials()
 
-            def refresh_channel_list():
-                channels = get_channels_info()
-                channels_container.clear()
-                if not channels:
-                    with channels_container:
-                        ui.label(
-                            "Chưa có kênh nào. Vui lòng đăng nhập để thêm kênh."
-                        ).classes("text-gray-500 italic")
-                    return
+    license_info = get_license_info()
+    expiry_text = format_expiry(license_info)
 
-                with channels_container:
-                    for channel_data in channels:
-                        name = channel_data.name
-                        avatar = channel_data.img_src
-                        cid = channel_data.id
+    with page_shell():
+        with page_header(
+            "Tài khoản & kênh",
+            "Quản lý kết nối YouTube và kiểm tra trạng thái workspace trước khi chạy tác vụ.",
+            eyebrow="Workspace",
+        ):
+            ui.button(
+                "Làm mới",
+                icon="refresh",
+                on_click=lambda: refresh_channel_list(),
+            ).classes("app-button-secondary")
+            ui.button(
+                "Thêm kênh",
+                icon="add",
+                on_click=login_dialog.open,
+            ).classes("app-button-primary")
 
-                        with ui.card().classes(
-                            "w-56 p-3 bg-[#e5d8ed] hover:bg-[#cca6e3] transition rounded-md shadow-md"
-                        ):
-                            with ui.row().classes(
-                                "items-center justify-between w-full"
-                            ):
-                                with ui.row().classes("items-center gap-2"):
-                                    if avatar:
-                                        ui.image(avatar).classes(
-                                            "w-8 h-8 rounded-full"
-                                        )
-                                    else:
-                                        ui.icon("account_circle").classes(
-                                            "text-2xl text-gray-500"
-                                        )
-                                    ui.label(name[:15]).classes(
-                                        "text-xs font-bold text-gray-900 truncate"
-                                    )
+        workflow_container = ui.column().classes("w-full gap-0")
 
-                                ui.button(
-                                    icon="delete",
-                                    on_click=create_delete_click_handler(cid, name),
-                                ).props("flat round dense").classes("text-red-600")
+        with app_card():
+            with section_header(
+                "Trạng thái workspace",
+                "Thông tin kích hoạt và mức độ sẵn sàng của ứng dụng.",
+            ):
+                status_badge(
+                    "Đã kích hoạt" if license_info else "Chưa kích hoạt",
+                    "success" if license_info else "warning",
+                )
 
-            refresh_channel_list()
+            with ui.element("div").classes("app-metrics mt-2"):
+                with ui.column().classes("app-metric gap-1"):
+                    ui.label("Giấy phép").classes("app-metric-label")
+                    ui.label(
+                        "Đang hoạt động" if license_info else "Chưa có dữ liệu"
+                    ).classes("app-metric-value")
+                with ui.column().classes("app-metric gap-1"):
+                    ui.label("Thời hạn").classes("app-metric-label")
+                    ui.label(expiry_text).classes("app-metric-value")
+                with ui.column().classes("app-metric gap-1"):
+                    ui.label("Kênh đã kết nối").classes("app-metric-label")
+                    channel_count_label = ui.label("0 kênh").classes("app-metric-value")
+
+        with app_card():
+            with section_header(
+                "Kênh YouTube",
+                "Các kênh được lưu riêng cho phiên bản ứng dụng này.",
+            ):
+                delete_all_button = ui.button(
+                    "Xóa tất cả",
+                    icon="delete_sweep",
+                    on_click=confirm_delete_all,
+                ).classes("app-button-danger")
+
+            with app_table("minmax(240px, 1.5fr) minmax(220px, 1fr) 140px 44px"):
+                with ui.element("div").classes("app-table-header"):
+                    ui.label("Kênh")
+                    ui.label("Channel ID")
+                    ui.label("Trạng thái")
+                    ui.label("")
+                channels_container = ui.column().classes("w-full gap-0")
+
+    def refresh_workflow(channels) -> None:
+        workflow_container.clear()
+        has_license = bool(license_info)
+        has_channels = bool(channels)
+        with workflow_container:
+            workflow_steps(
+                [
+                    {
+                        "title": "Kích hoạt ứng dụng",
+                        "description": "Xác nhận giấy phép sử dụng",
+                        "state": "complete" if has_license else "current",
+                    },
+                    {
+                        "title": "Kết nối kênh",
+                        "description": "Đăng nhập và đồng bộ YouTube",
+                        "state": (
+                            "complete"
+                            if has_channels
+                            else "current"
+                            if has_license
+                            else "pending"
+                        ),
+                    },
+                    {
+                        "title": "Sẵn sàng vận hành",
+                        "description": "Chọn tác vụ từ thanh điều hướng",
+                        "state": "current" if has_channels else "pending",
+                    },
+                ]
+            )
+
+    def refresh_channel_list():
+        channels = get_channels_info()
+        channels_container.clear()
+        channel_count_label.set_text(f"{len(channels)} kênh")
+        delete_all_button.set_enabled(bool(channels))
+        refresh_workflow(channels)
+
+        with channels_container:
+            if not channels:
+                empty_state(
+                    "Chưa có kênh YouTube",
+                    "Chọn “Thêm kênh” để đăng nhập và đồng bộ kênh đầu tiên.",
+                    icon="video_library",
+                )
+                return
+
+            for channel_data in channels:
+                name = channel_data.name
+                avatar = channel_data.img_src
+                channel_id = channel_data.id
+                with ui.element("div").classes("app-table-row"):
+                    with ui.row().classes("items-center gap-3 min-w-0"):
+                        if avatar:
+                            ui.image(avatar).classes(
+                                "w-8 h-8 rounded-lg object-cover shrink-0"
+                            )
+                        else:
+                            with ui.element("div").classes("app-account-avatar shrink-0"):
+                                ui.icon("smart_display").classes("text-base")
+                        with ui.column().classes("gap-0 min-w-0"):
+                            ui.label(name).classes(
+                                "text-sm font-semibold text-gray-800 truncate"
+                            )
+                            ui.label("YouTube channel").classes(
+                                "text-[11px] text-gray-400"
+                            )
+                    ui.label(channel_id).classes(
+                        "text-xs text-gray-500 truncate"
+                    ).tooltip(channel_id)
+                    status_badge("Đã kết nối", "success")
+                    ui.button(
+                        icon="delete_outline",
+                        on_click=create_delete_click_handler(channel_id, name),
+                    ).props("flat round dense").classes("app-icon-button")
+
+    refresh_channel_list()
