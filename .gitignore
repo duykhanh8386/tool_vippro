@@ -1,0 +1,9 @@
+.venv/
+.venv_*/
+__pycache__/
+*.py[cod]
+build/
+dist/
+installer_dist/
+*.db
+license.json
