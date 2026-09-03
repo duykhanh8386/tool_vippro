@@ -14,7 +14,10 @@ from selenium.webdriver.support.ui import WebDriverWait
 from src.channel_store import channel_store
 from src.cookie_utils import normalize_cookies_for_storage
 from src.utils import create_driver, get_request_payload_from_performance_log
-from src.task_runtime import unregister_driver
+from src.task_runtime import TaskStopped, current_run_context, unregister_driver
+
+
+AUTHENTICATION_TIMEOUT_SECONDS = 10 * 60
 
 
 class ChannelFetcher:
@@ -31,9 +34,14 @@ class ChannelFetcher:
     def __init__(self):
         self.driver = None
 
-    def run(self, email, password):
+    def run(self, email, password, on_authenticated=None):
+        run_context = current_run_context()
         try:
-            self._run(email, password)
+            self._run(email, password, on_authenticated=on_authenticated)
+        except Exception as exc:
+            if run_context is not None and run_context.stopped:
+                raise TaskStopped() from exc
+            raise
         finally:
             if self.driver is not None:
                 driver = self.driver
@@ -43,7 +51,7 @@ class ChannelFetcher:
                 finally:
                     unregister_driver(driver)
 
-    def _run(self, email, password):
+    def _run(self, email, password, on_authenticated=None):
         logger.info("*** Fetching channel info ***")
         self.driver = create_driver(enable_performance_log=True)
         self._login(email, password)
@@ -51,15 +59,29 @@ class ChannelFetcher:
         # Google may show a channel chooser, but accounts with one/default
         # channel are redirected straight to /channel/<id>. Accept either
         # state instead of waiting only for the chooser until it times out.
-        initial_state = WebDriverWait(self.driver, 60).until(
-            lambda driver: (
-                "channel"
-                if self._extract_channel_id(driver.current_url)
-                else "chooser"
-                if driver.find_elements(By.XPATH, self.CHANNEL_SELECTION_XPATH)
-                else False
-            )
-        )
+        run_context = current_run_context()
+
+        def detect_initial_state(driver):
+            if run_context is not None:
+                run_context.checkpoint()
+            if self._extract_channel_id(driver.current_url):
+                return "channel"
+            if driver.find_elements(By.XPATH, self.CHANNEL_SELECTION_XPATH):
+                return "chooser"
+            return False
+
+        try:
+            initial_state = WebDriverWait(
+                self.driver,
+                AUTHENTICATION_TIMEOUT_SECONDS,
+                poll_frequency=0.5,
+            ).until(detect_initial_state)
+        except TimeoutException as exc:
+            raise RuntimeError(
+                "Đã hết 10 phút xác thực Google. Vui lòng kết nối lại kênh."
+            ) from exc
+        if on_authenticated is not None:
+            on_authenticated()
         if initial_state == "chooser":
             channel_selection_button = WebDriverWait(self.driver, 10).until(
                 EC.element_to_be_clickable(

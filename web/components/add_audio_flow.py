@@ -3,6 +3,11 @@ import asyncio, random, tempfile, threading
 from pathlib import Path
 from loguru import logger
 from nicegui import ui
+from src.audio_language import (
+    call_audio_update_with_retry,
+    invalid_language_codes,
+    parse_language_codes,
+)
 from src.channel_store import channel_store
 from src.module.audio_module import update_audio_module
 from src.module.upload_video_module import upload_video_module
@@ -47,7 +52,7 @@ def _fmt_duration(seconds: float | None) -> str:
 def _new_steps() -> dict:
     return {"merge": "pending", "upload": "pending", "wait": "pending", "add_audio": "pending"}
 def create_add_audio_flow_page():
-    paths_state = {"video_folder": "", "music_folder": "", "output_folder": ""}; options_state = {"random_music": False, "audio_language": "en"}; selected_channel = {"id": None}; channels = get_channels_info(); videos_state = {"items": []}; saved_status_map = {}; video_list_container = None; suppress_autosave = {"value": False}; ui_refs = {"random_switch": None, "lang_input": None, "process_btn": None, "clear_btn": None, "refresh_channel_display": None, "refresh_overlay": None, "stop_btn": None}; folder_selectors = {}; progress_refs = {}; processing = {"value": False}; stop_requested = {"value": False}; active_run = {"parent": None, "children": {}}; PERSIST_FIELDS = ("music", "music_path", "audio_path", "output_path", "video_id", "scotty_resource_id", "frontend_upload_id")
+    paths_state = {"video_folder": "", "music_folder": "", "output_folder": ""}; options_state = {"random_music": False, "audio_language": "en"}; selected_channel = {"id": None}; channels = get_channels_info(); videos_state = {"items": []}; saved_status_map = {}; video_list_container = None; suppress_autosave = {"value": False}; ui_refs = {"random_switch": None, "lang_input": None, "process_btn": None, "clear_btn": None, "refresh_channel_display": None, "refresh_overlay": None, "stop_btn": None}; folder_selectors = {}; progress_refs = {}; processing = {"value": False}; stop_requested = {"value": False}; active_run = {"parent": None, "children": {}}; PERSIST_FIELDS = ("music", "music_path", "audio_path", "output_path", "video_id", "scotty_resource_id", "frontend_upload_id", "audio_language_results")
     def save_state():
         try:
             if suppress_autosave["value"]:
@@ -110,7 +115,8 @@ def create_add_audio_flow_page():
                     "steps": {**_new_steps(), **(saved.get("steps") or {})},
                 }
                 for field in PERSIST_FIELDS:
-                    item[field] = saved.get(field, "")
+                    default = {} if field == "audio_language_results" else ""
+                    item[field] = saved.get(field, default)
                 for k in item["steps"]:
                     if item["steps"][k] == "processing":
                         item["steps"][k] = "pending"
@@ -303,14 +309,7 @@ def create_add_audio_flow_page():
         if not audio_path or not Path(audio_path).is_file():
             raise Exception(f"Không tìm thấy file nhạc gốc: {audio_path}")
 
-        seen = set()
-        languages = []
-        for tok in run_config["audio_language"].split():
-            if tok and tok not in seen:
-                seen.add(tok)
-                languages.append(tok)
-        if not languages:
-            languages = ["en"]
+        languages = list(run_config["audio_languages"])
 
         step_label = None
         if step_label:
@@ -344,20 +343,87 @@ def create_add_audio_flow_page():
                 logger.warning(f"Không lấy được thời lượng video {video_id}, dùng nhạc gốc.")
                 data = await asyncio.to_thread(Path(audio_path).read_bytes)
 
-            for lang in languages:
+            language_errors = []
+            language_results = dict(item.get("audio_language_results") or {})
+            item["audio_language_results"] = language_results
+            for language_index, lang in enumerate(languages, 1):
+                previous = language_results.get(lang) or {}
+                if previous.get("status") in ("successful", "already_added"):
+                    push_log(f"Audio track đã hoàn tất trước đó, bỏ qua: {lang}", "ok", indent=True)
+                    continue
                 if step_label:
                     step_label.set_text(f"Bước: Add audio — ngôn ngữ {lang}")
-                status = await asyncio.to_thread(
-                    update_audio_module.add,
-                    id_video=video_id,
-                    channel_id=channel_id,
-                    file_name=audio_path,
-                    language=lang,
-                    data=data,
+                push_log(
+                    f"Audio {language_index}/{len(languages)} — đang xử lý {lang}",
+                    "wait",
+                    indent=True,
                 )
-                if status not in (200, 409):
-                    raise Exception(f"Add audio ({lang}) thất bại: HTTP {status}")
-                push_log(f"Đã thêm audio track: {lang}", "ok", indent=True)
+
+                def update_one_language(lang=lang):
+                    return update_audio_module.add(
+                        id_video=video_id,
+                        channel_id=channel_id,
+                        file_name=audio_path,
+                        language=lang,
+                        data=data,
+                    )
+
+                def log_retry(attempt, delay, exc, lang=lang):
+                    logger.warning(
+                        "Retry {}/3 for video {} language {} in {}s: {}",
+                        attempt,
+                        video_id,
+                        lang,
+                        delay,
+                        exc,
+                    )
+                    push_log(
+                        f"{lang}: thử lại sau {delay:g}s ({attempt}/3)",
+                        "wait",
+                        indent=True,
+                    )
+
+                try:
+                    status = await call_audio_update_with_retry(
+                        update_one_language,
+                        on_retry=log_retry,
+                    )
+                except TaskStopped:
+                    raise
+                except Exception as exc:
+                    message = str(exc)
+                    language_results[lang] = {
+                        "status": "unsuccessful",
+                        "error": message,
+                    }
+                    language_errors.append(f"{lang}: {message}")
+                    logger.error(
+                        "Add audio failed for video {} language {}: {}",
+                        video_id,
+                        lang,
+                        exc,
+                    )
+                    push_log(
+                        f"Audio {lang}: thất bại — tiếp tục mã kế tiếp",
+                        "error",
+                        indent=True,
+                    )
+                    save_state()
+                    continue
+
+                result_status = "successful" if status == 200 else "already_added"
+                language_results[lang] = {"status": result_status, "error": ""}
+                if status == 409:
+                    push_log(f"Audio track đã tồn tại: {lang}", "ok", indent=True)
+                else:
+                    push_log(f"Đã thêm audio track: {lang}", "ok", indent=True)
+                save_state()
+
+            if language_errors:
+                raise Exception(
+                    f"{len(language_errors)}/{len(languages)} ngôn ngữ thất bại: "
+                    + "; ".join(language_errors)
+                )
         finally:
             try:
                 if Path(matched_path).exists():
@@ -652,10 +718,21 @@ def create_add_audio_flow_page():
         if not channel_snapshot:
             ui.notify("Không tìm thấy dữ liệu kênh đã chọn", type="negative")
             return
+        audio_languages = parse_language_codes(options_state.get("audio_language"))
+        if not audio_languages:
+            ui.notify("Hãy nhập ít nhất một mã ngôn ngữ", type="warning")
+            return
+        invalid_languages = invalid_language_codes(audio_languages)
+        if invalid_languages:
+            ui.notify(
+                f"Mã ngôn ngữ không hợp lệ: {', '.join(invalid_languages)}",
+                type="negative",
+            )
+            return
         run_config = {
             "channel_id": selected_channel["id"],
             "random_music": bool(options_state["random_music"]),
-            "audio_language": (options_state.get("audio_language") or "en").strip() or "en",
+            "audio_languages": audio_languages,
             "overlay_png": channel_snapshot.overlay_png or "",
         }
 
@@ -742,10 +819,10 @@ def create_add_audio_flow_page():
             if ui_refs["random_switch"]:
                 ui_refs["random_switch"].value = False
             refresh_video_list()
-            save_state()
             ui.notify("Đã xóa tất cả input", type="info")
         finally:
             suppress_autosave["value"] = False
+        save_state()
 
     if False:
         pass
@@ -894,7 +971,7 @@ def create_add_audio_flow_page():
             build_folder_selector("music_folder", "Folder nhạc", "Chọn folder chứa nhạc", "music_note", extra_render=render_music_switch)
             build_folder_selector("output_folder", "Folder output", "Chọn nơi lưu video đã ghép nhạc", "drive_folder_upload")
         def on_lang_change(e=None):
-            options_state["audio_language"] = (lang_input.value or "en").strip() or "en"
+            options_state["audio_language"] = (lang_input.value or "").strip()
             save_state()
 
         with ui.row().classes("items-center gap-2 mt-2"):

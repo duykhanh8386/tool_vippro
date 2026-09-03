@@ -1,10 +1,11 @@
 import asyncio
+import time
 from datetime import datetime
 
 from loguru import logger
-from nicegui import ui
+from nicegui import context, ui
 
-from src.channel_scanner import ChannelFetcher
+from src.channel_scanner import AUTHENTICATION_TIMEOUT_SECONDS, ChannelFetcher
 from src.channel_store import channel_store
 from src.license_manager import get_license_info
 from src.state_manager import state_manager
@@ -23,6 +24,19 @@ from web.theme import (
 
 def create_studio_content():
     ui_refs = {"email_input": None, "password_input": None}
+    try:
+        page_client = context.client
+    except RuntimeError:
+        page_client = None
+    scan_state = {
+        "run_context": None,
+        "deadline": None,
+        "cancel_requested": False,
+        "authenticated": False,
+    }
+
+    def client_is_alive() -> bool:
+        return page_client is not None and not getattr(page_client, "_deleted", False)
 
     def save_credentials():
         """Save login credentials to file (remember me functionality)."""
@@ -62,6 +76,7 @@ def create_studio_content():
 
     async def fetch_channel_data(email, password):
         run_context = create_run_context("studio_channel_scan")
+        scan_state["run_context"] = run_context
         channel_fetcher = ChannelFetcher()
         try:
             logger.info("Fetching channel data...")
@@ -70,26 +85,85 @@ def create_studio_content():
                     channel_fetcher.run,
                     email=email,
                     password=password,
+                    on_authenticated=lambda: scan_state.update(authenticated=True),
                 )
         except TaskStopped:
             logger.info("Channel scan stopped")
-            ui.notify("Đã dừng quét kênh.", type="info")
+            if client_is_alive():
+                ui.notify("Đã dừng quét kênh.", type="info")
         except Exception as exc:
             logger.exception(f"Error fetching channels: {exc}")
-            ui.notify(f"Không thể lấy dữ liệu kênh: {exc}", type="negative")
+            if client_is_alive():
+                ui.notify(f"Không thể lấy dữ liệu kênh: {exc}", type="negative")
         finally:
             run_context.cleanup()
-            processing_popup.close()
-            refresh_channel_list()
+            if scan_state["run_context"] is run_context:
+                scan_state["run_context"] = None
+                scan_state["deadline"] = None
+            if client_is_alive():
+                processing_popup.close()
+                refresh_channel_list()
 
     def on_login():
-        email = email_input.value
-        password = password_input.value
+        if scan_state["run_context"] is not None:
+            ui.notify("Đang quét kênh, vui lòng chờ hoặc bấm Hủy.", type="warning")
+            return
+        email = str(email_input.value or "").strip()
+        password = str(password_input.value or "")
+        if not email or not password:
+            ui.notify("Vui lòng nhập đầy đủ email và mật khẩu.", type="warning")
+            return
         if remember_checkbox.value:
             save_credentials()
+        else:
+            state_manager.clear_state("studio_credentials")
         login_dialog.close()
+        scan_state["deadline"] = time.monotonic() + AUTHENTICATION_TIMEOUT_SECONDS
+        scan_state["cancel_requested"] = False
+        scan_state["authenticated"] = False
+        processing_status.set_text(
+            "Bạn có tối đa 10 phút để hoàn tất xác thực Google."
+        )
+        auth_countdown.set_text("Thời gian xác thực còn lại: 10:00")
+        cancel_scan_button.set_enabled(True)
         processing_popup.open()
         asyncio.create_task(fetch_channel_data(email, password))
+
+    async def cancel_channel_scan():
+        run_context = scan_state["run_context"]
+        if run_context is None or scan_state["cancel_requested"]:
+            return
+        scan_state["cancel_requested"] = True
+        cancel_scan_button.set_enabled(False)
+        processing_status.set_text("Đang hủy và đóng cửa sổ Chrome...")
+        await asyncio.to_thread(run_context.request_stop)
+
+    async def stop_scan_when_client_disconnects():
+        """Stop the owned Selenium session when this page is closed/reloaded."""
+        run_context = scan_state["run_context"]
+        if run_context is None:
+            return
+        scan_state["cancel_requested"] = True
+        logger.info("Studio page disconnected; stopping channel scan")
+        await asyncio.to_thread(run_context.request_stop)
+
+    if page_client is not None:
+        page_client.on_disconnect(stop_scan_when_client_disconnects)
+
+    def update_auth_countdown():
+        deadline = scan_state["deadline"]
+        if deadline is None:
+            return
+        if scan_state["authenticated"]:
+            scan_state["deadline"] = None
+            processing_status.set_text("Xác thực hoàn tất, đang đồng bộ các kênh...")
+            auth_countdown.set_text("Đã xác thực")
+            return
+        remaining = max(0, int(deadline - time.monotonic() + 0.999))
+        minutes, seconds = divmod(remaining, 60)
+        auth_countdown.set_text(
+            f"Thời gian xác thực còn lại: {minutes:02d}:{seconds:02d}"
+        )
 
     def delete_channel_from_db(channel_id: str):
         try:
@@ -193,6 +267,19 @@ def create_studio_content():
                 "Hãy hoàn tất đăng nhập trong cửa sổ Chrome. Dữ liệu sẽ tự động "
                 "cập nhật khi quá trình kết thúc."
             ).classes("app-section-copy")
+            processing_status = ui.label(
+                "Bạn có tối đa 10 phút để hoàn tất xác thực Google."
+            ).classes("text-sm text-gray-600")
+            auth_countdown = ui.label(
+                "Thời gian xác thực còn lại: 10:00"
+            ).classes("text-lg font-semibold text-primary")
+            cancel_scan_button = ui.button(
+                "Hủy",
+                icon="close",
+                on_click=cancel_channel_scan,
+            ).classes("app-button-secondary mt-2")
+
+    ui.timer(1.0, update_auth_countdown)
 
     with ui.dialog() as login_dialog:
         with ui.card().classes("app-card w-full max-w-md"):
@@ -212,19 +299,34 @@ def create_studio_content():
                 .classes("w-full")
             )
             ui_refs["password_input"] = password_input
+            def on_remember_change(event):
+                if not event.value:
+                    state_manager.clear_state("studio_credentials")
+
             remember_checkbox = ui.checkbox(
                 "Ghi nhớ thông tin đăng nhập",
                 value=True,
+                on_change=on_remember_change,
             ).classes("text-sm text-gray-600")
 
             def clear_login_inputs():
                 email_input.value = ""
                 password_input.value = ""
-                ui.notify("Đã xóa thông tin trong biểu mẫu", type="info")
+                remember_checkbox.value = False
+                if state_manager.clear_state("studio_credentials"):
+                    ui.notify(
+                        "Đã xóa thông tin đăng nhập khỏi biểu mẫu và dữ liệu đã lưu.",
+                        type="positive",
+                    )
+                else:
+                    ui.notify(
+                        "Đã xóa biểu mẫu nhưng không thể xóa dữ liệu đã lưu.",
+                        type="warning",
+                    )
 
             with ui.row().classes("w-full justify-between items-center mt-2"):
                 ui.button(
-                    "Xóa nội dung",
+                    "Xóa thông tin",
                     icon="backspace",
                     on_click=clear_login_inputs,
                 ).props("flat").classes("text-gray-500")
