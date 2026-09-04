@@ -18,6 +18,9 @@ from src.task_runtime import TaskStopped, current_run_context, unregister_driver
 
 
 AUTHENTICATION_TIMEOUT_SECONDS = 10 * 60
+LOGIN_FIELD_TIMEOUT_SECONDS = 30
+STUDIO_LOAD_TIMEOUT_SECONDS = 60
+ACCOUNT_MENU_TIMEOUT_SECONDS = 20
 
 
 class ChannelFetcher:
@@ -83,32 +86,39 @@ class ChannelFetcher:
         if on_authenticated is not None:
             on_authenticated()
         if initial_state == "chooser":
-            channel_selection_button = WebDriverWait(self.driver, 10).until(
+            channel_selection_button = WebDriverWait(
+                self.driver, LOGIN_FIELD_TIMEOUT_SECONDS
+            ).until(
                 EC.element_to_be_clickable(
                     (By.XPATH, self.CHANNEL_SELECTION_XPATH)
                 )
             )
             channel_selection_button.click()
-            WebDriverWait(self.driver, 30).until(
-                lambda driver: self._extract_channel_id(driver.current_url)
-                is not None
+            WebDriverWait(self.driver, STUDIO_LOAD_TIMEOUT_SECONDS).until(
+                lambda driver: self._checkpoint_and_get(
+                    lambda: self._extract_channel_id(driver.current_url) is not None
+                )
             )
 
         self._get_channel_info()
 
         try:
-            account_menu_btn = WebDriverWait(self.driver, 10).until(
+            account_menu_btn = WebDriverWait(
+                self.driver, ACCOUNT_MENU_TIMEOUT_SECONDS
+            ).until(
                 EC.element_to_be_clickable((By.XPATH, self.AVATAR_BUTTON_XPATH))
             )
             account_menu_btn.click()
-            switch_acocunt_button = WebDriverWait(self.driver, 5).until(
+            switch_acocunt_button = WebDriverWait(
+                self.driver, ACCOUNT_MENU_TIMEOUT_SECONDS
+            ).until(
                 EC.element_to_be_clickable(
                     (By.XPATH, self.SWTICH_ACCOUNT_BUTTON_XPATH)
                 )
             )
             switch_acocunt_button.click()
-            time.sleep(1)
-            WebDriverWait(self.driver, 5).until(
+            self._wait_interruptibly(1)
+            WebDriverWait(self.driver, ACCOUNT_MENU_TIMEOUT_SECONDS).until(
                 EC.element_to_be_clickable(
                     (By.XPATH, self.NEXT_CHANNEL_SELECTION_XPATH)
                 )
@@ -121,37 +131,59 @@ class ChannelFetcher:
         )
 
         while len(next_account_button) > 0:
-            next = WebDriverWait(self.driver, 5).until(
+            self._checkpoint()
+            previous_channel_id = self._extract_channel_id(self.driver.current_url)
+            next = WebDriverWait(
+                self.driver, ACCOUNT_MENU_TIMEOUT_SECONDS
+            ).until(
                 EC.element_to_be_clickable(
                     (By.XPATH, self.NEXT_CHANNEL_SELECTION_XPATH)
                 )
             )
             next.click()
+            WebDriverWait(self.driver, STUDIO_LOAD_TIMEOUT_SECONDS).until(
+                lambda driver: self._checkpoint_and_get(
+                    lambda: (
+                        "channel-appeal" in driver.current_url
+                        or (
+                            self._extract_channel_id(driver.current_url) is not None
+                            and self._extract_channel_id(driver.current_url)
+                            != previous_channel_id
+                        )
+                    )
+                )
+            )
             if "channel-appeal" in self.driver.current_url:
                 logger.error("Kênh đã bị xóa!!!")
             else:
                 try:
                     self._get_channel_info()
-                except:
-                    logger.error("Kênh đã bị xóa!!!")
+                except TaskStopped:
+                    raise
+                except Exception as exc:
+                    logger.exception("Không thể lưu kênh hiện tại: {}", exc)
 
-            account_menu_btn = WebDriverWait(self.driver, 10).until(
+            account_menu_btn = WebDriverWait(
+                self.driver, ACCOUNT_MENU_TIMEOUT_SECONDS
+            ).until(
                 EC.element_to_be_clickable((By.XPATH, self.AVATAR_BUTTON_XPATH))
             )
             account_menu_btn.click()
-            switch_acocunt_button = WebDriverWait(self.driver, 5).until(
+            switch_acocunt_button = WebDriverWait(
+                self.driver, ACCOUNT_MENU_TIMEOUT_SECONDS
+            ).until(
                 EC.element_to_be_clickable(
                     (By.XPATH, self.SWTICH_ACCOUNT_BUTTON_XPATH)
                 )
             )
             switch_acocunt_button.click()
             try:
-                WebDriverWait(self.driver, 5).until(
+                WebDriverWait(self.driver, ACCOUNT_MENU_TIMEOUT_SECONDS).until(
                     EC.element_to_be_clickable(
                         (By.XPATH, self.NEXT_CHANNEL_SELECTION_XPATH)
                     )
                 )
-            except:
+            except TimeoutException:
                 break
             next_account_button = self.driver.find_elements(
                 By.XPATH, self.NEXT_CHANNEL_SELECTION_XPATH
@@ -159,26 +191,32 @@ class ChannelFetcher:
 
     def _login(self, email: str, password: str):
         self.driver.get(self.LOGIN_URL)
-        email_input = self.driver.find_element(By.XPATH, self.EMAIL_XPATH)
+        email_input = WebDriverWait(
+            self.driver, LOGIN_FIELD_TIMEOUT_SECONDS
+        ).until(EC.element_to_be_clickable((By.XPATH, self.EMAIL_XPATH)))
         for char in email:
+            self._checkpoint()
             email_input.send_keys(char)
-            time.sleep(0.05)
+            self._wait_interruptibly(0.05)
 
         next_button = self.driver.find_element(By.XPATH, self.NEXT_BUTTON_XPATH)
         next_button.click()
-        password_input = WebDriverWait(self.driver, 10).until(
+        password_input = WebDriverWait(
+            self.driver, LOGIN_FIELD_TIMEOUT_SECONDS
+        ).until(
             EC.element_to_be_clickable((By.XPATH, self.PASSWORD_XPATH))
         )
         for char in password:
+            self._checkpoint()
             password_input.send_keys(char)
-            time.sleep(0.05)
+            self._wait_interruptibly(0.05)
 
         next_button = self.driver.find_element(By.XPATH, self.NEXT_BUTTON_XPATH)
         next_button.click()
 
     def _get_channel_info(self):
         img_element_xapth = "//img[@class='thumbnail image-thumbnail style-scope ytcp-navigation-drawer']"
-        WebDriverWait(self.driver, 30).until(
+        WebDriverWait(self.driver, STUDIO_LOAD_TIMEOUT_SECONDS).until(
             EC.element_to_be_clickable((By.XPATH, img_element_xapth))
         )
         id = self._extract_channel_id(self.driver.current_url)
@@ -194,6 +232,10 @@ class ChannelFetcher:
             if cookie["name"] == "SAPISID":
                 sapisid = cookie["value"]
                 sapisidhash = self._generate_sapisidhash_header(sapisid)
+        if not sapisidhash:
+            raise RuntimeError(
+                "Phiên đăng nhập thiếu cookie SAPISID; hãy đăng nhập lại Google."
+            )
 
         current_url = self.driver.current_url
         next_url = current_url + "/analytics/tab-overview/period-default"
@@ -207,8 +249,8 @@ class ChannelFetcher:
             payload_json = json.loads(payload)
             challenge = payload_json["challenge"]
             botguardResponse = payload_json["botguardResponse"]
-        except TimeoutError as e:
-            logger.error(str(e))
+        except (TimeoutError, json.JSONDecodeError, KeyError, TypeError) as exc:
+            logger.warning("Không lấy được dữ liệu BotGuard cho kênh {}: {}", id, exc)
 
         url = f"https://studio.youtube.com/channel/{id}"
         cookie_string = "; ".join(
@@ -218,9 +260,16 @@ class ChannelFetcher:
             "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
             "Cookie": cookie_string,
         }
-        res = requests.get(url, headers=header, timeout=30)
+        self._checkpoint()
+        res = requests.get(url, headers=header, timeout=(10, 30))
+        res.raise_for_status()
+        self._checkpoint()
         delegated_session_id = self._extract_datasync_id(res.text)
         role = self._get_role_type(res.text)
+        if not delegated_session_id or not role:
+            raise RuntimeError(
+                "Không lấy được quyền hoặc phiên làm việc của kênh YouTube."
+            )
         channel_store.upsert_channel(
             {
                 "id": id,
@@ -265,8 +314,26 @@ class ChannelFetcher:
     def _get_role_type(text):
         pattern = '"channelRoleType":"(CREATOR_CHANNEL_ROLE_TYPE_[A-Z_]+)"'
         match = re.search(pattern, text)
-        res = match.group(1)
-        return res
+        return match.group(1) if match else None
+
+    @staticmethod
+    def _checkpoint():
+        run_context = current_run_context()
+        if run_context is not None:
+            run_context.checkpoint()
+
+    @staticmethod
+    def _wait_interruptibly(seconds):
+        run_context = current_run_context()
+        if run_context is None:
+            time.sleep(seconds)
+        else:
+            run_context.wait(seconds)
+
+    @classmethod
+    def _checkpoint_and_get(cls, callback):
+        cls._checkpoint()
+        return callback()
 
 
 channel_fetcher = ChannelFetcher()

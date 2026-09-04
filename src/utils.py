@@ -423,7 +423,10 @@ def get_request_payload_from_performance_log(driver, url_substring: str, timeout
         - TimeoutError: nếu hết timeout vẫn không thấy request
     """
     deadline = time.monotonic() + timeout
+    run_context = current_run_context()
     while time.monotonic() < deadline:
+        if run_context is not None:
+            run_context.checkpoint()
         for entry in driver.get_log("performance"):
             try:
                 msg = json.loads(entry["message"])
@@ -437,5 +440,8 @@ def get_request_payload_from_performance_log(driver, url_substring: str, timeout
                 return request.get("postData")
             except (json.JSONDecodeError, KeyError, TypeError):
                 continue
-        time.sleep(poll_interval)
+        if run_context is None:
+            time.sleep(poll_interval)
+        else:
+            run_context.wait(poll_interval)
     raise TimeoutError(f"Không tìm thấy request chứa '{url_substring}' sau {timeout}s")
