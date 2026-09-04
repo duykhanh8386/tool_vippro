@@ -1,8 +1,13 @@
+import time
 import unittest
 from unittest.mock import patch
 
 import requests
-from selenium.common.exceptions import InvalidSessionIdException, TimeoutException
+from selenium.common.exceptions import (
+    ElementClickInterceptedException,
+    InvalidSessionIdException,
+    TimeoutException,
+)
 
 from src.channel_scanner import (
     CHANNEL_SCAN_MAX_ATTEMPTS,
@@ -20,6 +25,29 @@ class FakeDriver:
 
     def quit(self):
         self.quit_calls += 1
+
+
+class InterceptingElement:
+    def __init__(self, interceptions: int):
+        self.interceptions = interceptions
+        self.click_calls = 0
+
+    def click(self):
+        self.click_calls += 1
+        if self.click_calls <= self.interceptions:
+            raise ElementClickInterceptedException("overlay is still open")
+
+
+class ImmediateWait:
+    """Test double that returns a supplied target without real wall-clock waits."""
+
+    target = None
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def until(self, condition):
+        return self.target
 
 
 class FakeChannelFetcher(ChannelFetcher):
@@ -116,6 +144,57 @@ class ChannelScannerHardeningTests(unittest.TestCase):
         self.assertEqual([item["id"] for item in report.channels], ["A", "B", "C"])
         self.assertEqual(report.failures, [])
         self.assertEqual(driver.quit_calls, 1)
+
+    def test_overlay_intercept_retries_click_until_it_succeeds(self):
+        fetcher = ChannelFetcher()
+        fetcher.driver = object()
+        target = InterceptingElement(interceptions=2)
+        ImmediateWait.target = target
+
+        with (
+            patch("src.channel_scanner.WebDriverWait", ImmediateWait),
+            patch.object(
+                fetcher,
+                "_wait_until_click_target_is_unobstructed",
+                return_value=True,
+            ) as wait_for_overlay,
+        ):
+            fetcher._click_with_overlay_retry(
+                ("xpath", "avatar"),
+                action="nút menu tài khoản",
+                deadline=time.monotonic() + 180,
+            )
+
+        self.assertEqual(target.click_calls, 3)
+        self.assertEqual(wait_for_overlay.call_count, 2)
+
+    def test_persistent_overlay_stops_after_three_clicks_without_outer_retry(self):
+        fetcher = ChannelFetcher()
+        fetcher.driver = object()
+        target = InterceptingElement(interceptions=3)
+        ImmediateWait.target = target
+
+        with (
+            patch("src.channel_scanner.WebDriverWait", ImmediateWait),
+            patch.object(
+                fetcher,
+                "_wait_until_click_target_is_unobstructed",
+                return_value=False,
+            ),
+        ):
+            with self.assertRaises(ChannelScanError) as raised:
+                fetcher._click_with_overlay_retry(
+                    ("xpath", "avatar"),
+                    action="nút menu tài khoản",
+                    deadline=time.monotonic() + 180,
+                )
+
+        self.assertEqual(target.click_calls, 3)
+        self.assertEqual(
+            raised.exception.category,
+            ChannelScanErrorCategory.TRANSIENT_UI_ERROR,
+        )
+        self.assertFalse(raised.exception.retryable)
 
     def test_one_channel_error_is_skipped_and_scan_continues(self):
         channel_error = ChannelScanError(

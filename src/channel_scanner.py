@@ -33,6 +33,9 @@ AUTHENTICATION_TIMEOUT_SECONDS = 10 * 60
 LOGIN_FIELD_TIMEOUT_SECONDS = 30
 STUDIO_LOAD_TIMEOUT_SECONDS = 60
 ACCOUNT_MENU_TIMEOUT_SECONDS = 20
+OVERLAY_CLICK_MAX_ATTEMPTS = 3
+OVERLAY_DISMISS_TIMEOUT_SECONDS = 3 * 60
+OVERLAY_POLL_INTERVAL_SECONDS = 0.5
 BOTGUARD_TIMEOUT_SECONDS = 20
 CHANNEL_HTTP_CONNECT_TIMEOUT_SECONDS = 10
 CHANNEL_HTTP_READ_TIMEOUT_SECONDS = 30
@@ -62,6 +65,7 @@ class ChannelScanError(RuntimeError):
         channel_id: str | None = None,
         attempt: int = 1,
         exception_type: str = "",
+        retryable: bool | None = None,
     ) -> None:
         self.category = category
         self.step = step
@@ -70,6 +74,9 @@ class ChannelScanError(RuntimeError):
         self.channel_id = channel_id
         self.attempt = attempt
         self.exception_type = exception_type
+        # Some transient-looking errors have already exhausted a more specific
+        # retry policy. Do not restart that whole policy from the outer wrapper.
+        self.retryable = retryable
         super().__init__(
             f"Channel scan error: category={category.value} step={step} "
             f"channel_index={channel_index} channel_id={channel_id or '<unknown>'} "
@@ -339,25 +346,140 @@ class ChannelFetcher:
         self._checkpoint()
         if self.driver.find_elements(By.XPATH, self.CHANNEL_SELECTION_XPATH):
             return
-        account_menu_btn = WebDriverWait(
-            self.driver, ACCOUNT_MENU_TIMEOUT_SECONDS
-        ).until(EC.element_to_be_clickable((By.XPATH, self.AVATAR_BUTTON_XPATH)))
-        account_menu_btn.click()
-        switch_account_button = WebDriverWait(
-            self.driver, ACCOUNT_MENU_TIMEOUT_SECONDS
-        ).until(
-            EC.element_to_be_clickable(
-                (By.XPATH, self.SWTICH_ACCOUNT_BUTTON_XPATH)
-            )
+        deadline = time.monotonic() + OVERLAY_DISMISS_TIMEOUT_SECONDS
+        self._click_with_overlay_retry(
+            (By.XPATH, self.AVATAR_BUTTON_XPATH),
+            action="nút menu tài khoản",
+            deadline=deadline,
         )
-        switch_account_button.click()
-        WebDriverWait(self.driver, ACCOUNT_MENU_TIMEOUT_SECONDS).until(
+        self._click_with_overlay_retry(
+            (By.XPATH, self.SWTICH_ACCOUNT_BUTTON_XPATH),
+            action="nút chuyển kênh",
+            deadline=deadline,
+        )
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ChannelScanError(
+                ChannelScanErrorCategory.TRANSIENT_UI_ERROR,
+                step="open_channel_switcher",
+                detail="Account menu did not open before the 180s overlay deadline",
+                retryable=False,
+            )
+        WebDriverWait(self.driver, min(ACCOUNT_MENU_TIMEOUT_SECONDS, remaining)).until(
             lambda driver: self._checkpoint_and_get(
                 lambda: bool(
                     driver.find_elements(By.XPATH, self.CHANNEL_SELECTION_XPATH)
                 )
             )
         )
+
+    def _click_with_overlay_retry(
+        self,
+        locator: tuple[str, str],
+        *,
+        action: str,
+        deadline: float,
+    ) -> None:
+        """Click a Studio control without giving an overlay an immediate win.
+
+        YouTube occasionally leaves a ``tp-yt-paper-dialog-backdrop`` above the
+        account avatar. Selenium's normal ``element_to_be_clickable`` does not
+        detect that overlap. This makes at most three click attempts and gives
+        an obstructing overlay a total of three minutes to disappear.
+        """
+        last_intercept: ElementClickInterceptedException | None = None
+
+        for attempt in range(1, OVERLAY_CLICK_MAX_ATTEMPTS + 1):
+            self._checkpoint()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+
+            target = WebDriverWait(
+                self.driver,
+                min(ACCOUNT_MENU_TIMEOUT_SECONDS, remaining),
+                poll_frequency=OVERLAY_POLL_INTERVAL_SECONDS,
+            ).until(EC.element_to_be_clickable(locator))
+            try:
+                target.click()
+                return
+            except ElementClickInterceptedException as exc:
+                last_intercept = exc
+                remaining = max(0.0, deadline - time.monotonic())
+                attempts_left = OVERLAY_CLICK_MAX_ATTEMPTS - attempt + 1
+                wait_deadline = min(
+                    deadline,
+                    time.monotonic() + remaining / max(1, attempts_left),
+                )
+                logger.warning(
+                    "Studio {} is covered by an overlay; click attempt {}/{}. "
+                    "Waiting up to {:.1f}s before retrying.",
+                    action,
+                    attempt,
+                    OVERLAY_CLICK_MAX_ATTEMPTS,
+                    max(0.0, wait_deadline - time.monotonic()),
+                )
+                self._wait_until_click_target_is_unobstructed(target, wait_deadline)
+
+        elapsed = max(
+            0.0,
+            OVERLAY_DISMISS_TIMEOUT_SECONDS - max(0.0, deadline - time.monotonic()),
+        )
+        error = ChannelScanError(
+            ChannelScanErrorCategory.TRANSIENT_UI_ERROR,
+            step="open_channel_switcher",
+            detail=(
+                f"Studio {action} remained covered after "
+                f"{OVERLAY_CLICK_MAX_ATTEMPTS} click attempts and {elapsed:.1f}s"
+            ),
+            exception_type=(
+                type(last_intercept).__name__
+                if last_intercept is not None
+                else "TimeoutException"
+            ),
+            retryable=False,
+        )
+        raise error from last_intercept
+
+    def _wait_until_click_target_is_unobstructed(
+        self, target, deadline: float
+    ) -> bool:
+        """Return once the target centre is no longer covered by another element."""
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+
+        def target_is_unobstructed(driver) -> bool:
+            self._checkpoint()
+            try:
+                return bool(
+                    driver.execute_script(
+                        """
+                        const target = arguments[0];
+                        if (!target || !target.isConnected) return false;
+                        target.scrollIntoView({block: 'center', inline: 'center'});
+                        const box = target.getBoundingClientRect();
+                        const x = box.left + box.width / 2;
+                        const y = box.top + box.height / 2;
+                        const hit = document.elementFromPoint(x, y);
+                        return hit === target || target.contains(hit);
+                        """,
+                        target,
+                    )
+                )
+            except (StaleElementReferenceException, NoSuchElementException):
+                return False
+
+        try:
+            WebDriverWait(
+                self.driver,
+                remaining,
+                poll_frequency=OVERLAY_POLL_INTERVAL_SECONDS,
+            ).until(target_is_unobstructed)
+            return True
+        except TimeoutException:
+            return False
 
     def _has_next_channel(self) -> bool:
         self._checkpoint()
@@ -419,7 +541,11 @@ class ChannelFetcher:
                     default_category=default_category,
                 )
                 elapsed = time.monotonic() - started_at
-                if error.category in _RETRYABLE_SCAN_ERRORS and attempt < attempts:
+                if (
+                    error.retryable is not False
+                    and error.category in _RETRYABLE_SCAN_ERRORS
+                    and attempt < attempts
+                ):
                     logger.warning(
                         "Channel scan retry: channel_index={} channel_id={} step={} "
                         "attempt={}/{} elapsed={:.1f}s category={} exception={} detail={}",
@@ -458,6 +584,7 @@ class ChannelFetcher:
                 channel_id=exc.channel_id or channel_id,
                 attempt=attempt,
                 exception_type=exc.exception_type or type(exc).__name__,
+                retryable=exc.retryable,
             )
         if isinstance(exc, TimeoutException):
             category = timeout_category

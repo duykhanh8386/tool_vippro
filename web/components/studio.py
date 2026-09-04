@@ -46,7 +46,10 @@ def create_studio_content():
         if not client_is_alive():
             return False
         try:
-            callback()
+            # fetch_channel_data runs as a background task, which has no active
+            # NiceGUI slot. Re-enter the page client before creating/updating UI.
+            with page_client:
+                callback()
             return True
         except Exception as exc:
             logger.warning("Studio UI action '{}' was skipped: {}", action, exc)
