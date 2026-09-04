@@ -3,10 +3,22 @@ import hashlib
 import json
 import re
 import time
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Callable, TypeVar
 
 import requests
 from loguru import logger
-from selenium.common.exceptions import TimeoutException
+from selenium.common.exceptions import (
+    ElementClickInterceptedException,
+    ElementNotInteractableException,
+    InvalidSessionIdException,
+    NoSuchElementException,
+    NoSuchWindowException,
+    StaleElementReferenceException,
+    TimeoutException,
+    WebDriverException,
+)
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
@@ -21,6 +33,92 @@ AUTHENTICATION_TIMEOUT_SECONDS = 10 * 60
 LOGIN_FIELD_TIMEOUT_SECONDS = 30
 STUDIO_LOAD_TIMEOUT_SECONDS = 60
 ACCOUNT_MENU_TIMEOUT_SECONDS = 20
+BOTGUARD_TIMEOUT_SECONDS = 20
+CHANNEL_HTTP_CONNECT_TIMEOUT_SECONDS = 10
+CHANNEL_HTTP_READ_TIMEOUT_SECONDS = 30
+CHANNEL_SCAN_MAX_ATTEMPTS = 3
+CHANNEL_SCAN_RETRY_DELAY_SECONDS = 0.5
+CHANNEL_SCAN_DIAGNOSTIC_LIMIT = 500
+
+
+class ChannelScanErrorCategory(str, Enum):
+    TRANSIENT_UI_ERROR = "TRANSIENT_UI_ERROR"
+    NETWORK_ERROR = "NETWORK_ERROR"
+    AUTH_ERROR = "AUTH_ERROR"
+    UNKNOWN_AUTH_STATE = "UNKNOWN_AUTH_STATE"
+    CHANNEL_ERROR = "CHANNEL_ERROR"
+    SCAN_END = "SCAN_END"
+    FATAL_ERROR = "FATAL_ERROR"
+
+
+class ChannelScanError(RuntimeError):
+    def __init__(
+        self,
+        category: ChannelScanErrorCategory,
+        *,
+        step: str,
+        detail: str,
+        channel_index: int | None = None,
+        channel_id: str | None = None,
+        attempt: int = 1,
+        exception_type: str = "",
+    ) -> None:
+        self.category = category
+        self.step = step
+        self.detail = detail
+        self.channel_index = channel_index
+        self.channel_id = channel_id
+        self.attempt = attempt
+        self.exception_type = exception_type
+        super().__init__(
+            f"Channel scan error: category={category.value} step={step} "
+            f"channel_index={channel_index} channel_id={channel_id or '<unknown>'} "
+            f"attempt={attempt} exception={exception_type or '<none>'} "
+            f"detail={detail!r}"
+        )
+
+
+@dataclass(frozen=True)
+class ChannelScanFailure:
+    channel_index: int
+    channel_id: str | None
+    category: ChannelScanErrorCategory
+    step: str
+    message: str
+
+
+@dataclass
+class ChannelScanReport:
+    channels: list[dict] = field(default_factory=list)
+    failures: list[ChannelScanFailure] = field(default_factory=list)
+    completed: bool = False
+    end_category: ChannelScanErrorCategory | None = None
+
+
+_T = TypeVar("_T")
+_RETRYABLE_SCAN_ERRORS = {
+    ChannelScanErrorCategory.TRANSIENT_UI_ERROR,
+    ChannelScanErrorCategory.NETWORK_ERROR,
+}
+_TRANSIENT_UI_EXCEPTIONS = (
+    TimeoutException,
+    StaleElementReferenceException,
+    ElementClickInterceptedException,
+    ElementNotInteractableException,
+    NoSuchElementException,
+)
+_FATAL_WEBDRIVER_MARKERS = (
+    "invalid session",
+    "session deleted",
+    "no such window",
+    "browser has closed",
+    "chrome not reachable",
+    "disconnected",
+)
+_SCAN_SECRET_RE = re.compile(
+    r"(?i)\b(password|cookie|authorization|sapisidhash|sessiontoken|token|2fa)\b"
+    r"\s*[:=]\s*(?:\"[^\"]*\"|'[^']*'|\S+)"
+)
 
 
 class ChannelFetcher:
@@ -36,11 +134,12 @@ class ChannelFetcher:
 
     def __init__(self):
         self.driver = None
+        self.last_report = ChannelScanReport()
 
     def run(self, email, password, on_authenticated=None):
         run_context = current_run_context()
         try:
-            self._run(email, password, on_authenticated=on_authenticated)
+            return self._run(email, password, on_authenticated=on_authenticated)
         except Exception as exc:
             if run_context is not None and run_context.stopped:
                 raise TaskStopped() from exc
@@ -51,22 +150,45 @@ class ChannelFetcher:
                 self.driver = None
                 try:
                     driver.quit()
+                except Exception as exc:
+                    logger.warning(
+                        "Channel scanner WebDriver cleanup failed: type={} detail={}",
+                        type(exc).__name__,
+                        self._sanitize_detail(exc),
+                    )
                 finally:
                     unregister_driver(driver)
 
     def _run(self, email, password, on_authenticated=None):
         logger.info("*** Fetching channel info ***")
+        self.last_report = ChannelScanReport()
         self.driver = create_driver(enable_performance_log=True)
-        self._login(email, password)
+        self._run_step_with_retry(
+            lambda: self._login(email, password),
+            step="login",
+            max_attempts=1,
+            timeout_category=ChannelScanErrorCategory.UNKNOWN_AUTH_STATE,
+            default_category=ChannelScanErrorCategory.UNKNOWN_AUTH_STATE,
+        )
+        initial_state = self._run_step_with_retry(
+            self._wait_for_initial_state,
+            step="authentication",
+            max_attempts=1,
+            timeout_category=ChannelScanErrorCategory.UNKNOWN_AUTH_STATE,
+            default_category=ChannelScanErrorCategory.UNKNOWN_AUTH_STATE,
+        )
+        if on_authenticated is not None:
+            on_authenticated()
+        if initial_state == "chooser":
+            self._run_step_with_retry(
+                self._select_initial_channel_once,
+                step="select_initial_channel",
+            )
+        return self._scan_authenticated_channels()
 
-        # Google may show a channel chooser, but accounts with one/default
-        # channel are redirected straight to /channel/<id>. Accept either
-        # state instead of waiting only for the chooser until it times out.
-        run_context = current_run_context()
-
+    def _wait_for_initial_state(self) -> str:
         def detect_initial_state(driver):
-            if run_context is not None:
-                run_context.checkpoint()
+            self._checkpoint()
             if self._extract_channel_id(driver.current_url):
                 return "channel"
             if driver.find_elements(By.XPATH, self.CHANNEL_SELECTION_XPATH):
@@ -74,120 +196,320 @@ class ChannelFetcher:
             return False
 
         try:
-            initial_state = WebDriverWait(
+            return WebDriverWait(
                 self.driver,
                 AUTHENTICATION_TIMEOUT_SECONDS,
                 poll_frequency=0.5,
             ).until(detect_initial_state)
         except TimeoutException as exc:
-            raise RuntimeError(
-                "Đã hết 10 phút xác thực Google. Vui lòng kết nối lại kênh."
+            raise ChannelScanError(
+                ChannelScanErrorCategory.UNKNOWN_AUTH_STATE,
+                step="authentication",
+                detail=(
+                    "Authentication did not reach a known Studio channel or "
+                    "channel chooser state before the deadline"
+                ),
+                exception_type=type(exc).__name__,
             ) from exc
-        if on_authenticated is not None:
-            on_authenticated()
-        if initial_state == "chooser":
-            channel_selection_button = WebDriverWait(
-                self.driver, LOGIN_FIELD_TIMEOUT_SECONDS
-            ).until(
-                EC.element_to_be_clickable(
-                    (By.XPATH, self.CHANNEL_SELECTION_XPATH)
-                )
-            )
-            channel_selection_button.click()
-            WebDriverWait(self.driver, STUDIO_LOAD_TIMEOUT_SECONDS).until(
-                lambda driver: self._checkpoint_and_get(
-                    lambda: self._extract_channel_id(driver.current_url) is not None
-                )
-            )
 
-        self._get_channel_info()
-
-        try:
-            account_menu_btn = WebDriverWait(
-                self.driver, ACCOUNT_MENU_TIMEOUT_SECONDS
-            ).until(
-                EC.element_to_be_clickable((By.XPATH, self.AVATAR_BUTTON_XPATH))
-            )
-            account_menu_btn.click()
-            switch_acocunt_button = WebDriverWait(
-                self.driver, ACCOUNT_MENU_TIMEOUT_SECONDS
-            ).until(
-                EC.element_to_be_clickable(
-                    (By.XPATH, self.SWTICH_ACCOUNT_BUTTON_XPATH)
-                )
-            )
-            switch_acocunt_button.click()
-            self._wait_interruptibly(1)
-            WebDriverWait(self.driver, ACCOUNT_MENU_TIMEOUT_SECONDS).until(
-                EC.element_to_be_clickable(
-                    (By.XPATH, self.NEXT_CHANNEL_SELECTION_XPATH)
-                )
-            )
-        except TimeoutException:
-            logger.info("Current channel saved; no additional channel found")
+    def _select_initial_channel_once(self) -> None:
+        if self._extract_channel_id(self.driver.current_url):
             return
-        next_account_button = self.driver.find_elements(
-            By.XPATH, self.NEXT_CHANNEL_SELECTION_XPATH
+        channel_selection_button = WebDriverWait(
+            self.driver, LOGIN_FIELD_TIMEOUT_SECONDS
+        ).until(
+            EC.element_to_be_clickable((By.XPATH, self.CHANNEL_SELECTION_XPATH))
+        )
+        channel_selection_button.click()
+        WebDriverWait(self.driver, STUDIO_LOAD_TIMEOUT_SECONDS).until(
+            lambda driver: self._checkpoint_and_get(
+                lambda: self._extract_channel_id(driver.current_url) is not None
+            )
         )
 
-        while len(next_account_button) > 0:
-            self._checkpoint()
-            previous_channel_id = self._extract_channel_id(self.driver.current_url)
-            next = WebDriverWait(
-                self.driver, ACCOUNT_MENU_TIMEOUT_SECONDS
-            ).until(
-                EC.element_to_be_clickable(
-                    (By.XPATH, self.NEXT_CHANNEL_SELECTION_XPATH)
-                )
-            )
-            next.click()
-            WebDriverWait(self.driver, STUDIO_LOAD_TIMEOUT_SECONDS).until(
-                lambda driver: self._checkpoint_and_get(
-                    lambda: (
-                        "channel-appeal" in driver.current_url
-                        or (
-                            self._extract_channel_id(driver.current_url) is not None
-                            and self._extract_channel_id(driver.current_url)
-                            != previous_channel_id
-                        )
-                    )
-                )
-            )
-            if "channel-appeal" in self.driver.current_url:
-                logger.error("Kênh đã bị xóa!!!")
-            else:
-                try:
-                    self._get_channel_info()
-                except TaskStopped:
-                    raise
-                except Exception as exc:
-                    logger.exception("Không thể lưu kênh hiện tại: {}", exc)
+    def _scan_authenticated_channels(self) -> ChannelScanReport:
+        report = self.last_report
+        channel_index = 1
 
-            account_menu_btn = WebDriverWait(
-                self.driver, ACCOUNT_MENU_TIMEOUT_SECONDS
-            ).until(
-                EC.element_to_be_clickable((By.XPATH, self.AVATAR_BUTTON_XPATH))
+        while True:
+            self._checkpoint()
+            self._scan_current_channel(report, channel_index)
+            self._checkpoint()
+
+            current_channel_id = self._run_step_with_retry(
+                self._current_channel_id,
+                step="read_channel_state",
+                channel_index=channel_index,
             )
-            account_menu_btn.click()
-            switch_acocunt_button = WebDriverWait(
-                self.driver, ACCOUNT_MENU_TIMEOUT_SECONDS
-            ).until(
-                EC.element_to_be_clickable(
-                    (By.XPATH, self.SWTICH_ACCOUNT_BUTTON_XPATH)
+            self._run_step_with_retry(
+                self._open_channel_switcher_once,
+                step="open_channel_switcher",
+                channel_index=channel_index,
+                channel_id=current_channel_id,
+            )
+            self._checkpoint()
+            has_next_channel = self._run_step_with_retry(
+                self._has_next_channel,
+                step="detect_next_channel",
+                channel_index=channel_index,
+                channel_id=current_channel_id,
+            )
+            if not has_next_channel:
+                report.completed = True
+                report.end_category = ChannelScanErrorCategory.SCAN_END
+                logger.info(
+                    "Channel scan end confirmed: scanned={} saved={} failed={}",
+                    channel_index,
+                    len(report.channels),
+                    len(report.failures),
+                )
+                return report
+
+            previous_channel_id = self._run_step_with_retry(
+                self._current_channel_id,
+                step="read_channel_state",
+                channel_index=channel_index,
+            )
+            self._run_step_with_retry(
+                lambda: self._switch_to_next_channel_once(previous_channel_id),
+                step="switch_channel",
+                channel_index=channel_index + 1,
+                channel_id=previous_channel_id,
+            )
+            channel_index += 1
+
+    def _scan_current_channel(
+        self, report: ChannelScanReport, channel_index: int
+    ) -> None:
+        current_url = self._run_step_with_retry(
+            lambda: str(getattr(self.driver, "current_url", "")),
+            step="read_channel_state",
+            channel_index=channel_index,
+        )
+        channel_id = self._extract_channel_id(current_url)
+        if "channel-appeal" in current_url:
+            error = ChannelScanError(
+                ChannelScanErrorCategory.CHANNEL_ERROR,
+                step="channel_state",
+                detail="YouTube reports that this channel is unavailable or removed",
+                channel_index=channel_index,
+                channel_id=channel_id,
+            )
+            self._record_channel_failure(report, error, channel_index, channel_id)
+            return
+
+        try:
+            channel = self._run_step_with_retry(
+                self._get_channel_info,
+                step="channel_info",
+                channel_index=channel_index,
+                channel_id=channel_id,
+                default_category=ChannelScanErrorCategory.CHANNEL_ERROR,
+            )
+        except ChannelScanError as exc:
+            if exc.category in {
+                ChannelScanErrorCategory.AUTH_ERROR,
+                ChannelScanErrorCategory.UNKNOWN_AUTH_STATE,
+                ChannelScanErrorCategory.FATAL_ERROR,
+            }:
+                raise
+            self._record_channel_failure(report, exc, channel_index, channel_id)
+            return
+        report.channels.append(channel)
+
+    def _record_channel_failure(
+        self,
+        report: ChannelScanReport,
+        error: ChannelScanError,
+        channel_index: int,
+        channel_id: str | None,
+    ) -> None:
+        report.failures.append(
+            ChannelScanFailure(
+                channel_index=channel_index,
+                channel_id=channel_id,
+                category=error.category,
+                step=error.step,
+                message=str(error),
+            )
+        )
+        logger.error("Skipping channel after bounded failure: {}", error)
+
+    def _open_channel_switcher_once(self) -> None:
+        self._checkpoint()
+        if self.driver.find_elements(By.XPATH, self.CHANNEL_SELECTION_XPATH):
+            return
+        account_menu_btn = WebDriverWait(
+            self.driver, ACCOUNT_MENU_TIMEOUT_SECONDS
+        ).until(EC.element_to_be_clickable((By.XPATH, self.AVATAR_BUTTON_XPATH)))
+        account_menu_btn.click()
+        switch_account_button = WebDriverWait(
+            self.driver, ACCOUNT_MENU_TIMEOUT_SECONDS
+        ).until(
+            EC.element_to_be_clickable(
+                (By.XPATH, self.SWTICH_ACCOUNT_BUTTON_XPATH)
+            )
+        )
+        switch_account_button.click()
+        WebDriverWait(self.driver, ACCOUNT_MENU_TIMEOUT_SECONDS).until(
+            lambda driver: self._checkpoint_and_get(
+                lambda: bool(
+                    driver.find_elements(By.XPATH, self.CHANNEL_SELECTION_XPATH)
                 )
             )
-            switch_acocunt_button.click()
-            try:
-                WebDriverWait(self.driver, ACCOUNT_MENU_TIMEOUT_SECONDS).until(
-                    EC.element_to_be_clickable(
-                        (By.XPATH, self.NEXT_CHANNEL_SELECTION_XPATH)
+        )
+
+    def _has_next_channel(self) -> bool:
+        self._checkpoint()
+        return bool(
+            self.driver.find_elements(By.XPATH, self.NEXT_CHANNEL_SELECTION_XPATH)
+        )
+
+    def _switch_to_next_channel_once(self, previous_channel_id: str | None) -> None:
+        self._checkpoint()
+        next_button = WebDriverWait(
+            self.driver, ACCOUNT_MENU_TIMEOUT_SECONDS
+        ).until(
+            EC.element_to_be_clickable(
+                (By.XPATH, self.NEXT_CHANNEL_SELECTION_XPATH)
+            )
+        )
+        next_button.click()
+        WebDriverWait(self.driver, STUDIO_LOAD_TIMEOUT_SECONDS).until(
+            lambda driver: self._checkpoint_and_get(
+                lambda: (
+                    "channel-appeal" in driver.current_url
+                    or (
+                        self._extract_channel_id(driver.current_url) is not None
+                        and self._extract_channel_id(driver.current_url)
+                        != previous_channel_id
                     )
                 )
-            except TimeoutException:
-                break
-            next_account_button = self.driver.find_elements(
-                By.XPATH, self.NEXT_CHANNEL_SELECTION_XPATH
             )
+        )
+
+    def _run_step_with_retry(
+        self,
+        action: Callable[[], _T],
+        *,
+        step: str,
+        channel_index: int | None = None,
+        channel_id: str | None = None,
+        max_attempts: int = CHANNEL_SCAN_MAX_ATTEMPTS,
+        timeout_category: ChannelScanErrorCategory = ChannelScanErrorCategory.TRANSIENT_UI_ERROR,
+        default_category: ChannelScanErrorCategory = ChannelScanErrorCategory.FATAL_ERROR,
+    ) -> _T:
+        attempts = max(1, int(max_attempts))
+        started_at = time.monotonic()
+        for attempt in range(1, attempts + 1):
+            self._checkpoint()
+            try:
+                return action()
+            except TaskStopped:
+                raise
+            except Exception as exc:
+                self._checkpoint()
+                error = self._classify_error(
+                    exc,
+                    step=step,
+                    channel_index=channel_index,
+                    channel_id=channel_id,
+                    attempt=attempt,
+                    timeout_category=timeout_category,
+                    default_category=default_category,
+                )
+                elapsed = time.monotonic() - started_at
+                if error.category in _RETRYABLE_SCAN_ERRORS and attempt < attempts:
+                    logger.warning(
+                        "Channel scan retry: channel_index={} channel_id={} step={} "
+                        "attempt={}/{} elapsed={:.1f}s category={} exception={} detail={}",
+                        channel_index,
+                        channel_id or "<unknown>",
+                        step,
+                        attempt,
+                        attempts,
+                        elapsed,
+                        error.category.value,
+                        error.exception_type or type(exc).__name__,
+                        error.detail,
+                    )
+                    self._wait_interruptibly(CHANNEL_SCAN_RETRY_DELAY_SECONDS)
+                    continue
+                raise error from exc
+        raise AssertionError("unreachable channel scan retry state")
+
+    def _classify_error(
+        self,
+        exc: Exception,
+        *,
+        step: str,
+        channel_index: int | None,
+        channel_id: str | None,
+        attempt: int,
+        timeout_category: ChannelScanErrorCategory,
+        default_category: ChannelScanErrorCategory,
+    ) -> ChannelScanError:
+        if isinstance(exc, ChannelScanError):
+            return ChannelScanError(
+                exc.category,
+                step=exc.step or step,
+                detail=exc.detail,
+                channel_index=exc.channel_index or channel_index,
+                channel_id=exc.channel_id or channel_id,
+                attempt=attempt,
+                exception_type=exc.exception_type or type(exc).__name__,
+            )
+        if isinstance(exc, TimeoutException):
+            category = timeout_category
+        elif isinstance(exc, (requests.Timeout, requests.ConnectionError)):
+            category = ChannelScanErrorCategory.NETWORK_ERROR
+        elif isinstance(exc, requests.HTTPError):
+            status_code = getattr(getattr(exc, "response", None), "status_code", None)
+            if status_code in (401, 403):
+                category = ChannelScanErrorCategory.AUTH_ERROR
+            elif status_code in (408, 425, 429) or (
+                status_code is not None and status_code >= 500
+            ):
+                category = ChannelScanErrorCategory.NETWORK_ERROR
+            else:
+                category = ChannelScanErrorCategory.CHANNEL_ERROR
+        elif isinstance(exc, (InvalidSessionIdException, NoSuchWindowException)):
+            category = ChannelScanErrorCategory.FATAL_ERROR
+        elif isinstance(exc, _TRANSIENT_UI_EXCEPTIONS):
+            category = ChannelScanErrorCategory.TRANSIENT_UI_ERROR
+        elif isinstance(exc, WebDriverException):
+            detail = self._sanitize_detail(exc).lower()
+            category = (
+                ChannelScanErrorCategory.FATAL_ERROR
+                if any(marker in detail for marker in _FATAL_WEBDRIVER_MARKERS)
+                else ChannelScanErrorCategory.TRANSIENT_UI_ERROR
+            )
+        elif isinstance(exc, TimeoutError):
+            category = ChannelScanErrorCategory.TRANSIENT_UI_ERROR
+        else:
+            category = default_category
+        return ChannelScanError(
+            category,
+            step=step,
+            detail=self._sanitize_detail(exc),
+            channel_index=channel_index,
+            channel_id=channel_id,
+            attempt=attempt,
+            exception_type=type(exc).__name__,
+        )
+
+    def _current_channel_id(self) -> str | None:
+        return self._extract_channel_id(str(getattr(self.driver, "current_url", "")))
+
+    @staticmethod
+    def _sanitize_detail(value) -> str:
+        compact = " ".join(str(value or "").split())
+        compact = _SCAN_SECRET_RE.sub(
+            lambda match: f"{match.group(1)}=<redacted>", compact
+        )
+        if len(compact) > CHANNEL_SCAN_DIAGNOSTIC_LIMIT:
+            return compact[:CHANNEL_SCAN_DIAGNOSTIC_LIMIT] + "..."
+        return compact
 
     def _login(self, email: str, password: str):
         self.driver.get(self.LOGIN_URL)
@@ -216,10 +538,23 @@ class ChannelFetcher:
 
     def _get_channel_info(self):
         img_element_xapth = "//img[@class='thumbnail image-thumbnail style-scope ytcp-navigation-drawer']"
+        current_url = str(getattr(self.driver, "current_url", ""))
+        if "accounts.google.com" in current_url:
+            raise ChannelScanError(
+                ChannelScanErrorCategory.AUTH_ERROR,
+                step="channel_info",
+                detail="Browser session was redirected to Google login",
+            )
         WebDriverWait(self.driver, STUDIO_LOAD_TIMEOUT_SECONDS).until(
             EC.element_to_be_clickable((By.XPATH, img_element_xapth))
         )
         id = self._extract_channel_id(self.driver.current_url)
+        if not id:
+            raise ChannelScanError(
+                ChannelScanErrorCategory.CHANNEL_ERROR,
+                step="channel_info",
+                detail="Studio URL does not contain a channel ID",
+            )
         img_element = self.driver.find_element("xpath", img_element_xapth)
         img_src = img_element.get_attribute("src")
         name = img_element.get_attribute("alt")
@@ -233,24 +568,47 @@ class ChannelFetcher:
                 sapisid = cookie["value"]
                 sapisidhash = self._generate_sapisidhash_header(sapisid)
         if not sapisidhash:
-            raise RuntimeError(
-                "Phiên đăng nhập thiếu cookie SAPISID; hãy đăng nhập lại Google."
+            raise ChannelScanError(
+                ChannelScanErrorCategory.AUTH_ERROR,
+                step="channel_cookies",
+                detail="Authenticated browser session is missing the SAPISID cookie",
+                channel_id=id,
             )
 
-        current_url = self.driver.current_url
-        next_url = current_url + "/analytics/tab-overview/period-default"
+        next_url = (
+            f"https://studio.youtube.com/channel/{id}"
+            "/analytics/tab-overview/period-default"
+        )
         self.driver.get(next_url)
-        challenge = None
-        botguardResponse = None
+        if "accounts.google.com" in str(getattr(self.driver, "current_url", "")):
+            raise ChannelScanError(
+                ChannelScanErrorCategory.AUTH_ERROR,
+                step="botguard",
+                detail="Studio redirected to Google login while loading channel analytics",
+                channel_id=id,
+            )
         try:
             payload = get_request_payload_from_performance_log(
-                self.driver, "youtubei/v1/att/esr?alt=json", timeout=20.0
+                self.driver,
+                "youtubei/v1/att/esr?alt=json",
+                timeout=BOTGUARD_TIMEOUT_SECONDS,
             )
             payload_json = json.loads(payload)
             challenge = payload_json["challenge"]
             botguardResponse = payload_json["botguardResponse"]
-        except (TimeoutError, json.JSONDecodeError, KeyError, TypeError) as exc:
-            logger.warning("Không lấy được dữ liệu BotGuard cho kênh {}: {}", id, exc)
+        except TimeoutError:
+            raise
+        except (json.JSONDecodeError, KeyError, TypeError) as exc:
+            raise ChannelScanError(
+                ChannelScanErrorCategory.CHANNEL_ERROR,
+                step="botguard",
+                detail=(
+                    "BotGuard request payload is missing or malformed: "
+                    f"{self._sanitize_detail(exc)}"
+                ),
+                channel_id=id,
+                exception_type=type(exc).__name__,
+            ) from exc
 
         url = f"https://studio.youtube.com/channel/{id}"
         cookie_string = "; ".join(
@@ -261,14 +619,31 @@ class ChannelFetcher:
             "Cookie": cookie_string,
         }
         self._checkpoint()
-        res = requests.get(url, headers=header, timeout=(10, 30))
+        res = requests.get(
+            url,
+            headers=header,
+            timeout=(
+                CHANNEL_HTTP_CONNECT_TIMEOUT_SECONDS,
+                CHANNEL_HTTP_READ_TIMEOUT_SECONDS,
+            ),
+        )
         res.raise_for_status()
         self._checkpoint()
+        if "accounts.google.com" in str(getattr(res, "url", "")):
+            raise ChannelScanError(
+                ChannelScanErrorCategory.AUTH_ERROR,
+                step="channel_http",
+                detail="Channel request was redirected to Google login",
+                channel_id=id,
+            )
         delegated_session_id = self._extract_datasync_id(res.text)
         role = self._get_role_type(res.text)
         if not delegated_session_id or not role:
-            raise RuntimeError(
-                "Không lấy được quyền hoặc phiên làm việc của kênh YouTube."
+            raise ChannelScanError(
+                ChannelScanErrorCategory.CHANNEL_ERROR,
+                step="channel_http",
+                detail="Channel response is missing role or delegated session data",
+                channel_id=id,
             )
         channel_store.upsert_channel(
             {

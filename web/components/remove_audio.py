@@ -1,7 +1,8 @@
 # RECOVERED: clean-room implementation based on NiceGUI components & update_audio_module API
 import asyncio
 from pathlib import Path
-from nicegui import ui
+from typing import Awaitable, Callable, Iterable, TypeVar
+from nicegui import context, ui
 from loguru import logger
 
 from src.module.audio_module import update_audio_module
@@ -11,6 +12,29 @@ from web.components.common import create_channel_selection
 from web.theme import app_card, empty_state, page_header, page_shell, section_header
 
 STATE_KEY = "audio_remove"
+_T = TypeVar("_T")
+
+
+def _best_effort_ui(
+    action: str,
+    callback: Callable[[], object],
+    *,
+    is_available: Callable[[], bool] = lambda: True,
+) -> bool:
+    if not is_available():
+        return False
+    try:
+        callback()
+        return True
+    except Exception as exc:
+        logger.warning("Remove Audio UI action '{}' was skipped: {}", action, exc)
+        return False
+
+
+async def _gather_isolated(
+    awaitables: Iterable[Awaitable[_T]],
+) -> list[_T | BaseException]:
+    return await asyncio.gather(*awaitables, return_exceptions=True)
 
 
 def parse_ids_from_text(text: str) -> list[str]:
@@ -29,6 +53,28 @@ def parse_ids_from_text(text: str) -> list[str]:
 
 
 def create_remove_audio_page():
+    try:
+        page_client = context.client
+    except RuntimeError:
+        page_client = None
+    ui_available = {"value": True}
+
+    def client_is_alive() -> bool:
+        return (
+            ui_available["value"]
+            and page_client is not None
+            and not getattr(page_client, "_deleted", False)
+        )
+
+    def best_effort_ui(action: str, callback: Callable[[], object]) -> bool:
+        return _best_effort_ui(action, callback, is_available=client_is_alive)
+
+    def mark_client_unavailable() -> None:
+        ui_available["value"] = False
+
+    if page_client is not None:
+        page_client.on_disconnect(mark_client_unavailable)
+
     channels = get_channels_info() or []
     selected_remove_channel = {"id": None}
     ids_state = {"ids": []}
@@ -64,12 +110,15 @@ def create_remove_audio_page():
             video_processing_status.update(state.get("video_processing_status", {}))
 
             def update_ui():
-                if ui_refs["ids_textarea"] and ids_state["ids"]:
-                    ui_refs["ids_textarea"].value = "\n".join(ids_state["ids"])
-                if ui_refs["refresh_remove_channel_display"]:
-                    ui_refs["refresh_remove_channel_display"]()
-                refresh_right_panel()
-                logger.info("Remove audio state loaded and UI updated")
+                def render_loaded_state():
+                    if ui_refs["ids_textarea"] and ids_state["ids"]:
+                        ui_refs["ids_textarea"].value = "\n".join(ids_state["ids"])
+                    if ui_refs["refresh_remove_channel_display"]:
+                        ui_refs["refresh_remove_channel_display"]()
+                    refresh_right_panel()
+                    logger.info("Remove audio state loaded and UI updated")
+
+                best_effort_ui("render loaded remove-audio state", render_loaded_state)
 
             ui.timer(0.5, update_ui, once=True)
         except Exception as e:
@@ -169,9 +218,10 @@ def create_remove_audio_page():
                 progress_bar = ui.linear_progress(value=0)
 
         progress_dialog.props("persistent")
-        progress_dialog.open()
+        best_effort_ui("open remove-audio progress dialog", progress_dialog.open)
 
-        total_tasks = max(1, len(ids_state["ids"]))
+        video_ids_to_process = list(ids_state["ids"])
+        total_tasks = max(1, len(video_ids_to_process))
         completed_tasks = 0
         overall_errors = []
         semaphore = asyncio.Semaphore(performance_settings["max_concurrency"])
@@ -181,41 +231,74 @@ def create_remove_audio_page():
             async with semaphore:
                 try:
                     video_processing_status[vid] = "pending"
-                    refresh_right_panel()
-                    status_label.set_text(f"{vid} - Đang xóa...")
+                    save_remove_state()
+                    best_effort_ui(
+                        "render pending remove-audio video",
+                        lambda: (
+                            refresh_right_panel(),
+                            status_label.set_text(f"{vid} - Đang xóa..."),
+                        ),
+                    )
                     await asyncio.to_thread(
                         update_audio_module.delete,
                         id_video=vid,
                         channel_id=selected_remove_channel["id"],
                     )
                     video_processing_status[vid] = "successful"
+                    save_remove_state()
                 except Exception as exc:
                     video_processing_status[vid] = "unsuccessful"
                     overall_errors.append(f"{vid}: {exc}")
+                    save_remove_state()
                 finally:
                     completed_tasks += 1
-                    progress_bar.value = completed_tasks / total_tasks
-                    refresh_right_panel()
+                    save_remove_state()
+                    best_effort_ui(
+                        "render completed remove-audio video",
+                        lambda: (
+                            setattr(
+                                progress_bar,
+                                "value",
+                                completed_tasks / total_tasks,
+                            ),
+                            refresh_right_panel(),
+                        ),
+                    )
 
         tasks = [
             asyncio.create_task(run_delete(vid))
-            for vid in list(ids_state["ids"])
+            for vid in video_ids_to_process
         ]
-        await asyncio.gather(*tasks)
-
-        progress_dialog.close()
-        save_remove_state()
-        refresh_right_panel()
+        try:
+            results = await _gather_isolated(tasks)
+            for vid, result in zip(video_ids_to_process, results):
+                if isinstance(result, BaseException):
+                    logger.error(
+                        "Unexpected remove-audio worker failure for {}: {}", vid, result
+                    )
+                    video_processing_status[vid] = "unsuccessful"
+                    overall_errors.append(f"{vid}: {result}")
+                    save_remove_state()
+        finally:
+            save_remove_state()
+            best_effort_ui("close remove-audio progress dialog", progress_dialog.close)
+            best_effort_ui("render final remove-audio state", refresh_right_panel)
 
         if overall_errors:
-            ui.notify(
-                "Quá trình hoàn tất với một số lỗi. Kiểm tra trạng thái từng video bên dưới.",
-                type="warning",
+            best_effort_ui(
+                "notify remove-audio errors",
+                lambda: ui.notify(
+                    "Quá trình hoàn tất với một số lỗi. Kiểm tra trạng thái từng video bên dưới.",
+                    type="warning",
+                ),
             )
         else:
-            ui.notify(
-                "Quá trình hoàn tất thành công! Kiểm tra trạng thái từng video bên dưới.",
-                type="positive",
+            best_effort_ui(
+                "notify remove-audio completion",
+                lambda: ui.notify(
+                    "Quá trình hoàn tất thành công! Kiểm tra trạng thái từng video bên dưới.",
+                    type="positive",
+                ),
             )
 
     def clear_all_inputs():

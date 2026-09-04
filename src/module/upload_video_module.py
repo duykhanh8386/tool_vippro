@@ -1,9 +1,11 @@
 # RECOVERED: reconstructed from CPython 3.12 bytecode
 import json, os, time, uuid
+from dataclasses import dataclass
+from enum import Enum
 from urllib.parse import quote
 import requests
 from loguru import logger
-from src.module.base import IModule
+from src.module.base import IModule, YouTubeRequestError
 from src.utils import get_channels_info
 from src.task_runtime import (
     TaskStopped,
@@ -13,6 +15,34 @@ from src.task_runtime import (
 )
 
 _USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
+
+
+class VideoProcessingState(str, Enum):
+    PROCESSED = "processed"
+    PROCESSING = "processing"
+    TRANSIENT_ERROR = "transient_error"
+    AUTH_ERROR = "auth_error"
+    PERMANENT_ERROR = "permanent_error"
+    UNKNOWN_ERROR = "unknown_error"
+
+
+@dataclass(frozen=True)
+class VideoProcessingResult:
+    state: VideoProcessingState
+    message: str = ""
+    http_status: int | None = None
+    youtube_status: str = ""
+    error_type: str = ""
+
+
+class VideoProcessingCheckError(RuntimeError):
+    def __init__(self, result: VideoProcessingResult):
+        super().__init__(result.message or result.state.value)
+        self.result = result
+
+
+_PROCESSING_STATUS_MARKERS = ("PROCESSING", "PENDING", "UPLOADED", "TRANSCODING")
+_PERMANENT_STATUS_MARKERS = ("FAILED", "REJECTED", "DELETED", "REMOVED")
 
 
 def make_frontend_upload_id(index: int = 0) -> str:
@@ -225,20 +255,116 @@ class UploadVideoModule(IModule):
         logger.info(f"Created video {video_id} (title='{_sanitize_title(title)}')")
         return video_id
 
-    def is_processed(self, channel_id: str, video_id: str) -> bool:
-        """Kiểm tra video đã được YouTube xử lý xong chưa.
-
-        Trả True khi video.status == "VIDEO_STATUS_PROCESSED".
-        """
+    def get_processing_status(
+        self, channel_id: str, video_id: str
+    ) -> VideoProcessingResult:
+        """Return a classified result without flattening request failures to False."""
         check_stopped()
+        if not channel_id:
+            return VideoProcessingResult(
+                VideoProcessingState.PERMANENT_ERROR,
+                message=f"Không tìm thấy dữ liệu kênh: {channel_id}",
+                error_type="ChannelNotFound",
+            )
+        if not video_id:
+            return VideoProcessingResult(
+                VideoProcessingState.PERMANENT_ERROR,
+                message="Video ID không hợp lệ",
+                error_type="InvalidVideoId",
+            )
         try:
+            if not get_channels_info(channel_id):
+                return VideoProcessingResult(
+                    VideoProcessingState.PERMANENT_ERROR,
+                    message=f"Không tìm thấy dữ liệu kênh: {channel_id}",
+                    error_type="ChannelNotFound",
+                )
             info = self._get_video_info(video_id=video_id, channel_id=channel_id)
         except TaskStopped:
             raise
-        except Exception as e:
-            logger.warning(f"Không lấy được trạng thái video {video_id}: {e}")
+        except (requests.Timeout, requests.ConnectionError) as exc:
+            return VideoProcessingResult(
+                VideoProcessingState.TRANSIENT_ERROR,
+                message=f"Lỗi mạng khi kiểm tra trạng thái YouTube: {exc}",
+                error_type=type(exc).__name__,
+            )
+        except YouTubeRequestError as exc:
+            status_code = exc.status_code
+            if status_code in (401, 403):
+                state = VideoProcessingState.AUTH_ERROR
+                message = (
+                    "Phiên đăng nhập YouTube không còn hợp lệ "
+                    f"(HTTP {status_code}). Hãy đăng nhập và quét lại kênh."
+                )
+            elif status_code in (408, 425, 429) or (
+                status_code is not None and status_code >= 500
+            ):
+                state = VideoProcessingState.TRANSIENT_ERROR
+                message = str(exc)
+            elif status_code is not None and 400 <= status_code < 500:
+                state = VideoProcessingState.PERMANENT_ERROR
+                message = str(exc)
+            else:
+                state = VideoProcessingState.UNKNOWN_ERROR
+                message = str(exc)
+            return VideoProcessingResult(
+                state,
+                message=message,
+                http_status=status_code,
+                error_type=type(exc).__name__,
+            )
+        except requests.RequestException as exc:
+            return VideoProcessingResult(
+                VideoProcessingState.TRANSIENT_ERROR,
+                message=f"Lỗi request khi kiểm tra trạng thái YouTube: {exc}",
+                error_type=type(exc).__name__,
+            )
+        except Exception as exc:
+            return VideoProcessingResult(
+                VideoProcessingState.UNKNOWN_ERROR,
+                message=f"Không thể phân loại lỗi kiểm tra trạng thái YouTube: {exc}",
+                error_type=type(exc).__name__,
+            )
+
+        if info is None:
+            return VideoProcessingResult(
+                VideoProcessingState.UNKNOWN_ERROR,
+                message="YouTube không trả dữ liệu video",
+                error_type="MissingVideoInfo",
+            )
+        youtube_status = str(info.video_status or "").strip().upper()
+        if youtube_status == "VIDEO_STATUS_PROCESSED":
+            return VideoProcessingResult(
+                VideoProcessingState.PROCESSED,
+                youtube_status=youtube_status,
+            )
+        if any(marker in youtube_status for marker in _PROCESSING_STATUS_MARKERS):
+            return VideoProcessingResult(
+                VideoProcessingState.PROCESSING,
+                youtube_status=youtube_status,
+            )
+        if any(marker in youtube_status for marker in _PERMANENT_STATUS_MARKERS):
+            return VideoProcessingResult(
+                VideoProcessingState.PERMANENT_ERROR,
+                message=f"YouTube báo trạng thái video không thể tiếp tục: {youtube_status}",
+                youtube_status=youtube_status,
+                error_type="YouTubeVideoStatus",
+            )
+        return VideoProcessingResult(
+            VideoProcessingState.UNKNOWN_ERROR,
+            message=f"YouTube trả trạng thái video không xác định: {youtube_status or '<empty>'}",
+            youtube_status=youtube_status,
+            error_type="UnknownYouTubeVideoStatus",
+        )
+
+    def is_processed(self, channel_id: str, video_id: str) -> bool:
+        """Backward-compatible bool API which raises instead of hiding check errors."""
+        result = self.get_processing_status(channel_id, video_id)
+        if result.state == VideoProcessingState.PROCESSED:
+            return True
+        if result.state == VideoProcessingState.PROCESSING:
             return False
-        return bool(info and info.video_status == "VIDEO_STATUS_PROCESSED")
+        raise VideoProcessingCheckError(result)
 
 
 upload_video_module = UploadVideoModule()

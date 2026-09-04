@@ -1,8 +1,9 @@
 # RECOVERED: partial depyo recovery; unresolved regions marked below
-import asyncio, random, tempfile, threading
+import asyncio, random, tempfile, threading, time
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from loguru import logger
-from nicegui import ui
+from nicegui import context, ui
 from src.audio_language import (
     call_audio_update_with_retry,
     invalid_language_codes,
@@ -10,7 +11,11 @@ from src.audio_language import (
 )
 from src.channel_store import channel_store
 from src.module.audio_module import update_audio_module
-from src.module.upload_video_module import upload_video_module
+from src.module.upload_video_module import (
+    VideoProcessingResult,
+    VideoProcessingState,
+    upload_video_module,
+)
 from src.state_manager import state_manager
 from src.task_runtime import (
     TaskStopped,
@@ -18,7 +23,7 @@ from src.task_runtime import (
     create_run_context,
     current_run_context,
 )
-from src.utils import AUDIO_EXTENSIONS, VIDEO_EXTENSIONS, build_intermittent_audio, get_channels_info, get_video_duration, list_media_files, multiply_audio, mux_audio_into_video, normalize_path
+from src.utils import AUDIO_EXTENSIONS, VIDEO_EXTENSIONS, FFprobeError, build_intermittent_audio, get_channels_info, get_video_duration, list_media_files, multiply_audio, mux_audio_into_video, normalize_path
 from web.components.common import create_channel_selection, select_directory, select_file
 from web.components.drawer import nav_state; STEP_STYLE = {"pending": ("schedule", "text-gray-400", "Chờ"), "processing": ("hourglass_top", "text-blue-600", "Đang xử lý"), "successful": ("check_circle", "text-green-600", "Xong"), "stopped": ("stop_circle", "text-amber-600", "Đã dừng"), "unsuccessful": ("error", "text-red-600", "Lỗi")}
 from web.theme import app_card, page_header, section_header, workflow_steps
@@ -27,10 +32,305 @@ MAX_ACTIVE_VIDEOS = 5
 MAX_FFMPEG_JOBS = 5
 MAX_UPLOAD_JOBS = 5
 MAX_ADD_AUDIO_JOBS = 1
+YOUTUBE_PROCESSING_TIMEOUT_SECONDS = 1200
+YOUTUBE_PROCESSING_POLL_INTERVAL_SECONDS = 15
+YOUTUBE_STATUS_MAX_CONSECUTIVE_TRANSIENT_ERRORS = 3
 
 # NiceGUI can open the same page in multiple browser tabs.  Keep one flow run
 # per application instance so two tabs cannot overwrite output_0/output_1...
 _FLOW_RUN_GUARD = threading.Lock()
+
+
+class YouTubeProcessingWaitError(RuntimeError):
+    """A classified failure while waiting for YouTube video processing."""
+
+    def __init__(self, message: str, *, state: VideoProcessingState):
+        super().__init__(message)
+        self.state = state
+
+
+class YouTubeProcessingTimeoutError(TimeoutError):
+    """The video remained in a real processing state until the deadline."""
+
+
+def _processing_deadline_error(
+    *,
+    video_id: str,
+    timeout_seconds: float,
+    poll_count: int,
+    elapsed: float,
+    last_result: VideoProcessingResult | None,
+) -> Exception:
+    if (
+        last_result is not None
+        and last_result.state == VideoProcessingState.TRANSIENT_ERROR
+    ):
+        return YouTubeProcessingWaitError(
+            "YouTube status check không phục hồi trước deadline "
+            f"(video_id={video_id}, polls={poll_count}, elapsed={elapsed:.1f}s): "
+            f"{last_result.message}",
+            state=VideoProcessingState.TRANSIENT_ERROR,
+        )
+    return YouTubeProcessingTimeoutError(
+        f"YouTube processing timeout sau {timeout_seconds:g}s "
+        f"(video_id={video_id}, polls={poll_count}, elapsed={elapsed:.1f}s)"
+    )
+
+
+async def _wait_for_youtube_processing(
+    status_check: Callable[[], Awaitable[VideoProcessingResult]],
+    *,
+    video_id: str,
+    timeout_seconds: float = YOUTUBE_PROCESSING_TIMEOUT_SECONDS,
+    poll_interval_seconds: float = YOUTUBE_PROCESSING_POLL_INTERVAL_SECONDS,
+    max_consecutive_transient_errors: int = YOUTUBE_STATUS_MAX_CONSECUTIVE_TRANSIENT_ERRORS,
+    monotonic: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    checkpoint: Callable[[], None] = lambda: None,
+    on_transient_error: Callable[[VideoProcessingResult, int, int, float], None]
+    | None = None,
+    on_poll_wait: Callable[[float], None] | None = None,
+) -> VideoProcessingResult:
+    """Poll a classified status using a wall-time deadline and bounded retries."""
+    started_at = monotonic()
+    deadline = started_at + max(0.0, timeout_seconds)
+    poll_count = 0
+    consecutive_transient_errors = 0
+    last_result = None
+
+    while True:
+        checkpoint()
+        now = monotonic()
+        elapsed = max(0.0, now - started_at)
+        if now >= deadline:
+            raise _processing_deadline_error(
+                video_id=video_id,
+                timeout_seconds=timeout_seconds,
+                poll_count=poll_count,
+                elapsed=elapsed,
+                last_result=last_result,
+            )
+
+        poll_count += 1
+        result = await status_check()
+        last_result = result
+        elapsed = max(0.0, monotonic() - started_at)
+
+        if result.state == VideoProcessingState.PROCESSED:
+            return result
+        if result.state == VideoProcessingState.PROCESSING:
+            consecutive_transient_errors = 0
+        elif result.state == VideoProcessingState.TRANSIENT_ERROR:
+            consecutive_transient_errors += 1
+            logger.warning(
+                "YouTube status check transient failure: video_id={} poll={} "
+                "elapsed={:.1f}s consecutive={}/{} error_type={} http_status={} detail={}",
+                video_id,
+                poll_count,
+                elapsed,
+                consecutive_transient_errors,
+                max_consecutive_transient_errors,
+                result.error_type or "unknown",
+                result.http_status,
+                result.message,
+            )
+            if on_transient_error is not None:
+                on_transient_error(
+                    result,
+                    consecutive_transient_errors,
+                    poll_count,
+                    elapsed,
+                )
+            if consecutive_transient_errors >= max(
+                1, max_consecutive_transient_errors
+            ):
+                raise YouTubeProcessingWaitError(
+                    "YouTube status check failed sau "
+                    f"{consecutive_transient_errors} lỗi tạm thời liên tiếp "
+                    f"(video_id={video_id}, poll={poll_count}, elapsed={elapsed:.1f}s): "
+                    f"{result.message}",
+                    state=result.state,
+                )
+        else:
+            logger.error(
+                "YouTube status check failed: video_id={} poll={} elapsed={:.1f}s "
+                "state={} error_type={} http_status={} youtube_status={} detail={}",
+                video_id,
+                poll_count,
+                elapsed,
+                result.state.value,
+                result.error_type or "unknown",
+                result.http_status,
+                result.youtube_status or "unknown",
+                result.message,
+            )
+            raise YouTubeProcessingWaitError(
+                f"{result.message} (video_id={video_id}, poll={poll_count}, elapsed={elapsed:.1f}s)",
+                state=result.state,
+            )
+
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            raise _processing_deadline_error(
+                video_id=video_id,
+                timeout_seconds=timeout_seconds,
+                poll_count=poll_count,
+                elapsed=elapsed,
+                last_result=last_result,
+            )
+        if on_poll_wait is not None:
+            on_poll_wait(elapsed)
+        await sleep(min(max(0.0, poll_interval_seconds), remaining))
+
+
+def _best_effort_ui(
+    action: str,
+    callback: Callable[[], object],
+    *,
+    is_available: Callable[[], bool] = lambda: True,
+) -> bool:
+    """Run a UI-only callback without allowing it to affect backend work."""
+    if not is_available():
+        return False
+    try:
+        callback()
+        return True
+    except Exception as exc:
+        logger.warning("Add Audio UI update '{}' was skipped: {}", action, exc)
+        return False
+
+
+def _persist_then_ui(
+    persist: Callable[[], object],
+    ui_steps: list[tuple[str, Callable[[], object]]],
+) -> object:
+    """Persist a domain checkpoint before running any best-effort UI work."""
+    result = persist()
+    for name, callback in ui_steps:
+        _best_effort_ui(name, callback)
+    return result
+
+
+def _run_finalizers(steps: list[tuple[str, Callable[[], object]]]) -> list[Exception]:
+    """Run every finalizer even when an earlier finalizer fails."""
+    errors = []
+    for name, callback in steps:
+        try:
+            callback()
+        except Exception as exc:
+            errors.append(exc)
+            logger.exception("Add Audio finalizer '{}' failed: {}", name, exc)
+    return errors
+
+
+async def _run_supervised_queue(
+    entries: list,
+    worker_count: int,
+    process_item: Callable[[object], Awaitable[None]],
+    should_stop: Callable[[], bool],
+    on_unexpected_error: Callable[[object, Exception], None],
+) -> tuple[list[Exception], list]:
+    """Drain a queue despite item exceptions, or preserve leftovers on stop."""
+    queue: asyncio.Queue = asyncio.Queue()
+    for entry in entries:
+        queue.put_nowait(entry)
+
+    unexpected_errors: list[Exception] = []
+
+    async def worker() -> None:
+        while not should_stop():
+            try:
+                entry = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            try:
+                await process_item(entry)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                unexpected_errors.append(exc)
+                try:
+                    on_unexpected_error(entry, exc)
+                except Exception as report_exc:
+                    logger.exception(
+                        "Failed to record unexpected Add Audio item error: {}",
+                        report_exc,
+                    )
+            finally:
+                queue.task_done()
+
+    workers = [
+        asyncio.create_task(worker())
+        for _ in range(min(max(1, worker_count), len(entries)))
+    ]
+    worker_results = await asyncio.gather(*workers, return_exceptions=True)
+    fatal_worker_errors = [
+        result for result in worker_results if isinstance(result, BaseException)
+    ]
+
+    remaining = []
+    while not queue.empty():
+        try:
+            remaining.append(queue.get_nowait())
+            queue.task_done()
+        except asyncio.QueueEmpty:
+            break
+    await queue.join()
+
+    if remaining and not should_stop():
+        details = "; ".join(str(error) for error in fatal_worker_errors) or "unknown worker exit"
+        raise RuntimeError(
+            f"Add Audio queue còn {len(remaining)} item sau khi worker kết thúc: {details}"
+        )
+    if fatal_worker_errors and not should_stop():
+        raise RuntimeError(
+            "Add Audio worker kết thúc bất thường: "
+            + "; ".join(str(error) for error in fatal_worker_errors)
+        )
+    return unexpected_errors, remaining
+
+
+def _restore_steps(saved_steps: dict | None, *, reset_processing: bool) -> dict:
+    steps = {**_new_steps(), **(saved_steps or {})}
+    if reset_processing:
+        for key, value in steps.items():
+            if value == "processing":
+                steps[key] = "pending"
+    return steps
+
+
+def _replace_status_snapshot(target: dict, source: dict) -> None:
+    """Replace the reload source so later list rebuilds cannot restore stale state."""
+    target.clear()
+    target.update(source)
+
+
+def _replace_video_items_unless_processing(
+    videos_state: dict,
+    items: list,
+    *,
+    is_processing: bool,
+) -> bool:
+    """Do not detach workers from the item objects they are currently updating."""
+    if is_processing:
+        return False
+    videos_state["items"] = items
+    return True
+
+
+def _upload_resume_point(item: dict) -> str:
+    """Return the first remote upload operation which has not been checkpointed."""
+    if item.get("video_id"):
+        return "done"
+    if item.get("frontend_upload_id") and item.get("scotty_resource_id"):
+        return "create_video"
+    return "upload"
+
+
+def _require_checkpoint(persist: Callable[[], object], label: str) -> None:
+    """Do not start another remote side effect after a failed critical checkpoint."""
+    if persist() is False:
+        raise RuntimeError(f"Không thể lưu checkpoint: {label}")
 
 def _human_size(num: float) -> str:
     for unit in ("B", "KB", "MB", "GB"):
@@ -52,20 +352,84 @@ def _fmt_duration(seconds: float | None) -> str:
 def _new_steps() -> dict:
     return {"merge": "pending", "upload": "pending", "wait": "pending", "add_audio": "pending"}
 def create_add_audio_flow_page():
+    try:
+        page_client = context.client
+    except RuntimeError:
+        page_client = None
+    ui_lifecycle = {"available": page_client is not None}
     paths_state = {"video_folder": "", "music_folder": "", "output_folder": ""}; options_state = {"random_music": False, "audio_language": "en"}; selected_channel = {"id": None}; channels = get_channels_info(); videos_state = {"items": []}; saved_status_map = {}; video_list_container = None; suppress_autosave = {"value": False}; ui_refs = {"random_switch": None, "lang_input": None, "process_btn": None, "clear_btn": None, "refresh_channel_display": None, "refresh_overlay": None, "stop_btn": None}; folder_selectors = {}; progress_refs = {}; processing = {"value": False}; stop_requested = {"value": False}; active_run = {"parent": None, "children": {}}; PERSIST_FIELDS = ("music", "music_path", "audio_path", "output_path", "video_id", "scotty_resource_id", "frontend_upload_id", "audio_language_results")
+
+    def client_is_alive() -> bool:
+        return (
+            ui_lifecycle["available"]
+            and page_client is not None
+            and not getattr(page_client, "_deleted", False)
+        )
+
+    def element_is_alive(element) -> bool:
+        return (
+            client_is_alive()
+            and element is not None
+            and not getattr(element, "is_deleted", False)
+        )
+
+    def safe_ui(action: str, callback: Callable[[], object]) -> bool:
+        def invoke():
+            with page_client:
+                return callback()
+
+        return _best_effort_ui(action, invoke, is_available=client_is_alive)
+
+    def safe_element_call(element, method: str, *args) -> bool:
+        if not element_is_alive(element):
+            return False
+        return safe_ui(
+            f"{method} on {type(element).__name__}",
+            lambda: getattr(element, method)(*args),
+        )
+
+    def safe_notify(message: str, **kwargs) -> bool:
+        return safe_ui("notification", lambda: ui.notify(message, **kwargs))
+
+    def configuration_change_blocked() -> bool:
+        """Keep a detached run's persisted inputs stable until it finishes."""
+        if not _FLOW_RUN_GUARD.locked():
+            return False
+        safe_notify(
+            "Không thể thay đổi cấu hình khi Add Audio Flow đang chạy.",
+            type="warning",
+        )
+        return True
+
+    def deactivate_state_sync_timer() -> None:
+        timer = state_sync_timer["value"]
+        if timer is not None:
+            _best_effort_ui("deactivate state sync timer", timer.deactivate)
+
+    def mark_client_unavailable() -> None:
+        ui_lifecycle["available"] = False
+        logger.info(
+            "Add Audio page disconnected; backend flow will continue without UI updates"
+        )
+
+    if page_client is not None:
+        page_client.on_disconnect(mark_client_unavailable)
+
     def save_state():
         try:
             if suppress_autosave["value"]:
-                return None
+                return False
             statuses = {}
             for it in videos_state["items"]:
                 entry = {"steps": it["steps"]}
                 for field in PERSIST_FIELDS:
                     entry[field] = it.get(field, "")
                 statuses[it["name"]] = entry
-            state_manager.save_state("add_audio_flow", {"video_folder": paths_state["video_folder"], "music_folder": paths_state["music_folder"], "output_folder": paths_state["output_folder"], "random_music": options_state["random_music"], "audio_language": options_state["audio_language"], "selected_channel": selected_channel["id"], "statuses": statuses})
+            _replace_status_snapshot(saved_status_map, statuses)
+            return state_manager.save_state("add_audio_flow", {"video_folder": paths_state["video_folder"], "music_folder": paths_state["music_folder"], "output_folder": paths_state["output_folder"], "random_music": options_state["random_music"], "audio_language": options_state["audio_language"], "selected_channel": selected_channel["id"], "statuses": statuses})
         except Exception as e:
             logger.error(f"Failed to save add_audio_flow state: {e}")
+            return False
     def load_state():
         try:
             state = state_manager.load_state("add_audio_flow")
@@ -77,8 +441,7 @@ def create_add_audio_flow_page():
             options_state["random_music"] = state.get("random_music", False)
             options_state["audio_language"] = state.get("audio_language", "en")
             selected_channel["id"] = state.get("selected_channel")
-            saved_status_map.clear()
-            saved_status_map.update(state.get("statuses", {}))
+            _replace_status_snapshot(saved_status_map, state.get("statuses", {}))
             def update_ui():
                 try:
                     for render in folder_selectors.values():
@@ -112,16 +475,22 @@ def create_add_audio_flow_page():
                     "path": str(p),
                     "size": size,
                     "duration": None,
-                    "steps": {**_new_steps(), **(saved.get("steps") or {})},
+                    "duration_error": "",
+                    "steps": _restore_steps(
+                        saved.get("steps"),
+                        reset_processing=not _FLOW_RUN_GUARD.locked(),
+                    ),
                 }
                 for field in PERSIST_FIELDS:
                     default = {} if field == "audio_language_results" else ""
                     item[field] = saved.get(field, default)
-                for k in item["steps"]:
-                    if item["steps"][k] == "processing":
-                        item["steps"][k] = "pending"
                 items.append(item)
-        videos_state["items"] = items
+        if not _replace_video_items_unless_processing(
+            videos_state,
+            items,
+            is_processing=processing["value"],
+        ):
+            return
         refresh_video_list()
         if items:
             ui.timer(0.05, load_durations, once=True)
@@ -131,10 +500,73 @@ def create_add_audio_flow_page():
                 try:
                     item["duration"] = await asyncio.to_thread(
                         get_video_duration, item["path"]
-                    ) or 0
-                except Exception:
-                    item["duration"] = 0
+                    )
+                    item["duration_error"] = ""
+                except FFprobeError as exc:
+                    item["duration_error"] = str(exc)
+                except Exception as exc:
+                    item["duration_error"] = f"Unexpected metadata error: {exc}"
+                    logger.exception(
+                        "Unexpected duration error for {}: {}", item["path"], exc
+                    )
                 refresh_video_list()
+
+    state_sync_timer = {
+        "value": None,
+        "observed_active_run": _FLOW_RUN_GUARD.locked(),
+    }
+
+    def sync_persisted_running_state():
+        """Let a reloaded page observe the still-running detached backend job."""
+        if not client_is_alive():
+            deactivate_state_sync_timer()
+            return
+        detached_run_active = _FLOW_RUN_GUARD.locked()
+        if detached_run_active:
+            state_sync_timer["observed_active_run"] = True
+        state = state_manager.load_state("add_audio_flow")
+        if not state:
+            if not detached_run_active and not state_sync_timer["observed_active_run"]:
+                deactivate_state_sync_timer()
+            return
+        statuses = state.get("statuses") or {}
+        _replace_status_snapshot(saved_status_map, statuses)
+        changed = False
+        for item in videos_state["items"]:
+            saved = statuses.get(item["name"])
+            if not saved:
+                continue
+            restored_steps = _restore_steps(
+                saved.get("steps"),
+                reset_processing=False,
+            )
+            if item["steps"] != restored_steps:
+                item["steps"] = restored_steps
+                changed = True
+            for field in PERSIST_FIELDS:
+                restored_value = saved.get(
+                    field,
+                    {} if field == "audio_language_results" else "",
+                )
+                if item.get(field) != restored_value:
+                    item[field] = restored_value
+                    changed = True
+        if changed:
+            refresh_video_list()
+        safe_element_call(
+            ui_refs.get("process_btn"), "set_enabled", not detached_run_active
+        )
+        safe_element_call(
+            ui_refs.get("clear_btn"), "set_enabled", not detached_run_active
+        )
+        if detached_run_active:
+            safe_element_call(
+                progress_refs.get("current"),
+                "set_text",
+                "Backend đang tiếp tục xử lý sau khi trang được tải lại",
+            )
+        else:
+            deactivate_state_sync_timer()
 
     def step_badge(status: str):
         icon, color, label = STEP_STYLE.get(status, STEP_STYLE["pending"])
@@ -142,63 +574,77 @@ def create_add_audio_flow_page():
             ui.icon(icon).classes(f"text-sm shrink-0 {color}")
             ui.label(label).classes(f"text-xs font-medium whitespace-nowrap {color}")
     def refresh_video_list():
-        if not video_list_container:
-            return
-        video_list_container.clear()
-        items = videos_state["items"]
-        with video_list_container:
-            with ui.row().classes("items-center gap-2 mb-1"):
-                ui.icon("video_library").classes("text-gray-500")
-                ui.label(f"Tìm thấy {len(items)} video").classes("text-sm font-semibold text-gray-700")
-            if not items:
-                ui.label("Chưa chọn folder video hoặc folder không có video nào.").classes("text-gray-500 italic text-sm")
-                return
+        if not element_is_alive(video_list_container):
+            return False
 
-            with ui.row().classes("w-full min-h-[42px] items-center font-semibold text-xs text-gray-500 bg-gray-50 border-b border-gray-200 px-3 flex-nowrap"):
-                ui.label("#").classes("w-1/12")
-                ui.label("Video").classes("w-3/12")
-                ui.label("ID").classes("w-2/12")
-                ui.label("Nhạc").classes("w-2/12")
-                ui.label("Ghép nhạc").classes("w-1/12 text-center")
-                ui.label("Upload").classes("w-1/12 text-center")
-                ui.label("Chờ xử lý").classes("w-1/12 text-center")
-                ui.label("Add audio").classes("w-1/12 text-center")
+        def render():
+            video_list_container.clear()
+            items = videos_state["items"]
+            with video_list_container:
+                with ui.row().classes("items-center gap-2 mb-1"):
+                    ui.icon("video_library").classes("text-gray-500")
+                    ui.label(f"Tìm thấy {len(items)} video").classes("text-sm font-semibold text-gray-700")
+                if not items:
+                    ui.label("Chưa chọn folder video hoặc folder không có video nào.").classes("text-gray-500 italic text-sm")
+                    return
 
-            for idx, item in enumerate(items, 1):
-                steps = item["steps"]
-                with ui.row().classes("w-full min-h-[54px] items-center bg-white px-3 py-1 border-b border-gray-100 flex-nowrap hover:bg-gray-50"):
-                    ui.label(str(idx)).classes("w-1/12 text-xs text-gray-500")
-                    with ui.column().classes("w-3/12 min-w-0 gap-0"):
-                        ui.label(item["name"]).classes("truncate text-sm font-medium text-gray-800").tooltip(item["name"])
-                        meta = _human_size(item["size"])
-                        if item["duration"] is None:
-                            meta += " · đang đọc..."
-                        else:
-                            meta += f" · {_fmt_duration(item['duration'])}"
-                        ui.label(meta).classes("text-xs text-gray-400")
+                with ui.row().classes("w-full min-h-[42px] items-center font-semibold text-xs text-gray-500 bg-gray-50 border-b border-gray-200 px-3 flex-nowrap"):
+                    ui.label("#").classes("w-1/12")
+                    ui.label("Video").classes("w-3/12")
+                    ui.label("ID").classes("w-2/12")
+                    ui.label("Nhạc").classes("w-2/12")
+                    ui.label("Ghép nhạc").classes("w-1/12 text-center")
+                    ui.label("Upload").classes("w-1/12 text-center")
+                    ui.label("Chờ xử lý").classes("w-1/12 text-center")
+                    ui.label("Add audio").classes("w-1/12 text-center")
 
-                    vid = item.get("video_id")
-                    with ui.column().classes("w-2/12 min-w-0"):
-                        if vid:
-                            ui.label(vid).classes("truncate text-xs font-medium text-indigo-600").tooltip(vid)
-                        else:
-                            ui.label("—").classes("text-xs text-gray-400")
+                for idx, item in enumerate(items, 1):
+                    steps = item["steps"]
+                    with ui.row().classes("w-full min-h-[54px] items-center bg-white px-3 py-1 border-b border-gray-100 flex-nowrap hover:bg-gray-50"):
+                        ui.label(str(idx)).classes("w-1/12 text-xs text-gray-500")
+                        with ui.column().classes("w-3/12 min-w-0 gap-0"):
+                            ui.label(item["name"]).classes("truncate text-sm font-medium text-gray-800").tooltip(item["name"])
+                            meta = _human_size(item["size"])
+                            if item.get("duration_error"):
+                                meta += " · không đọc được duration"
+                            elif item["duration"] is None:
+                                meta += " · đang đọc..."
+                            else:
+                                meta += f" · {_fmt_duration(item['duration'])}"
+                            meta_label = ui.label(meta).classes("text-xs text-gray-400")
+                            if item.get("duration_error"):
+                                meta_label.tooltip(item["duration_error"])
 
-                    ui.label(item.get("music") or "—").classes("w-2/12 truncate text-xs text-gray-600")
-                    with ui.element("div").classes("w-1/12 flex justify-center"):
-                        step_badge(steps["merge"])
-                    with ui.element("div").classes("w-1/12 flex justify-center"):
-                        step_badge(steps["upload"])
-                    with ui.element("div").classes("w-1/12 flex justify-center"):
-                        step_badge(steps["wait"])
-                    with ui.element("div").classes("w-1/12 flex justify-center"):
-                        step_badge(steps["add_audio"])
+                        vid = item.get("video_id")
+                        with ui.column().classes("w-2/12 min-w-0"):
+                            if vid:
+                                ui.label(vid).classes("truncate text-xs font-medium text-indigo-600").tooltip(vid)
+                            else:
+                                ui.label("—").classes("text-xs text-gray-400")
+
+                        ui.label(item.get("music") or "—").classes("w-2/12 truncate text-xs text-gray-600")
+                        with ui.element("div").classes("w-1/12 flex justify-center"):
+                            step_badge(steps["merge"])
+                        with ui.element("div").classes("w-1/12 flex justify-center"):
+                            step_badge(steps["upload"])
+                        with ui.element("div").classes("w-1/12 flex justify-center"):
+                            step_badge(steps["wait"])
+                        with ui.element("div").classes("w-1/12 flex justify-center"):
+                            step_badge(steps["add_audio"])
+
+        return safe_ui("refresh video list", render)
     async def step_merge(item, output_folder, musics, index, run_config):
         """Render video với nhạc gián đoạn (phát 3s / tắt 7s, 3s cuối luôn có tiếng).
 
         Xuất 2 file: output_{i}.m4v (audio đã mute) và output_{i}_processed.mp4
         (video đã render với audio đó).
         """
+        if item.get("duration") is None:
+            item["duration"] = await asyncio.to_thread(
+                get_video_duration, item["path"]
+            )
+            item["duration_error"] = ""
+
         if run_config["random_music"]:
             music = random.choice(musics)
         else:
@@ -236,6 +682,7 @@ def create_add_audio_flow_page():
         if run_context is not None:
             run_context.keep_path(audio_out)
             run_context.keep_path(video_out)
+        save_state()
     async def step_upload(item, output_folder, musics, index, run_config):
         """Upload video đã ghép nhạc lên kênh và tạo video.
 
@@ -246,26 +693,33 @@ def create_add_audio_flow_page():
         if not channel_id:
             raise Exception("Chưa chọn kênh")
 
-        upload_prog = {"sent": 0, "total": 0}
-        item["upload_progress"] = upload_prog
-        result = await asyncio.to_thread(
-            upload_video_module.upload,
-            channel_id=channel_id,
-            file_path=item["output_path"],
-            index=index,
-            progress=upload_prog,
-        )
+        resume_point = _upload_resume_point(item)
+        if resume_point == "done":
+            return
 
-        item["frontend_upload_id"] = result["frontend_upload_id"]
-        item["scotty_resource_id"] = result["scotty_resource_id"]
+        if resume_point == "upload":
+            upload_prog = {"sent": 0, "total": 0}
+            item["upload_progress"] = upload_prog
+            result = await asyncio.to_thread(
+                upload_video_module.upload,
+                channel_id=channel_id,
+                file_path=item["output_path"],
+                index=index,
+                progress=upload_prog,
+            )
+
+            item["frontend_upload_id"] = result["frontend_upload_id"]
+            item["scotty_resource_id"] = result["scotty_resource_id"]
+            _require_checkpoint(save_state, "upload resource IDs")
         video_id = await asyncio.to_thread(
             upload_video_module.create_video,
             channel_id=channel_id,
-            scotty_resource_id=result["scotty_resource_id"],
-            frontend_upload_id=result["frontend_upload_id"],
+            scotty_resource_id=item["scotty_resource_id"],
+            frontend_upload_id=item["frontend_upload_id"],
             title=Path(item.get("music") or item["name"]).stem,
         )
         item["video_id"] = video_id
+        _require_checkpoint(save_state, "video ID")
     async def step_wait_processed(item, output_folder, musics, index, run_config):
         """Chờ YouTube xử lý video xong (poll status = VIDEO_STATUS_PROCESSED)."""
         channel_id = run_config["channel_id"]
@@ -275,25 +729,59 @@ def create_add_audio_flow_page():
 
         step_label = None
         push_log("Chờ YouTube xử lý video xong...", "wait", indent=True)
-        max_wait, interval, waited = 1200, 15, 0
-        while True:
+
+        def checkpoint() -> None:
             run_context = current_run_context()
             if run_context is not None:
                 run_context.checkpoint()
             if stop_requested["value"]:
                 raise TaskStopped()
-            ready = await asyncio.to_thread(upload_video_module.is_processed, channel_id, video_id)
-            if ready:
-                break
-            if waited >= max_wait:
-                raise Exception(f"Video chưa xử lý xong sau {max_wait}s (video_id={video_id})")
+
+        async def check_status() -> VideoProcessingResult:
+            return await asyncio.to_thread(
+                upload_video_module.get_processing_status,
+                channel_id,
+                video_id,
+            )
+
+        async def sleep_interruptibly(seconds: float) -> None:
+            sleep_deadline = time.monotonic() + seconds
+            while True:
+                checkpoint()
+                remaining = sleep_deadline - time.monotonic()
+                if remaining <= 0:
+                    return
+                await asyncio.sleep(min(0.1, remaining))
+
+        def report_transient_error(
+            result: VideoProcessingResult,
+            consecutive: int,
+            poll_count: int,
+            elapsed: float,
+        ) -> None:
+            push_log(
+                "Kiểm tra trạng thái YouTube lỗi tạm thời "
+                f"({consecutive}/{YOUTUBE_STATUS_MAX_CONSECUTIVE_TRANSIENT_ERRORS})",
+                "wait",
+                indent=True,
+            )
+
+        def report_poll_wait(elapsed: float) -> None:
             if step_label:
-                step_label.set_text(f"Bước: Chờ xử lý — {waited}s")
-            for _ in range(interval * 10):
-                if run_context is not None:
-                    run_context.checkpoint()
-                await asyncio.sleep(0.1)
-            waited += interval
+                safe_element_call(
+                    step_label,
+                    "set_text",
+                    f"Bước: Chờ xử lý — {int(elapsed)}s",
+                )
+
+        await _wait_for_youtube_processing(
+            check_status,
+            video_id=video_id,
+            checkpoint=checkpoint,
+            sleep=sleep_interruptibly,
+            on_transient_error=report_transient_error,
+            on_poll_wait=report_poll_wait,
+        )
         push_log("Video đã xử lý xong", "ok", indent=True)
     async def step_add_audio(item, output_folder, musics, index, run_config):
         """Thêm audio track (file nhạc gốc) cho video_id đã xử lý xong.
@@ -313,7 +801,7 @@ def create_add_audio_flow_page():
 
         step_label = None
         if step_label:
-            step_label.set_text("Bước: Add audio — chuẩn bị audio khớp thời lượng...")
+            safe_element_call(step_label, "set_text", "Bước: Add audio — chuẩn bị audio khớp thời lượng...")
         info = await asyncio.to_thread(
             upload_video_module._get_video_info,
             video_id=video_id,
@@ -352,7 +840,7 @@ def create_add_audio_flow_page():
                     push_log(f"Audio track đã hoàn tất trước đó, bỏ qua: {lang}", "ok", indent=True)
                     continue
                 if step_label:
-                    step_label.set_text(f"Bước: Add audio — ngôn ngữ {lang}")
+                    safe_element_call(step_label, "set_text", f"Bước: Add audio — ngôn ngữ {lang}")
                 push_log(
                     f"Audio {language_index}/{len(languages)} — đang xử lý {lang}",
                     "wait",
@@ -397,6 +885,7 @@ def create_add_audio_flow_page():
                         "error": message,
                     }
                     language_errors.append(f"{lang}: {message}")
+                    save_state()
                     logger.error(
                         "Add audio failed for video {} language {}: {}",
                         video_id,
@@ -408,16 +897,15 @@ def create_add_audio_flow_page():
                         "error",
                         indent=True,
                     )
-                    save_state()
                     continue
 
                 result_status = "successful" if status == 200 else "already_added"
                 language_results[lang] = {"status": result_status, "error": ""}
+                _require_checkpoint(save_state, f"audio language {lang}")
                 if status == 409:
                     push_log(f"Audio track đã tồn tại: {lang}", "ok", indent=True)
                 else:
                     push_log(f"Đã thêm audio track: {lang}", "ok", indent=True)
-                save_state()
 
             if language_errors:
                 raise Exception(
@@ -445,43 +933,35 @@ def create_add_audio_flow_page():
             nav_state.lock("Đang xử lý video, vui lòng đợi hoàn tất trước khi chuyển trang.")
         else:
             nav_state.unlock()
-        panel = progress_refs.get("panel")
-        if panel:
-            panel.set_visibility(active)
-        if progress_refs.get("bar"):
-            progress_refs["bar"].value = 0
-
-        if progress_refs.get("current") and message:
-            progress_refs["current"].set_text(message)
-        if ui_refs.get("process_btn"):
-            ui_refs["process_btn"].set_enabled(not active)
-
-        if ui_refs.get("clear_btn"):
-            ui_refs["clear_btn"].set_enabled(not active)
-        if ui_refs.get("stop_btn"):
-            ui_refs["stop_btn"].set_visibility(active)
-            ui_refs["stop_btn"].set_enabled(active)
+        safe_element_call(progress_refs.get("panel"), "set_visibility", active)
+        safe_element_call(progress_refs.get("bar"), "set_value", 0)
+        if message:
+            safe_element_call(progress_refs.get("current"), "set_text", message)
+        safe_element_call(ui_refs.get("process_btn"), "set_enabled", not active)
+        safe_element_call(ui_refs.get("clear_btn"), "set_enabled", not active)
+        safe_element_call(ui_refs.get("stop_btn"), "set_visibility", active)
+        safe_element_call(ui_refs.get("stop_btn"), "set_enabled", active)
         if active:
-            if progress_refs.get("log"):
-                progress_refs["log"].clear()
-                return None
-            return None
+            safe_element_call(progress_refs.get("log"), "clear")
     LOG_STYLE = {"info": ("chevron_right", "text-gray-600"), "work": ("autorenew", "text-blue-600"), "wait": ("hourglass_top", "text-amber-600"), "ok": ("check_circle", "text-green-600"), "error": ("error", "text-red-600")}
     def push_log(message: str, level: str="info", indent: bool=False):
         """Thêm 1 dòng progress thân thiện cho user (không lộ chi tiết kỹ thuật)."""
         log = progress_refs.get("log")
-        if not log:
-            return None
+        if not element_is_alive(log):
+            return False
         icon, color = LOG_STYLE.get(level, LOG_STYLE["info"])
 
-        with log:
-            with ui.row().classes(f"items-center gap-1 w-full flex-nowrap {'pl-5' if indent else ''}"):
-                ui.icon(icon).classes(f"text-sm shrink-0 {color}")
-                ui.label(message).classes(f"text-xs {color} truncate")
-        area = progress_refs.get("log_area")
-        if area:
-            area.scroll_to(percent=1.0)
-            return None
+        def render():
+            with log:
+                with ui.row().classes(f"items-center gap-1 w-full flex-nowrap {'pl-5' if indent else ''}"):
+                    ui.icon(icon).classes(f"text-sm shrink-0 {color}")
+                    ui.label(message).classes(f"text-xs {color} truncate")
+            area = progress_refs.get("log_area")
+            if element_is_alive(area):
+                area.scroll_to(percent=1.0)
+
+        return safe_ui("append progress log", render)
+
     def update_parallel_progress(total: int, stats: dict) -> None:
         active = sum(
             1
@@ -489,20 +969,26 @@ def create_add_audio_flow_page():
             if any(value == "processing" for value in item["steps"].values())
         )
         finished = stats["finished"]
-        if progress_refs.get("current"):
-            progress_refs["current"].set_text(
-                f"Đang chạy {active}/{MAX_ACTIVE_VIDEOS} video song song"
-            )
-        if progress_refs.get("step"):
-            progress_refs["step"].set_text(
-                f"Hoàn tất {finished}/{total} — Lỗi {stats['failed']}"
-            )
-        if progress_refs.get("remaining"):
-            progress_refs["remaining"].set_text(
-                f"Còn lại: {max(0, total - finished)} video"
-            )
-        if progress_refs.get("bar"):
-            progress_refs["bar"].value = finished / total if total else 0
+        safe_element_call(
+            progress_refs.get("current"),
+            "set_text",
+            f"Đang chạy {active}/{MAX_ACTIVE_VIDEOS} video song song",
+        )
+        safe_element_call(
+            progress_refs.get("step"),
+            "set_text",
+            f"Hoàn tất {finished}/{total} — Lỗi {stats['failed']}",
+        )
+        safe_element_call(
+            progress_refs.get("remaining"),
+            "set_text",
+            f"Còn lại: {max(0, total - finished)} video",
+        )
+        safe_element_call(
+            progress_refs.get("bar"),
+            "set_value",
+            finished / total if total else 0,
+        )
 
     async def run_video_item(
         orig_index: int,
@@ -514,7 +1000,7 @@ def create_add_audio_flow_page():
         errors: list,
         stats: dict,
         total: int,
-    ) -> None:
+    ) -> str:
         context_key = f"{orig_index}:{item['path']}"
         context = create_run_context(f"add_audio_video_{orig_index}")
         active_run["children"][context_key] = context
@@ -525,9 +1011,22 @@ def create_add_audio_flow_page():
                     if item["steps"].get(step_key) == "processing":
                         item["steps"][step_key] = "pending"
 
-                push_log(f"Video {orig_index + 1}: {item['name']}", "work")
-                refresh_video_list()
-                update_parallel_progress(total, stats)
+                _persist_then_ui(
+                    save_state,
+                    [
+                        (
+                            "announce video start",
+                            lambda: push_log(
+                                f"Video {orig_index + 1}: {item['name']}", "work"
+                            ),
+                        ),
+                        ("render video start", refresh_video_list),
+                        (
+                            "render initial progress",
+                            lambda: update_parallel_progress(total, stats),
+                        ),
+                    ],
+                )
 
                 for step_key, step_name, step_fn in STEP_SEQUENCE:
                     if stop_requested["value"] or context.stopped:
@@ -536,13 +1035,24 @@ def create_add_audio_flow_page():
                         continue
 
                     item["steps"][step_key] = "processing"
-                    push_log(
-                        f"{item['name']} — {step_name}: đang xử lý...",
-                        "wait",
-                        indent=True,
+                    _persist_then_ui(
+                        save_state,
+                        [
+                            (
+                                "announce step start",
+                                lambda: push_log(
+                                    f"{item['name']} — {step_name}: đang xử lý...",
+                                    "wait",
+                                    indent=True,
+                                ),
+                            ),
+                            ("render step start", refresh_video_list),
+                            (
+                                "render step progress",
+                                lambda: update_parallel_progress(total, stats),
+                            ),
+                        ],
                     )
-                    refresh_video_list()
-                    update_parallel_progress(total, stats)
                     try:
                         semaphore = step_limits.get(step_key)
                         if semaphore is None:
@@ -552,13 +1062,22 @@ def create_add_audio_flow_page():
                                 context.checkpoint()
                                 await step_fn(item, output_folder, musics, orig_index, run_config)
                         item["steps"][step_key] = "successful"
-                        push_log(
-                            f"{item['name']} — {step_name}: xong",
-                            "ok",
-                            indent=True,
+                        _persist_then_ui(
+                            save_state,
+                            [
+                                (
+                                    "announce step success",
+                                    lambda: push_log(
+                                        f"{item['name']} — {step_name}: xong",
+                                        "ok",
+                                        indent=True,
+                                    ),
+                                )
+                            ],
                         )
                     except TaskStopped:
                         item["steps"][step_key] = "stopped"
+                        save_state()
                         raise
                     except Exception as exc:
                         if context.stopped or stop_requested["value"]:
@@ -567,36 +1086,50 @@ def create_add_audio_flow_page():
                         item["steps"][step_key] = "unsuccessful"
                         failed = True
                         errors.append(f"{item['name']} [{step_name}]: {exc}")
+                        _persist_then_ui(
+                            save_state,
+                            [
+                                (
+                                    "announce step failure",
+                                    lambda: push_log(
+                                        f"{item['name']} — {step_name}: thất bại",
+                                        "error",
+                                        indent=True,
+                                    ),
+                                )
+                            ],
+                        )
                         logger.error(
                             "Step '{}' failed for {}: {}",
                             step_key,
                             item["name"],
                             exc,
                         )
-                        push_log(
-                            f"{item['name']} — {step_name}: thất bại",
-                            "error",
-                            indent=True,
-                        )
                         break
                     finally:
                         refresh_video_list()
-                        save_state()
                         update_parallel_progress(total, stats)
         except TaskStopped:
             for step_key, value in item["steps"].items():
                 if value == "processing":
                     item["steps"][step_key] = "stopped"
-            push_log(f"{item['name']}: đã dừng", "info", indent=True)
-        finally:
-            context.cleanup()
-            active_run["children"].pop(context_key, None)
-            stats["finished"] += 1
-            if failed:
-                stats["failed"] += 1
-            refresh_video_list()
             save_state()
+            push_log(f"{item['name']}: đã dừng", "info", indent=True)
+            return "stopped"
+        finally:
+            save_state()
+            _run_finalizers(
+                [
+                    ("cleanup item run context", context.cleanup),
+                    (
+                        "remove active item context",
+                        lambda: active_run["children"].pop(context_key, None),
+                    ),
+                ]
+            )
+            refresh_video_list()
             update_parallel_progress(total, stats)
+        return "failed" if failed else "successful"
 
     async def run_parallel_queue(
         pending_items: list,
@@ -605,10 +1138,6 @@ def create_add_audio_flow_page():
         run_config: dict,
         errors: list,
     ) -> dict:
-        queue: asyncio.Queue = asyncio.Queue()
-        for entry in pending_items:
-            queue.put_nowait(entry)
-
         stats = {"finished": 0, "failed": 0}
         step_limits = {
             "merge": asyncio.Semaphore(MAX_FFMPEG_JOBS),
@@ -616,37 +1145,61 @@ def create_add_audio_flow_page():
             "add_audio": asyncio.Semaphore(MAX_ADD_AUDIO_JOBS),
         }
 
-        async def worker() -> None:
-            while not stop_requested["value"]:
-                try:
-                    orig_index, item = queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    return
-                try:
-                    await run_video_item(
-                        orig_index,
-                        item,
-                        output_folder,
-                        musics,
-                        run_config,
-                        step_limits,
-                        errors,
-                        stats,
-                        len(pending_items),
-                    )
-                finally:
-                    queue.task_done()
-
-        workers = [
-            asyncio.create_task(worker())
-            for _ in range(min(MAX_ACTIVE_VIDEOS, len(pending_items)))
-        ]
-        worker_results = await asyncio.gather(*workers, return_exceptions=True)
-        for result in worker_results:
-            if isinstance(result, BaseException):
+        async def process_entry(entry) -> None:
+            orig_index, item = entry
+            outcome = await run_video_item(
+                orig_index,
+                item,
+                output_folder,
+                musics,
+                run_config,
+                step_limits,
+                errors,
+                stats,
+                len(pending_items),
+            )
+            stats["finished"] += 1
+            if outcome == "failed":
                 stats["failed"] += 1
-                errors.append(f"Lỗi worker: {result}")
-                logger.error("Add-audio worker failed: {}", result)
+            save_state()
+            refresh_video_list()
+            update_parallel_progress(len(pending_items), stats)
+
+        def record_unexpected_error(entry, exc: Exception) -> None:
+            _, item = entry
+            marked = False
+            for step_key, value in item.get("steps", {}).items():
+                if value == "processing":
+                    item["steps"][step_key] = "unsuccessful"
+                    marked = True
+            if not marked:
+                for step_key, value in item.get("steps", {}).items():
+                    if value != "successful":
+                        item["steps"][step_key] = "unsuccessful"
+                        break
+            stats["finished"] += 1
+            stats["failed"] += 1
+            errors.append(f"{item.get('name', '<unknown>')} [unexpected]: {exc}")
+            save_state()
+            logger.exception(
+                "Unexpected Add Audio item failure for {}: {}",
+                item.get("name", "<unknown>"),
+                exc,
+            )
+
+        _, remaining = await _run_supervised_queue(
+            pending_items,
+            MAX_ACTIVE_VIDEOS,
+            process_entry,
+            lambda: stop_requested["value"],
+            record_unexpected_error,
+        )
+        if remaining:
+            logger.info(
+                "Add Audio stopped with {} queued item(s) preserved for retry",
+                len(remaining),
+            )
+        save_state()
         return stats
 
     async def handle_stop():
@@ -654,11 +1207,11 @@ def create_add_audio_flow_page():
             return None
         stop_requested["value"] = True
 
-        if ui_refs.get("stop_btn"):
-            ui_refs["stop_btn"].set_enabled(False)
-        if progress_refs.get("step"):
-            progress_refs["step"].set_text("Đang dừng tác vụ hiện tại...")
-        ui.notify("Đang dừng tác vụ hiện tại...", type="info")
+        safe_element_call(ui_refs.get("stop_btn"), "set_enabled", False)
+        safe_element_call(
+            progress_refs.get("step"), "set_text", "Đang dừng tác vụ hiện tại..."
+        )
+        safe_notify("Đang dừng tác vụ hiện tại...", type="info")
         contexts = []
         parent = active_run.get("parent")
         if parent is not None:
@@ -672,37 +1225,37 @@ def create_add_audio_flow_page():
 
     async def handle_process():
         if processing["value"]:
-            ui.notify("Đang xử lý, vui lòng đợi hoàn tất", type="warning")
+            safe_notify("Đang xử lý, vui lòng đợi hoàn tất", type="warning")
             return
 
         video_folder = normalize_path(paths_state["video_folder"])
         music_folder = normalize_path(paths_state["music_folder"])
         output_folder = normalize_path(paths_state["output_folder"])
         if not video_folder or not Path(video_folder).is_dir():
-            ui.notify("Folder video không hợp lệ", type="warning")
+            safe_notify("Folder video không hợp lệ", type="warning")
             return
         if not music_folder or not Path(music_folder).is_dir():
-            ui.notify("Folder nhạc không hợp lệ", type="warning")
+            safe_notify("Folder nhạc không hợp lệ", type="warning")
             return
         if not output_folder:
-            ui.notify("Vui lòng chọn folder output", type="warning")
+            safe_notify("Vui lòng chọn folder output", type="warning")
             return
         if not selected_channel["id"]:
-            ui.notify("Vui lòng chọn kênh để upload", type="warning")
+            safe_notify("Vui lòng chọn kênh để upload", type="warning")
             return
 
         items = videos_state["items"]
         if not items:
-            ui.notify("Không có video nào để xử lý", type="warning")
+            safe_notify("Không có video nào để xử lý", type="warning")
             return
         musics = list_media_files(music_folder, AUDIO_EXTENSIONS)
         if not musics:
-            ui.notify("Không tìm thấy file nhạc nào trong folder", type="warning")
+            safe_notify("Không tìm thấy file nhạc nào trong folder", type="warning")
             return
         try:
             Path(output_folder).mkdir(parents=True, exist_ok=True)
         except Exception as e:
-            ui.notify(f"Không tạo được folder output: {e}", type="negative")
+            safe_notify(f"Không tạo được folder output: {e}", type="negative")
             return
 
         pending_items = [
@@ -711,20 +1264,20 @@ def create_add_audio_flow_page():
             if not all(it["steps"][k] == "successful" for k, _, _ in STEP_SEQUENCE)
         ]
         if not pending_items:
-            ui.notify("Tất cả video đã hoàn thành. Không có gì để chạy.", type="info")
+            safe_notify("Tất cả video đã hoàn thành. Không có gì để chạy.", type="info")
             return
 
         channel_snapshot = get_channels_info(selected_channel["id"])
         if not channel_snapshot:
-            ui.notify("Không tìm thấy dữ liệu kênh đã chọn", type="negative")
+            safe_notify("Không tìm thấy dữ liệu kênh đã chọn", type="negative")
             return
         audio_languages = parse_language_codes(options_state.get("audio_language"))
         if not audio_languages:
-            ui.notify("Hãy nhập ít nhất một mã ngôn ngữ", type="warning")
+            safe_notify("Hãy nhập ít nhất một mã ngôn ngữ", type="warning")
             return
         invalid_languages = invalid_language_codes(audio_languages)
         if invalid_languages:
-            ui.notify(
+            safe_notify(
                 f"Mã ngôn ngữ không hợp lệ: {', '.join(invalid_languages)}",
                 type="negative",
             )
@@ -737,7 +1290,7 @@ def create_add_audio_flow_page():
         }
 
         if not _FLOW_RUN_GUARD.acquire(blocking=False):
-            ui.notify(
+            safe_notify(
                 "Luồng Thêm audio đang chạy ở một cửa sổ khác.",
                 type="warning",
             )
@@ -766,18 +1319,32 @@ def create_add_audio_flow_page():
             )
             stopped = stop_requested["value"] or run_context.stopped
             update_parallel_progress(total, stats)
-        finally:
-            set_processing_ui(False)
+        except Exception as exc:
+            errors.append(f"Lỗi batch: {exc}")
             save_state()
+            logger.exception("Add Audio batch failed: {}", exc)
+            push_log(f"Batch thất bại: {exc}", "error")
+        finally:
+            critical_steps = [("persist final state", save_state)]
             if run_context is not None:
-                run_context.cleanup()
-            active_run["parent"] = None
-            active_run["children"].clear()
-            _FLOW_RUN_GUARD.release()
+                critical_steps.append(("cleanup parent run context", run_context.cleanup))
+            critical_steps.extend(
+                [
+                    (
+                        "clear active run references",
+                        lambda: (
+                            active_run.__setitem__("parent", None),
+                            active_run["children"].clear(),
+                        ),
+                    ),
+                    ("release flow guard", _FLOW_RUN_GUARD.release),
+                    ("reset processing UI", lambda: set_processing_ui(False)),
+                ]
+            )
+            _run_finalizers(critical_steps)
 
         if stopped:
-            if progress_refs.get("step"):
-                progress_refs["step"].set_text("Đã dừng")
+            safe_element_call(progress_refs.get("step"), "set_text", "Đã dừng")
             push_log("Đã dừng theo yêu cầu", "info")
         elif errors:
             push_log("Hoàn tất — có một số video lỗi", "error")
@@ -790,22 +1357,24 @@ def create_add_audio_flow_page():
             if all(it["steps"][k] == "successful" for k, _, _ in STEP_SEQUENCE)
         )
         if stopped:
-            ui.notify(
+            safe_notify(
                 f"Đã dừng. {done_count}/{len(items)} video hoàn thành toàn bộ flow. Bấm Xử lý để chạy tiếp phần còn lại.",
                 type="info",
             )
             return
         if errors:
-            ui.notify(
+            safe_notify(
                 f"Hoàn tất với một số lỗi. {done_count}/{len(items)} video hoàn thành. Bấm Xử lý để thử lại phần lỗi.",
                 type="warning",
             )
             return
-        ui.notify(
+        safe_notify(
             f"Hoàn tất! {done_count}/{len(items)} video đã xử lý xong toàn bộ flow.",
             type="positive",
         )
     def clear_all_inputs():
+        if configuration_change_blocked():
+            return
         try:
             suppress_autosave["value"] = True
             paths_state["video_folder"] = ""
@@ -831,6 +1400,8 @@ def create_add_audio_flow_page():
 
     def build_folder_selector(key: str, label: str, placeholder: str, icon: str, on_after=None, extra_render=None):
         def pick_folder(_=None):
+            if configuration_change_blocked():
+                return
             selected = select_directory(initial_dir=paths_state[key] or None, title=label)
             if selected:
                 paths_state[key] = selected
@@ -840,6 +1411,8 @@ def create_add_audio_flow_page():
                     on_after()
 
         def clear_folder(_=None):
+            if configuration_change_blocked():
+                return
             paths_state[key] = ""
             render()
             save_state()
@@ -899,6 +1472,8 @@ def create_add_audio_flow_page():
             ):
                 pass
         def on_channel_select(channel_id):
+            if configuration_change_blocked():
+                return
             selected_channel["id"] = channel_id
 
             save_state()
@@ -960,6 +1535,13 @@ def create_add_audio_flow_page():
         ui_refs["refresh_overlay"] = refresh_overlay_display
         refresh_overlay_display()
         def on_random_change(e=None):
+            if configuration_change_blocked():
+                safe_element_call(
+                    ui_refs.get("random_switch"),
+                    "set_value",
+                    options_state["random_music"],
+                )
+                return
             options_state["random_music"] = bool(e.value if e else False)
 
             save_state()
@@ -971,6 +1553,13 @@ def create_add_audio_flow_page():
             build_folder_selector("music_folder", "Folder nhạc", "Chọn folder chứa nhạc", "music_note", extra_render=render_music_switch)
             build_folder_selector("output_folder", "Folder output", "Chọn nơi lưu video đã ghép nhạc", "drive_folder_upload")
         def on_lang_change(e=None):
+            if configuration_change_blocked():
+                safe_element_call(
+                    ui_refs.get("lang_input"),
+                    "set_value",
+                    options_state["audio_language"],
+                )
+                return
             options_state["audio_language"] = (lang_input.value or "").strip()
             save_state()
 
@@ -1017,3 +1606,4 @@ def create_add_audio_flow_page():
         refresh_video_list()
 
     load_state()
+    state_sync_timer["value"] = ui.timer(1.0, sync_persisted_running_state)

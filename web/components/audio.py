@@ -1,8 +1,9 @@
 # RECOVERED: partial depyo recovery; unresolved regions marked below
 import asyncio, tempfile
 from pathlib import Path
+from typing import Awaitable, Callable, Iterable, TypeVar
 from loguru import logger
-from nicegui import ui
+from nicegui import context, ui
 from src.audio_language import (
     call_audio_update_with_retry,
     invalid_language_codes,
@@ -12,6 +13,52 @@ from src.module.audio_module import update_audio_module
 from src.state_manager import state_manager
 from src.utils import get_channels_info, multiply_audio, normalize_path, validate_path_text
 from web.theme import app_card, page_header, section_header
+
+
+_T = TypeVar("_T")
+
+
+def _best_effort_ui(
+    action: str,
+    callback: Callable[[], object],
+    *,
+    is_available: Callable[[], bool] = lambda: True,
+) -> bool:
+    if not is_available():
+        return False
+    try:
+        callback()
+        return True
+    except Exception as exc:
+        logger.warning("Audio UI action '{}' was skipped: {}", action, exc)
+        return False
+
+
+async def _run_sequentially_isolated(
+    items: Iterable[_T],
+    process_item: Callable[[_T], Awaitable[None]],
+    on_error: Callable[[_T, Exception], None],
+) -> list[tuple[_T, Exception]]:
+    failures: list[tuple[_T, Exception]] = []
+    for item in items:
+        try:
+            await process_item(item)
+        except Exception as exc:
+            failures.append((item, exc))
+            on_error(item, exc)
+    return failures
+
+
+def _cleanup_temp_audio_file(path: Path | None) -> None:
+    if path is None:
+        return
+    try:
+        if path.exists():
+            path.unlink()
+    except Exception as exc:
+        logger.warning("Failed to clean up temporary file {}: {}", path, exc)
+
+
 def create_channel_selection(channels, on_channel_select):
     """Create a channel selection interface similar to studio page"""
     selected_channel = {"id": None}
@@ -63,6 +110,28 @@ def create_channel_selection(channels, on_channel_select):
         refresh_channel_display()
     return selected_channel, refresh_channel_display
 def create_add_audio_page():
+    try:
+        page_client = context.client
+    except RuntimeError:
+        page_client = None
+    ui_available = {"value": True}
+
+    def client_is_alive() -> bool:
+        return (
+            ui_available["value"]
+            and page_client is not None
+            and not getattr(page_client, "_deleted", False)
+        )
+
+    def best_effort_ui(action: str, callback: Callable[[], object]) -> bool:
+        return _best_effort_ui(action, callback, is_available=client_is_alive)
+
+    def mark_client_unavailable() -> None:
+        ui_available["value"] = False
+
+    if page_client is not None:
+        page_client.on_disconnect(mark_client_unavailable)
+
     selected_channel = {"id": None}; selected_languages = {"languages": []}; channels = get_channels_info(); video_ids_state = {"ids": []}; id_to_path = {}; video_processing_status = {}; video_processing_errors = {}; repeat_settings = {"times": 2, "extra_minutes": 0}; performance_settings = {"max_concurrency": 1}; right_panel_container = None; suppress_autosave = {"value": False}; ui_refs = {"ids_textarea": None, "language_input": None, "times_input": None, "minutes_input": None, "refresh_channel_display": None, "refresh_language_chips": None, "concurrency_input": None}
     def save_right_panel_state():
         """Save the current state of right_panel_container to file"""
@@ -337,6 +406,7 @@ def create_add_audio_page():
                 logger.error(err)
             return None
         video_processing_errors.clear()
+        save_right_panel_state()
         with ui.dialog() as progress_dialog:
             with ui.card().classes("app-card w-96"):
                 ui.label("Đang thêm âm thanh...").classes("text-base font-semibold")
@@ -346,7 +416,7 @@ def create_add_audio_page():
                 concurrent_label = ui.label("").classes("text-xs text-gray-500 mt-1")
                 progress_bar = ui.linear_progress(value=0)
         progress_dialog.props("persistent")
-        progress_dialog.open()
+        best_effort_ui("open progress dialog", progress_dialog.open)
         total_videos = len(video_ids_state["ids"])
         total_tasks = total_videos * len(languages_to_process)
         completed_tasks = 0
@@ -358,7 +428,8 @@ def create_add_audio_page():
                     video_processing_status[vid] = {}
                 video_processing_status[vid][lang] = "pending"
                 video_processing_errors.setdefault(vid, {}).pop(lang, None)
-                refresh_right_panel()
+                save_right_panel_state()
+                best_effort_ui("render pending language", refresh_right_panel)
 
                 def update_one_language():
                     return update_audio_module.add(
@@ -387,91 +458,160 @@ def create_add_audio_page():
                     video_processing_status[vid][lang] = "successful"
                 else:
                     video_processing_status[vid][lang] = "already_added"
+                save_right_panel_state()
             except Exception as exc:
                 video_processing_status.setdefault(vid, {})[lang] = "unsuccessful"
                 overall_errors.append(f"{vid}-{lang}: {exc}")
                 video_processing_errors.setdefault(vid, {})[lang] = str(exc)
+                save_right_panel_state()
+
+        async def process_video(item: tuple[int, str]) -> None:
+            nonlocal completed_tasks
+            video_index, vid = item
+            temp_audio_path: Path | None = None
+            try:
+                existing_status = video_processing_status.setdefault(vid, {})
+                missing_languages = [
+                    lang
+                    for lang in languages_to_process
+                    if existing_status.get(lang) not in ("successful", "already_added")
+                ]
+                skipped_count = len(languages_to_process) - len(missing_languages)
+                if skipped_count:
+                    completed_tasks += skipped_count
+                    best_effort_ui(
+                        "update skipped-language progress",
+                        lambda: setattr(progress_bar, "value", completed_tasks / total_tasks),
+                    )
+                if not missing_languages:
+                    best_effort_ui(
+                        "render already-complete video",
+                        lambda: (
+                            current_video_label.set_text(
+                                f"Video {video_index}/{total_videos}: {vid}"
+                            ),
+                            status_label.set_text(
+                                "Đã đủ audio track — không cần tải lại"
+                            ),
+                            refresh_right_panel(),
+                        ),
+                    )
+                    return
+
+                file_path = Path((id_to_path.get(vid) or "").strip())
+                best_effort_ui(
+                    "render current audio video",
+                    lambda: (
+                        current_video_label.set_text(
+                            f"Video {video_index}/{total_videos}: {vid}"
+                        ),
+                        remaining_label.set_text(
+                            f"Còn lại: {total_videos - video_index} video"
+                        ),
+                        status_label.set_text("Đang lấy thông tin video..."),
+                    ),
+                )
+                video_info = await asyncio.to_thread(
+                    update_audio_module._get_video_info,
+                    video_id=vid,
+                    channel_id=selected_channel["id"],
+                )
+                video_duration_seconds = (
+                    video_info.duration_ms / 1000.0
+                    if video_info.duration_ms > 0
+                    else None
+                )
+                best_effort_ui(
+                    "render audio processing state",
+                    lambda: status_label.set_text("Đang xử lý âm thanh..."),
+                )
+                with tempfile.NamedTemporaryFile(
+                    suffix=file_path.suffix, delete=False
+                ) as temp_file:
+                    temp_audio_path = Path(temp_file.name)
+                await asyncio.to_thread(
+                    multiply_audio,
+                    input_file=normalize_path(str(file_path)),
+                    output_file=str(temp_audio_path),
+                    times=repeat_settings["times"],
+                    extra_minutes=repeat_settings["extra_minutes"],
+                    video_duration_seconds=video_duration_seconds,
+                )
+                file_bytes = await asyncio.to_thread(temp_audio_path.read_bytes)
+                best_effort_ui(
+                    "render sequential upload state",
+                    lambda: concurrent_label.set_text(
+                        "Đang xử lý tuần tự để YouTube nhận đủ từng ngôn ngữ"
+                    ),
+                )
+                for language_index, lang in enumerate(missing_languages, 1):
+                    best_effort_ui(
+                        "render language upload state",
+                        lambda language_index=language_index, lang=lang: status_label.set_text(
+                            f"Đang tải mã còn thiếu {language_index}/{len(missing_languages)}: {lang}"
+                        ),
+                    )
+                    await run_upload(
+                        vid=vid,
+                        lang=lang,
+                        temp_audio_path=temp_audio_path,
+                        file_bytes=file_bytes,
+                    )
+                    completed_tasks += 1
+                    save_right_panel_state()
+                    best_effort_ui(
+                        "render completed language",
+                        lambda language_index=language_index: (
+                            setattr(
+                                progress_bar,
+                                "value",
+                                completed_tasks / total_tasks,
+                            ),
+                            refresh_right_panel(),
+                            status_label.set_text(
+                                f"Hoàn thành {language_index}/{len(missing_languages)} mã còn thiếu cho video {vid}"
+                            ),
+                        ),
+                    )
+                best_effort_ui(
+                    "clear sequential upload state",
+                    lambda: concurrent_label.set_text(""),
+                )
+            finally:
+                _cleanup_temp_audio_file(temp_audio_path)
+
+        def handle_video_error(item: tuple[int, str], vid_exc: Exception) -> None:
+            nonlocal completed_tasks
+            _, vid = item
+            logger.error("Error processing video {}: {}", vid, vid_exc)
+            overall_errors.append(f"{vid}: {vid_exc}")
+            video_processing_errors.setdefault(vid, {})["xử lý"] = str(vid_exc)
+            completed_tasks = min(
+                total_tasks,
+                completed_tasks + len(languages_to_process),
+            )
+            save_right_panel_state()
+            best_effort_ui(
+                "render failed audio video",
+                lambda: (
+                    setattr(progress_bar, "value", completed_tasks / total_tasks),
+                    refresh_right_panel(),
+                ),
+            )
 
         try:
-            for video_index, vid in enumerate(list(video_ids_state["ids"]), 1):
-                try:
-                    existing_status = video_processing_status.setdefault(vid, {})
-                    missing_languages = [
-                        lang
-                        for lang in languages_to_process
-                        if existing_status.get(lang) not in ("successful", "already_added")
-                    ]
-                    skipped_count = len(languages_to_process) - len(missing_languages)
-                    if skipped_count:
-                        completed_tasks += skipped_count
-                        progress_bar.value = completed_tasks / total_tasks
-                    if not missing_languages:
-                        current_video_label.set_text(f"Video {video_index}/{total_videos}: {vid}")
-                        status_label.set_text("Đã đủ audio track — không cần tải lại")
-                        refresh_right_panel()
-                        continue
-                    file_path = Path((id_to_path.get(vid) or "").strip())
-                    current_video_label.set_text(f"Video {video_index}/{total_videos}: {vid}")
-                    remaining_label.set_text(f"Còn lại: {total_videos - video_index} video")
-                    status_label.set_text("Đang lấy thông tin video...")
-                    video_info = await asyncio.to_thread(
-                        update_audio_module._get_video_info,
-                        video_id=vid,
-                        channel_id=selected_channel["id"],
-                    )
-                    video_duration_seconds = video_info.duration_ms / 1000.0 if video_info.duration_ms > 0 else None
-                    status_label.set_text("Đang xử lý âm thanh...")
-                    with tempfile.NamedTemporaryFile(suffix=file_path.suffix, delete=False) as temp_file:
-                        temp_audio_path = Path(temp_file.name)
-                    await asyncio.to_thread(
-                        multiply_audio,
-                        input_file=normalize_path(str(file_path)),
-                        output_file=str(temp_audio_path),
-                        times=repeat_settings["times"],
-                        extra_minutes=repeat_settings["extra_minutes"],
-                        video_duration_seconds=video_duration_seconds,
-                    )
-                    file_bytes = await asyncio.to_thread(temp_audio_path.read_bytes)
-                    concurrent_label.set_text("Đang xử lý tuần tự để YouTube nhận đủ từng ngôn ngữ")
-                    for language_index, lang in enumerate(missing_languages, 1):
-                        status_label.set_text(
-                            f"Đang tải mã còn thiếu {language_index}/{len(missing_languages)}: {lang}"
-                        )
-                        await run_upload(
-                            vid=vid,
-                            lang=lang,
-                            temp_audio_path=temp_audio_path,
-                            file_bytes=file_bytes,
-                        )
-                        completed_tasks += 1
-                        progress_bar.value = completed_tasks / total_tasks
-                        refresh_right_panel()
-                        status_label.set_text(
-                            f"Hoàn thành {language_index}/{len(missing_languages)} mã còn thiếu cho video {vid}"
-                        )
-                    concurrent_label.set_text("")
-                    try:
-                        if "temp_audio_path" in locals() and temp_audio_path.exists():
-                            temp_audio_path.unlink()
-                    except Exception as exc:
-                        logger.warning(f"Failed to clean up temporary file {temp_audio_path}: {exc}")
-                except Exception as vid_exc:
-                    logger.error(f"Error processing video {vid}: {vid_exc}")
-                    overall_errors.append(f"{vid}: {vid_exc}")
-                    video_processing_errors.setdefault(vid, {})["xử lý"] = str(vid_exc)
-                    completed_tasks = min(
-                        total_tasks,
-                        completed_tasks + len(languages_to_process),
-                    )
-                    progress_bar.value = completed_tasks / total_tasks
-                    refresh_right_panel()
+            await _run_sequentially_isolated(
+                enumerate(list(video_ids_state["ids"]), 1),
+                process_video,
+                handle_video_error,
+            )
         except Exception as main_exc:
-            logger.error(f"Main processing error: {main_exc}")
+            logger.error("Main processing error: {}", main_exc)
             overall_errors.append(f"Main process: {main_exc}")
-
-        progress_dialog.close()
-        save_right_panel_state()
-        refresh_right_panel()
+        finally:
+            save_right_panel_state()
+            best_effort_ui("close progress dialog", progress_dialog.close)
+            best_effort_ui("render final audio state", refresh_right_panel)
         total_videos = len(video_ids_state["ids"])
         successful_videos = 0
         for vid in video_ids_state["ids"]:
@@ -486,9 +626,21 @@ def create_add_audio_page():
                 successful_videos += 1
         success_percentage = successful_videos / total_videos * 100 if total_videos > 0 else 0
         if overall_errors:
-            ui.notify(f"Cập nhật thất bại: {overall_errors[0]}. Xem chi tiết trong khung màu đỏ bên dưới.", type="negative")
+            best_effort_ui(
+                "notify audio errors",
+                lambda: ui.notify(
+                    f"Cập nhật thất bại: {overall_errors[0]}. Xem chi tiết trong khung màu đỏ bên dưới.",
+                    type="negative",
+                ),
+            )
         else:
-            ui.notify(f"Quá trình hoàn tất! {successful_videos}/{total_videos} video thành công. Kiểm tra trạng thái từng video bên dưới.", type="positive" if success_percentage >= 50 else "warning")
+            best_effort_ui(
+                "notify audio completion",
+                lambda: ui.notify(
+                    f"Quá trình hoàn tất! {successful_videos}/{total_videos} video thành công. Kiểm tra trạng thái từng video bên dưới.",
+                    type="positive" if success_percentage >= 50 else "warning",
+                ),
+            )
 
     page = ui.column().classes("app-page audio-add-page")
     with page:

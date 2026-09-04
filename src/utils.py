@@ -1,5 +1,6 @@
 # RECOVERED: reconstructed from CPython 3.12 bytecode
-import json, math, os, re, subprocess, sys, tempfile, threading, time, unicodedata
+import errno, json, math, os, re, stat, subprocess, sys, tempfile, threading, time, unicodedata
+from enum import Enum
 from pathlib import Path
 from loguru import logger
 from selenium import webdriver
@@ -11,39 +12,333 @@ from src.task_runtime import (
     current_run_context,
     register_driver,
     run_owned_process,
+    wait_interruptibly,
 )
 
 
-def get_video_duration(input_file):
-    """Get duration of video file in seconds using ffprobe"""
-    try:
-        cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "json", input_file]
-        completed = run_owned_process(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+FFPROBE_MAX_ATTEMPTS = 3
+FFPROBE_RETRY_DELAY_SECONDS = 0.25
+FFPROBE_DIAGNOSTIC_LIMIT = 500
+
+
+class FFprobeErrorCategory(str, Enum):
+    FILE_NOT_FOUND = "FILE_NOT_FOUND"
+    FILE_NOT_READY = "FILE_NOT_READY"
+    TRANSIENT = "TRANSIENT"
+    INVALID_MEDIA = "INVALID_MEDIA"
+    PERMISSION_ERROR = "PERMISSION_ERROR"
+    IO_ERROR = "IO_ERROR"
+    FFPROBE_NOT_FOUND = "FFPROBE_NOT_FOUND"
+    UNKNOWN_FFPROBE_ERROR = "UNKNOWN_FFPROBE_ERROR"
+
+
+class FFprobeError(RuntimeError):
+    """A duration-read failure with stable, sanitized diagnostics."""
+
+    def __init__(
+        self,
+        category: FFprobeErrorCategory,
+        path: str | Path,
+        *,
+        reason: str,
+        exists: bool,
+        size: int | None,
+        exit_code: int | None = None,
+        stderr: str = "",
+        attempt: int = 1,
+    ) -> None:
+        self.category = category
+        self.path = str(path)
+        self.reason = reason
+        self.exists = exists
+        self.size = size
+        self.exit_code = exit_code
+        self.stderr = stderr
+        self.attempt = attempt
+        detail = stderr or reason
+        super().__init__(
+            "Cannot read media metadata: "
+            f"category={category.value} path={self.path!r} exists={exists} "
+            f"size={size} ffprobe_exit={exit_code} attempt={attempt} "
+            f"reason={detail!r}"
         )
-        result = completed.stdout.decode("utf-8")
-        data = json.loads(result)
-        duration = float(data["format"]["duration"])
-        if duration <= 0:
-            logger.warning(f"Invalid duration for {input_file}: {duration}")
-            return None
+
+
+_FFPROBE_TRANSIENT_MARKERS = (
+    "resource temporarily unavailable",
+    "temporarily unavailable",
+    "sharing violation",
+    "being used by another process",
+    "device or resource busy",
+    "text file busy",
+)
+_FFPROBE_INVALID_MEDIA_MARKERS = (
+    "invalid data found when processing input",
+    "moov atom not found",
+    "invalid container",
+    "could not find codec parameters",
+)
+_FFPROBE_NOT_FOUND_MARKERS = (
+    "no such file or directory",
+    "file not found",
+)
+_FFPROBE_PERMISSION_MARKERS = ("permission denied", "access is denied")
+_FFPROBE_IO_MARKERS = ("input/output error", "i/o error")
+_FFPROBE_SECRET_RE = re.compile(
+    r"(?i)\b(authorization|cookie|sapisidhash|sessiontoken|token)\b"
+    r"\s*[:=]\s*(?:\"[^\"]*\"|'[^']*'|\S+)"
+)
+
+
+def _sanitize_ffprobe_text(value, *, limit: int = FFPROBE_DIAGNOSTIC_LIMIT) -> str:
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", errors="replace")
+    compact = " ".join(str(value or "").split())
+    compact = _FFPROBE_SECRET_RE.sub(lambda match: f"{match.group(1)}=<redacted>", compact)
+    if len(compact) > limit:
+        return compact[:limit] + "..."
+    return compact
+
+
+def _classify_ffprobe_stderr(stderr: str) -> FFprobeErrorCategory:
+    lowered = stderr.lower()
+    if any(marker in lowered for marker in _FFPROBE_NOT_FOUND_MARKERS):
+        return FFprobeErrorCategory.FILE_NOT_FOUND
+    if any(marker in lowered for marker in _FFPROBE_PERMISSION_MARKERS):
+        return FFprobeErrorCategory.PERMISSION_ERROR
+    if any(marker in lowered for marker in _FFPROBE_TRANSIENT_MARKERS):
+        return FFprobeErrorCategory.TRANSIENT
+    if any(marker in lowered for marker in _FFPROBE_INVALID_MEDIA_MARKERS):
+        return FFprobeErrorCategory.INVALID_MEDIA
+    if any(marker in lowered for marker in _FFPROBE_IO_MARKERS):
+        return FFprobeErrorCategory.IO_ERROR
+    return FFprobeErrorCategory.UNKNOWN_FFPROBE_ERROR
+
+
+def _classify_filesystem_error(exc: OSError) -> FFprobeErrorCategory:
+    if isinstance(exc, PermissionError):
+        return FFprobeErrorCategory.PERMISSION_ERROR
+    if exc.errno in {errno.EAGAIN, errno.EBUSY, errno.ETXTBSY}:
+        return FFprobeErrorCategory.TRANSIENT
+    return FFprobeErrorCategory.IO_ERROR
+
+
+def _logged_ffprobe_error(error: FFprobeError) -> FFprobeError:
+    logger.error("{}", error)
+    return error
+
+
+def _raise_or_retry_ffprobe(
+    error: FFprobeError,
+    *,
+    attempt: int,
+    max_attempts: int,
+    retry_delay: float,
+    sleep,
+) -> None:
+    retryable = error.category in {
+        FFprobeErrorCategory.FILE_NOT_READY,
+        FFprobeErrorCategory.TRANSIENT,
+    }
+    if retryable and attempt < max_attempts:
+        logger.warning(
+            "FFprobe temporary failure: category={} path={} exists={} size={} "
+            "ffprobe_exit={} attempt={}/{} reason={}",
+            error.category.value,
+            error.path,
+            error.exists,
+            error.size,
+            error.exit_code,
+            attempt,
+            max_attempts,
+            error.stderr or error.reason,
+        )
+        sleep(max(0.0, retry_delay))
+        return
+    logger.error("{}", error)
+    raise error
+
+
+def get_video_duration(
+    input_file,
+    *,
+    max_attempts: int = FFPROBE_MAX_ATTEMPTS,
+    retry_delay: float = FFPROBE_RETRY_DELAY_SECONDS,
+    sleep=wait_interruptibly,
+) -> float:
+    """Return a positive duration or raise :class:`FFprobeError`.
+
+    Only zero-length/not-ready files and explicitly temporary ffprobe errors
+    are retried. Permanent or unknown failures fail immediately.
+    """
+    path = Path(input_file)
+    attempts = max(1, int(max_attempts))
+
+    for attempt in range(1, attempts + 1):
+        try:
+            file_stat = path.stat()
+        except FileNotFoundError as exc:
+            raise _logged_ffprobe_error(FFprobeError(
+                FFprobeErrorCategory.FILE_NOT_FOUND,
+                path,
+                reason="path does not exist",
+                exists=False,
+                size=None,
+                attempt=attempt,
+            )) from exc
+        except OSError as exc:
+            error = FFprobeError(
+                _classify_filesystem_error(exc),
+                path,
+                reason=_sanitize_ffprobe_text(exc),
+                exists=True,
+                size=None,
+                attempt=attempt,
+            )
+            _raise_or_retry_ffprobe(
+                error,
+                attempt=attempt,
+                max_attempts=attempts,
+                retry_delay=retry_delay,
+                sleep=sleep,
+            )
+            continue
+
+        if not stat.S_ISREG(file_stat.st_mode):
+            raise _logged_ffprobe_error(FFprobeError(
+                FFprobeErrorCategory.FILE_NOT_FOUND,
+                path,
+                reason="path is not a regular file",
+                exists=True,
+                size=None,
+                attempt=attempt,
+            ))
+
+        size = file_stat.st_size
+        if size <= 0:
+            error = FFprobeError(
+                FFprobeErrorCategory.FILE_NOT_READY,
+                path,
+                reason="file size is zero",
+                exists=True,
+                size=size,
+                attempt=attempt,
+            )
+            _raise_or_retry_ffprobe(
+                error,
+                attempt=attempt,
+                max_attempts=attempts,
+                retry_delay=retry_delay,
+                sleep=sleep,
+            )
+            continue
+
+        cmd = [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "json",
+            str(path),
+        ]
+        try:
+            completed = run_owned_process(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+        except TaskStopped:
+            raise
+        except FileNotFoundError as exc:
+            raise _logged_ffprobe_error(FFprobeError(
+                FFprobeErrorCategory.FFPROBE_NOT_FOUND,
+                path,
+                reason="ffprobe executable was not found",
+                exists=True,
+                size=size,
+                attempt=attempt,
+            )) from exc
+        except subprocess.CalledProcessError as exc:
+            stderr = _sanitize_ffprobe_text(exc.stderr)
+            error = FFprobeError(
+                _classify_ffprobe_stderr(stderr),
+                path,
+                reason="ffprobe exited with an error",
+                exists=True,
+                size=size,
+                exit_code=exc.returncode,
+                stderr=stderr,
+                attempt=attempt,
+            )
+            _raise_or_retry_ffprobe(
+                error,
+                attempt=attempt,
+                max_attempts=attempts,
+                retry_delay=retry_delay,
+                sleep=sleep,
+            )
+            continue
+        except PermissionError as exc:
+            raise _logged_ffprobe_error(FFprobeError(
+                FFprobeErrorCategory.PERMISSION_ERROR,
+                path,
+                reason=_sanitize_ffprobe_text(exc),
+                exists=True,
+                size=size,
+                attempt=attempt,
+            )) from exc
+        except OSError as exc:
+            raise _logged_ffprobe_error(FFprobeError(
+                FFprobeErrorCategory.IO_ERROR,
+                path,
+                reason=_sanitize_ffprobe_text(exc),
+                exists=True,
+                size=size,
+                attempt=attempt,
+            )) from exc
+
+        try:
+            result = completed.stdout
+            if isinstance(result, bytes):
+                result = result.decode("utf-8", errors="replace")
+            data = json.loads(result)
+        except json.JSONDecodeError as exc:
+            raise _logged_ffprobe_error(FFprobeError(
+                FFprobeErrorCategory.UNKNOWN_FFPROBE_ERROR,
+                path,
+                reason=f"ffprobe returned invalid JSON: {_sanitize_ffprobe_text(exc)}",
+                exists=True,
+                size=size,
+                exit_code=completed.returncode,
+                attempt=attempt,
+            )) from exc
+        try:
+            duration = float(data["format"]["duration"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise _logged_ffprobe_error(FFprobeError(
+                FFprobeErrorCategory.INVALID_MEDIA,
+                path,
+                reason=f"ffprobe did not return a valid duration: {_sanitize_ffprobe_text(exc)}",
+                exists=True,
+                size=size,
+                exit_code=completed.returncode,
+                attempt=attempt,
+            )) from exc
+        if not math.isfinite(duration) or duration <= 0:
+            raise _logged_ffprobe_error(FFprobeError(
+                FFprobeErrorCategory.INVALID_MEDIA,
+                path,
+                reason=f"ffprobe returned non-positive duration {duration!r}",
+                exists=True,
+                size=size,
+                exit_code=completed.returncode,
+                attempt=attempt,
+            ))
         return duration
-    except TaskStopped:
-        raise
-    except FileNotFoundError:
-        logger.error("FFprobe not found. Please install FFmpeg to use video processing features.")
-        return None
-    except subprocess.CalledProcessError as e:
-        logger.error(f"FFprobe failed for {input_file}: {e}")
-        return None
-    except (json.JSONDecodeError, KeyError, ValueError) as e:
-        logger.error(f"Failed to parse FFprobe output for {input_file}: {e}")
-        return None
-    except Exception as e:
-        logger.error(f"Unexpected error getting duration for {input_file}: {e}")
-        return None
+
+    raise AssertionError("unreachable ffprobe retry state")
 
 
 def calculate_total_seconds(iso_duration):
@@ -196,8 +491,8 @@ def mux_audio_into_video(video_file: str, audio_file: str, video_out: str, durat
 
     Audio thay thế hoàn toàn tiếng gốc.
     """
-    dur = duration or get_video_duration(audio_file)
-    if not dur or dur <= 0:
+    dur = duration if duration is not None else get_video_duration(audio_file)
+    if dur <= 0:
         raise RuntimeError(f"Could not determine target duration for {video_file}")
     use_overlay = bool(overlay_png and Path(normalize_path(overlay_png)).is_file())
     with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tf:

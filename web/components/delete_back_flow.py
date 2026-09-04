@@ -23,6 +23,7 @@ from src.task_runtime import (
 from src.utils import (
     AUDIO_EXTENSIONS,
     VIDEO_EXTENSIONS,
+    FFprobeError,
     build_intermittent_audio,
     get_channels_info,
     get_video_duration,
@@ -296,6 +297,7 @@ def create_delete_back_flow_page():
                         "path": str(p),
                         "size": size,
                         "duration": None,
+                        "duration_error": "",
                         "steps": saved.get("steps") or _new_steps(),
                     }
                     for field in PERSIST_FIELDS:
@@ -316,8 +318,18 @@ def create_delete_back_flow_page():
     async def load_durations():
         for item in videos_state["items"]:
             if item["duration"] is None:
-                dur = await asyncio.to_thread(get_video_duration, item["path"])
-                item["duration"] = dur or 0
+                try:
+                    item["duration"] = await asyncio.to_thread(
+                        get_video_duration, item["path"]
+                    )
+                    item["duration_error"] = ""
+                except FFprobeError as exc:
+                    item["duration_error"] = str(exc)
+                except Exception as exc:
+                    item["duration_error"] = f"Unexpected metadata error: {exc}"
+                    logger.exception(
+                        "Unexpected duration error for {}: {}", item["path"], exc
+                    )
                 refresh_video_list()
 
     def step_badge(status: str):
@@ -367,12 +379,15 @@ def create_delete_back_flow_page():
                             "truncate text-sm font-medium text-gray-800"
                         ).tooltip(item["name"])
                         size_str = _human_size(item["size"])
-                        dur_str = (
-                            "đang đọc..."
-                            if item["duration"] is None
-                            else _fmt_duration(item["duration"])
-                        )
-                        ui.label(f"{size_str} · {dur_str}").classes("text-xs text-gray-400")
+                        if item.get("duration_error"):
+                            dur_str = "không đọc được duration"
+                        elif item["duration"] is None:
+                            dur_str = "đang đọc..."
+                        else:
+                            dur_str = _fmt_duration(item["duration"])
+                        meta_label = ui.label(f"{size_str} · {dur_str}").classes("text-xs text-gray-400")
+                        if item.get("duration_error"):
+                            meta_label.tooltip(item["duration_error"])
 
                     vid = item.get("video_id")
                     with ui.column().classes("w-2/12 min-w-0"):
@@ -426,6 +441,12 @@ def create_delete_back_flow_page():
             safe_element_call(ui_refs["clear_btn"], "set_enabled", True)
 
     async def step_merge(item, output_folder, musics, index, run_config):
+        if item.get("duration") is None:
+            item["duration"] = await asyncio.to_thread(
+                get_video_duration, item["path"]
+            )
+            item["duration_error"] = ""
+
         if run_config["random_music"]:
             music = random.choice(musics)
         else:
@@ -455,6 +476,7 @@ def create_delete_back_flow_page():
             video_file=item["path"],
             audio_file=audio_out,
             video_out=video_out,
+            duration=dur,
             overlay_png=overlay_png,
         )
         if run_context is not None:

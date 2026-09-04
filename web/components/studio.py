@@ -5,7 +5,11 @@ from datetime import datetime
 from loguru import logger
 from nicegui import context, ui
 
-from src.channel_scanner import AUTHENTICATION_TIMEOUT_SECONDS, ChannelFetcher
+from src.channel_scanner import (
+    AUTHENTICATION_TIMEOUT_SECONDS,
+    ChannelFetcher,
+    ChannelScanError,
+)
 from src.channel_store import channel_store
 from src.license_manager import get_license_info
 from src.state_manager import state_manager
@@ -37,6 +41,16 @@ def create_studio_content():
 
     def client_is_alive() -> bool:
         return page_client is not None and not getattr(page_client, "_deleted", False)
+
+    def best_effort_ui(action: str, callback) -> bool:
+        if not client_is_alive():
+            return False
+        try:
+            callback()
+            return True
+        except Exception as exc:
+            logger.warning("Studio UI action '{}' was skipped: {}", action, exc)
+            return False
 
     def save_credentials():
         """Save login credentials to file (remember me functionality)."""
@@ -81,28 +95,59 @@ def create_studio_content():
         try:
             logger.info("Fetching channel data...")
             with bind_run_context(run_context):
-                await asyncio.to_thread(
+                report = await asyncio.to_thread(
                     channel_fetcher.run,
                     email=email,
                     password=password,
                     on_authenticated=lambda: scan_state.update(authenticated=True),
                 )
+            if report.failures:
+                best_effort_ui(
+                    "notify partial channel scan",
+                    lambda: ui.notify(
+                        f"Đã lưu {len(report.channels)} kênh; "
+                        f"bỏ qua {len(report.failures)} kênh lỗi.",
+                        type="warning",
+                    ),
+                )
+            else:
+                best_effort_ui(
+                    "notify channel scan success",
+                    lambda: ui.notify(
+                        f"Đã đồng bộ {len(report.channels)} kênh.",
+                        type="positive",
+                    ),
+                )
         except TaskStopped:
             logger.info("Channel scan stopped")
-            if client_is_alive():
-                ui.notify("Đã dừng quét kênh.", type="info")
+            best_effort_ui(
+                "notify channel scan stopped",
+                lambda: ui.notify("Đã dừng quét kênh.", type="info"),
+            )
+        except ChannelScanError as exc:
+            logger.error("Channel scan failed: {}", exc)
+            best_effort_ui(
+                "notify classified channel scan error",
+                lambda: ui.notify(
+                    f"Không thể lấy dữ liệu kênh: {exc}", type="negative"
+                ),
+            )
         except Exception as exc:
             logger.exception(f"Error fetching channels: {exc}")
-            if client_is_alive():
-                ui.notify(f"Không thể lấy dữ liệu kênh: {exc}", type="negative")
+            best_effort_ui(
+                "notify unexpected channel scan error",
+                lambda: ui.notify(
+                    "Không thể lấy dữ liệu kênh do lỗi không xác định.",
+                    type="negative",
+                ),
+            )
         finally:
             run_context.cleanup()
             if scan_state["run_context"] is run_context:
                 scan_state["run_context"] = None
                 scan_state["deadline"] = None
-            if client_is_alive():
-                processing_popup.close()
-                refresh_channel_list()
+            best_effort_ui("close channel scan popup", processing_popup.close)
+            best_effort_ui("refresh channel list", refresh_channel_list)
 
     def on_login():
         if scan_state["run_context"] is not None:
@@ -134,8 +179,14 @@ def create_studio_content():
         if run_context is None or scan_state["cancel_requested"]:
             return
         scan_state["cancel_requested"] = True
-        cancel_scan_button.set_enabled(False)
-        processing_status.set_text("Đang hủy và đóng cửa sổ Chrome...")
+        best_effort_ui(
+            "disable channel scan cancel button",
+            lambda: cancel_scan_button.set_enabled(False),
+        )
+        best_effort_ui(
+            "show channel scan cancellation",
+            lambda: processing_status.set_text("Đang hủy và đóng cửa sổ Chrome..."),
+        )
         await asyncio.to_thread(run_context.request_stop)
 
     async def stop_scan_when_client_disconnects():
@@ -152,17 +203,27 @@ def create_studio_content():
 
     def update_auth_countdown():
         deadline = scan_state["deadline"]
-        if deadline is None:
+        if deadline is None or not client_is_alive():
             return
         if scan_state["authenticated"]:
             scan_state["deadline"] = None
-            processing_status.set_text("Xác thực hoàn tất, đang đồng bộ các kênh...")
-            auth_countdown.set_text("Đã xác thực")
+            best_effort_ui(
+                "show channel scan authenticated state",
+                lambda: (
+                    processing_status.set_text(
+                        "Xác thực hoàn tất, đang đồng bộ các kênh..."
+                    ),
+                    auth_countdown.set_text("Đã xác thực"),
+                ),
+            )
             return
         remaining = max(0, int(deadline - time.monotonic() + 0.999))
         minutes, seconds = divmod(remaining, 60)
-        auth_countdown.set_text(
-            f"Thời gian xác thực còn lại: {minutes:02d}:{seconds:02d}"
+        best_effort_ui(
+            "update channel scan authentication countdown",
+            lambda: auth_countdown.set_text(
+                f"Thời gian xác thực còn lại: {minutes:02d}:{seconds:02d}"
+            ),
         )
 
     def delete_channel_from_db(channel_id: str):

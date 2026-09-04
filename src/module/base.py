@@ -6,6 +6,60 @@ from loguru import logger
 from src.module.model import ChannelInfo, Video, VideoType
 from src.utils import get_channels_info
 from src.task_runtime import post_with_stop
+
+
+class YouTubeRequestError(RuntimeError):
+    """A sanitized YouTube HTTP/response error which preserves its status code."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        response_excerpt: str = "",
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.response_excerpt = response_excerpt
+
+
+def _safe_response_excerpt(response: requests.Response) -> str:
+    try:
+        payload = response.json()
+        message = payload.get("error", {}).get("message", "") if isinstance(payload, dict) else ""
+    except (ValueError, AttributeError):
+        message = ""
+    # Never copy an arbitrary response body into exceptions: those exceptions are
+    # logged by the polling layer and the body is not guaranteed to be secret-free.
+    return str(message or "").strip()[:500]
+
+
+def _response_json_or_error(response: requests.Response, action: str) -> dict:
+    excerpt = _safe_response_excerpt(response)
+    if response.status_code != 200:
+        suffix = f": {excerpt}" if excerpt else ""
+        raise YouTubeRequestError(
+            f"YouTube {action} failed (HTTP {response.status_code}){suffix}",
+            status_code=response.status_code,
+            response_excerpt=excerpt,
+        )
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise YouTubeRequestError(
+            f"YouTube {action} returned invalid JSON",
+            status_code=response.status_code,
+            response_excerpt=excerpt,
+        ) from exc
+    if not isinstance(payload, dict):
+        raise YouTubeRequestError(
+            f"YouTube {action} returned an unexpected response",
+            status_code=response.status_code,
+            response_excerpt=excerpt,
+        )
+    return payload
+
+
 class IModule(ABC):
     EATS = "AXAuXyagZ24uKnNz0kYZbLTt32KGDRxhKqK2ns7At7Rkxw4UXW19g-oH1ng4py8No7EiqwNid9eQAFhJ7_8XJFiitSaWQdlXlG7nmJStO8tVWrrAAQ=="; CLIENT_SCREEN_NONCE = "8Z1g2AhnbTXfVuBp"; CHALLENGE = "a=6&a2=3&b=UAAoAmaAwwDIrKcvn9_rgzH-Jr4&c=1746756602&d=62&e3=UCAICychz3FdwEAyD6Rv-IRQ&c1a=1&hh=PSyUV3k8pO-Z9_6qmFQtKyKipjuIekgJtEtZvvmqpn0"; BOT_GUARD_RESPONSE = "$euU55b1RAAbvRbg0z0XewMv_S0uMtXGnADQBEArZ1HMQG4pgLXVbdPcdDixwJ1GZIjKtUDtG9tZmNJbg9W0ElVuifwYo-lT9CfcGMbryngAAACzOAAAA8fQBB-IASY3N5JAhIeAY5HKAdoI0yEECI_IJZ-vRui2z4nzlEoLB50R2iz607ou69KS463F-Ncivzmqmrurv2jJXSyl-d0TbLu7WaW-WEbsFBG4ZglwEBE_ccLro1tMinuYe2g0-E842CWJroVmf6sc716sKgXbH8XKn5WXsRjXqeuVHSZ8g-ds5FQLBMCLVRU7zVhpijepG729n8mztRnv3IuDL4sWycDhphf0IyIxPhQ_vVeuwX9En5nue0pZjeNetiMIFmI1acJDq474vIS9dU6XDknDze6gN0QbjXWrsYMYyO1zj5sMiLShfljFfCp7dp2f0LHOmAPGJdklHWgMXIYOmZW2wDi5FmcZBK12hx4YUrtMxXtXv1l6BJftZCzR0apgb5kDcR56jtHzxQCGp4kaNPV5SLO4oUV7vlkUCL2yc_a9seNhRnDeIM3ToQYRv7M1nQpPDfeiFaP4-X3WtlvdNFit_0UQV8BYImVdnnTdulniHz2roAg3PoMhtLT0QFUE5UfE6gupz1A35kHrb9UAqMtAgC0JSEI9Hn2m64wviQH5YyOoYlxNIGYz7vFGDqXX_yquJ57zosGcmgGwPulJjh_cUOBXjnwGRFAgTdvHkaIcwQNmWdJUWT4yxhy7-9AsLAravJUjygijZfajXrVEd9Dhv2GvyKSDGO_8WCunYImbXNy6bjfdO31HD9B0Bb9Yaqsyq3TFlUy1giqhdDJKRVZ2fQpjIKApaXITB-uLJQfleS6VVCKeMfwrtty056wlNQVuWuaQ8-XqDgOJclKHt8wOEMSEBEpwVc5ocBjEZ-wBLiorr7G1q66Ulp-HF4_Iwh7xUULUhH1M5FupXG93XQY9AR1M-MWeqQ07AIJ7FKGthd0wLuTavQ-1xQrymxWULSIuyaC7hpQxf1cIVh7EE2YrOhKVBowEe1LnFCUgCGXPBOd9TrQnkGLyKcYAOwzWdII7Zl5RPfHmPLUyk-niJ1Ygey4Dhmxzv9g8udrOvGr9mZDtIjKr-1z1cl-W2lDXWuRjfiRYNgOhPQOCXq21ULvlEOtR-9C2EVIABVXd14rGtJzsuXUwnr6CD29Odm64nbRPCa3leXuz1pOR1QOi0984sblJ0B_lRIGiXVd4RoUewatihEyzSGg2MFV1k2CdYrxK_yfv0hCHWc-JmixNmWFjXp7PrQvD3NMWZlb5Wb9J1mgl6nnxT7gPGo07xvYpiRBRwA6HU7QFcnP7yYsekWGXte5Sk3QJsu2m1lWpp-R9jiqpfw6Qf8zjwDVgbjXaq7pkrCyJIZeiBgDEWow2IbKa0GlRPuvmxLj3QToOjqCCqCXAtRiYGJzeyH0dd6HdIaJckCHYE1KiWp1SifXILE9TwQs2izR55MteVSZ_D9k3n0GBNnJXhUv5LREKWCFo5i0IgFMIFUEYA9uAaA_KPIxbfNYwy5VL6GvHFctg8RdHvZb6-ZYpieMTnkT2srMF20Yh148zsAIoZ3Z6J6upgwljNeHqOUXYVtIORaPUt7Sq54x67YZ7eVKU1-eA-qpqqAJ9jfTXjalxYRe2RbScWuluGr7lfL4vT5CL_ySttj-4doOtBJgVW4YRkhKjicZpBZg_uZizhgzB3Q7Q"
     pass
@@ -69,8 +123,26 @@ class IModule(ABC):
     "titleFormattedString": {"all": True}, "viewCountIsHidden": True, "autoChapterSettings": {"all": True}, "autoPlacesMentionedSettings": {"all": True}, "videoArtworkEditorState": {"all": True}, "learningConceptSettings": {"all": True}, "videoEditorProject": {"all": True}, "originalFilename": True, "timeCreatedSeconds": True,
 
     "videoResolutions": {"all": True}, "watchUrl": True, "publicShorts": {"all": True}, "publicMetrics": {"all": True}, "academicLearning": {"all": True}, "manualPlacesMentionedPlaces": {"all": True}, "autoProductsSettings": {"all": True},
-    "videoAutoSummarySettings": {"all": True}, "issues": {"all": True}}, "criticalRead": False}; response = post_with_stop(url=url, headers=headers, json=payload); res = response.json()
-        return Video(id=res["videos"][0].get("videoId", ""), title=res["videos"][0].get("title", ""), description=res["videos"][0].get("description", ""), channel_id=res["videos"][0].get("channelId", ""), duration_ms=res["videos"][0].get("videoDurationMs", 0), thumbnail=res["videos"][0].get("thumbnailDetails", {}).get("thumbnails", [{}])[0].get("url", ""), video_status=res["videos"][0].get("status", ""))
+    "videoAutoSummarySettings": {"all": True}, "issues": {"all": True}}, "criticalRead": False}; response = post_with_stop(url=url, headers=headers, json=payload)
+        res = _response_json_or_error(response, "video status check")
+        videos = res.get("videos")
+        if not isinstance(videos, list) or not videos or not isinstance(videos[0], dict):
+            raise YouTubeRequestError(
+                "YouTube video status response does not contain the requested video",
+                status_code=response.status_code,
+                response_excerpt=_safe_response_excerpt(response),
+            )
+        video = videos[0]
+        thumbnails = video.get("thumbnailDetails", {}).get("thumbnails") or [{}]
+        return Video(
+            id=video.get("videoId", ""),
+            title=video.get("title", ""),
+            description=video.get("description", ""),
+            channel_id=video.get("channelId", ""),
+            duration_ms=video.get("videoDurationMs", 0),
+            thumbnail=thumbnails[0].get("url", ""),
+            video_status=video.get("status", ""),
+        )
 
         cookie = None
     def _build_context(self, channel_id: str, role: str, delegated_session_id: str, *, client_version: str="1.20260311.03.00", hl: str="en", theme: str="USER_INTERFACE_THEME_DARK", screen_width: int=1920, screen_height: int=945, include_on_behalf_of_user: bool=True, extra_request_fields: dict | None=None) -> dict:
@@ -95,12 +167,58 @@ class IModule(ABC):
         Raises:
             Exception: If YouTube has changed its auth algorithm.
         """
-        channel_id = channel_info.id; role = channel_info.role; delegated_session_id = channel_info.delegated_session_id; challenge = channel_info.challenge; bot_guard_response = channel_info.botguardResponse; cookie_string = channel_info.cookie_string(); sapisidhash = channel_info.sapisidhash; user_agent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"; headers = {"origin": "https://studio.youtube.com", "user-agent": user_agent, "cookie": cookie_string, "content-type": "application/json", "authorization": f"SAPISIDHASH {sapisidhash}"}; res = post_with_stop(url="https://studio.youtube.com/youtubei/v1/att/esr?alt=json", headers=headers, json={"context": self._build_context(channel_id, role, delegated_session_id), "challenge": challenge, "botguardResponse": bot_guard_response, "xguardClientStatus": 0}).json()
+        channel_id = channel_info.id
+        role = channel_info.role
+        delegated_session_id = channel_info.delegated_session_id
+        challenge = channel_info.challenge
+        bot_guard_response = channel_info.botguardResponse
+        user_agent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+        headers = {
+            "origin": "https://studio.youtube.com",
+            "user-agent": user_agent,
+            "cookie": channel_info.cookie_string(),
+            "content-type": "application/json",
+            "authorization": f"SAPISIDHASH {channel_info.sapisidhash}",
+        }
+
+        def fetch_attestation_context() -> dict:
+            response = post_with_stop(
+                url="https://studio.youtube.com/youtubei/v1/att/esr?alt=json",
+                headers=headers,
+                json={
+                    "context": self._build_context(
+                        channel_id, role, delegated_session_id
+                    ),
+                    "challenge": challenge,
+                    "botguardResponse": bot_guard_response,
+                    "xguardClientStatus": 0,
+                },
+            )
+            return _response_json_or_error(response, "attestation request")
+
+        def fetch_reauth_context(ivctx: str) -> dict:
+            response = post_with_stop(
+                url="https://studio.youtube.com/youtubei/v1/security/get_web_reauth_url?alt=json",
+                headers=headers,
+                json={
+                    "context": self._build_context(
+                        channel_id, role, delegated_session_id
+                    ),
+                    "continueUrl": "https://studio.youtube.com/reauth",
+                    "flow": "REAUTH_FLOW_YT_STUDIO_COLD_LOAD",
+                    "ivctx": ivctx,
+                    "challenge": challenge,
+                    "botguardResponse": bot_guard_response,
+                },
+            )
+            return _response_json_or_error(response, "reauth request")
+
+        res = fetch_attestation_context()
         if "ctx" not in res:
             raise Exception("Youtube thay đổi thuật toán. Vui lòng lấy lại thông tin kênh. Nếu sau đó vẫn lỗi, hãy liên hệ admin!!!")
         ivctx = res["ctx"]
 
-        res = post_with_stop(url="https://studio.youtube.com/youtubei/v1/security/get_web_reauth_url?alt=json", headers=headers, json={"context": self._build_context(channel_id, role, delegated_session_id), "continueUrl": "https://studio.youtube.com/reauth", "flow": "REAUTH_FLOW_YT_STUDIO_COLD_LOAD", "ivctx": ivctx, "challenge": challenge, "botguardResponse": bot_guard_response}).json()
+        res = fetch_reauth_context(ivctx)
         if "encodedReauthProofToken" not in res:
             logger.warning("Missing encodedReauthProofToken for channel {}, refreshing challenge...", channel_id)
             from src.channel_refresh import refresh_challenge_and_botguard
@@ -114,15 +232,46 @@ class IModule(ABC):
             delegated_session_id = channel_info.delegated_session_id
             headers["cookie"] = cookie_string
             headers["authorization"] = f"SAPISIDHASH {sapisidhash}"
-            res = post_with_stop(url="https://studio.youtube.com/youtubei/v1/att/esr?alt=json", headers=headers, json={"context": self._build_context(channel_id, role, delegated_session_id), "challenge": challenge, "botguardResponse": bot_guard_response, "xguardClientStatus": 0}).json()
+            res = fetch_attestation_context()
             if "ctx" not in res:
                 raise Exception("Youtube thay đổi thuật toán. Vui lòng lấy lại thông tin kênh. Nếu sau đó vẫn lỗi, hãy liên hệ admin!!!")
             ivctx = res["ctx"]
-            res = post_with_stop(url="https://studio.youtube.com/youtubei/v1/security/get_web_reauth_url?alt=json", headers=headers, json={"context": self._build_context(channel_id, role, delegated_session_id), "continueUrl": "https://studio.youtube.com/reauth", "flow": "REAUTH_FLOW_YT_STUDIO_COLD_LOAD", "ivctx": ivctx, "challenge": challenge, "botguardResponse": bot_guard_response}).json()
+            res = fetch_reauth_context(ivctx)
             if "encodedReauthProofToken" not in res:
                 raise Exception("Retry failed: encodedReauthProofToken vẫn không có sau khi refresh challenge. Vui lòng lấy lại thông tin kênh hoặc liên hệ admin!")
             logger.info("Retry successful after refreshing challenge for {}", channel_id)
-        encoded_reauth_proof_token = res["encodedReauthProofToken"]; session_risk_ctx = res["sessionRiskCtx"]
+        encoded_reauth_proof_token = res["encodedReauthProofToken"]
+        session_risk_ctx = res["sessionRiskCtx"]
 
-        res = post_with_stop(url="https://studio.youtube.com/youtubei/v1/ars/grst?alt=json", headers=headers, json={"context": self._build_context(channel_id, "CREATOR_CHANNEL_ROLE_TYPE_OWNER", delegated_session_id, client_version="1.20241125.01.00", hl="vi", theme="USER_INTERFACE_THEME_LIGHT", screen_width=1847, screen_height=285, include_on_behalf_of_user=False, extra_request_fields={"reauthRequestInfo": {"encodedReauthProofToken": encoded_reauth_proof_token}}), "ctx": session_risk_ctx}).json()
-        return res["sessionToken"]
+        response = post_with_stop(
+            url="https://studio.youtube.com/youtubei/v1/ars/grst?alt=json",
+            headers=headers,
+            json={
+                "context": self._build_context(
+                    channel_id,
+                    "CREATOR_CHANNEL_ROLE_TYPE_OWNER",
+                    delegated_session_id,
+                    client_version="1.20241125.01.00",
+                    hl="vi",
+                    theme="USER_INTERFACE_THEME_LIGHT",
+                    screen_width=1847,
+                    screen_height=285,
+                    include_on_behalf_of_user=False,
+                    extra_request_fields={
+                        "reauthRequestInfo": {
+                            "encodedReauthProofToken": encoded_reauth_proof_token
+                        }
+                    },
+                ),
+                "ctx": session_risk_ctx,
+            },
+        )
+        res = _response_json_or_error(response, "session token request")
+        session_token = res.get("sessionToken")
+        if not session_token:
+            raise YouTubeRequestError(
+                "YouTube session token response is missing sessionToken",
+                status_code=response.status_code,
+                response_excerpt=_safe_response_excerpt(response),
+            )
+        return session_token
