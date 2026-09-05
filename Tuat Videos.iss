@@ -1,6 +1,6 @@
 #define MyAppName "Tuất Videos"
 #ifndef MyAppVersion
-  #define MyAppVersion "1.1.5"
+  #define MyAppVersion "2026.9.5.2"
 #endif
 #define MyAppExeName "Tuat Videos.exe"
 #define MyAppInstallName "Tuat Videos 7F47B95D"
