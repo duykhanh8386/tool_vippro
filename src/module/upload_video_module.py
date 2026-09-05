@@ -63,8 +63,9 @@ class UploadVideoModule(IModule):
     """
     # Smaller chunks give the Stop button a frequent cancellation checkpoint
     # without changing the resumable upload protocol.
-    _CHUNK_TARGET = 8_388_608
+    _CHUNK_TARGET = 4_194_304
     _MAX_CHUNK_RETRIES = 5
+    _UPLOAD_TIMEOUT = (30, 180)
 
     pass
     pass
@@ -174,7 +175,7 @@ class UploadVideoModule(IModule):
                         upload_url,
                         headers=headers,
                         data=chunk,
-                        timeout=(15, 60),
+                        timeout=self._UPLOAD_TIMEOUT,
                     )
                     if resp.status_code == 200:
                         offset += len(chunk)
@@ -199,7 +200,7 @@ class UploadVideoModule(IModule):
                         offset = srv
                         if progress is not None:
                             progress["sent"] = offset
-                    wait_interruptibly(2)
+                    wait_interruptibly(min(2**retries, 30))
 
     pass
     pass
