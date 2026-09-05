@@ -398,6 +398,21 @@ AUDIO_EXTENSIONS = {".aac", ".m4a", ".ogg", ".flac", ".opus", ".mp3", ".wav"}
 
 _QSV_PROBE_LOCK = threading.Lock()
 _QSV_AVAILABLE: bool | None = None
+DEFAULT_VIDEO_BITRATE = "4M"
+DEFAULT_VIDEO_MAXRATE = "5M"
+DEFAULT_VIDEO_BUFSIZE = "8M"
+
+
+def _video_quality_args(*, qsv: bool, video_bitrate: str | None) -> list[str]:
+    """Return balanced VBR settings while preserving an explicit override."""
+    del qsv  # Both encoders use the same bounded average bitrate.
+    if video_bitrate:
+        return ["-b:v", video_bitrate]
+    return [
+        "-b:v", DEFAULT_VIDEO_BITRATE,
+        "-maxrate", DEFAULT_VIDEO_MAXRATE,
+        "-bufsize", DEFAULT_VIDEO_BUFSIZE,
+    ]
 
 
 def has_working_h264_qsv() -> bool:
@@ -480,7 +495,7 @@ def build_intermittent_audio(music_file: str, audio_out: str, play_sec: float = 
 pass
 pass
 pass
-def mux_audio_into_video(video_file: str, audio_file: str, video_out: str, duration: float | None = None, video_bitrate: str = "1M", overlay_png: str | None = None) -> None:
+def mux_audio_into_video(video_file: str, audio_file: str, video_out: str, duration: float | None = None, video_bitrate: str | None = None, overlay_png: str | None = None) -> None:
     """
     Nén clip gốc 1 lần rồi loop cho bằng `duration` và ghép `audio_file`.
 
@@ -509,13 +524,13 @@ def mux_audio_into_video(video_file: str, audio_file: str, video_out: str, durat
             if qsv:
                 command += [
                     "-an", "-c:v", "h264_qsv", "-preset", "veryfast",
-                    "-b:v", video_bitrate, "-maxrate", "1400k", "-bufsize", "2M",
+                    *_video_quality_args(qsv=True, video_bitrate=video_bitrate),
                     "-pix_fmt", "nv12", compressed_clip,
                 ]
             else:
                 command += [
                     "-an", "-c:v", "libx264", "-preset", "veryfast",
-                    "-b:v", video_bitrate, "-maxrate", "1400k", "-bufsize", "2M",
+                    *_video_quality_args(qsv=False, video_bitrate=video_bitrate),
                     "-pix_fmt", "yuv420p", compressed_clip,
                 ]
             return command
@@ -533,11 +548,24 @@ def mux_audio_into_video(video_file: str, audio_file: str, video_out: str, durat
             "-i", audio_file, "-map", "0:v:0", "-map", "1:a:0", "-t", f"{dur:.6f}",
         ]
         try:
-            run_owned_process(base_cmd + ["-c:v", "copy", "-c:a", "copy", video_out], check=True)
+            run_owned_process(
+                base_cmd
+                + ["-c:v", "copy", "-c:a", "copy", "-movflags", "+faststart", video_out],
+                check=True,
+            )
             return
         except subprocess.CalledProcessError:
             pass
-        run_owned_process(base_cmd + ["-c:v", "libx264", "-preset", "veryfast", "-c:a", "aac", "-b:a", "192k", video_out], check=True)
+        run_owned_process(
+            base_cmd
+            + [
+                "-c:v", "libx264", "-preset", "veryfast",
+                *_video_quality_args(qsv=False, video_bitrate=video_bitrate),
+                "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
+                "-movflags", "+faststart", video_out,
+            ],
+            check=True,
+        )
     finally:
         try:
             if Path(compressed_clip).exists():

@@ -1,6 +1,6 @@
 #define MyAppName "Tuất Videos"
 #ifndef MyAppVersion
-  #define MyAppVersion "1.1.1"
+  #define MyAppVersion "1.1.5"
 #endif
 #define MyAppExeName "Tuat Videos.exe"
 #define MyAppInstallName "Tuat Videos 7F47B95D"
@@ -43,6 +43,12 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
 Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Additional shortcuts:"; Flags: unchecked
+
+[InstallDelete]
+; Remove the previous packaged runtime so stale optional Python modules cannot
+; survive an upgrade. User databases and settings live under AppData and are
+; intentionally not touched here.
+Type: filesandordirs; Name: "{app}\_internal"
 
 [Files]
 Source: "{#BuildSourceDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs

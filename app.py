@@ -11,6 +11,8 @@ from loguru import logger
 
 from src.startup_diagnostics import (
     configure_startup_diagnostics,
+    ensure_standard_streams,
+    quarantine_invalid_brotlicffi,
     report_startup_failure,
     show_startup_error,
     startup_log_path,
@@ -133,6 +135,8 @@ def main() -> None:
 
 if __name__ == "__main__":
     configure_startup_diagnostics()
+    ensure_standard_streams()
+    quarantine_invalid_brotlicffi()
     try:
         main()
     except SystemExit:
