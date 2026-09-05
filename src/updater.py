@@ -20,11 +20,13 @@ import asyncio, json, os, platform, re, ssl, subprocess, sys, tempfile
 from pathlib import Path
 from typing import Callable, Optional
 from urllib.error import HTTPError, URLError
+from urllib.parse import quote
 from urllib.request import Request, urlopen
 from loguru import logger
 
 REPO_OWNER = "duykhanh8386"
 REPO_NAME = "tool_vippro"
+UPDATE_BRANCH = "recovered-project-only"
 DEFAULT_INSTALLER_NAME = "TuatVideos_Setup.exe"
 FALLBACK_DOWNLOAD_URL: str | None = f"https://github.com/{REPO_OWNER}/{REPO_NAME}/releases/latest/download/{DEFAULT_INSTALLER_NAME}"
 _USER_AGENT = "Tuat-Videos-Updater"
@@ -102,26 +104,62 @@ def _find_platform_asset(assets: list[dict]) -> dict | None:
     return None
 
 
+def _request_github_json(url: str):
+    req = Request(url, headers={"User-Agent": _USER_AGENT, "Accept": "application/vnd.github+json"})
+    try:
+        with urlopen(req, timeout=15, context=_get_ssl_context()) as resp:
+            return json.loads(resp.read().decode())
+    except HTTPError as exc:
+        raise RuntimeError(f"GitHub API error: HTTP {exc.code}") from exc
+    except URLError as exc:
+        raise RuntimeError(f"Network error: {exc.reason}") from exc
+
+
 def _check_latest_release(
     owner: str,
     repo: str,
     current_version: str,
     fallback_url: str | None,
+    branch: str | None = UPDATE_BRANCH,
 ) -> dict | None:
     """Blocking GitHub API call — run inside a worker thread.
 
     Returns the release info dict if a newer version exists, else None.
     Raises RuntimeError on network/API problems.
     """
-    url = f"https://api.github.com/repos/{owner}/{repo}/releases/latest"
-    req = Request(url, headers={"User-Agent": _USER_AGENT, "Accept": "application/vnd.github+json"})
-    try:
-        with urlopen(req, timeout=15, context=_get_ssl_context()) as resp:
-            data = json.loads(resp.read().decode())
-    except HTTPError as e:
-        raise RuntimeError(f"GitHub API error: HTTP {e.code}") from e
-    except URLError as e:
-        raise RuntimeError(f"Network error: {e.reason}") from e
+    if branch:
+        encoded_branch = quote(branch, safe="")
+        branch_url = f"https://api.github.com/repos/{owner}/{repo}/branches/{encoded_branch}"
+        branch_data = _request_github_json(branch_url)
+        head_sha = str((branch_data.get("commit") or {}).get("sha") or "").strip()
+        if not head_sha:
+            raise RuntimeError(f"Missing HEAD commit for update branch {branch}")
+
+        releases_url = f"https://api.github.com/repos/{owner}/{repo}/releases?per_page=30"
+        releases = _request_github_json(releases_url)
+        if not isinstance(releases, list):
+            raise RuntimeError("Invalid GitHub releases response")
+        data = next(
+            (
+                release
+                for release in releases
+                if isinstance(release, dict)
+                and not release.get("draft")
+                and not release.get("prerelease")
+                and str(release.get("target_commitish") or "").strip() == head_sha
+            ),
+            None,
+        )
+        if data is None:
+            raise RuntimeError(
+                f"Commit mới nhất {head_sha[:7]} trên nhánh {branch} "
+                "đang được đóng gói. Vui lòng kiểm tra lại sau."
+            )
+    else:
+        data = _request_github_json(
+            f"https://api.github.com/repos/{owner}/{repo}/releases/latest"
+        )
+
     tag = str(data.get("tag_name") or "").strip()
     if not tag:
         raise RuntimeError("Missing tag_name in release")
@@ -136,7 +174,15 @@ def _check_latest_release(
         dl_url = str(asset.get("browser_download_url") or "").strip()
         filename = str(asset.get("name") or "").strip()
     if not dl_url and fallback_url:
-        dl_url = fallback_url
+        latest_marker = "/releases/latest/download/"
+        if latest_marker in fallback_url:
+            encoded_tag = quote(tag, safe="")
+            dl_url = (
+                f"https://github.com/{owner}/{repo}/releases/download/"
+                f"{encoded_tag}/{DEFAULT_INSTALLER_NAME}"
+            )
+        else:
+            dl_url = fallback_url
         filename = Path(dl_url).name or DEFAULT_INSTALLER_NAME
     if not dl_url:
         raise RuntimeError("No downloadable asset for this platform")
@@ -145,6 +191,7 @@ def _check_latest_release(
         "body": str(data.get("body") or ""), "published_at": str(data.get("published_at") or ""),
         "download_url": dl_url, "filename": filename or DEFAULT_INSTALLER_NAME,
         "html_url": str(data.get("html_url") or ""),
+        "commit_sha": str(data.get("target_commitish") or ""),
     }
 
 
