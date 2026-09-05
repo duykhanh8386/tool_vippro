@@ -1,0 +1,86 @@
+name: Publish Windows installer
+
+on:
+  push:
+    branches:
+      - recovered-project-only
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-installer-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-and-publish:
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out the pushed commit
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-build.txt
+
+      - name: Install Python build dependencies
+        shell: pwsh
+        run: python -m pip install --upgrade pip ; python -m pip install -r requirements.txt -r requirements-build.txt
+
+      - name: Download FFmpeg and ChromeDriver required by the package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path vendor\ffmpeg\bin, vendor\chromedriver | Out-Null
+
+          Invoke-WebRequest 'https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip' -OutFile ffmpeg.zip
+          Expand-Archive ffmpeg.zip -DestinationPath ffmpeg-unpacked -Force
+          $ffmpegBin = Get-ChildItem ffmpeg-unpacked -Directory | Select-Object -First 1 | ForEach-Object { Join-Path $_.FullName 'bin' }
+          Copy-Item (Join-Path $ffmpegBin 'ffmpeg.exe') vendor\ffmpeg\bin\ffmpeg.exe
+          Copy-Item (Join-Path $ffmpegBin 'ffprobe.exe') vendor\ffmpeg\bin\ffprobe.exe
+
+          $versions = Invoke-RestMethod 'https://googlechromelabs.github.io/chrome-for-testing/last-known-good-versions-with-downloads.json'
+          $driver = $versions.channels.Stable.downloads.chromedriver | Where-Object { $_.platform -eq 'win64' } | Select-Object -First 1
+          if (-not $driver.url) { throw 'Could not find a Windows ChromeDriver download.' }
+          Invoke-WebRequest $driver.url -OutFile chromedriver.zip
+          Expand-Archive chromedriver.zip -DestinationPath chromedriver-unpacked -Force
+          $driverFile = Get-ChildItem chromedriver-unpacked -Recurse -Filter chromedriver.exe | Select-Object -First 1
+          Copy-Item $driverFile.FullName vendor\chromedriver\chromedriver.exe
+
+      - name: Create the release version embedded in this build
+        id: version
+        shell: pwsh
+        run: |
+          $version = '{0:yyyy.M.d}.{1}' -f (Get-Date).ToUniversalTime(), [int]$env:GITHUB_RUN_NUMBER
+          Set-Content -Path VERSION -Value $version -NoNewline
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+      - name: Build the application
+        shell: pwsh
+        run: python -m PyInstaller --noconfirm --clean "Tuat Videos.spec"
+
+      - name: Create installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = '${{ steps.version.outputs.version }}'
+          choco install innosetup -y --no-progress
+          $iscc = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'
+          & $iscc "/DMyAppVersion=$version" "/DBuildSourceDir=dist\Tuat Videos" "/DBuildOutputDir=installer_dist" "Tuat Videos.iss"
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed with exit code $LASTEXITCODE." }
+
+      - name: Publish installer as the latest GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.version.outputs.version }}
+          name: Tuất Videos v${{ steps.version.outputs.version }}
+          target_commitish: ${{ github.sha }}
+          generate_release_notes: true
+          files: installer_dist/TuatVideos_Setup.exe

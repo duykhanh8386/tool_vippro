@@ -266,4 +266,14 @@ def stop_all_runs() -> None:
         context.cleanup()
 
 
+def active_run_count() -> int:
+    """Return the number of feature runs that would be interrupted by shutdown."""
+    with _ACTIVE_LOCK:
+        return sum(
+            1
+            for context in _ACTIVE_CONTEXTS.values()
+            if context is not _APPLICATION_CONTEXT and not context._closed
+        )
+
+
 atexit.register(stop_all_runs)

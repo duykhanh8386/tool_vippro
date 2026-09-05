@@ -3,6 +3,8 @@ from typing import Iterator, Optional
 
 from nicegui import context, ui
 
+from web.components.update_dialog import create_update_control
+
 
 class NavigationState:
     def __init__(self, default_route: str = "/studio"):
@@ -101,6 +103,7 @@ def create_drawer():
                     pass
 
             ui.separator().classes("bg-gray-200 mb-2")
+            create_update_control()
             with (
                 ui.row()
                 .classes("app-account w-full items-center gap-2 cursor-pointer")

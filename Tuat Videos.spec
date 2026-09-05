@@ -1,11 +1,22 @@
+import os
 from pathlib import Path
 
 from PyInstaller.utils.hooks import collect_data_files, copy_metadata
 
 
 project_root = Path(SPECPATH).resolve()
-media_bin = project_root / "vendor" / "ffmpeg" / "bin"
-chromedriver_bin = project_root / "vendor" / "chromedriver" / "chromedriver.exe"
+media_bin = Path(
+    os.environ.get(
+        "TVAUTOMATION_FFMPEG_DIR",
+        project_root / "vendor" / "ffmpeg" / "bin",
+    )
+)
+chromedriver_bin = Path(
+    os.environ.get(
+        "TVAUTOMATION_CHROMEDRIVER",
+        project_root / "vendor" / "chromedriver" / "chromedriver.exe",
+    )
+)
 
 
 def collect_media_binaries():
@@ -78,7 +89,7 @@ exe = EXE(
     bootloader_ignore_signals=False,
     strip=False,
     upx=False,
-    console=True,
+    console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
