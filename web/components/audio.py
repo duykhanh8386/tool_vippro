@@ -1,5 +1,5 @@
 # RECOVERED: partial depyo recovery; unresolved regions marked below
-import asyncio, tempfile
+import asyncio, tempfile, threading
 from pathlib import Path
 from typing import Awaitable, Callable, Iterable, TypeVar
 from loguru import logger
@@ -16,6 +16,7 @@ from web.theme import app_card, page_header, section_header
 
 
 _T = TypeVar("_T")
+_ADD_AUDIO_RUN_GUARD = threading.Lock()
 
 
 def _best_effort_ui(
@@ -59,17 +60,35 @@ def _cleanup_temp_audio_file(path: Path | None) -> None:
         logger.warning("Failed to clean up temporary file {}: {}", path, exc)
 
 
+def _restore_language_statuses(
+    statuses: dict | None, *, reset_processing: bool
+) -> dict:
+    """Keep completed languages and retry only work interrupted by a process exit."""
+    restored = {
+        video_id: dict(language_statuses)
+        for video_id, language_statuses in (statuses or {}).items()
+        if isinstance(language_statuses, dict)
+    }
+    if reset_processing:
+        for language_statuses in restored.values():
+            for language, status in language_statuses.items():
+                if status == "processing":
+                    language_statuses[language] = "pending"
+    return restored
+
+
 def create_channel_selection(channels, on_channel_select):
     """Create a channel selection interface similar to studio page"""
     selected_channel = {"id": None}
 
     def handle_channel_click(channel_id):
-        if selected_channel["id"] == channel_id:
-            selected_channel["id"] = None
-            on_channel_select(None)
-        else:
-            selected_channel["id"] = channel_id
-            on_channel_select(channel_id)
+        new_channel_id = None if selected_channel["id"] == channel_id else channel_id
+        # Callers can decline a change while their background job owns the
+        # persisted configuration.  In that case keep this visual selector in
+        # sync with the real state as well.
+        if on_channel_select(new_channel_id) is False:
+            return
+        selected_channel["id"] = new_channel_id
         refresh_channel_display()
 
     def refresh_channel_display():
@@ -133,15 +152,29 @@ def create_add_audio_page():
         page_client.on_disconnect(mark_client_unavailable)
 
     selected_channel = {"id": None}; selected_languages = {"languages": []}; channels = get_channels_info(); video_ids_state = {"ids": []}; id_to_path = {}; video_processing_status = {}; video_processing_errors = {}; repeat_settings = {"times": 2, "extra_minutes": 0}; performance_settings = {"max_concurrency": 1}; right_panel_container = None; suppress_autosave = {"value": False}; ui_refs = {"ids_textarea": None, "language_input": None, "times_input": None, "minutes_input": None, "refresh_channel_display": None, "refresh_language_chips": None, "concurrency_input": None}
-    def save_right_panel_state():
+
+    def configuration_change_blocked() -> bool:
+        """Do not let a form edit overwrite a checkpoint owned by a live run."""
+        if not _ADD_AUDIO_RUN_GUARD.locked():
+            return False
+        best_effort_ui(
+            "notify locked add-audio configuration",
+            lambda: ui.notify(
+                "Thêm audio đang chạy; chưa thể thay đổi dữ liệu.", type="warning"
+            ),
+        )
+        return True
+
+    def save_right_panel_state() -> bool:
         """Save the current state of right_panel_container to file"""
         try:
             if suppress_autosave["value"]:
-                return
+                return False
             state = {"video_ids": video_ids_state["ids"], "id_to_path": id_to_path, "video_processing_status": video_processing_status, "video_processing_errors": video_processing_errors, "selected_languages": selected_languages["languages"], "repeat_settings": repeat_settings, "selected_channel": selected_channel["id"], "performance_settings": performance_settings}
-            state_manager.save_state("audio_add", state)
+            return state_manager.save_state("audio_add", state)
         except Exception as e:
             logger.error(f"Failed to save right panel state: {e}")
+            return False
     def load_right_panel_state():
         """Load the saved state from file"""
         try:
@@ -153,7 +186,14 @@ def create_add_audio_page():
             if "id_to_path" in state:
                 id_to_path.update(state["id_to_path"])
             if "video_processing_status" in state:
-                video_processing_status.update(state["video_processing_status"])
+                restored_statuses = _restore_language_statuses(
+                    state["video_processing_status"],
+                    reset_processing=not _ADD_AUDIO_RUN_GUARD.locked(),
+                )
+                video_processing_status.clear()
+                video_processing_status.update(restored_statuses)
+                if restored_statuses != state["video_processing_status"]:
+                    save_right_panel_state()
             if "video_processing_errors" in state:
                 video_processing_errors.update(state["video_processing_errors"])
             if "selected_languages" in state:
@@ -189,9 +229,12 @@ def create_add_audio_page():
         except Exception as e:
             logger.error(f"Failed to load state: {e}")
     def on_channel_select(channel_id):
+        if configuration_change_blocked():
+            return False
         selected_channel["id"] = channel_id
 
         save_right_panel_state()
+        return True
     def create_language_input_and_chips():
         """Create manual language input and display entered languages as chips"""
         def parse_languages(text: str) -> list[str]:
@@ -203,6 +246,8 @@ def create_add_audio_page():
                     chip_classes = "px-2 py-1 rounded-full text-xs font-medium cursor-pointer transition-all duration-200 border bg-emerald-50 text-emerald-700 border-emerald-200 hover:bg-emerald-100"
                     def create_remove_handler(lang: str):
                         def _remove():
+                            if configuration_change_blocked():
+                                return
                             if lang in selected_languages["languages"]:
                                 selected_languages["languages"].remove(lang)
                                 language_input.value = " ".join(selected_languages["languages"])
@@ -212,10 +257,15 @@ def create_add_audio_page():
                     ui.label(language).classes(chip_classes).on("click", create_remove_handler(language))
             pass  # TODO: bytecode recovery incomplete
         def on_language_input_change(e=None):
+            if configuration_change_blocked():
+                language_input.value = " ".join(selected_languages["languages"])
+                return
             selected_languages["languages"] = parse_languages(language_input.value)
 
             refresh_language_chips(); save_right_panel_state()
         def reset_languages():
+            if configuration_change_blocked():
+                return
             selected_languages["languages"] = []
 
             language_input.value = ""; refresh_language_chips(); save_right_panel_state()
@@ -241,6 +291,9 @@ def create_add_audio_page():
                 times_input = ui.number(label="Số lần lặp lại (n)", value=repeat_settings["times"], min=1, max=10, step=1).props("outlined").classes("w-32")
                 ui_refs["times_input"] = times_input
                 def update_times(e):
+                    if configuration_change_blocked():
+                        times_input.value = repeat_settings["times"]
+                        return
                     value = int(e.args) if e.args and int(e.args) >= 1 else 1
                     repeat_settings["times"] = value
 
@@ -249,6 +302,9 @@ def create_add_audio_page():
                 minutes_input = ui.number(label="Phút bổ sung (m)", value=repeat_settings["extra_minutes"], min=0, max=60, step=1).props("outlined").classes("w-32")
                 ui_refs["minutes_input"] = minutes_input
                 def update_minutes(e):
+                    if configuration_change_blocked():
+                        minutes_input.value = repeat_settings["extra_minutes"]
+                        return
                     value = float(e.args) if e.args and float(e.args) >= 0 else 0
                     repeat_settings["extra_minutes"] = value
 
@@ -326,6 +382,9 @@ def create_add_audio_page():
 
                     def make_path_on_change(video_id: str, input_ref):
                         def _on_change(e=None):
+                            if configuration_change_blocked():
+                                input_ref.value = id_to_path.get(video_id, "")
+                                return
                             id_to_path[video_id] = (input_ref.value or "").strip()
                             save_right_panel_state()
 
@@ -353,6 +412,8 @@ def create_add_audio_page():
 
                     def make_delete(video_id: str):
                         def _delete():
+                            if configuration_change_blocked():
+                                return
                             if video_id in video_ids_state["ids"]:
                                 video_ids_state["ids"].remove(video_id)
                             id_to_path.pop(video_id, None)
@@ -363,6 +424,7 @@ def create_add_audio_page():
                                 ids_textarea.value = "\n".join(video_ids_state["ids"])
                             else:
                                 ids_textarea.value = ""
+                            save_right_panel_state()
 
                         return _delete
 
@@ -377,6 +439,9 @@ def create_add_audio_page():
                         for error_lang, error_message in video_errors.items():
                             ui.label(f"Ngôn ngữ {error_lang}: {error_message}").classes("text-sm text-red-700 whitespace-normal break-words")
     async def handle_add_audio():
+        if _ADD_AUDIO_RUN_GUARD.locked():
+            ui.notify("Thêm audio đang chạy ở một trang khác.", type="warning")
+            return None
         if not selected_channel["id"]:
             ui.notify("Hãy chọn kênh", type="warning")
             return None
@@ -405,8 +470,17 @@ def create_add_audio_page():
             for err in row_errors:
                 logger.error(err)
             return None
+        if not _ADD_AUDIO_RUN_GUARD.acquire(blocking=False):
+            ui.notify("Thêm audio đang chạy ở một trang khác.", type="warning")
+            return None
+        channel_id = selected_channel["id"]
+        repeat_times = repeat_settings["times"]
+        extra_minutes = repeat_settings["extra_minutes"]
         video_processing_errors.clear()
-        save_right_panel_state()
+        if save_right_panel_state() is False:
+            _ADD_AUDIO_RUN_GUARD.release()
+            ui.notify("Không thể lưu phiên xử lý. Vui lòng thử lại.", type="negative")
+            return None
         with ui.dialog() as progress_dialog:
             with ui.card().classes("app-card w-96"):
                 ui.label("Đang thêm âm thanh...").classes("text-base font-semibold")
@@ -426,15 +500,16 @@ def create_add_audio_page():
             try:
                 if vid not in video_processing_status:
                     video_processing_status[vid] = {}
-                video_processing_status[vid][lang] = "pending"
+                video_processing_status[vid][lang] = "processing"
                 video_processing_errors.setdefault(vid, {}).pop(lang, None)
-                save_right_panel_state()
+                if save_right_panel_state() is False:
+                    raise RuntimeError("Không thể lưu checkpoint trước khi thêm audio")
                 best_effort_ui("render pending language", refresh_right_panel)
 
                 def update_one_language():
                     return update_audio_module.add(
                         id_video=vid,
-                        channel_id=selected_channel["id"],
+                        channel_id=channel_id,
                         file_name=str(temp_audio_path),
                         language=lang,
                         data=file_bytes,
@@ -458,7 +533,8 @@ def create_add_audio_page():
                     video_processing_status[vid][lang] = "successful"
                 else:
                     video_processing_status[vid][lang] = "already_added"
-                save_right_panel_state()
+                if save_right_panel_state() is False:
+                    raise RuntimeError("Không thể lưu checkpoint sau khi thêm audio")
             except Exception as exc:
                 video_processing_status.setdefault(vid, {})[lang] = "unsuccessful"
                 overall_errors.append(f"{vid}-{lang}: {exc}")
@@ -514,7 +590,7 @@ def create_add_audio_page():
                 video_info = await asyncio.to_thread(
                     update_audio_module._get_video_info,
                     video_id=vid,
-                    channel_id=selected_channel["id"],
+                    channel_id=channel_id,
                 )
                 video_duration_seconds = (
                     video_info.duration_ms / 1000.0
@@ -533,8 +609,8 @@ def create_add_audio_page():
                     multiply_audio,
                     input_file=normalize_path(str(file_path)),
                     output_file=str(temp_audio_path),
-                    times=repeat_settings["times"],
-                    extra_minutes=repeat_settings["extra_minutes"],
+                    times=repeat_times,
+                    extra_minutes=extra_minutes,
                     video_duration_seconds=video_duration_seconds,
                 )
                 file_bytes = await asyncio.to_thread(temp_audio_path.read_bytes)
@@ -612,6 +688,7 @@ def create_add_audio_page():
             save_right_panel_state()
             best_effort_ui("close progress dialog", progress_dialog.close)
             best_effort_ui("render final audio state", refresh_right_panel)
+            _ADD_AUDIO_RUN_GUARD.release()
         total_videos = len(video_ids_state["ids"])
         successful_videos = 0
         for vid in video_ids_state["ids"]:
@@ -674,6 +751,9 @@ def create_add_audio_page():
             with ui.column().classes("flex-1 min-w-[560px]"):
                 right_panel_container = ui.column().classes("audio-add-table w-full gap-1")
                 def on_ids_input():
+                    if configuration_change_blocked():
+                        ids_textarea.value = "\n".join(video_ids_state["ids"])
+                        return
                     video_ids_state["ids"] = parse_ids_from_text(ids_textarea.value or "")
                     to_delete_path = [k for k in id_to_path.keys() if k not in video_ids_state["ids"]]
                     for k in to_delete_path:
@@ -684,8 +764,60 @@ def create_add_audio_page():
                     save_right_panel_state()
                 refresh_right_panel()
         load_right_panel_state()
+
+        state_sync_timer = {
+            "value": None,
+            "observed_active_run": _ADD_AUDIO_RUN_GUARD.locked(),
+        }
+
+        def deactivate_state_sync_timer() -> None:
+            timer = state_sync_timer["value"]
+            if timer is not None:
+                try:
+                    timer.deactivate()
+                except RuntimeError:
+                    pass
+
+        def sync_persisted_running_state() -> None:
+            """Let a freshly reloaded page follow its detached worker's state."""
+            if not client_is_alive():
+                deactivate_state_sync_timer()
+                return
+
+            run_is_active = _ADD_AUDIO_RUN_GUARD.locked()
+            if run_is_active:
+                state_sync_timer["observed_active_run"] = True
+            if not run_is_active and not state_sync_timer["observed_active_run"]:
+                deactivate_state_sync_timer()
+                return
+
+            try:
+                state = state_manager.load_state("audio_add") or {}
+                refreshed_statuses = _restore_language_statuses(
+                    state.get("video_processing_status"), reset_processing=False
+                )
+                refreshed_errors = state.get("video_processing_errors") or {}
+                if (
+                    refreshed_statuses != video_processing_status
+                    or refreshed_errors != video_processing_errors
+                ):
+                    video_processing_status.clear()
+                    video_processing_status.update(refreshed_statuses)
+                    video_processing_errors.clear()
+                    video_processing_errors.update(refreshed_errors)
+                    refresh_right_panel()
+            except Exception as exc:
+                logger.warning("Failed to sync add-audio checkpoint: {}", exc)
+
+            if not run_is_active:
+                deactivate_state_sync_timer()
+
+        state_sync_timer["value"] = ui.timer(0.5, sync_persisted_running_state)
+
         def clear_all_inputs():
             """Clear all inputs and reset form state"""
+            if configuration_change_blocked():
+                return
             try:
                 suppress_autosave["value"] = True
                 if ui_refs["ids_textarea"]:

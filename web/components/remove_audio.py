@@ -1,5 +1,6 @@
 # RECOVERED: clean-room implementation based on NiceGUI components & update_audio_module API
 import asyncio
+import threading
 from pathlib import Path
 from typing import Awaitable, Callable, Iterable, TypeVar
 from nicegui import context, ui
@@ -13,6 +14,7 @@ from web.theme import app_card, empty_state, page_header, page_shell, section_he
 
 STATE_KEY = "audio_remove"
 _T = TypeVar("_T")
+_REMOVE_AUDIO_RUN_GUARD = threading.Lock()
 
 
 def _best_effort_ui(
@@ -52,6 +54,16 @@ def parse_ids_from_text(text: str) -> list[str]:
     return ids
 
 
+def _restore_remove_statuses(statuses: dict | None, *, reset_processing: bool) -> dict:
+    """Make a state from a stopped process retryable on the next launch."""
+    restored = dict(statuses or {})
+    if reset_processing:
+        for video_id, status in restored.items():
+            if status == "processing":
+                restored[video_id] = "pending"
+    return restored
+
+
 def create_remove_audio_page():
     try:
         page_client = context.client
@@ -79,6 +91,9 @@ def create_remove_audio_page():
     selected_remove_channel = {"id": None}
     ids_state = {"ids": []}
     video_processing_status = {}
+    # Kept separately from the display status.  It is set *before* a
+    # destructive request so a restart can verify what YouTube received.
+    delete_requested = {}
     performance_settings = {"max_concurrency": 5}
     suppress_autosave = {"value": False}
     ui_refs = {
@@ -86,18 +101,29 @@ def create_remove_audio_page():
         "refresh_remove_channel_display": None,
     }
 
-    def save_remove_state():
+    def configuration_change_blocked() -> bool:
+        if not _REMOVE_AUDIO_RUN_GUARD.locked():
+            return False
+        best_effort_ui(
+            "notify locked remove-audio configuration",
+            lambda: ui.notify("Xóa audio đang chạy; chưa thể thay đổi dữ liệu.", type="warning"),
+        )
+        return True
+
+    def save_remove_state() -> bool:
         if suppress_autosave["value"]:
-            return
+            return False
         state = {
             "selected_channel": selected_remove_channel["id"],
             "ids": ids_state["ids"],
             "video_processing_status": video_processing_status,
+            "delete_requested": delete_requested,
         }
         try:
-            state_manager.save_state(STATE_KEY, state)
+            return state_manager.save_state(STATE_KEY, state)
         except Exception as e:
             logger.error(f"Failed to save remove audio state: {e}")
+            return False
 
     def load_remove_state():
         try:
@@ -106,8 +132,16 @@ def create_remove_audio_page():
                 return
             selected_remove_channel["id"] = state.get("selected_channel")
             ids_state["ids"] = state.get("ids", [])
+            restored_statuses = _restore_remove_statuses(
+                state.get("video_processing_status"),
+                reset_processing=not _REMOVE_AUDIO_RUN_GUARD.locked(),
+            )
             video_processing_status.clear()
-            video_processing_status.update(state.get("video_processing_status", {}))
+            video_processing_status.update(restored_statuses)
+            delete_requested.clear()
+            delete_requested.update(state.get("delete_requested") or {})
+            if restored_statuses != (state.get("video_processing_status") or {}):
+                save_remove_state()
 
             def update_ui():
                 def render_loaded_state():
@@ -125,6 +159,8 @@ def create_remove_audio_page():
             logger.error(f"Failed to load remove audio state: {e}")
 
     def on_channel_select(channel_id: str):
+        if configuration_change_blocked():
+            return
         selected_remove_channel["id"] = channel_id
         save_remove_state()
 
@@ -152,6 +188,8 @@ def create_remove_audio_page():
                     status_icon, status_color = "check_circle", "text-green-600"
                 elif status == "unsuccessful":
                     status_icon, status_color = "error", "text-red-600"
+                elif status == "processing":
+                    status_icon, status_color = "autorenew", "text-blue-600"
                 else:
                     status_icon, status_color = "schedule", "text-yellow-600"
 
@@ -171,9 +209,12 @@ def create_remove_audio_page():
 
                     def make_delete(video_id=vid):
                         def _delete():
+                            if configuration_change_blocked():
+                                return
                             if video_id in ids_state["ids"]:
                                 ids_state["ids"].remove(video_id)
                             video_processing_status.pop(video_id, None)
+                            delete_requested.pop(video_id, None)
                             refresh_right_panel()
                             if ids_state["ids"]:
                                 ids_textarea.value = "\n".join(ids_state["ids"])
@@ -189,9 +230,14 @@ def create_remove_audio_page():
                         )
 
     def on_ids_input():
+        if configuration_change_blocked():
+            if ui_refs["ids_textarea"]:
+                ui_refs["ids_textarea"].value = "\n".join(ids_state["ids"])
+            return
         if not ids_textarea.value:
             ids_state["ids"] = []
             video_processing_status.clear()
+            delete_requested.clear()
         else:
             new_ids = parse_ids_from_text(ids_textarea.value)
             ids_state["ids"] = new_ids
@@ -200,6 +246,7 @@ def create_remove_audio_page():
             ]
             for k in to_delete:
                 del video_processing_status[k]
+                delete_requested.pop(k, None)
         refresh_right_panel()
         save_remove_state()
 
@@ -211,6 +258,10 @@ def create_remove_audio_page():
             ui.notify("Vui lòng chọn kênh", type="warning")
             return
 
+        if not _REMOVE_AUDIO_RUN_GUARD.acquire(blocking=False):
+            ui.notify("Xóa audio đang chạy ở một trang khác.", type="warning")
+            return
+
         with ui.dialog() as progress_dialog:
             with ui.card().classes("app-card w-96"):
                 ui.label("Đang xóa âm thanh...").classes("text-base font-semibold")
@@ -220,7 +271,22 @@ def create_remove_audio_page():
         progress_dialog.props("persistent")
         best_effort_ui("open remove-audio progress dialog", progress_dialog.open)
 
-        video_ids_to_process = list(ids_state["ids"])
+        channel_id = selected_remove_channel["id"]
+        video_ids_to_process = [
+            video_id
+            for video_id in ids_state["ids"]
+            if video_processing_status.get(video_id) != "successful"
+        ]
+        if not video_ids_to_process:
+            best_effort_ui(
+                "close empty remove-audio progress dialog", progress_dialog.close
+            )
+            _REMOVE_AUDIO_RUN_GUARD.release()
+            best_effort_ui(
+                "notify no pending remove-audio videos",
+                lambda: ui.notify("Các video đã xóa audio xong.", type="info"),
+            )
+            return
         total_tasks = max(1, len(video_ids_to_process))
         completed_tasks = 0
         overall_errors = []
@@ -230,8 +296,31 @@ def create_remove_audio_page():
             nonlocal completed_tasks
             async with semaphore:
                 try:
-                    video_processing_status[vid] = "pending"
-                    save_remove_state()
+                    if delete_requested.get(vid):
+                        # A power loss can occur after the DELETE request is
+                        # accepted but before its result is saved.  If no
+                        # translated tracks remain, treat that request as
+                        # completed instead of issuing a duplicate one.
+                        remaining_tracks = await asyncio.to_thread(
+                            update_audio_module._get_all_audio_track_ids,
+                            vid,
+                            channel_id,
+                        )
+                        if not remaining_tracks:
+                            video_processing_status[vid] = "successful"
+                            delete_requested.pop(vid, None)
+                            if save_remove_state() is False:
+                                delete_requested[vid] = True
+                                video_processing_status[vid] = "pending"
+                                raise RuntimeError(
+                                    "Không thể lưu checkpoint xác nhận xóa audio"
+                                )
+                            return
+
+                    video_processing_status[vid] = "processing"
+                    delete_requested[vid] = True
+                    if save_remove_state() is False:
+                        raise RuntimeError("Không thể lưu checkpoint trước khi xóa audio")
                     best_effort_ui(
                         "render pending remove-audio video",
                         lambda: (
@@ -242,12 +331,22 @@ def create_remove_audio_page():
                     await asyncio.to_thread(
                         update_audio_module.delete,
                         id_video=vid,
-                        channel_id=selected_remove_channel["id"],
+                        channel_id=channel_id,
                     )
                     video_processing_status[vid] = "successful"
-                    save_remove_state()
+                    delete_requested.pop(vid, None)
+                    if save_remove_state() is False:
+                        # Leave the intent in the next successful checkpoint;
+                        # a restart will verify the remote result first.
+                        delete_requested[vid] = True
+                        video_processing_status[vid] = "pending"
+                        raise RuntimeError(
+                            "Không thể lưu checkpoint sau khi xóa audio"
+                        )
                 except Exception as exc:
                     video_processing_status[vid] = "unsuccessful"
+                    # Keep the intent so an uncertain request is verified on
+                    # the next resume rather than blindly repeated.
                     overall_errors.append(f"{vid}: {exc}")
                     save_remove_state()
                 finally:
@@ -283,6 +382,7 @@ def create_remove_audio_page():
             save_remove_state()
             best_effort_ui("close remove-audio progress dialog", progress_dialog.close)
             best_effort_ui("render final remove-audio state", refresh_right_panel)
+            _REMOVE_AUDIO_RUN_GUARD.release()
 
         if overall_errors:
             best_effort_ui(
@@ -302,12 +402,15 @@ def create_remove_audio_page():
             )
 
     def clear_all_inputs():
+        if configuration_change_blocked():
+            return
         try:
             suppress_autosave["value"] = True
             if ui_refs["ids_textarea"]:
                 ui_refs["ids_textarea"].value = ""
             ids_state["ids"] = []
             video_processing_status.clear()
+            delete_requested.clear()
             selected_remove_channel["id"] = None
             refresh_right_panel()
             if ui_refs["refresh_remove_channel_display"]:
@@ -365,3 +468,52 @@ def create_remove_audio_page():
                     )
 
     load_remove_state()
+
+    state_sync_timer = {
+        "value": None,
+        "observed_active_run": _REMOVE_AUDIO_RUN_GUARD.locked(),
+    }
+
+    def deactivate_state_sync_timer() -> None:
+        timer = state_sync_timer["value"]
+        if timer is not None:
+            try:
+                timer.deactivate()
+            except RuntimeError:
+                pass
+
+    def sync_persisted_running_state() -> None:
+        """Keep a reloaded page attached to a still-running delete job."""
+        if not client_is_alive():
+            deactivate_state_sync_timer()
+            return
+
+        run_is_active = _REMOVE_AUDIO_RUN_GUARD.locked()
+        if run_is_active:
+            state_sync_timer["observed_active_run"] = True
+        if not run_is_active and not state_sync_timer["observed_active_run"]:
+            deactivate_state_sync_timer()
+            return
+
+        try:
+            state = state_manager.load_state(STATE_KEY) or {}
+            refreshed_statuses = _restore_remove_statuses(
+                state.get("video_processing_status"), reset_processing=False
+            )
+            refreshed_intents = state.get("delete_requested") or {}
+            if (
+                refreshed_statuses != video_processing_status
+                or refreshed_intents != delete_requested
+            ):
+                video_processing_status.clear()
+                video_processing_status.update(refreshed_statuses)
+                delete_requested.clear()
+                delete_requested.update(refreshed_intents)
+                refresh_right_panel()
+        except Exception as exc:
+            logger.warning("Failed to sync remove-audio checkpoint: {}", exc)
+
+        if not run_is_active:
+            deactivate_state_sync_timer()
+
+    state_sync_timer["value"] = ui.timer(0.5, sync_persisted_running_state)

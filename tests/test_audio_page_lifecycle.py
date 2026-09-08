@@ -6,15 +6,33 @@ from pathlib import Path
 from web.components.audio import (
     _best_effort_ui as audio_best_effort_ui,
     _cleanup_temp_audio_file,
+    _restore_language_statuses,
     _run_sequentially_isolated,
 )
 from web.components.remove_audio import (
     _best_effort_ui as remove_audio_best_effort_ui,
     _gather_isolated,
+    _restore_remove_statuses,
 )
 
 
 class AudioPageLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    def test_add_audio_restart_only_retries_interrupted_languages(self):
+        restored = _restore_language_statuses(
+            {
+                "video-1": {
+                    "en": "successful",
+                    "vi": "processing",
+                    "ja": "already_added",
+                }
+            },
+            reset_processing=True,
+        )
+
+        self.assertEqual(restored["video-1"]["en"], "successful")
+        self.assertEqual(restored["video-1"]["vi"], "pending")
+        self.assertEqual(restored["video-1"]["ja"], "already_added")
+
     async def test_happy_path_processes_multiple_videos(self):
         processed = []
 
@@ -122,6 +140,17 @@ class AudioPageLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
 
 class RemoveAudioPageLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    def test_remove_audio_restart_only_retries_interrupted_videos(self):
+        restored = _restore_remove_statuses(
+            {"A": "successful", "B": "processing", "C": "unsuccessful"},
+            reset_processing=True,
+        )
+
+        self.assertEqual(
+            restored,
+            {"A": "successful", "B": "pending", "C": "unsuccessful"},
+        )
+
     async def test_remove_audio_happy_path_processes_multiple_videos(self):
         completed = []
 

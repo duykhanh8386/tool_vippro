@@ -45,6 +45,7 @@ POLL_INTERVAL = 10
 CSV_FILENAME = "deleted_videos.csv"
 DEFAULT_OUTPUT_DIR = get_history_dir() / "delete_video"
 _SETTINGS_KEY = "delete_video_settings"
+_RUN_STATE_KEY = "delete_video_run"
 _TERMINAL = ("deleted", "deleting", "error")
 
 
@@ -84,9 +85,52 @@ class DeleteVideoController:
         self._channel_name_map = {}
         self._channel_avatar_map = {}
         self.output_dir = _load_output_dir()
+        self._restore_run_state()
 
     def _bump(self):
         self.version += 1
+        self._save_run_state()
+
+    def _save_run_state(self) -> bool:
+        """Durably checkpoint scan progress so a later launch can resume it."""
+        try:
+            return state_manager.save_state(
+                _RUN_STATE_KEY,
+                {
+                    "selected_channel_ids": list(self.selected_channel_ids),
+                    "max_workers": self.max_workers,
+                    "all_videos": self.all_videos,
+                    "status_text": self.status_text,
+                },
+            )
+        except Exception as exc:
+            logger.error("Failed to save delete-video run state: {}", exc)
+            return False
+
+    def _restore_run_state(self) -> None:
+        """Restore the last local queue without pretending its task is alive."""
+        try:
+            state = state_manager.load_state(_RUN_STATE_KEY) or {}
+            self.selected_channel_ids = list(state.get("selected_channel_ids") or [])
+            self.max_workers = max(1, int(state.get("max_workers") or 5))
+            restored = state.get("all_videos") or []
+            self.all_videos = [dict(video) for video in restored if isinstance(video, dict)]
+
+            recovered = False
+            for video in self.all_videos:
+                # A process that was killed cannot still be deleting.  Make it
+                # eligible for verification/retry when the user resumes.
+                if video.get("row_status") == "deleting":
+                    video["row_status"] = "ready"
+                    recovered = True
+            if self.all_videos:
+                self.status_text = (
+                    "Đã khôi phục danh sách trước đó. Bấm Quét & Xóa để tiếp tục."
+                )
+            if recovered:
+                self._save_run_state()
+        except Exception as exc:
+            logger.error("Failed to restore delete-video run state: {}", exc)
 
     @property
     def log_file(self) -> Path:
@@ -126,9 +170,13 @@ class DeleteVideoController:
         if self.is_running():
             return
         self.refresh_channel_maps()
+        is_resume = (
+            list(channel_ids) == self.selected_channel_ids and bool(self.all_videos)
+        )
         self.selected_channel_ids = list(channel_ids)
         self.max_workers = max(1, int(max_workers))
-        self.all_videos = []
+        if not is_resume:
+            self.all_videos = []
         self.running = True
         self.polling = False
         self.next_poll_at = 0.0
@@ -157,6 +205,7 @@ class DeleteVideoController:
     async def _run_loop(self, run_context):
         try:
             with bind_run_context(run_context):
+                await self._recover_interrupted_deletions()
                 while self.running:
                     run_context.checkpoint()
                     self.polling = True
@@ -211,6 +260,7 @@ class DeleteVideoController:
             "privacy": v.privacy,
             "copyright_check_status": v.copyright_check_status,
             "row_status": copyright_to_row_status(v.copyright_check_status),
+            "delete_requested": False,
         }
 
     def _set_row_status(self, video_id: str, new_status: str):
@@ -244,6 +294,38 @@ class DeleteVideoController:
         except Exception as exc:
             logger.error(f"Failed to write deleted_videos.csv: {exc}")
 
+    async def _recover_interrupted_deletions(self) -> None:
+        """Check requests that may have reached YouTube before power was lost."""
+        candidates = [
+            video
+            for video in self.all_videos
+            if video.get("delete_requested")
+            and video.get("row_status") not in {"deleted", "error"}
+        ]
+        for video in candidates:
+            if not self.running:
+                return
+            try:
+                statuses = await asyncio.to_thread(
+                    list_videos_module.get_copyright_statuses,
+                    video["channel_id"],
+                    {video["id"]},
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Could not verify interrupted delete {}: {}", video["id"], exc
+                )
+                continue
+
+            if video["id"] not in (statuses or {}):
+                video["delete_requested"] = False
+                self._set_row_status(video["id"], "deleted")
+                self._log_deleted(video)
+            else:
+                video["delete_requested"] = False
+                self._set_row_status(video["id"], "ready")
+                self._bump()
+
     async def _scan_channel(self, channel_id: str) -> list[dict]:
         result = []
         page_token = None
@@ -269,6 +351,7 @@ class DeleteVideoController:
 
     async def _delete_video(self, video: dict):
         vid_id = video["id"]
+        video["delete_requested"] = True
         self._set_row_status(vid_id, "deleting")
         try:
             code = await asyncio.to_thread(
@@ -276,6 +359,7 @@ class DeleteVideoController:
                 vid_id,
                 video["channel_id"],
             )
+            video["delete_requested"] = False
             self._set_row_status(vid_id, "deleted" if code == 200 else "error")
             if code != 200:
                 logger.warning(f"Delete {vid_id} → HTTP {code}")

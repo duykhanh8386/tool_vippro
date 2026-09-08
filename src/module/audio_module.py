@@ -163,7 +163,12 @@ class UpdateAudioModule(IModule):
             payload = {"videoId": id_video, "audioTrackId": track_id, "unpublishTrack": False, "context": {"client": {"clientName": 62, "clientVersion": "1.20250902.04.00", "hl": "en", "gl": "VN", "experimentsToken": "", "utcOffsetMinutes": 420, "userInterfaceTheme": "USER_INTERFACE_THEME_DARK", "screenWidthPoints": 1920, "screenHeightPoints": 945, "screenPixelDensity": 1, "screenDensityFloat": 1}, "request": {"returnLogEntry": True, "internalExperimentFlags": [], "eats": "AWSNWa3PV1e-JQRiHlmMmNXCMA9Kt6en05uq7bbw9WnQgnJdNT8RNsEfMheyglxoOPf_TMIzUzU80CM9khDsuy6zp2Uz9ROtcC5RGvGrdEkSa_rIL5z6FDB2wAAYVWg=", "sessionInfo": {"token": session_token}}, "user": {"onBehalfOfUser": channel_info.delegated_session_id, "delegationContext": {"externalChannelId": channel_info.id, "roleType": {"channelRoleType": channel_info.role}}, "serializedDelegationContext": ""}, "clientScreenNonce": "7nFa5dcSfcGGJAJS"}}
             response = post_with_stop(url, headers=headers, json=payload)
             if response.status_code != 200:
-                logger.exception(f"Failed to delete audio track: {response}")
+                raise AudioUpdateError(
+                    _youtube_error_message(response, "xóa audio track"),
+                    status_code=response.status_code,
+                    retryable=response.status_code == 429 or response.status_code >= 500,
+                )
+        return 200
     def _get_audio_translation_items(self, id_video: str, channel_id: str) -> list[dict]:
         url = "https://studio.youtube.com/youtubei/v1/crowdsourcing/get_video_translations?alt=json"
         channel_info = get_channels_info(channel_id)

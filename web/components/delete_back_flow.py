@@ -55,6 +55,7 @@ PERSIST_FIELDS = (
     "video_id",
     "frontend_upload_id",
     "scotty_resource_id",
+    "delete_requested",
 )
 
 STEP_STYLE = {
@@ -104,6 +105,52 @@ def _new_steps() -> dict:
     }
 
 
+def _restore_steps(saved_steps: dict | None, *, reset_processing: bool) -> dict:
+    """Build a complete step map and recover an interrupted local run.
+
+    A process which disappears unexpectedly cannot complete the current step.
+    On the next app launch that step must therefore be available for retry, while
+    completed steps remain immutable and are not repeated.
+    """
+    steps = {**_new_steps(), **(saved_steps or {})}
+    if reset_processing:
+        for key, value in steps.items():
+            if value == "processing":
+                steps[key] = "pending"
+    return steps
+
+
+def _replace_status_snapshot(target: dict, source: dict) -> None:
+    """Keep the saved-state source in sync with the latest checkpoint."""
+    target.clear()
+    target.update(source)
+
+
+def _replace_video_items_unless_processing(
+    videos_state: dict, items: list, *, is_processing: bool
+) -> bool:
+    """Do not replace item objects that active workers are updating."""
+    if is_processing:
+        return False
+    videos_state["items"] = items
+    return True
+
+
+def _upload_resume_point(item: dict) -> str:
+    """Return the first upload side effect that is not durably checkpointed."""
+    if item.get("video_id"):
+        return "done"
+    if item.get("frontend_upload_id") and item.get("scotty_resource_id"):
+        return "create_video"
+    return "upload"
+
+
+def _require_checkpoint(persist, label: str) -> None:
+    """Never start the next remote operation if its recovery point was not saved."""
+    if persist() is False:
+        raise RuntimeError(f"Không thể lưu checkpoint khôi phục: {label}")
+
+
 def _log_deleted(
     output_folder: str,
     video_id: str,
@@ -141,6 +188,7 @@ def create_delete_back_flow_page():
     except RuntimeError:
         page_client = None
 
+    ui_lifecycle = {"available": page_client is not None}
     paths_state = {"video_folder": "", "music_folder": "", "output_folder": ""}
     options_state = {"random_music": False}
     selected_channel = {"id": None}
@@ -170,7 +218,11 @@ def create_delete_back_flow_page():
 
     def client_is_alive() -> bool:
         """Return whether this page's NiceGUI client can still receive UI updates."""
-        return page_client is not None and not getattr(page_client, "_deleted", False)
+        return (
+            ui_lifecycle["available"]
+            and page_client is not None
+            and not getattr(page_client, "_deleted", False)
+        )
 
     def element_is_alive(element) -> bool:
         return (
@@ -203,40 +255,38 @@ def create_delete_back_flow_page():
                 return False
             raise
 
-    async def stop_run_when_client_disconnects() -> None:
-        """Prevent an orphaned flow when its browser tab is closed or reloaded."""
-        if not processing["value"]:
-            return
-        stop_requested["value"] = True
-        contexts = []
-        parent = active_run.get("parent")
-        if parent is not None:
-            contexts.append(parent)
-        contexts.extend(list(active_run["children"].values()))
-        logger.info(
-            "Delete-Back page disconnected; stopping {} owned run context(s)",
-            len(contexts),
+    def configuration_change_blocked() -> bool:
+        """Keep the inputs stable while a detached page still owns a run."""
+        if not _FLOW_RUN_GUARD.locked():
+            return False
+        safe_notify(
+            "Delete-Back Flow đang chạy; chưa thể thay đổi cấu hình.",
+            type="warning",
         )
-        if contexts:
-            await asyncio.gather(
-                *(asyncio.to_thread(run_context.request_stop) for run_context in contexts),
-                return_exceptions=True,
-            )
+        return True
+
+    def mark_client_unavailable() -> None:
+        """Let backend workers finish and checkpoint when the browser disconnects."""
+        ui_lifecycle["available"] = False
+        logger.info(
+            "Delete-Back page disconnected; backend flow will continue and save checkpoints"
+        )
 
     if page_client is not None:
-        page_client.on_disconnect(stop_run_when_client_disconnects)
+        page_client.on_disconnect(mark_client_unavailable)
 
-    def save_state():
+    def save_state() -> bool:
         if suppress_autosave["value"]:
-            return
+            return False
         statuses = {}
         for it in videos_state["items"]:
-            entry = {"steps": it["steps"]}
+            entry = {"steps": dict(it["steps"])}
             for field in PERSIST_FIELDS:
                 entry[field] = it.get(field, "")
             statuses[it["name"]] = entry
         try:
-            state_manager.save_state(
+            _replace_status_snapshot(saved_status_map, statuses)
+            return state_manager.save_state(
                 STATE_KEY,
                 {
                     "video_folder": paths_state["video_folder"],
@@ -249,6 +299,7 @@ def create_delete_back_flow_page():
             )
         except Exception as e:
             logger.error(f"Failed to save delete_back_flow state: {e}")
+            return False
 
     def load_state():
         try:
@@ -260,8 +311,7 @@ def create_delete_back_flow_page():
             paths_state["output_folder"] = state.get("output_folder", "")
             options_state["random_music"] = state.get("random_music", False)
             selected_channel["id"] = state.get("selected_channel")
-            saved_status_map.clear()
-            saved_status_map.update(state.get("statuses", {}))
+            _replace_status_snapshot(saved_status_map, state.get("statuses", {}))
 
             def update_ui():
                 if not client_is_alive():
@@ -284,6 +334,8 @@ def create_delete_back_flow_page():
         try:
             folder = normalize_path(paths_state["video_folder"])
             items = []
+            recovered_interrupted_step = False
+            reset_processing = not _FLOW_RUN_GUARD.locked()
             if folder and Path(folder).is_dir():
                 for p in list_media_files(folder, VIDEO_EXTENSIONS):
                     saved = saved_status_map.get(p.name, {})
@@ -298,17 +350,31 @@ def create_delete_back_flow_page():
                         "size": size,
                         "duration": None,
                         "duration_error": "",
-                        "steps": saved.get("steps") or _new_steps(),
+                        "steps": _restore_steps(
+                            saved.get("steps"),
+                            reset_processing=reset_processing,
+                        ),
                     }
                     for field in PERSIST_FIELDS:
                         item[field] = saved.get(field, "")
 
-                    for k, st in item["steps"].items():
-                        if st == "processing":
-                            item["steps"][k] = "pending"
+                    if reset_processing and any(
+                        value == "processing"
+                        for value in (saved.get("steps") or {}).values()
+                    ):
+                        recovered_interrupted_step = True
 
                     items.append(item)
-            videos_state["items"] = items
+            if not _replace_video_items_unless_processing(
+                videos_state,
+                items,
+                is_processing=processing["value"],
+            ):
+                return
+            if recovered_interrupted_step:
+                # Persist the recovery immediately. A second power loss before
+                # the user clicks Process still leaves the work retryable.
+                save_state()
             refresh_video_list()
             if items:
                 ui.timer(0.05, load_durations, once=True)
@@ -331,6 +397,76 @@ def create_delete_back_flow_page():
                         "Unexpected duration error for {}: {}", item["path"], exc
                     )
                 refresh_video_list()
+
+    state_sync_timer = {
+        "value": None,
+        "observed_active_run": _FLOW_RUN_GUARD.locked(),
+    }
+
+    def deactivate_state_sync_timer() -> None:
+        timer = state_sync_timer["value"]
+        if timer is not None:
+            try:
+                timer.deactivate()
+            except RuntimeError:
+                pass
+
+    def sync_persisted_running_state() -> None:
+        """Reattach a refreshed page to the latest durable backend checkpoint."""
+        if not client_is_alive():
+            deactivate_state_sync_timer()
+            return
+        detached_run_active = _FLOW_RUN_GUARD.locked()
+        if detached_run_active:
+            state_sync_timer["observed_active_run"] = True
+
+        state = state_manager.load_state(STATE_KEY)
+        if not state:
+            if not detached_run_active and not state_sync_timer["observed_active_run"]:
+                deactivate_state_sync_timer()
+            return
+
+        statuses = state.get("statuses") or {}
+        _replace_status_snapshot(saved_status_map, statuses)
+        changed = False
+        for item in videos_state["items"]:
+            saved = statuses.get(item["name"])
+            if not saved:
+                continue
+            restored_steps = _restore_steps(
+                saved.get("steps"), reset_processing=False
+            )
+            if item["steps"] != restored_steps:
+                item["steps"] = restored_steps
+                changed = True
+            for field in PERSIST_FIELDS:
+                restored_value = saved.get(field, "")
+                if item.get(field) != restored_value:
+                    item[field] = restored_value
+                    changed = True
+        if changed:
+            refresh_video_list()
+
+        safe_element_call(
+            ui_refs.get("process_btn"), "set_enabled", not detached_run_active
+        )
+        safe_element_call(
+            ui_refs.get("clear_btn"), "set_enabled", not detached_run_active
+        )
+        if detached_run_active:
+            safe_element_call(progress_refs.get("panel"), "set_visibility", True)
+            safe_element_call(
+                progress_refs.get("current"),
+                "set_text",
+                "Tiến trình đang tiếp tục ở nền sau khi trang được tải lại.",
+            )
+            safe_element_call(
+                progress_refs.get("step"),
+                "set_text",
+                "Trang này đang hiển thị tiến trình đã lưu.",
+            )
+        elif state_sync_timer["observed_active_run"]:
+            deactivate_state_sync_timer()
 
     def step_badge(status: str):
         icon, color, label = STEP_STYLE.get(status, STEP_STYLE["pending"])
@@ -485,28 +621,34 @@ def create_delete_back_flow_page():
 
     async def step_upload(item, output_folder, musics, index, run_config):
         channel_id = run_config["channel_id"]
+        resume_point = _upload_resume_point(item)
+        if resume_point == "done":
+            return
         assert channel_id, "Chưa chọn kênh"
 
-        upload_prog = {"sent": 0, "total": 0}
-        item["upload_progress"] = upload_prog
-        result = await asyncio.to_thread(
-            upload_video_module.upload,
-            channel_id=channel_id,
-            file_path=item["output_path"],
-            index=index,
-            progress=upload_prog,
-        )
-        item["frontend_upload_id"] = result["frontend_upload_id"]
-        item["scotty_resource_id"] = result["scotty_resource_id"]
+        if resume_point == "upload":
+            upload_prog = {"sent": 0, "total": 0}
+            item["upload_progress"] = upload_prog
+            result = await asyncio.to_thread(
+                upload_video_module.upload,
+                channel_id=channel_id,
+                file_path=item["output_path"],
+                index=index,
+                progress=upload_prog,
+            )
+            item["frontend_upload_id"] = result["frontend_upload_id"]
+            item["scotty_resource_id"] = result["scotty_resource_id"]
+            _require_checkpoint(save_state, "upload resource IDs")
 
         video_id = await asyncio.to_thread(
             upload_video_module.create_video,
             channel_id=channel_id,
             title=Path(item["name"]).stem,
-            frontend_upload_id=result["frontend_upload_id"],
-            scotty_resource_id=result["scotty_resource_id"],
+            frontend_upload_id=item["frontend_upload_id"],
+            scotty_resource_id=item["scotty_resource_id"],
         )
         item["video_id"] = video_id
+        _require_checkpoint(save_state, "video ID")
 
     async def step_wait_processed(item, output_folder, musics, index, run_config):
         channel_id = run_config["channel_id"]
@@ -568,6 +710,27 @@ def create_delete_back_flow_page():
         video_id = item.get("video_id")
         assert video_id, "Chưa có Video ID"
 
+        if item.get("delete_requested"):
+            # The app may have lost power after YouTube accepted the deletion,
+            # but before the HTTP response could be checkpointed. Verify first
+            # instead of blindly issuing a second destructive request.
+            statuses = await asyncio.to_thread(
+                list_videos_module.get_copyright_statuses, channel_id, {video_id}
+            )
+            if video_id not in (statuses or {}):
+                _log_deleted(
+                    output_folder=output_folder,
+                    video_id=video_id,
+                    channel_id=channel_id,
+                    channel_name=run_config["channel_name"],
+                    title=item["name"],
+                )
+                return
+            item["delete_requested"] = False
+            _require_checkpoint(save_state, "delete verification")
+
+        item["delete_requested"] = True
+        _require_checkpoint(save_state, "delete request")
         code = await asyncio.to_thread(
             delete_video_module.delete, video_id, channel_id
         )
@@ -645,6 +808,7 @@ def create_delete_back_flow_page():
                         continue
 
                     item["steps"][step_key] = "processing"
+                    save_state()
                     push_log(f"{item['name']} - {step_name}: đang xử lý", "info")
                     refresh_video_list()
                     save_state()
@@ -660,20 +824,24 @@ def create_delete_back_flow_page():
                                 run_config,
                             )
                         item["steps"][step_key] = "successful"
+                        save_state()
                         push_log(
                             f"{item['name']} - {step_name}: thành công",
                             "success",
                         )
                     except TaskStopped:
                         item["steps"][step_key] = "stopped"
+                        save_state()
                         raise
                     except Exception as exc:
                         if context.stopped or stop_requested["value"]:
                             item["steps"][step_key] = "stopped"
+                            save_state()
                             raise TaskStopped() from exc
                         item["steps"][step_key] = "error"
                         failed = True
                         errors.append(f"{item['name']} [{step_name}]: {exc}")
+                        save_state()
                         logger.error(
                             "Delete-Back step '{}' failed for {}: {}",
                             step_key,
@@ -760,6 +928,9 @@ def create_delete_back_flow_page():
         if processing["value"]:
             safe_notify("Delete-Back Flow đang chạy", type="warning")
             return
+        if _FLOW_RUN_GUARD.locked():
+            safe_notify("Delete-Back Flow đang chạy ở một trang khác.", type="warning")
+            return
         if not selected_channel["id"]:
             safe_notify("Vui lòng chọn kênh trước khi xử lý", type="warning")
             return
@@ -836,14 +1007,20 @@ def create_delete_back_flow_page():
             )
             stopped = stop_requested["value"] or run_context.stopped
             update_parallel_progress(total_items, stats)
+        except Exception as exc:
+            errors.append(f"Lỗi batch: {exc}")
+            save_state()
+            logger.exception("Delete-Back batch failed: {}", exc)
         finally:
-            set_processing_ui(False)
+            # Persist before any UI cleanup. This is the last durable recovery
+            # point when the application is closed normally.
             save_state()
             if run_context is not None:
                 run_context.cleanup()
             active_run["parent"] = None
             active_run["children"].clear()
             _FLOW_RUN_GUARD.release()
+            set_processing_ui(False)
 
         done_count = sum(
             1
@@ -888,6 +1065,8 @@ def create_delete_back_flow_page():
             )
 
     def clear_all_inputs():
+        if configuration_change_blocked():
+            return
         try:
             suppress_autosave["value"] = True
             paths_state["video_folder"] = ""
@@ -917,6 +1096,8 @@ def create_delete_back_flow_page():
         )
 
         def pick_folder():
+            if configuration_change_blocked():
+                return
             chosen = select_directory(
                 initial_dir=paths_state[key], title=f"Chọn {label}"
             )
@@ -928,6 +1109,8 @@ def create_delete_back_flow_page():
                     load_videos()
 
         def clear_folder(e=None):
+            if configuration_change_blocked():
+                return
             paths_state[key] = ""
             render()
             save_state()
@@ -991,6 +1174,11 @@ def create_delete_back_flow_page():
                 pass
 
         def on_channel_select(channel_id: str):
+            if (
+                selected_channel["id"] != channel_id
+                and configuration_change_blocked()
+            ):
+                return
             selected_channel["id"] = channel_id
             save_state()
             if ui_refs.get("refresh_overlay"):
@@ -1004,6 +1192,8 @@ def create_delete_back_flow_page():
         ui_refs["refresh_channel_display"] = refresh_channel_display
 
         def pick_overlay():
+            if configuration_change_blocked():
+                return
             cid = selected_channel["id"]
             if not cid:
                 safe_notify("Hãy chọn kênh trước", type="warning")
@@ -1015,6 +1205,8 @@ def create_delete_back_flow_page():
                 safe_notify("Đã gán ảnh tên kênh cho kênh này", type="positive")
 
         def clear_overlay():
+            if configuration_change_blocked():
+                return
             cid = selected_channel["id"]
             if cid:
                 channel_store.set_overlay_png(cid, "")
@@ -1067,6 +1259,10 @@ def create_delete_back_flow_page():
         refresh_overlay_display()
 
         def on_random_change(e):
+            if configuration_change_blocked():
+                if hasattr(e, "sender"):
+                    e.sender.value = options_state["random_music"]
+                return
             options_state["random_music"] = bool(e.value)
             save_state()
 
@@ -1139,3 +1335,5 @@ def create_delete_back_flow_page():
         refresh_video_list()
 
     load_state()
+    state_sync_timer["value"] = ui.timer(1.0, sync_persisted_running_state)
+    sync_persisted_running_state()

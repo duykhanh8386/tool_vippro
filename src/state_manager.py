@@ -39,6 +39,10 @@ class StateManager:
                 )
                 self._conn.execute("PRAGMA busy_timeout = 30000")
                 self._conn.execute("PRAGMA journal_mode = WAL")
+                # Checkpoints protect against sudden loss of power, not just a
+                # normal application shutdown.  FULL asks SQLite to flush each
+                # committed transaction to durable storage before reporting it.
+                self._conn.execute("PRAGMA synchronous = FULL")
                 self._conn.execute(_CREATE_TABLE_SQL)
                 self._conn.commit()
         return self._conn

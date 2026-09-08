@@ -102,5 +102,40 @@ class AudioUploadTests(unittest.TestCase):
         )
 
 
+class AudioDeleteTests(unittest.TestCase):
+    def _channel(self):
+        return SimpleNamespace(
+            cookies=[],
+            sapisidhash="hash",
+            id="channel",
+            delegated_session_id="delegated",
+            role="OWNER",
+        )
+
+    def test_delete_returns_only_after_all_tracks_succeed(self):
+        module = UpdateAudioModule()
+        with (
+            patch("src.module.audio_module.get_channels_info", return_value=self._channel()),
+            patch.object(module, "_get_session_token", return_value="token"),
+            patch.object(module, "_get_all_audio_track_ids", return_value=["a", "b"]),
+            patch("src.module.audio_module.post_with_stop", return_value=Response(200)) as post,
+        ):
+            self.assertEqual(module.delete("video", "channel"), 200)
+        self.assertEqual(post.call_count, 2)
+
+    def test_delete_propagates_youtube_failure(self):
+        module = UpdateAudioModule()
+        with (
+            patch("src.module.audio_module.get_channels_info", return_value=self._channel()),
+            patch.object(module, "_get_session_token", return_value="token"),
+            patch.object(module, "_get_all_audio_track_ids", return_value=["a"]),
+            patch("src.module.audio_module.post_with_stop", return_value=Response(503)),
+        ):
+            with self.assertRaises(AudioUpdateError) as raised:
+                module.delete("video", "channel")
+        self.assertEqual(raised.exception.status_code, 503)
+        self.assertTrue(raised.exception.retryable)
+
+
 if __name__ == "__main__":
     unittest.main()
