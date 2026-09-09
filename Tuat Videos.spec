@@ -1,7 +1,7 @@
 import os
 from pathlib import Path
 
-from PyInstaller.utils.hooks import collect_data_files, copy_metadata
+from PyInstaller.utils.hooks import collect_data_files, collect_submodules, copy_metadata
 
 
 project_root = Path(SPECPATH).resolve()
@@ -46,7 +46,9 @@ datas = [
     (str(project_root / "vendor" / "chromedriver" / "THIRD_PARTY_NOTICES.chromedriver"), "licenses/chromedriver"),
     *collect_data_files("nicegui"),
     *collect_data_files("certifi"),
+    *collect_data_files("yt_dlp"),
     *copy_metadata("nicegui"),
+    *copy_metadata("yt-dlp"),
 ]
 
 hiddenimports = [
@@ -61,6 +63,7 @@ hiddenimports = [
     "uvicorn.protocols.websockets.websockets_impl",
     "uvicorn.protocols.websockets.websockets_sansio_impl",
     "uvicorn.protocols.websockets.wsproto_impl",
+    *collect_submodules("yt_dlp"),
 ]
 
 a = Analysis(

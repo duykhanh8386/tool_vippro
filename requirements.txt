@@ -11,3 +11,4 @@ webdriver-manager==4.0.2
 # Optional in src.updater's direct import path, but also required by NiceGUI.
 # Embedded certifi.__version__ is "2025.08.03" (PEP 440 canonical: 2025.8.3).
 certifi==2025.8.3
+yt-dlp==2026.8.19

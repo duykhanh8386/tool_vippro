@@ -91,6 +91,12 @@ def create_drawer():
                     pass
                 with nav_item("/reup/delete-video", "Xóa - Back", "o_delete_sweep"):
                     pass
+                with nav_item(
+                    "/tools/youtube-mp3",
+                    "Download MP3 from YouTube",
+                    "o_download_for_offline",
+                ):
+                    pass
 
                 ui.label("Quy trình").classes("app-nav-label")
                 with nav_item("/audio/flow", "Thêm audio flow", "o_account_tree"):
