@@ -145,6 +145,35 @@ def _upload_resume_point(item: dict) -> str:
     return "upload"
 
 
+def _repair_missing_upload_input(item: dict) -> bool:
+    """Make a corrupted local checkpoint safe to retry.
+
+    A completed remote upload no longer needs the merged local file.  Otherwise,
+    a missing output means the merge must run again before upload.  This also
+    repairs checkpoints written by the old state-sync race where ``output_path``
+    was replaced with an empty value while FFmpeg was still running.
+    """
+    steps = item.setdefault("steps", _new_steps())
+    if steps.get("upload") == "successful":
+        return False
+    if _upload_resume_point(item) != "upload":
+        return False
+
+    output_path = normalize_path(str(item.get("output_path") or ""))
+    if output_path and Path(output_path).is_file():
+        return False
+
+    changed = False
+    for step_key in ("merge", "upload", "wait", "delete_back"):
+        if steps.get(step_key) != "pending":
+            steps[step_key] = "pending"
+            changed = True
+    if item.get("output_path"):
+        item["output_path"] = ""
+        changed = True
+    return changed
+
+
 def _require_checkpoint(persist, label: str) -> None:
     """Never start the next remote operation if its recovery point was not saved."""
     if persist() is False:
@@ -358,6 +387,9 @@ def create_delete_back_flow_page():
                     for field in PERSIST_FIELDS:
                         item[field] = saved.get(field, "")
 
+                    if reset_processing and _repair_missing_upload_input(item):
+                        recovered_interrupted_step = True
+
                     if reset_processing and any(
                         value == "processing"
                         for value in (saved.get("steps") or {}).values()
@@ -415,6 +447,11 @@ def create_delete_back_flow_page():
         """Reattach a refreshed page to the latest durable backend checkpoint."""
         if not client_is_alive():
             deactivate_state_sync_timer()
+            return
+        if processing["value"]:
+            # This page owns the live item objects.  Reading an older database
+            # snapshot here can erase output_path while FFmpeg is still running.
+            state_sync_timer["observed_active_run"] = True
             return
         detached_run_active = _FLOW_RUN_GUARD.locked()
         if detached_run_active:
@@ -793,6 +830,8 @@ def create_delete_back_flow_page():
         file_index = orig_index + 1
         try:
             with bind_run_context(context):
+                if _repair_missing_upload_input(item):
+                    save_state()
                 for step_key in _new_steps():
                     if item["steps"].get(step_key) == "processing":
                         item["steps"][step_key] = "pending"
