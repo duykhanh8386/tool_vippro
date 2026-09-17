@@ -24,7 +24,6 @@ from src.utils import (
     AUDIO_EXTENSIONS,
     VIDEO_EXTENSIONS,
     FFprobeError,
-    build_intermittent_audio,
     get_channels_info,
     get_video_duration,
     list_media_files,
@@ -36,6 +35,7 @@ from web.components.drawer import nav_state
 from web.theme import app_card, page_header, section_header, workflow_steps
 
 STATE_KEY = "delete_back_flow"
+ORIGINAL_AUDIO_RENDER_MODE = "original_music_v1"
 _DELETE_LOG_FILENAME = "deleted_back_videos.csv"
 MAX_ACTIVE_VIDEOS = 5
 MAX_FFMPEG_JOBS = 5
@@ -52,6 +52,7 @@ PERSIST_FIELDS = (
     "music_path",
     "audio_path",
     "output_path",
+    "render_audio_mode",
     "video_id",
     "frontend_upload_id",
     "scotty_resource_id",
@@ -118,6 +119,59 @@ def _restore_steps(saved_steps: dict | None, *, reset_processing: bool) -> dict:
             if value == "processing":
                 steps[key] = "pending"
     return steps
+
+
+def _restore_delete_back_steps(saved: dict, *, reset_processing: bool) -> dict:
+    """Re-render legacy gated outputs only before any upload side effect."""
+    steps = _restore_steps(saved.get("steps"), reset_processing=reset_processing)
+    if (
+        reset_processing
+        and steps["merge"] == "successful"
+        and saved.get("render_audio_mode") != ORIGINAL_AUDIO_RENDER_MODE
+        and not any(
+            saved.get(field)
+            for field in (
+                "video_id", "frontend_upload_id", "scotty_resource_id",
+                "delete_requested",
+            )
+        )
+        and not any(
+            steps[key] == "successful" for key in ("upload", "wait", "delete_back")
+        )
+    ):
+        steps["merge"] = "pending"
+    return steps
+
+
+async def _render_delete_back_output(
+    item: dict, output_folder: str, music: Path, index: int, overlay_png: str | None
+) -> None:
+    """Mux the original, uninterrupted music; never create a 3s/7s track."""
+    music_path = str(music)
+    video_out = str(Path(output_folder) / f"output_{index}_processed.mp4")
+    item.update(
+        music=music.name,
+        music_path=music_path,
+        audio_path=music_path,
+        output_path=video_out,
+    )
+    run_context = current_run_context()
+    if run_context is not None:
+        # The source MP3 is user data, not a temporary output to clean up.
+        run_context.register_cleanup_path(video_out)
+
+    duration = await asyncio.to_thread(get_video_duration, music_path)
+    await asyncio.to_thread(
+        mux_audio_into_video,
+        video_file=item["path"],
+        audio_file=music_path,
+        video_out=video_out,
+        duration=duration,
+        overlay_png=overlay_png or None,
+    )
+    item["render_audio_mode"] = ORIGINAL_AUDIO_RENDER_MODE
+    if run_context is not None:
+        run_context.keep_path(video_out)
 
 
 def _replace_status_snapshot(target: dict, source: dict) -> None:
@@ -350,17 +404,16 @@ def create_delete_back_flow_page():
                         "size": size,
                         "duration": None,
                         "duration_error": "",
-                        "steps": _restore_steps(
-                            saved.get("steps"),
+                        "steps": _restore_delete_back_steps(
+                            saved,
                             reset_processing=reset_processing,
                         ),
                     }
                     for field in PERSIST_FIELDS:
                         item[field] = saved.get(field, "")
 
-                    if reset_processing and any(
-                        value == "processing"
-                        for value in (saved.get("steps") or {}).values()
+                    if reset_processing and item["steps"] != _restore_steps(
+                        saved.get("steps"), reset_processing=False
                     ):
                         recovered_interrupted_step = True
 
@@ -577,6 +630,7 @@ def create_delete_back_flow_page():
             safe_element_call(ui_refs["clear_btn"], "set_enabled", True)
 
     async def step_merge(item, output_folder, musics, index, run_config):
+        """Ghép nhạc gốc liên tục, không áp dụng mute 3 giây / 7 giây."""
         if item.get("duration") is None:
             item["duration"] = await asyncio.to_thread(
                 get_video_duration, item["path"]
@@ -588,36 +642,9 @@ def create_delete_back_flow_page():
         else:
             music = musics[index % len(musics)]
 
-        item["music"] = music.name
-        item["music_path"] = str(music)
-        base = str(Path(output_folder) / f"output_{index}")
-        audio_out = f"{base}.m4v"
-        video_out = f"{base}_processed.mp4"
-        item["audio_path"] = audio_out
-        item["output_path"] = video_out
-        run_context = current_run_context()
-        if run_context is not None:
-            run_context.register_cleanup_path(audio_out)
-            run_context.register_cleanup_path(video_out)
-
-        overlay_png = run_config["overlay_png"]
-
-        dur = await asyncio.to_thread(
-            build_intermittent_audio,
-            music_file=str(music),
-            audio_out=audio_out,
+        await _render_delete_back_output(
+            item, output_folder, music, index, run_config["overlay_png"]
         )
-        await asyncio.to_thread(
-            mux_audio_into_video,
-            video_file=item["path"],
-            audio_file=audio_out,
-            video_out=video_out,
-            duration=dur,
-            overlay_png=overlay_png,
-        )
-        if run_context is not None:
-            run_context.keep_path(audio_out)
-            run_context.keep_path(video_out)
 
     async def step_upload(item, output_folder, musics, index, run_config):
         channel_id = run_config["channel_id"]
@@ -1152,13 +1179,13 @@ def create_delete_back_flow_page():
     with page:
         with page_header(
             "Xóa Back flow",
-            "Ghép nhạc, upload, chờ YouTube xử lý và chạy bước Xóa - Back tự động.",
+            "Ghép nhạc gốc liên tục (không ngắt 3s/7s), upload, chờ xử lý và Xóa - Back.",
             eyebrow="Quy trình",
         ):
             pass
         workflow_steps(
             [
-                {"title": "Ghép nhạc", "description": "Tạo video đầu ra", "state": "current"},
+                {"title": "Ghép nhạc", "description": "Giữ nguyên nhạc gốc", "state": "current"},
                 {"title": "Upload", "description": "Đăng video lên kênh", "state": "pending"},
                 {"title": "Chờ xử lý", "description": "Đợi trạng thái YouTube", "state": "pending"},
                 {"title": "Xóa - Back", "description": "Hoàn tất quy trình", "state": "pending"},
