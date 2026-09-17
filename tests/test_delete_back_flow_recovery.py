@@ -8,6 +8,7 @@ from web.components.delete_video_controller import DeleteVideoController
 from web.components.delete_back_flow import (
     ORIGINAL_AUDIO_RENDER_MODE,
     PERSIST_FIELDS,
+    _repair_missing_upload_input,
     _replace_video_items_unless_processing,
     _require_checkpoint,
     _restore_delete_back_steps,
@@ -126,6 +127,73 @@ class DeleteBackFlowRecoveryTests(unittest.TestCase):
         restored = _restore_delete_back_steps(live, reset_processing=False)
         self.assertEqual(restored["merge"], "successful")
         self.assertEqual(restored["upload"], "processing")
+
+    def test_missing_merged_output_restarts_local_pipeline(self):
+        item = {
+            "output_path": "",
+            "steps": {
+                "merge": "successful",
+                "upload": "error",
+                "wait": "pending",
+                "delete_back": "pending",
+            },
+        }
+
+        self.assertTrue(_repair_missing_upload_input(item))
+        self.assertEqual(
+            item["steps"],
+            {
+                "merge": "pending",
+                "upload": "pending",
+                "wait": "pending",
+                "delete_back": "pending",
+            },
+        )
+
+    def test_existing_merged_output_is_kept(self):
+        with tempfile.NamedTemporaryFile(suffix=".mp4") as output:
+            item = {
+                "output_path": output.name,
+                "steps": {
+                    "merge": "successful",
+                    "upload": "error",
+                    "wait": "pending",
+                    "delete_back": "pending",
+                },
+            }
+
+            self.assertFalse(_repair_missing_upload_input(item))
+            self.assertEqual(item["steps"]["merge"], "successful")
+
+    def test_remote_upload_checkpoint_does_not_need_local_output(self):
+        item = {
+            "output_path": "",
+            "frontend_upload_id": "frontend-id",
+            "scotty_resource_id": "scotty-id",
+            "steps": {
+                "merge": "successful",
+                "upload": "processing",
+                "wait": "pending",
+                "delete_back": "pending",
+            },
+        }
+
+        self.assertFalse(_repair_missing_upload_input(item))
+        self.assertEqual(item["steps"]["merge"], "successful")
+
+    def test_successful_upload_is_never_retried_without_remote_ids(self):
+        item = {
+            "output_path": "",
+            "steps": {
+                "merge": "successful",
+                "upload": "successful",
+                "wait": "successful",
+                "delete_back": "successful",
+            },
+        }
+
+        self.assertFalse(_repair_missing_upload_input(item))
+        self.assertEqual(item["steps"]["upload"], "successful")
 
 
 class StateManagerDurabilityTests(unittest.TestCase):
