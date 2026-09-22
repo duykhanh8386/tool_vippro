@@ -49,6 +49,10 @@ _RUN_STATE_KEY = "delete_video_run"
 _TERMINAL = ("deleted", "deleting", "error")
 
 
+def video_watch_url(video_id: str) -> str:
+    return f"https://www.youtube.com/watch?v={video_id}"
+
+
 def _load_output_dir() -> Path:
     """Return the persisted output folder, falling back to the default."""
     try:
@@ -118,11 +122,16 @@ class DeleteVideoController:
 
             recovered = False
             for video in self.all_videos:
+                if video.get("id") and not video.get("video_url"):
+                    video["video_url"] = video_watch_url(video["id"])
+                    recovered = True
                 # A process that was killed cannot still be deleting.  Make it
                 # eligible for verification/retry when the user resumes.
                 if video.get("row_status") == "deleting":
                     video["row_status"] = "ready"
                     recovered = True
+            if self._restore_deleted_history():
+                recovered = True
             if self.all_videos:
                 self.status_text = (
                     "Đã khôi phục danh sách trước đó. Bấm Quét & Xóa để tiếp tục."
@@ -131,6 +140,49 @@ class DeleteVideoController:
                 self._save_run_state()
         except Exception as exc:
             logger.error("Failed to restore delete-video run state: {}", exc)
+
+    def _restore_deleted_history(self) -> bool:
+        """Recover completed rows from the delete log if the queue was lost."""
+        if not self.log_file.is_file():
+            return False
+        changed = False
+        try:
+            with self.log_file.open(newline="", encoding="utf-8") as log:
+                rows = list(csv.DictReader(log))
+            by_id = {video.get("id"): video for video in self.all_videos}
+            for row in rows:
+                video_id = row.get("video_id")
+                if not video_id:
+                    continue
+                existing = by_id.get(video_id)
+                if existing is not None:
+                    if (
+                        existing.get("row_status") != "deleted"
+                        or existing.get("delete_requested")
+                    ):
+                        existing["row_status"] = "deleted"
+                        existing["delete_requested"] = False
+                        changed = True
+                    continue
+                video = {
+                    "id": video_id,
+                    "video_url": row.get("video_url") or video_watch_url(video_id),
+                    "channel_id": row.get("channel_id") or "",
+                    "channel_name": row.get("channel_name") or "",
+                    "channel_avatar": "",
+                    "title": row.get("title") or "",
+                    "thumbnail": "",
+                    "privacy": "",
+                    "copyright_check_status": "",
+                    "row_status": "deleted",
+                    "delete_requested": False,
+                }
+                self.all_videos.append(video)
+                by_id[video_id] = video
+                changed = True
+        except Exception as exc:
+            logger.error("Failed to restore deleted video history: {}", exc)
+        return changed
 
     @property
     def log_file(self) -> Path:
@@ -146,6 +198,7 @@ class DeleteVideoController:
         state_manager.save_state(
             _SETTINGS_KEY, {"output_dir": str(self.output_dir)}
         )
+        self._restore_deleted_history()
         self._bump()
 
     def refresh_channel_maps(self):
@@ -170,13 +223,11 @@ class DeleteVideoController:
         if self.is_running():
             return
         self.refresh_channel_maps()
-        is_resume = (
-            list(channel_ids) == self.selected_channel_ids and bool(self.all_videos)
-        )
         self.selected_channel_ids = list(channel_ids)
         self.max_workers = max(1, int(max_workers))
-        if not is_resume:
-            self.all_videos = []
+        # Keep previously scanned videos in the durable queue, including their
+        # IDs after a different set of channels is selected.  A fresh scan only
+        # adds or updates videos from its selected channels.
         self.running = True
         self.polling = False
         self.next_poll_at = 0.0
@@ -252,6 +303,7 @@ class DeleteVideoController:
     def _video_dict(self, v, channel_id: str) -> dict:
         return {
             "id": v.id,
+            "video_url": video_watch_url(v.id),
             "channel_id": channel_id,
             "channel_name": self._channel_name_map.get(channel_id, channel_id),
             "channel_avatar": self._channel_avatar_map.get(channel_id, ""),
@@ -271,17 +323,48 @@ class DeleteVideoController:
                     self._bump()
                 return
 
+    def ensure_log_links(self) -> bool:
+        """Add watch URLs to an older delete log without dropping its rows."""
+        log_file = self.log_file
+        try:
+            if not log_file.exists() or not log_file.stat().st_size:
+                return True
+            with log_file.open("r", newline="", encoding="utf-8") as existing:
+                reader = csv.DictReader(existing)
+                fieldnames = reader.fieldnames or []
+                if "video_url" in fieldnames:
+                    return True
+                rows = list(reader)
+            if "video_id" not in fieldnames:
+                raise ValueError("delete log has no video_id column")
+            upgraded_file = log_file.with_name(log_file.name + ".tmp")
+            with upgraded_file.open("w", newline="", encoding="utf-8") as upgraded:
+                writer = csv.DictWriter(
+                    upgraded, fieldnames=[*fieldnames, "video_url"]
+                )
+                writer.writeheader()
+                for row in rows:
+                    row["video_url"] = video_watch_url(row["video_id"])
+                    writer.writerow(row)
+            upgraded_file.replace(log_file)
+            return True
+        except Exception as exc:
+            logger.error(f"Failed to add links to deleted_videos.csv: {exc}")
+            return False
+
     def _log_deleted(self, video: dict):
         """Append one row to deleted_videos.csv on a successful delete."""
         log_file = self.log_file
         try:
             log_file.parent.mkdir(parents=True, exist_ok=True)
-            file_exists = log_file.exists()
+            if not self.ensure_log_links():
+                return
+            file_exists = log_file.exists() and log_file.stat().st_size > 0
             with log_file.open("a", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
                 if not file_exists:
                     writer.writerow(
-                        ["video_id", "channel_id", "channel_name", "deleted_at"]
+                        ["video_id", "channel_id", "channel_name", "deleted_at", "video_url"]
                     )
                 writer.writerow(
                     [
@@ -289,6 +372,7 @@ class DeleteVideoController:
                         video["channel_id"],
                         video.get("channel_name", ""),
                         datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        video.get("video_url") or video_watch_url(video["id"]),
                     ]
                 )
         except Exception as exc:

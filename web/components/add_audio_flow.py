@@ -39,6 +39,8 @@ YOUTUBE_STATUS_MAX_CONSECUTIVE_TRANSIENT_ERRORS = 3
 # NiceGUI can open the same page in multiple browser tabs.  Keep one flow run
 # per application instance so two tabs cannot overwrite output_0/output_1...
 _FLOW_RUN_GUARD = threading.Lock()
+_ACTIVE_FLOW_RUN = {"parent": None, "children": {}}
+_FLOW_STOP_REQUESTED = {"value": False}
 
 
 class YouTubeProcessingWaitError(RuntimeError):
@@ -357,7 +359,21 @@ def create_add_audio_flow_page():
     except RuntimeError:
         page_client = None
     ui_lifecycle = {"available": page_client is not None}
-    paths_state = {"video_folder": "", "music_folder": "", "output_folder": ""}; options_state = {"random_music": False, "audio_language": "en"}; selected_channel = {"id": None}; channels = get_channels_info(); videos_state = {"items": []}; saved_status_map = {}; video_list_container = None; suppress_autosave = {"value": False}; ui_refs = {"random_switch": None, "lang_input": None, "process_btn": None, "clear_btn": None, "refresh_channel_display": None, "refresh_overlay": None, "stop_btn": None}; folder_selectors = {}; progress_refs = {}; processing = {"value": False}; stop_requested = {"value": False}; active_run = {"parent": None, "children": {}}; PERSIST_FIELDS = ("music", "music_path", "audio_path", "output_path", "video_id", "scotty_resource_id", "frontend_upload_id", "audio_language_results")
+    paths_state = {"video_folder": "", "music_folder": "", "output_folder": ""}
+    options_state = {"random_music": False, "audio_language": "en"}
+    selected_channel = {"id": None}
+    channels = get_channels_info()
+    videos_state = {"items": []}
+    saved_status_map = {}
+    video_list_container = None
+    suppress_autosave = {"value": False}
+    ui_refs = {"random_switch": None, "lang_input": None, "process_btn": None, "clear_btn": None, "refresh_channel_display": None, "refresh_overlay": None, "stop_btn": None}
+    folder_selectors = {}
+    progress_refs = {}
+    processing = {"value": False}
+    stop_requested = _FLOW_STOP_REQUESTED
+    active_run = _ACTIVE_FLOW_RUN
+    PERSIST_FIELDS = ("music", "music_path", "audio_path", "output_path", "video_id", "scotty_resource_id", "frontend_upload_id", "audio_language_results")
 
     def client_is_alive() -> bool:
         return (
@@ -521,6 +537,11 @@ def create_add_audio_flow_page():
         if not client_is_alive():
             deactivate_state_sync_timer()
             return
+        if processing["value"]:
+            # This page owns the live items; an older checkpoint must not
+            # overwrite values that a worker is still updating.
+            state_sync_timer["observed_active_run"] = True
+            return
         detached_run_active = _FLOW_RUN_GUARD.locked()
         if detached_run_active:
             state_sync_timer["observed_active_run"] = True
@@ -558,6 +579,16 @@ def create_add_audio_flow_page():
         )
         safe_element_call(
             ui_refs.get("clear_btn"), "set_enabled", not detached_run_active
+        )
+        safe_element_call(
+            ui_refs.get("stop_btn"), "set_visibility", detached_run_active
+        )
+        safe_element_call(
+            ui_refs.get("stop_btn"), "set_enabled",
+            detached_run_active and not stop_requested["value"],
+        )
+        safe_element_call(
+            progress_refs.get("panel"), "set_visibility", detached_run_active
         )
         if detached_run_active:
             safe_element_call(
@@ -930,9 +961,9 @@ def create_add_audio_flow_page():
         processing["value"] = active
 
         if active:
-            nav_state.lock("Đang xử lý video, vui lòng đợi hoàn tất trước khi chuyển trang.")
+            nav_state.lock("/audio/flow", "Đang xử lý video, vui lòng đợi hoàn tất trước khi chuyển trang.")
         else:
-            nav_state.unlock()
+            nav_state.unlock("/audio/flow")
         safe_element_call(progress_refs.get("panel"), "set_visibility", active)
         safe_element_call(progress_refs.get("bar"), "set_value", 0)
         if message:
@@ -1203,7 +1234,7 @@ def create_add_audio_flow_page():
         return stats
 
     async def handle_stop():
-        if not processing["value"]:
+        if not (processing["value"] or _FLOW_RUN_GUARD.locked()):
             return None
         stop_requested["value"] = True
 

@@ -1,7 +1,10 @@
+import asyncio
+import copy
+import csv
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from src.state_manager import StateManager
 from web.components.delete_video_controller import DeleteVideoController
@@ -247,6 +250,174 @@ class DeleteVideoControllerRecoveryTests(unittest.TestCase):
         self.assertEqual(restored.all_videos[0]["row_status"], "ready")
         self.assertTrue(restored.all_videos[0]["delete_requested"])
         self.assertEqual(restored.all_videos[1]["row_status"], "deleted")
+        self.assertEqual(
+            restored.all_videos[1]["video_url"],
+            "https://www.youtube.com/watch?v=video-2",
+        )
+
+
+class DeleteVideoHistoryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_stopped_scan_keeps_rows_after_controller_reload(self):
+        class MemoryStateManager:
+            def __init__(self):
+                self.states = {}
+
+            def save_state(self, key, value):
+                self.states[key] = copy.deepcopy(value)
+                return True
+
+            def load_state(self, key):
+                return copy.deepcopy(self.states.get(key))
+
+        memory_state = MemoryStateManager()
+        with tempfile.TemporaryDirectory() as temp_dir, patch(
+            "web.components.delete_video_controller.state_manager", memory_state
+        ), patch(
+            "web.components.delete_video_controller._load_output_dir",
+            return_value=Path(temp_dir),
+        ):
+            controller = DeleteVideoController()
+            controller.all_videos = [
+                {
+                    "id": "finished-id",
+                    "channel_id": "channel-id",
+                    "row_status": "deleted",
+                    "delete_requested": False,
+                }
+            ]
+
+            async def no_scan(_channel_id, _semaphore):
+                await asyncio.sleep(0)
+
+            with patch.object(controller, "refresh_channel_maps"), patch.object(
+                controller, "_process_channel", side_effect=no_scan
+            ):
+                controller.start(["channel-id"])
+                await asyncio.sleep(0)
+                await controller.stop()
+
+            restored = DeleteVideoController()
+
+        self.assertEqual(restored.all_videos[0]["id"], "finished-id")
+        self.assertEqual(restored.all_videos[0]["row_status"], "deleted")
+        self.assertEqual(
+            restored.all_videos[0]["video_url"],
+            "https://www.youtube.com/watch?v=finished-id",
+        )
+
+    def test_deleted_rows_restore_from_csv_when_checkpoint_is_missing(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            log_file = Path(temp_dir) / "deleted_videos.csv"
+            log_file.write_text(
+                "video_id,channel_id,channel_name,deleted_at\n"
+                "saved-id,channel-id,Channel,2026-09-01 12:00:00\n",
+                encoding="utf-8",
+            )
+
+            class MemoryStateManager:
+                def __init__(self):
+                    self.states = {"delete_video_settings": {"output_dir": temp_dir}}
+
+                def save_state(self, key, value):
+                    self.states[key] = value
+                    return True
+
+                def load_state(self, key):
+                    return self.states.get(key)
+
+            memory_state = MemoryStateManager()
+            with patch("web.components.delete_video_controller.state_manager", memory_state):
+                controller = DeleteVideoController()
+
+            self.assertEqual(len(controller.all_videos), 1)
+            self.assertEqual(controller.all_videos[0]["row_status"], "deleted")
+            self.assertEqual(
+                controller.all_videos[0]["video_url"],
+                "https://www.youtube.com/watch?v=saved-id",
+            )
+            self.assertEqual(
+                memory_state.load_state("delete_video_run")["all_videos"][0]["id"],
+                "saved-id",
+            )
+
+    def test_existing_delete_log_gains_links_without_losing_old_rows(self):
+        with tempfile.TemporaryDirectory() as temp_dir, patch(
+            "web.components.delete_video_controller.state_manager"
+        ) as memory_state:
+            memory_state.load_state.return_value = None
+            controller = DeleteVideoController()
+            controller.output_dir = Path(temp_dir)
+            controller.log_file.write_text(
+                "video_id,channel_id,channel_name,deleted_at\n"
+                "old-id,old-channel,Old,2026-09-01 12:00:00\n",
+                encoding="utf-8",
+            )
+
+            self.assertTrue(controller.ensure_log_links())
+            with controller.log_file.open(newline="", encoding="utf-8") as log:
+                old_rows = list(csv.DictReader(log))
+            self.assertEqual(len(old_rows), 1)
+            self.assertEqual(
+                old_rows[0]["video_url"], "https://www.youtube.com/watch?v=old-id"
+            )
+
+            controller._log_deleted(
+                {"id": "new-id", "channel_id": "new-channel", "channel_name": "New"}
+            )
+
+            with controller.log_file.open(newline="", encoding="utf-8") as log:
+                rows = list(csv.DictReader(log))
+            self.assertEqual(len(rows), 2)
+            self.assertEqual(
+                rows[0]["video_url"], "https://www.youtube.com/watch?v=old-id"
+            )
+            self.assertEqual(
+                rows[1]["video_url"], "https://www.youtube.com/watch?v=new-id"
+            )
+
+    async def test_scanning_another_channel_keeps_previous_video_links_in_checkpoint(self):
+        class MemoryStateManager:
+            def __init__(self):
+                self.states = {}
+
+            def save_state(self, key, value):
+                self.states[key] = value
+                return True
+
+            def load_state(self, key):
+                return self.states.get(key)
+
+        memory_state = MemoryStateManager()
+        release_run = asyncio.Event()
+
+        async def held_run(_context):
+            await release_run.wait()
+
+        with patch("web.components.delete_video_controller.state_manager", memory_state), patch(
+            "web.components.delete_video_controller.create_run_context",
+            return_value=Mock(),
+        ):
+            controller = DeleteVideoController()
+            controller.selected_channel_ids = ["old-channel"]
+            controller.all_videos = [
+                {
+                    "id": "saved-video-id",
+                    "channel_id": "old-channel",
+                    "row_status": "deleted",
+                }
+            ]
+            with patch.object(controller, "refresh_channel_maps"), patch.object(
+                controller, "_run_loop", side_effect=held_run
+            ):
+                controller.start(["new-channel"])
+                self.assertEqual(controller.selected_channel_ids, ["new-channel"])
+                self.assertEqual(controller.all_videos[0]["id"], "saved-video-id")
+                self.assertEqual(
+                    memory_state.load_state("delete_video_run")["all_videos"][0]["id"],
+                    "saved-video-id",
+                )
+                release_run.set()
+                await controller._task
 
 
 if __name__ == "__main__":

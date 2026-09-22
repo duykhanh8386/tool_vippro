@@ -10,16 +10,19 @@ class NavigationState:
     def __init__(self, default_route: str = "/studio"):
         self.active_route = default_route
         self._default_route = default_route
-        self.locked = False
-        self.lock_message = "Đang xử lý, vui lòng dừng trước khi chuyển trang."
+        self._locks: dict[str, str] = {}
+        self._default_lock_message = "Đang xử lý, vui lòng dừng trước khi chuyển trang."
 
-    def lock(self, message: Optional[str] = None):
-        self.locked = True
-        if message:
-            self.lock_message = message
+    def lock(self, route: str, message: Optional[str] = None):
+        self._locks[route] = message or self._default_lock_message
 
-    def unlock(self):
-        self.locked = False
+    def unlock(self, route: str):
+        self._locks.pop(route, None)
+
+    def blocking_message(self, current_route: str, target_route: str) -> Optional[str]:
+        if current_route == target_route:
+            return None
+        return self._locks.get(current_route)
 
     def set_active_route(self, route: str):
         self.active_route = route
@@ -34,8 +37,13 @@ nav_state = NavigationState()
 
 
 def _navigate(route: str) -> None:
-    if nav_state.locked:
-        ui.notify(nav_state.lock_message, type="warning")
+    try:
+        current_route = context.client.page.path
+    except RuntimeError:
+        current_route = nav_state.active_route
+    message = nav_state.blocking_message(current_route, route)
+    if message:
+        ui.notify(message, type="warning")
         return
     nav_state.set_active_route(route)
     ui.navigate.to(route)

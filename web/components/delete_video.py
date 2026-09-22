@@ -5,7 +5,7 @@ from nicegui import ui
 
 from src.utils import get_channels_info
 from web.components.common import create_channel_selection, select_directory
-from web.components.delete_video_controller import delete_controller
+from web.components.delete_video_controller import delete_controller, video_watch_url
 from web.components.drawer import nav_state
 from web.theme import app_card, empty_state, page_header, page_shell, section_header
 
@@ -71,13 +71,14 @@ def create_delete_video_page():
         ):
             ui.label("Thumb").classes("w-16 shrink-0")
             ui.label("Kênh").classes("w-40 shrink-0")
-            ui.label("Video ID").classes("w-28 shrink-0")
+            ui.label("Video ID / link").classes("w-36 shrink-0")
             ui.label("Tiêu đề").classes("flex-1")
             ui.label("Quyền riêng tư").classes("w-28 shrink-0")
             ui.label("Trạng thái").classes("w-36 shrink-0")
 
     def _render_row(video: dict):
         vid_id = video["id"]
+        video_url = video.get("video_url") or video_watch_url(vid_id)
         with ui.row().classes(
             "w-full min-h-[54px] items-center flex-nowrap border-b border-gray-100 bg-white hover:bg-gray-50"
         ):
@@ -107,10 +108,15 @@ def create_delete_video_page():
                 ui.label(ch_name).classes("text-xs text-gray-700 truncate")
 
             # Video ID
-            with ui.column().classes("w-28 shrink-0 px-1"):
-                ui.label(vid_id).classes(
-                    "text-xs font-mono bg-gray-100 text-gray-700 px-1.5 py-0.5 rounded break-all leading-tight"
-                )
+            with ui.column().classes("w-36 shrink-0 px-1"):
+                with ui.row().classes("items-center gap-1 flex-nowrap"):
+                    ui.link(vid_id, video_url, new_tab=True).classes(
+                        "text-xs font-mono bg-gray-100 text-gray-700 px-1.5 py-0.5 rounded break-all leading-tight"
+                    ).tooltip(video_url)
+                    ui.button(
+                        icon="content_copy",
+                        on_click=lambda url=video_url: ui.clipboard.write(url),
+                    ).props("flat dense round size=xs").tooltip("Sao chép link")
 
             # Title
             with ui.column().classes("flex-1 min-w-0 px-1"):
@@ -215,9 +221,9 @@ def create_delete_video_page():
         if stop_btn:
             stop_btn.set_enabled(running)
         if running:
-            nav_state.lock(NAV_LOCK_MSG)
+            nav_state.lock("/reup/delete-video", NAV_LOCK_MSG)
         else:
-            nav_state.unlock()
+            nav_state.unlock("/reup/delete-video")
 
     def _update_countdown():
         cd = ui_refs["countdown_label"]
@@ -294,6 +300,7 @@ def create_delete_video_page():
             )
             return
         try:
+            delete_controller.ensure_log_links()
             os.startfile(str(log_file))
         except Exception as exc:
             ui.notify(f"Không thể mở file lịch sử: {exc}", type="negative")
@@ -359,7 +366,7 @@ def create_delete_video_page():
         with app_card():
             with section_header(
                 "Danh sách theo dõi",
-                "Trạng thái video được đồng bộ tự động trong quá trình quét.",
+                "Video và link được giữ lại sau khi dừng hoặc quét kênh khác.",
             ):
                 pass
             pb = ui.linear_progress(value=0).classes("w-full mb-1")

@@ -654,14 +654,14 @@ def create_delete_back_flow_page():
     def set_processing_ui(is_processing: bool):
         processing["value"] = is_processing
         if is_processing:
-            nav_state.lock("Đang chạy Delete-Back Flow, hãy bấm Dừng trước khi chuyển trang.")
+            nav_state.lock("/reup/delete-back-flow", "Đang chạy Delete-Back Flow, hãy bấm Dừng trước khi chuyển trang.")
             safe_element_call(ui_refs["process_btn"], "set_visibility", False)
             safe_element_call(ui_refs["stop_btn"], "set_visibility", True)
             safe_element_call(ui_refs["stop_btn"], "set_enabled", True)
             safe_element_call(ui_refs["clear_btn"], "set_enabled", False)
             safe_element_call(progress_refs["panel"], "set_visibility", True)
         else:
-            nav_state.unlock()
+            nav_state.unlock("/reup/delete-back-flow")
             safe_element_call(ui_refs["process_btn"], "set_visibility", True)
             safe_element_call(ui_refs["stop_btn"], "set_visibility", False)
             safe_element_call(ui_refs["clear_btn"], "set_enabled", True)
