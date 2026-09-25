@@ -9,6 +9,7 @@ from src.audio_batch_matcher import (
     build_audio_rename_plan,
     execute_audio_rename_plan,
     match_audio_files,
+    match_audio_files_by_title,
     match_audio_files_sequentially,
 )
 from src.audio_language import (
@@ -207,6 +208,7 @@ def create_add_audio_page():
     batch_scan_state = {
         "music_folder": "",
         "recursive": True,
+        "duration_tolerance": 2.0,
         "result_channel": None,
         "summary": {},
         "issues": [],
@@ -226,8 +228,10 @@ def create_add_audio_page():
         "music_folder_input": None,
         "recursive_switch": None,
         "scan_button": None,
+        "title_button": None,
         "sequential_button": None,
         "rename_button": None,
+        "duration_tolerance_input": None,
     }
 
     def configuration_change_blocked() -> bool:
@@ -317,6 +321,10 @@ def create_add_audio_page():
                         ui_refs["music_folder_input"].value = batch_scan_state["music_folder"]
                     if ui_refs["recursive_switch"]:
                         ui_refs["recursive_switch"].value = batch_scan_state["recursive"]
+                    if ui_refs["duration_tolerance_input"]:
+                        ui_refs["duration_tolerance_input"].value = batch_scan_state[
+                            "duration_tolerance"
+                        ]
                     refresh_right_panel()
                     refresh_scan_preview()
                     refresh_rename_button()
@@ -450,8 +458,13 @@ def create_add_audio_page():
                     f"trùng {summary.get('ambiguous', 0)} · "
                     f"file dư {summary.get('extra_files', 0)}"
                 ).classes("text-xs text-gray-500")
-                if summary.get("mode") == "sequential":
-                    ui.label("Chế độ: ghép lần lượt").classes(
+                mode_label = {
+                    "duration": "Chế độ: khớp thời lượng",
+                    "title": "Chế độ: khớp tiêu đề",
+                    "sequential": "Chế độ: ghép lần lượt",
+                }.get(summary.get("mode"))
+                if mode_label:
+                    ui.label(mode_label).classes(
                         "text-xs font-medium text-blue-600"
                     )
             if issues:
@@ -486,12 +499,13 @@ def create_add_audio_page():
         button = ui_refs.get("rename_button")
         if not button:
             return
-        has_sequential_matches = any(
-            (auto_match_info.get(video_id) or {}).get("status") == "sequential"
+        has_renameable_matches = any(
+            (auto_match_info.get(video_id) or {}).get("status")
+            in {"duration", "title", "sequential"}
             and id_to_path.get(video_id)
             for video_id in video_ids_state["ids"]
         )
-        if has_sequential_matches:
+        if has_renameable_matches:
             button.props(remove="disable")
         else:
             button.props("disable")
@@ -561,7 +575,7 @@ def create_add_audio_page():
 
     scan_runtime = {"running": False}
 
-    async def run_folder_scan(*, sequential: bool):
+    async def run_folder_scan(*, mode: str):
         if configuration_change_blocked():
             return
         if scan_runtime["running"]:
@@ -577,9 +591,13 @@ def create_add_audio_page():
             return
 
         scan_runtime["running"] = True
-        active_button_key = "sequential_button" if sequential else "scan_button"
+        active_button_key = {
+            "duration": "scan_button",
+            "title": "title_button",
+            "sequential": "sequential_button",
+        }[mode]
         active_button = ui_refs.get(active_button_key)
-        for key in ("scan_button", "sequential_button"):
+        for key in ("scan_button", "title_button", "sequential_button"):
             button = ui_refs.get(key)
             if button:
                 button.props("disable")
@@ -590,27 +608,41 @@ def create_add_audio_page():
             videos = await asyncio.to_thread(
                 _fetch_all_channel_videos, selected_channel["id"]
             )
+            matcher = {
+                "duration": match_audio_files,
+                "title": match_audio_files_by_title,
+                "sequential": match_audio_files_sequentially,
+            }[mode]
+            matcher_kwargs = {
+                "recursive": bool(batch_scan_state.get("recursive", True))
+            }
+            if mode == "duration":
+                matcher_kwargs["tolerance_seconds"] = float(
+                    batch_scan_state.get("duration_tolerance", 2.0)
+                )
             result = await asyncio.to_thread(
-                match_audio_files_sequentially if sequential else match_audio_files,
+                matcher,
                 videos,
                 folder,
-                recursive=bool(batch_scan_state.get("recursive", True)),
+                **matcher_kwargs,
             )
-            matched_count = apply_batch_match(
-                result, mode="sequential" if sequential else "automatic"
-            )
+            matched_count = apply_batch_match(result, mode=mode)
             if matched_count:
-                action = "ghép lần lượt" if sequential else "tự ghép"
+                action = {
+                    "duration": "ghép theo thời lượng",
+                    "title": "ghép theo tiêu đề",
+                    "sequential": "ghép lần lượt",
+                }[mode]
                 ui.notify(
                     f"Đã {action} {matched_count}/{len(videos)} video. Hãy kiểm tra bảng rồi cập nhật audio.",
                     type="positive",
                 )
             else:
-                message = (
-                    "Thư mục không có file âm thanh để ghép lần lượt."
-                    if sequential
-                    else "Không tìm thấy file khớp. Hãy đặt Video ID ở đầu tên file hoặc dùng mapping.csv."
-                )
+                message = {
+                    "duration": "Không tìm thấy file có thời lượng phù hợp.",
+                    "title": "Không tìm thấy file chứa tiêu đề YouTube trong tên file.",
+                    "sequential": "Thư mục không có file âm thanh để ghép lần lượt.",
+                }[mode]
                 ui.notify(message, type="warning")
         except Exception as exc:
             logger.exception("Automatic audio scan failed")
@@ -623,16 +655,19 @@ def create_add_audio_page():
             scan_runtime["running"] = False
             if active_button:
                 active_button.props(remove="loading")
-            for key in ("scan_button", "sequential_button"):
+            for key in ("scan_button", "title_button", "sequential_button"):
                 button = ui_refs.get(key)
                 if button:
                     button.props(remove="disable")
 
     async def handle_auto_scan():
-        await run_folder_scan(sequential=False)
+        await run_folder_scan(mode="duration")
+
+    async def handle_title_scan():
+        await run_folder_scan(mode="title")
 
     async def handle_sequential_scan():
-        await run_folder_scan(sequential=True)
+        await run_folder_scan(mode="sequential")
 
     def open_rename_dialog():
         if configuration_change_blocked():
@@ -644,10 +679,11 @@ def create_add_audio_page():
             (video_id, id_to_path[video_id])
             for video_id in video_ids_state["ids"]
             if id_to_path.get(video_id)
-            and (auto_match_info.get(video_id) or {}).get("status") == "sequential"
+            and (auto_match_info.get(video_id) or {}).get("status")
+            in {"duration", "title", "sequential"}
         ]
         if not assignments:
-            ui.notify("Chưa có kết quả Ghép lần lượt để đổi tên.", type="warning")
+            ui.notify("Chưa có kết quả ghép tự động để đổi tên.", type="warning")
             return
         try:
             plan = build_audio_rename_plan(assignments)
@@ -764,6 +800,7 @@ def create_add_audio_page():
                             match_label = {
                                 "mapping": "mapping.csv",
                                 "video_id": "Khớp ID",
+                                "duration": "Khớp thời lượng",
                                 "title": "Khớp tiêu đề",
                                 "sequential": "Ghép lần lượt",
                                 "manual": "Thủ công",
@@ -1244,6 +1281,24 @@ def create_add_audio_page():
             batch_scan_state["recursive"] = bool(e.value)
             save_right_panel_state()
 
+        def on_duration_tolerance_change(e=None):
+            if configuration_change_blocked():
+                if ui_refs["duration_tolerance_input"]:
+                    ui_refs["duration_tolerance_input"].value = batch_scan_state[
+                        "duration_tolerance"
+                    ]
+                return
+            input_ref = ui_refs["duration_tolerance_input"]
+            try:
+                value = float(input_ref.value if input_ref else 2.0)
+            except (TypeError, ValueError):
+                value = 2.0
+            value = min(10.0, max(0.0, value))
+            batch_scan_state["duration_tolerance"] = value
+            if input_ref:
+                input_ref.value = value
+            save_right_panel_state()
+
         with ui.card().classes("w-full bg-emerald-50 border border-emerald-200 p-3 mb-4"):
             with ui.row().classes("w-full items-end gap-2 flex-wrap"):
                 music_folder_input = ui.input(
@@ -1258,19 +1313,35 @@ def create_add_audio_page():
                     on_click=pick_music_folder,
                 ).props("outline")
             with ui.row().classes("w-full items-center justify-between gap-2 flex-wrap"):
-                recursive_switch = ui.switch(
-                    "Quét cả thư mục con",
-                    value=batch_scan_state["recursive"],
-                    on_change=on_recursive_change,
-                ).props("dense")
-                ui_refs["recursive_switch"] = recursive_switch
+                with ui.row().classes("items-center gap-3"):
+                    recursive_switch = ui.switch(
+                        "Quét cả thư mục con",
+                        value=batch_scan_state["recursive"],
+                        on_change=on_recursive_change,
+                    ).props("dense")
+                    ui_refs["recursive_switch"] = recursive_switch
+                    duration_tolerance_input = ui.number(
+                        "Lệch tối đa (giây)",
+                        value=batch_scan_state["duration_tolerance"],
+                        min=0,
+                        max=10,
+                        step=0.5,
+                        on_change=on_duration_tolerance_change,
+                    ).props("outlined dense").classes("w-36")
+                    ui_refs["duration_tolerance_input"] = duration_tolerance_input
                 with ui.row().classes("items-center gap-2 flex-wrap"):
                     scan_button = ui.button(
-                        "Tự ghép theo ID",
-                        icon="manage_search",
+                        "Ghép theo thời lượng",
+                        icon="timer",
                         on_click=handle_auto_scan,
                     ).props("outline")
                     ui_refs["scan_button"] = scan_button
+                    title_button = ui.button(
+                        "Ghép theo tiêu đề",
+                        icon="title",
+                        on_click=handle_title_scan,
+                    ).props("outline")
+                    ui_refs["title_button"] = title_button
                     sequential_button = ui.button(
                         "Ghép lần lượt",
                         icon="format_list_numbered",
@@ -1284,11 +1355,10 @@ def create_add_audio_page():
                     ).props("outline disable")
                     ui_refs["rename_button"] = rename_button
             ui.label(
-                "Đặt Video ID ở đầu tên file, ví dụ VIDEO_ID.m4a hoặc "
-                "VIDEO_ID__ghi-chú.flac. Phần đuôi có thể là MP3, M4A, WAV, "
-                "AAC, FLAC, OGG, OPUS, WMA, AIFF, APE và các định dạng được hỗ trợ khác. "
-                "Nếu tên file bất kỳ, dùng Ghép lần lượt để xem trước mà không cần đổi tên file; "
-                "hoặc dùng mapping.csv với hai cột video_id,audio_file."
+                "Ghép theo thời lượng dùng thời lượng video YouTube và mức sai lệch bên trên. "
+                "Nếu nhiều video cùng phù hợp một file, tool chọn video có thời lượng gần nhất. "
+                "Ghép theo tiêu đề chỉ cần toàn bộ tiêu đề YouTube xuất hiện trong tên file, "
+                "không cần giống 100%. Vẫn có thể dùng Ghép lần lượt hoặc mapping.csv."
             ).classes("text-xs text-gray-600")
             scan_preview_container = ui.column().classes("w-full gap-1")
             refresh_scan_preview()
@@ -1390,6 +1460,8 @@ def create_add_audio_page():
                     ui_refs["music_folder_input"].value = ""
                 if ui_refs["recursive_switch"]:
                     ui_refs["recursive_switch"].value = True
+                if ui_refs["duration_tolerance_input"]:
+                    ui_refs["duration_tolerance_input"].value = 2.0
                 video_ids_state["ids"] = []
                 id_to_path.clear()
                 video_titles.clear()
@@ -1403,6 +1475,7 @@ def create_add_audio_page():
                 performance_settings["max_concurrency"] = 1
                 batch_scan_state["music_folder"] = ""
                 batch_scan_state["recursive"] = True
+                batch_scan_state["duration_tolerance"] = 2.0
                 batch_scan_state["result_channel"] = None
                 batch_scan_state["summary"] = {}
                 batch_scan_state["issues"] = []

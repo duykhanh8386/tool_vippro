@@ -7,9 +7,9 @@ import re
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Iterable
+from typing import TYPE_CHECKING, Callable, Iterable
 
-from src.utils import AUDIO_INPUT_EXTENSIONS
+from src.utils import AUDIO_INPUT_EXTENSIONS, get_video_duration
 
 if TYPE_CHECKING:
     from src.module.model import Video
@@ -56,9 +56,10 @@ class AudioRename:
 
 
 def normalize_title(value: str) -> str:
-    """Normalize a title for conservative, exact fallback matching."""
+    """Normalize a title for filename containment matching."""
     decomposed = unicodedata.normalize("NFKD", value or "")
     ascii_like = "".join(ch for ch in decomposed if not unicodedata.combining(ch))
+    ascii_like = ascii_like.replace("đ", "d").replace("Đ", "D")
     return "".join(ch.casefold() for ch in ascii_like if ch.isalnum())
 
 
@@ -211,10 +212,9 @@ def load_mapping_csv(folder: str | Path) -> tuple[dict[str, Path], dict[str, str
     return mappings, errors
 
 
-def _id_named_candidates(video_id: str, files: Iterable[Path]) -> list[Path]:
-    escaped = re.escape(video_id)
-    pattern = re.compile(rf"^{escaped}(?:$|__|[ ._-])", re.IGNORECASE)
-    return [path for path in files if pattern.match(path.stem)]
+def _title_is_in_filename(title: str, path: Path) -> bool:
+    normalized_title = normalize_title(title)
+    return bool(normalized_title) and normalized_title in normalize_title(path.stem)
 
 
 def match_audio_files(
@@ -222,19 +222,146 @@ def match_audio_files(
     folder: str | Path,
     *,
     recursive: bool = True,
+    tolerance_seconds: float = 2.0,
+    duration_reader: Callable[[str], float] = get_video_duration,
 ) -> AudioBatchMatchResult:
-    """Match one audio file per video, preferring explicit and exact rules."""
+    """Match audio by YouTube duration, allowing a small configurable delta."""
+    if tolerance_seconds < 0:
+        raise ValueError("Sai lệch thời lượng không được nhỏ hơn 0 giây")
     videos = list(videos)
     files = scan_audio_files(folder, recursive=recursive)
     mappings, mapping_errors = load_mapping_csv(folder)
-    title_index: dict[str, list[Path]] = {}
+    mapped_paths = set(mappings.values())
+    durations: dict[Path, float] = {}
     for path in files:
-        title_index.setdefault(normalize_title(path.stem), []).append(path)
-    video_title_counts: dict[str, int] = {}
+        if path in mapped_paths:
+            continue
+        try:
+            duration = float(duration_reader(str(path)))
+            if duration > 0:
+                durations[path] = duration
+        except Exception:
+            # Invalid/unreadable files remain visible in the unused-files list.
+            continue
+
+    assigned: dict[int, AudioMatch] = {}
+    used_paths: set[Path] = set()
+    eligible: list[tuple[int, "Video", float]] = []
+    for video_index, video in enumerate(videos):
+        video_id = (video.id or "").strip()
+        title = video.title or ""
+        if not video_id:
+            continue
+
+        mapped_path = mappings.get(video_id)
+        if mapped_path is not None:
+            used_paths.add(mapped_path)
+            assigned[video_index] = AudioMatch(
+                video_id, title, str(mapped_path), "mapping", "mapping.csv"
+            )
+            continue
+        if video_id in mapping_errors:
+            assigned[video_index] = AudioMatch(
+                video_id, title, None, "ambiguous", mapping_errors[video_id]
+            )
+            continue
+
+        video_duration = float(getattr(video, "duration_ms", 0) or 0) / 1000.0
+        if video_duration <= 0:
+            assigned[video_index] = AudioMatch(
+                video_id,
+                title,
+                None,
+                "unmatched",
+                "YouTube không trả về thời lượng video",
+            )
+            continue
+        eligible.append((video_index, video, video_duration))
+
+    # Rank every possible audio/video pair globally. This prevents whichever
+    # video happens to be visited first from stealing a file that is closer to
+    # another video with a similar duration.
+    candidate_paths: dict[int, list[Path]] = {}
+    ranked_pairs = []
+    for video_index, video, video_duration in eligible:
+        title = video.title or ""
+        for path, audio_duration in durations.items():
+            if path in used_paths:
+                continue
+            delta = abs(audio_duration - video_duration)
+            if delta > tolerance_seconds:
+                continue
+            candidate_paths.setdefault(video_index, []).append(path)
+            ranked_pairs.append(
+                (
+                    delta,
+                    0 if _title_is_in_filename(title, path) else 1,
+                    video_index,
+                    _natural_path_key(path),
+                    path,
+                    video_duration,
+                    audio_duration,
+                )
+            )
+
+    ranked_pairs.sort(key=lambda item: item[:4])
+    for (
+        delta,
+        title_penalty,
+        video_index,
+        _path_key,
+        path,
+        video_duration,
+        audio_duration,
+    ) in ranked_pairs:
+        if video_index in assigned or path in used_paths:
+            continue
+        video = videos[video_index]
+        video_id = (video.id or "").strip()
+        title_hint = " · tên file chứa tiêu đề" if title_penalty == 0 else ""
+        assigned[video_index] = AudioMatch(
+            video_id,
+            video.title or "",
+            str(path),
+            "duration",
+            f"Video {video_duration:.1f}s · audio {audio_duration:.1f}s · "
+            f"lệch {delta:.1f}s{title_hint}",
+        )
+        used_paths.add(path)
+
+    results: list[AudioMatch] = []
+    for video_index, video in enumerate(videos):
+        video_id = (video.id or "").strip()
+        if not video_id:
+            continue
+        if video_index in assigned:
+            results.append(assigned[video_index])
+            continue
+        if candidate_paths.get(video_index):
+            detail = "Audio phù hợp đã được ghép cho video có thời lượng gần hơn"
+        else:
+            detail = f"Không có audio lệch tối đa {tolerance_seconds:g} giây"
+        results.append(AudioMatch(video_id, video.title or "", None, "unmatched", detail))
+
+    extra_files = tuple(str(path) for path in files if path not in used_paths)
+    return AudioBatchMatchResult(tuple(results), len(files), extra_files)
+
+
+def match_audio_files_by_title(
+    videos: Iterable["Video"],
+    folder: str | Path,
+    *,
+    recursive: bool = True,
+) -> AudioBatchMatchResult:
+    """Match when the normalized YouTube title occurs anywhere in a filename."""
+    videos = list(videos)
+    files = scan_audio_files(folder, recursive=recursive)
+    mappings, mapping_errors = load_mapping_csv(folder)
+    title_counts: dict[str, int] = {}
     for video in videos:
         normalized = normalize_title(video.title or "")
         if normalized:
-            video_title_counts[normalized] = video_title_counts.get(normalized, 0) + 1
+            title_counts[normalized] = title_counts.get(normalized, 0) + 1
 
     results: list[AudioMatch] = []
     used_paths: set[Path] = set()
@@ -243,7 +370,6 @@ def match_audio_files(
         title = video.title or ""
         if not video_id:
             continue
-
         mapped_path = mappings.get(video_id)
         if mapped_path is not None:
             used_paths.add(mapped_path)
@@ -253,50 +379,48 @@ def match_audio_files(
             results.append(AudioMatch(video_id, title, None, "ambiguous", mapping_errors[video_id]))
             continue
 
-        id_candidates = _id_named_candidates(video_id, files)
-        if len(id_candidates) == 1:
-            path = id_candidates[0]
-            used_paths.add(path)
-            results.append(AudioMatch(video_id, title, str(path), "video_id", "Khớp Video ID"))
-            continue
-        if len(id_candidates) > 1:
-            results.append(
-                AudioMatch(
-                    video_id,
-                    title,
-                    None,
-                    "ambiguous",
-                    "Có nhiều file cùng khớp Video ID",
-                    tuple(str(path) for path in id_candidates),
-                )
-            )
-            continue
-
         normalized_title = normalize_title(title)
-        title_candidates = (
-            [path for path in title_index.get(normalized_title, []) if path not in used_paths]
-            if normalized_title and video_title_counts.get(normalized_title) == 1
-            else []
-        )
-        if len(title_candidates) == 1:
-            path = title_candidates[0]
-            used_paths.add(path)
-            results.append(AudioMatch(video_id, title, str(path), "title", "Khớp chính xác tiêu đề"))
+        if not normalized_title:
+            results.append(AudioMatch(video_id, title, None, "unmatched", "Video không có tiêu đề"))
             continue
-        if len(title_candidates) > 1:
+        if title_counts.get(normalized_title, 0) > 1:
             results.append(
                 AudioMatch(
                     video_id,
                     title,
                     None,
                     "ambiguous",
-                    "Có nhiều file cùng khớp tiêu đề",
-                    tuple(str(path) for path in title_candidates),
+                    "Kênh có nhiều video trùng tiêu đề",
                 )
             )
             continue
 
-        results.append(AudioMatch(video_id, title, None, "unmatched", "Không tìm thấy file phù hợp"))
+        candidates = [
+            path
+            for path in files
+            if path not in used_paths and _title_is_in_filename(title, path)
+        ]
+        if len(candidates) == 1:
+            path = candidates[0]
+            used_paths.add(path)
+            results.append(
+                AudioMatch(video_id, title, str(path), "title", "Tiêu đề YouTube có trong tên file")
+            )
+        elif len(candidates) > 1:
+            results.append(
+                AudioMatch(
+                    video_id,
+                    title,
+                    None,
+                    "ambiguous",
+                    "Có nhiều file chứa cùng tiêu đề YouTube",
+                    tuple(str(path) for path in candidates),
+                )
+            )
+        else:
+            results.append(
+                AudioMatch(video_id, title, None, "unmatched", "Tiêu đề YouTube không có trong tên file")
+            )
 
     extra_files = tuple(str(path) for path in files if path not in used_paths)
     return AudioBatchMatchResult(tuple(results), len(files), extra_files)
