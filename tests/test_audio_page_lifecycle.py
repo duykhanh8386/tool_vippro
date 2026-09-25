@@ -2,10 +2,14 @@ import asyncio
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from web.components.audio import (
     _best_effort_ui as audio_best_effort_ui,
     _cleanup_temp_audio_file,
+    _fetch_all_channel_videos,
+    _is_youtube_auth_error,
     _restore_language_statuses,
     _run_sequentially_isolated,
 )
@@ -17,6 +21,28 @@ from web.components.remove_audio import (
 
 
 class AudioPageLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    def test_channel_scan_follows_pagination_and_deduplicates_video_ids(self):
+        pages = [
+            ([SimpleNamespace(id="A")], "next"),
+            ([SimpleNamespace(id="A"), SimpleNamespace(id="B")], None),
+        ]
+        with patch(
+            "web.components.audio.list_videos_module.list_all_videos",
+            side_effect=pages,
+        ) as list_videos:
+            videos = _fetch_all_channel_videos("channel")
+
+        self.assertEqual([item.id for item in videos], ["A", "B"])
+        self.assertEqual(list_videos.call_count, 2)
+
+    def test_channel_scan_rejects_repeated_page_token(self):
+        with patch(
+            "web.components.audio.list_videos_module.list_all_videos",
+            side_effect=[([], "same"), ([], "same")],
+        ):
+            with self.assertRaisesRegex(RuntimeError, "phân trang bị lặp"):
+                _fetch_all_channel_videos("channel")
+
     def test_add_audio_restart_only_retries_interrupted_languages(self):
         restored = _restore_language_statuses(
             {
@@ -67,6 +93,27 @@ class AudioPageLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(completed, ["A", "C"])
         self.assertEqual(recorded_errors, [("B", "video B failed")])
         self.assertEqual([item for item, _ in failures], ["B"])
+
+    async def test_auth_failure_stops_remaining_batch(self):
+        attempted = []
+
+        class AuthError(RuntimeError):
+            status_code = 401
+
+        async def process(video_id):
+            attempted.append(video_id)
+            if video_id == "B":
+                raise AuthError("HTTP 401")
+
+        with self.assertRaises(AuthError):
+            await _run_sequentially_isolated(
+                ["A", "B", "C"],
+                process,
+                lambda _item, _exc: None,
+                stop_on_error=_is_youtube_auth_error,
+            )
+
+        self.assertEqual(attempted, ["A", "B"])
 
     async def test_disconnected_audio_client_skips_ui_and_backend_completes(self):
         backend = []

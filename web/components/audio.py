@@ -4,14 +4,17 @@ from pathlib import Path
 from typing import Awaitable, Callable, Iterable, TypeVar
 from loguru import logger
 from nicegui import context, ui
+from src.audio_batch_matcher import AudioBatchMatchResult, match_audio_files
 from src.audio_language import (
     call_audio_update_with_retry,
     invalid_language_codes,
     parse_language_codes,
 )
 from src.module.audio_module import update_audio_module
+from src.module.list_videos_module import list_videos_module
 from src.state_manager import state_manager
 from src.utils import get_channels_info, multiply_audio, normalize_path, validate_path_text
+from web.components.common import select_directory
 from web.theme import app_card, page_header, section_header
 
 
@@ -39,6 +42,8 @@ async def _run_sequentially_isolated(
     items: Iterable[_T],
     process_item: Callable[[_T], Awaitable[None]],
     on_error: Callable[[_T, Exception], None],
+    *,
+    stop_on_error: Callable[[Exception], bool] | None = None,
 ) -> list[tuple[_T, Exception]]:
     failures: list[tuple[_T, Exception]] = []
     for item in items:
@@ -47,7 +52,38 @@ async def _run_sequentially_isolated(
         except Exception as exc:
             failures.append((item, exc))
             on_error(item, exc)
+            if stop_on_error is not None and stop_on_error(exc):
+                raise
     return failures
+
+
+def _is_youtube_auth_error(exc: BaseException) -> bool:
+    if getattr(exc, "status_code", None) == 401:
+        return True
+    message = str(exc).casefold()
+    return "http 401" in message or "authentication credential" in message
+
+
+def _fetch_all_channel_videos(channel_id: str):
+    """Fetch every channel page and guard against a repeated continuation token."""
+    videos = []
+    seen_ids = set()
+    seen_tokens = set()
+    page_token = None
+    while True:
+        page, next_token = list_videos_module.list_all_videos(
+            channel_id, limit=50, page_token=page_token
+        )
+        for video in page:
+            if video.id and video.id not in seen_ids:
+                seen_ids.add(video.id)
+                videos.append(video)
+        if not next_token:
+            return videos
+        if next_token in seen_tokens:
+            raise RuntimeError("YouTube trả về mã phân trang bị lặp; đã dừng quét để tránh treo.")
+        seen_tokens.add(next_token)
+        page_token = next_token
 
 
 def _cleanup_temp_audio_file(path: Path | None) -> None:
@@ -151,7 +187,40 @@ def create_add_audio_page():
     if page_client is not None:
         page_client.on_disconnect(mark_client_unavailable)
 
-    selected_channel = {"id": None}; selected_languages = {"languages": []}; channels = get_channels_info(); video_ids_state = {"ids": []}; id_to_path = {}; video_processing_status = {}; video_processing_errors = {}; repeat_settings = {"times": 2, "extra_minutes": 0}; performance_settings = {"max_concurrency": 1}; right_panel_container = None; suppress_autosave = {"value": False}; ui_refs = {"ids_textarea": None, "language_input": None, "times_input": None, "minutes_input": None, "refresh_channel_display": None, "refresh_language_chips": None, "concurrency_input": None}
+    selected_channel = {"id": None}
+    selected_languages = {"languages": []}
+    channels = get_channels_info()
+    video_ids_state = {"ids": []}
+    id_to_path = {}
+    video_titles = {}
+    auto_match_info = {}
+    video_processing_status = {}
+    video_processing_errors = {}
+    repeat_settings = {"times": 2, "extra_minutes": 0}
+    performance_settings = {"max_concurrency": 1}
+    batch_scan_state = {
+        "music_folder": "",
+        "recursive": True,
+        "result_channel": None,
+        "summary": {},
+        "issues": [],
+        "extra_files": [],
+    }
+    right_panel_container = None
+    scan_preview_container = None
+    suppress_autosave = {"value": False}
+    ui_refs = {
+        "ids_textarea": None,
+        "language_input": None,
+        "times_input": None,
+        "minutes_input": None,
+        "refresh_channel_display": None,
+        "refresh_language_chips": None,
+        "concurrency_input": None,
+        "music_folder_input": None,
+        "recursive_switch": None,
+        "scan_button": None,
+    }
 
     def configuration_change_blocked() -> bool:
         """Do not let a form edit overwrite a checkpoint owned by a live run."""
@@ -170,7 +239,19 @@ def create_add_audio_page():
         try:
             if suppress_autosave["value"]:
                 return False
-            state = {"video_ids": video_ids_state["ids"], "id_to_path": id_to_path, "video_processing_status": video_processing_status, "video_processing_errors": video_processing_errors, "selected_languages": selected_languages["languages"], "repeat_settings": repeat_settings, "selected_channel": selected_channel["id"], "performance_settings": performance_settings}
+            state = {
+                "video_ids": video_ids_state["ids"],
+                "id_to_path": id_to_path,
+                "video_titles": video_titles,
+                "auto_match_info": auto_match_info,
+                "video_processing_status": video_processing_status,
+                "video_processing_errors": video_processing_errors,
+                "selected_languages": selected_languages["languages"],
+                "repeat_settings": repeat_settings,
+                "selected_channel": selected_channel["id"],
+                "performance_settings": performance_settings,
+                "batch_scan_state": batch_scan_state,
+            }
             return state_manager.save_state("audio_add", state)
         except Exception as e:
             logger.error(f"Failed to save right panel state: {e}")
@@ -185,6 +266,10 @@ def create_add_audio_page():
                 video_ids_state["ids"] = state["video_ids"]
             if "id_to_path" in state:
                 id_to_path.update(state["id_to_path"])
+            if "video_titles" in state:
+                video_titles.update(state["video_titles"])
+            if "auto_match_info" in state:
+                auto_match_info.update(state["auto_match_info"])
             if "video_processing_status" in state:
                 restored_statuses = _restore_language_statuses(
                     state["video_processing_status"],
@@ -204,6 +289,8 @@ def create_add_audio_page():
                 selected_channel["id"] = state["selected_channel"]
             if "performance_settings" in state:
                 performance_settings.update(state["performance_settings"])
+            if "batch_scan_state" in state:
+                batch_scan_state.update(state["batch_scan_state"])
             # Audio languages for one video must be registered sequentially.
             performance_settings["max_concurrency"] = 1
             def update_ui():
@@ -218,7 +305,12 @@ def create_add_audio_page():
                         ui_refs["minutes_input"].value = repeat_settings["extra_minutes"]
                     if ui_refs["concurrency_input"]:
                         ui_refs["concurrency_input"].value = performance_settings["max_concurrency"]
+                    if ui_refs["music_folder_input"]:
+                        ui_refs["music_folder_input"].value = batch_scan_state["music_folder"]
+                    if ui_refs["recursive_switch"]:
+                        ui_refs["recursive_switch"].value = batch_scan_state["recursive"]
                     refresh_right_panel()
+                    refresh_scan_preview()
                     if ui_refs["refresh_language_chips"]:
                         ui_refs["refresh_language_chips"]()
                     if selected_channel["id"] and ui_refs["refresh_channel_display"]:
@@ -326,6 +418,172 @@ def create_add_audio_page():
             seen.add(vid)
             result.append(vid)
         return result
+
+    def refresh_scan_preview():
+        if not scan_preview_container:
+            return
+        scan_preview_container.clear()
+        summary = batch_scan_state.get("summary") or {}
+        issues = batch_scan_state.get("issues") or []
+        extra_files = batch_scan_state.get("extra_files") or []
+        if not summary:
+            return
+        with scan_preview_container:
+            with ui.row().classes("items-center gap-2 flex-wrap"):
+                ui.icon("task_alt").classes("text-emerald-600")
+                ui.label(
+                    f"Đã quét {summary.get('videos', 0)} video và "
+                    f"{summary.get('audio_files', 0)} file · "
+                    f"ghép được {summary.get('matched', 0)}"
+                ).classes("text-sm font-semibold text-gray-700")
+                ui.label(
+                    f"Thiếu {summary.get('unmatched', 0)} · "
+                    f"trùng {summary.get('ambiguous', 0)} · "
+                    f"file dư {summary.get('extra_files', 0)}"
+                ).classes("text-xs text-gray-500")
+            if issues:
+                total_issues = summary.get("unmatched", 0) + summary.get("ambiguous", 0)
+                with ui.expansion(
+                    f"Xem {total_issues} video chưa thể ghép tự động",
+                    icon="warning_amber",
+                ).classes("w-full text-sm"):
+                    for issue in issues:
+                        title = issue.get("title") or "Không có tiêu đề"
+                        ui.label(
+                            f"{issue.get('video_id', '')} · {title}: {issue.get('detail', '')}"
+                        ).classes("text-xs text-gray-600 break-words")
+                    if total_issues > len(issues):
+                        ui.label(
+                            f"Còn {total_issues - len(issues)} video khác; hãy đổi tên file theo Video ID rồi quét lại."
+                        ).classes("text-xs text-orange-600")
+            if extra_files:
+                total_extra = summary.get("extra_files", len(extra_files))
+                with ui.expansion(
+                    f"Xem {total_extra} file chưa được dùng",
+                    icon="audio_file",
+                ).classes("w-full text-sm"):
+                    for path in extra_files:
+                        ui.label(path).classes("text-xs text-gray-600 break-all")
+                    if total_extra > len(extra_files):
+                        ui.label(f"Còn {total_extra - len(extra_files)} file khác.").classes(
+                            "text-xs text-orange-600"
+                        )
+
+    def apply_batch_match(result: AudioBatchMatchResult) -> int:
+        matched = list(result.matched)
+        issues = [
+            {
+                "video_id": item.video_id,
+                "title": item.title,
+                "status": item.status,
+                "detail": item.detail,
+                "candidates": list(item.candidates),
+            }
+            for item in result.matches
+            if not item.path
+        ]
+        batch_scan_state["summary"] = {
+            "videos": len(result.matches),
+            "audio_files": result.audio_file_count,
+            "matched": len(matched),
+            "unmatched": len(result.unmatched),
+            "ambiguous": len(result.ambiguous),
+            "extra_files": len(result.extra_files),
+        }
+        # Keep the checkpoint compact for very large channels while retaining
+        # totals in the summary above.
+        batch_scan_state["issues"] = issues[:200]
+        batch_scan_state["extra_files"] = list(result.extra_files[:200])
+
+        if not matched:
+            refresh_scan_preview()
+            save_right_panel_state()
+            return 0
+
+        old_paths = dict(id_to_path)
+        new_ids = [item.video_id for item in matched]
+        new_paths = {item.video_id: item.path or "" for item in matched}
+        new_titles = {item.video_id: item.title for item in matched}
+        new_match_info = {
+            item.video_id: {"status": item.status, "detail": item.detail}
+            for item in matched
+        }
+
+        for video_id in set(video_ids_state["ids"]) | set(new_ids):
+            if video_id not in new_paths or old_paths.get(video_id) != new_paths.get(video_id):
+                video_processing_status.pop(video_id, None)
+                video_processing_errors.pop(video_id, None)
+
+        video_ids_state["ids"] = new_ids
+        batch_scan_state["result_channel"] = selected_channel["id"]
+        id_to_path.clear()
+        id_to_path.update(new_paths)
+        video_titles.clear()
+        video_titles.update(new_titles)
+        auto_match_info.clear()
+        auto_match_info.update(new_match_info)
+        if ui_refs["ids_textarea"]:
+            ui_refs["ids_textarea"].value = "\n".join(new_ids)
+        refresh_right_panel()
+        refresh_scan_preview()
+        save_right_panel_state()
+        return len(matched)
+
+    scan_runtime = {"running": False}
+
+    async def handle_auto_scan():
+        if configuration_change_blocked():
+            return
+        if scan_runtime["running"]:
+            ui.notify("Đang quét video và thư mục nhạc.", type="warning")
+            return
+        if not selected_channel["id"]:
+            ui.notify("Hãy chọn kênh trước khi quét", type="warning")
+            return
+        folder_text = normalize_path(batch_scan_state.get("music_folder") or "")
+        folder = Path(folder_text)
+        if not folder_text or not folder.is_dir():
+            ui.notify("Hãy chọn một thư mục nhạc hợp lệ", type="warning")
+            return
+
+        scan_runtime["running"] = True
+        scan_button = ui_refs.get("scan_button")
+        if scan_button:
+            scan_button.props("loading disable")
+        try:
+            ui.notify("Đang quét toàn bộ video của kênh...", type="info")
+            videos = await asyncio.to_thread(
+                _fetch_all_channel_videos, selected_channel["id"]
+            )
+            result = await asyncio.to_thread(
+                match_audio_files,
+                videos,
+                folder,
+                recursive=bool(batch_scan_state.get("recursive", True)),
+            )
+            matched_count = apply_batch_match(result)
+            if matched_count:
+                ui.notify(
+                    f"Đã tự ghép {matched_count}/{len(videos)} video. Hãy kiểm tra bảng rồi cập nhật audio.",
+                    type="positive",
+                )
+            else:
+                ui.notify(
+                    "Không tìm thấy file khớp. Hãy đặt Video ID ở đầu tên file hoặc dùng mapping.csv.",
+                    type="warning",
+                )
+        except Exception as exc:
+            logger.exception("Automatic audio scan failed")
+            if _is_youtube_auth_error(exc):
+                message = "Phiên đăng nhập YouTube đã hết hạn. Hãy đăng nhập và quét lại kênh."
+            else:
+                message = f"Không thể quét tự động: {exc}"
+            ui.notify(message, type="negative")
+        finally:
+            scan_runtime["running"] = False
+            if scan_button:
+                scan_button.props(remove="loading disable")
+
     def refresh_right_panel():
         if not right_panel_container:
             return
@@ -379,13 +637,37 @@ def create_add_audio_page():
                 with ui.row().classes("audio-add-table-row w-full min-h-[56px] items-center bg-white border-b border-gray-100 flex-nowrap"):
                     with ui.column().classes("w-2/12 p-2"):
                         ui.label(vid).classes("truncate px-2 py-1 font-medium text-gray-800")
+                        if video_titles.get(vid):
+                            ui.label(video_titles[vid]).classes(
+                                "truncate px-2 text-[11px] text-gray-500"
+                            ).tooltip(video_titles[vid])
+                        match = auto_match_info.get(vid) or {}
+                        if match:
+                            match_label = {
+                                "mapping": "mapping.csv",
+                                "video_id": "Khớp ID",
+                                "title": "Khớp tiêu đề",
+                                "manual": "Thủ công",
+                            }.get(match.get("status"), match.get("detail", ""))
+                            ui.label(match_label).classes(
+                                "px-2 text-[10px] font-medium text-emerald-600"
+                            )
 
                     def make_path_on_change(video_id: str, input_ref):
                         def _on_change(e=None):
                             if configuration_change_blocked():
                                 input_ref.value = id_to_path.get(video_id, "")
                                 return
-                            id_to_path[video_id] = (input_ref.value or "").strip()
+                            new_path = (input_ref.value or "").strip()
+                            if id_to_path.get(video_id, "") != new_path:
+                                video_processing_status.pop(video_id, None)
+                                video_processing_errors.pop(video_id, None)
+                            id_to_path[video_id] = new_path
+                            auto_match_info[video_id] = {
+                                "status": "manual",
+                                "detail": "Đã sửa đường dẫn thủ công",
+                            }
+                            refresh_right_panel()
                             save_right_panel_state()
 
                         return _on_change
@@ -417,6 +699,8 @@ def create_add_audio_page():
                             if video_id in video_ids_state["ids"]:
                                 video_ids_state["ids"].remove(video_id)
                             id_to_path.pop(video_id, None)
+                            video_titles.pop(video_id, None)
+                            auto_match_info.pop(video_id, None)
                             video_processing_status.pop(video_id, None)
                             video_processing_errors.pop(video_id, None)
                             refresh_right_panel()
@@ -445,10 +729,17 @@ def create_add_audio_page():
         if not selected_channel["id"]:
             ui.notify("Hãy chọn kênh", type="warning")
             return None
-        elif len(selected_languages["languages"]) == 0:
+        data_channel = batch_scan_state.get("result_channel")
+        if data_channel and data_channel != selected_channel["id"]:
+            ui.notify(
+                "Danh sách video thuộc kênh đã chọn trước đó. Hãy quét lại hoặc nhập lại Video ID cho kênh hiện tại.",
+                type="warning",
+            )
+            return None
+        if len(selected_languages["languages"]) == 0:
             ui.notify("Hãy chọn ít nhất một ngôn ngữ", type="warning")
             return None
-        elif len(video_ids_state["ids"]) == 0:
+        if len(video_ids_state["ids"]) == 0:
             ui.notify("Vui lòng nhập ít nhất một Video ID", type="warning")
             return None
         languages_to_process = list(selected_languages["languages"])
@@ -540,6 +831,8 @@ def create_add_audio_page():
                 overall_errors.append(f"{vid}-{lang}: {exc}")
                 video_processing_errors.setdefault(vid, {})[lang] = str(exc)
                 save_right_panel_state()
+                if _is_youtube_auth_error(exc):
+                    raise
 
         async def process_video(item: tuple[int, str]) -> None:
             nonlocal completed_tasks
@@ -573,6 +866,53 @@ def create_add_audio_page():
                         ),
                     )
                     return
+
+                try:
+                    existing_remote_languages = await asyncio.to_thread(
+                        update_audio_module.get_existing_audio_languages,
+                        vid,
+                        channel_id,
+                    )
+                except Exception as exc:
+                    if _is_youtube_auth_error(exc):
+                        raise
+                    logger.warning(
+                        "Could not inspect existing audio tracks for {}: {}", vid, exc
+                    )
+                else:
+                    already_on_youtube = [
+                        lang
+                        for lang in missing_languages
+                        if lang.casefold() in existing_remote_languages
+                    ]
+                    for lang in already_on_youtube:
+                        existing_status[lang] = "already_added"
+                        video_processing_errors.setdefault(vid, {}).pop(lang, None)
+                    if already_on_youtube:
+                        completed_tasks += len(already_on_youtube)
+                        save_right_panel_state()
+                        best_effort_ui(
+                            "render remote audio tracks",
+                            lambda: (
+                                setattr(
+                                    progress_bar,
+                                    "value",
+                                    completed_tasks / total_tasks,
+                                ),
+                                refresh_right_panel(),
+                            ),
+                        )
+                    missing_languages = [
+                        lang for lang in missing_languages if lang not in already_on_youtube
+                    ]
+                    if not missing_languages:
+                        best_effort_ui(
+                            "render remotely complete video",
+                            lambda: status_label.set_text(
+                                "YouTube đã có đủ audio track — đã bỏ qua"
+                            ),
+                        )
+                        return
 
                 file_path = Path((id_to_path.get(vid) or "").strip())
                 best_effort_ui(
@@ -683,6 +1023,7 @@ def create_add_audio_page():
                 enumerate(list(video_ids_state["ids"]), 1),
                 process_video,
                 handle_video_error,
+                stop_on_error=_is_youtube_auth_error,
             )
         except Exception as main_exc:
             logger.error("Main processing error: {}", main_exc)
@@ -732,6 +1073,7 @@ def create_add_audio_page():
             pass
     with page:
         channel_state, refresh_channel_display = create_channel_selection(channels, on_channel_select)
+        selected_channel = channel_state
         ui_refs["refresh_channel_display"] = refresh_channel_display
     with page:
         refresh_language_chips = create_language_input_and_chips()
@@ -742,10 +1084,77 @@ def create_add_audio_page():
     with main_card:
         with section_header(
             "Video và file audio",
-            "Nhập Video ID và đường dẫn audio. Hỗ trợ MP3, M4A, WAV, AAC, "
-            "FLAC, OGG, OPUS, WMA và các định dạng phổ biến khác.",
+            "Quét tự động theo kênh và thư mục nhạc, hoặc nhập Video ID thủ công. "
+            "Hỗ trợ MP3, M4A, WAV, AAC, FLAC, OGG, OPUS, WMA và các định dạng phổ biến khác.",
         ):
             pass
+
+        def on_music_folder_change(e=None):
+            if configuration_change_blocked():
+                if ui_refs["music_folder_input"]:
+                    ui_refs["music_folder_input"].value = batch_scan_state["music_folder"]
+                return
+            value = (
+                ui_refs["music_folder_input"].value
+                if ui_refs["music_folder_input"]
+                else ""
+            )
+            batch_scan_state["music_folder"] = normalize_path(value or "")
+            save_right_panel_state()
+
+        def pick_music_folder():
+            if configuration_change_blocked():
+                return
+            selected = select_directory(
+                initial_dir=batch_scan_state["music_folder"] or None,
+                title="Chọn thư mục nhạc để ghép theo Video ID",
+            )
+            if selected:
+                batch_scan_state["music_folder"] = normalize_path(selected)
+                if ui_refs["music_folder_input"]:
+                    ui_refs["music_folder_input"].value = batch_scan_state["music_folder"]
+                save_right_panel_state()
+
+        def on_recursive_change(e):
+            if configuration_change_blocked():
+                if hasattr(e, "sender"):
+                    e.sender.value = batch_scan_state["recursive"]
+                return
+            batch_scan_state["recursive"] = bool(e.value)
+            save_right_panel_state()
+
+        with ui.card().classes("w-full bg-emerald-50 border border-emerald-200 p-3 mb-4"):
+            with ui.row().classes("w-full items-end gap-2 flex-nowrap"):
+                music_folder_input = ui.input(
+                    "Thư mục nhạc",
+                    value=batch_scan_state["music_folder"],
+                ).props('outlined clearable placeholder="Chọn thư mục chứa các file mang Video ID"').classes("flex-1")
+                music_folder_input.on("change", on_music_folder_change)
+                ui_refs["music_folder_input"] = music_folder_input
+                ui.button(
+                    "Chọn thư mục",
+                    icon="folder_open",
+                    on_click=pick_music_folder,
+                ).props("outline")
+                scan_button = ui.button(
+                    "Quét video & nhạc",
+                    icon="manage_search",
+                    on_click=handle_auto_scan,
+                ).classes("app-button-primary")
+                ui_refs["scan_button"] = scan_button
+            recursive_switch = ui.switch(
+                "Quét cả thư mục con",
+                value=batch_scan_state["recursive"],
+                on_change=on_recursive_change,
+            ).props("dense")
+            ui_refs["recursive_switch"] = recursive_switch
+            ui.label(
+                "Đặt tên file dạng VIDEO_ID.m4a hoặc VIDEO_ID__ghi-chú.mp3. "
+                "Có thể dùng mapping.csv với hai cột video_id,audio_file."
+            ).classes("text-xs text-gray-600")
+            scan_preview_container = ui.column().classes("w-full gap-1")
+            refresh_scan_preview()
+
         with ui.row().classes("w-full items-start gap-5 flex-wrap"):
             with ui.column().classes("w-72 shrink-0"):
                 def handle_ids_textarea_change(e=None):
@@ -759,9 +1168,12 @@ def create_add_audio_page():
                         ids_textarea.value = "\n".join(video_ids_state["ids"])
                         return
                     video_ids_state["ids"] = parse_ids_from_text(ids_textarea.value or "")
+                    batch_scan_state["result_channel"] = selected_channel["id"]
                     to_delete_path = [k for k in id_to_path.keys() if k not in video_ids_state["ids"]]
                     for k in to_delete_path:
                         del id_to_path[k]
+                        video_titles.pop(k, None)
+                        auto_match_info.pop(k, None)
                         video_processing_status.pop(k, None)
                         video_processing_errors.pop(k, None)
                     refresh_right_panel()
@@ -834,8 +1246,14 @@ def create_add_audio_page():
                     ui_refs["minutes_input"].value = 0
                 if ui_refs["concurrency_input"]:
                     ui_refs["concurrency_input"].value = 1
+                if ui_refs["music_folder_input"]:
+                    ui_refs["music_folder_input"].value = ""
+                if ui_refs["recursive_switch"]:
+                    ui_refs["recursive_switch"].value = True
                 video_ids_state["ids"] = []
                 id_to_path.clear()
+                video_titles.clear()
+                auto_match_info.clear()
                 video_processing_status.clear()
                 video_processing_errors.clear()
                 selected_channel["id"] = None
@@ -843,7 +1261,14 @@ def create_add_audio_page():
                 repeat_settings["times"] = 2
                 repeat_settings["extra_minutes"] = 0
                 performance_settings["max_concurrency"] = 1
+                batch_scan_state["music_folder"] = ""
+                batch_scan_state["recursive"] = True
+                batch_scan_state["result_channel"] = None
+                batch_scan_state["summary"] = {}
+                batch_scan_state["issues"] = []
+                batch_scan_state["extra_files"] = []
                 refresh_right_panel()
+                refresh_scan_preview()
                 if ui_refs["refresh_language_chips"]:
                     ui_refs["refresh_language_chips"]()
                 if ui_refs["refresh_channel_display"]:

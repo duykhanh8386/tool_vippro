@@ -178,11 +178,25 @@ class UpdateAudioModule(IModule):
         payload = payload = {"context": {"client": {"clientName": 62, "clientVersion": "1.20250902.04.00", "hl": "en", "gl": "VN", "experimentsToken": "", "utcOffsetMinutes": 420, "userInterfaceTheme": "USER_INTERFACE_THEME_DARK", "screenWidthPoints": 1920, "screenHeightPoints": 945, "screenPixelDensity": 1, "screenDensityFloat": 1}, "request": {"returnLogEntry": True, "internalExperimentFlags": [], "eats": "AWSNWa3PV1e-JQRiHlmMmNXCMA9Kt6en05uq7bbw9WnQgnJdNT8RNsEfMheyglxoOPf_TMIzUzU80CM9khDsuy6zp2Uz9ROtcC5RGvGrdEkSa_rIL5z6FDB2wAAYVWg=", "sessionInfo": {"token": session_token}, "consistencyTokenJars": []}, "user": {"onBehalfOfUser": channel_info.delegated_session_id, "delegationContext": {"externalChannelId": channel_info.id, "roleType": {"channelRoleType": channel_info.role}}, "serializedDelegationContext": ""}, "clientScreenNonce": "7nFa5dcSfcGGJAJS"}, "videoIds": [id_video], "filters": [], "fetchAloudData": False, "fetchAutoDubbingData": False, "fetchAutoDubbingAsrData": False, "fetchBulkActionsStatus": False}
         response = post_with_stop(url, headers=headers, json=payload)
         if response.status_code != 200:
-            raise Exception(f"Failed to get audio track IDs: {response.status_code}")
+            raise AudioUpdateError(
+                _youtube_error_message(response, "đọc danh sách audio track"),
+                status_code=response.status_code,
+                retryable=response.status_code == 429 or response.status_code >= 500,
+            )
         video_translations = response.json().get("videoTranslations") or []
         if not video_translations:
             return []
         return video_translations[0].get("translations") or []
+
+    def get_existing_audio_languages(self, id_video: str, channel_id: str) -> set[str]:
+        """Return normalized language codes which already have an audio track."""
+        languages = set()
+        for item in self._get_audio_translation_items(id_video, channel_id):
+            audio = item.get("audioTranslation") or {}
+            language = self._translation_language(item)
+            if audio.get("audioTrackId") and language:
+                languages.add(language.casefold())
+        return languages
 
     @staticmethod
     def _translation_language(item: dict) -> str | None:

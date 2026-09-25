@@ -1,7 +1,7 @@
 # RECOVERED: reconstructed from CPython 3.12 bytecode
 import requests
 from loguru import logger
-from src.module.base import IModule
+from src.module.base import IModule, _response_json_or_error
 from src.module.model import Video, VideoType
 from src.utils import get_channels_info
 from src.task_runtime import check_stopped, post_with_stop
@@ -64,7 +64,7 @@ class ListVideosModule(IModule):
             payload["pageToken"] = page_token
         url = "https://studio.youtube.com/youtubei/v1/creator/list_creator_videos?alt=json"
         response = post_with_stop(url, headers=headers, json=payload)
-        res = response.json()
+        res = _response_json_or_error(response, "channel video scan")
         next_page_token = res.get("nextPageToken") or None
         videos = []
         for item in res.get("videos", []):

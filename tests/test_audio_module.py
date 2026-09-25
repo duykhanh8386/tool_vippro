@@ -101,6 +101,19 @@ class AudioUploadTests(unittest.TestCase):
             "nl-BE",
         )
 
+    def test_collects_only_languages_with_an_audio_track(self):
+        module = UpdateAudioModule()
+        items = [
+            {"languageCode": "EN", "audioTranslation": {"audioTrackId": "one"}},
+            {"translationLanguage": {"code": "vi"}, "audioTranslation": {"audioTrackId": "two"}},
+            {"languageCode": "ja", "audioTranslation": {}},
+        ]
+        with patch.object(module, "_get_audio_translation_items", return_value=items):
+            self.assertEqual(
+                module.get_existing_audio_languages("video", "channel"),
+                {"en", "vi"},
+            )
+
 
 class AudioDeleteTests(unittest.TestCase):
     def _channel(self):
