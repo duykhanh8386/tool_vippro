@@ -840,8 +840,7 @@ def create_add_audio_flow_page():
         )
         video_dur = info.duration_ms / 1000.0 if info and info.duration_ms > 0 else None
 
-        suffix = Path(audio_path).suffix or ".mp3"
-        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tf:
+        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tf:
             matched_path = tf.name
         run_context = current_run_context()
         if run_context is not None:

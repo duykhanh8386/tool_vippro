@@ -394,7 +394,31 @@ def multiply_audio(input_file: str, output_file: str, times: int, extra_minutes=
 
 
 VIDEO_EXTENSIONS = {".avi", ".flv", ".m4v", ".mkv", ".mov", ".webm", ".mp4"}
-AUDIO_EXTENSIONS = {".aac", ".m4a", ".ogg", ".flac", ".opus", ".mp3", ".wav"}
+AUDIO_EXTENSIONS = {
+    ".aac",
+    ".ac3",
+    ".aif",
+    ".aiff",
+    ".alac",
+    ".amr",
+    ".ape",
+    ".caf",
+    ".eac3",
+    ".flac",
+    ".m4a",
+    ".mka",
+    ".mp2",
+    ".mp3",
+    ".oga",
+    ".ogg",
+    ".opus",
+    ".wav",
+    ".wma",
+}
+# The manual Audio Path field historically accepted MP4 files as audio sources.
+# Keep those media containers compatible while sharing all real audio formats
+# with the folder based workflows.
+AUDIO_INPUT_EXTENSIONS = AUDIO_EXTENSIONS | {".m4v", ".mov", ".mp4", ".webm"}
 
 _QSV_PROBE_LOCK = threading.Lock()
 _QSV_AVAILABLE: bool | None = None
@@ -727,9 +751,9 @@ def validate_path_text(path_text: str) -> tuple[(bool, str | None)]:
     p = Path(path_text)
     if not p.exists() or not p.is_file():
         return False, f"File không tồn tại hoặc không phải là file hợp lệ: {path_text}"
-    allowed_extensions = [".mp4", ".wav", ".mp3"]
-    if p.suffix.lower() not in allowed_extensions:
-        return False, f"Định dạng không hợp lệ. Chỉ chấp nhận {', '.join(allowed_extensions)}"
+    if p.suffix.lower() not in AUDIO_INPUT_EXTENSIONS:
+        allowed = ", ".join(sorted(AUDIO_INPUT_EXTENSIONS))
+        return False, f"Định dạng không hợp lệ. Chỉ chấp nhận {allowed}"
     return True, None
 
 

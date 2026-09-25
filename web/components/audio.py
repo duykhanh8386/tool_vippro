@@ -601,8 +601,11 @@ def create_add_audio_page():
                     "render audio processing state",
                     lambda: status_label.set_text("Đang xử lý âm thanh..."),
                 )
+                # Normalize every supported input container/codec to one upload
+                # format. This also makes M4A, FLAC, OGG, WMA, etc. reliable
+                # when stream copy into their original container is impossible.
                 with tempfile.NamedTemporaryFile(
-                    suffix=file_path.suffix, delete=False
+                    suffix=".mp3", delete=False
                 ) as temp_file:
                     temp_audio_path = Path(temp_file.name)
                 await asyncio.to_thread(
@@ -739,7 +742,8 @@ def create_add_audio_page():
     with main_card:
         with section_header(
             "Video và file audio",
-            "Nhập Video ID, sau đó cung cấp đường dẫn audio tương ứng trong bảng.",
+            "Nhập Video ID và đường dẫn audio. Hỗ trợ MP3, M4A, WAV, AAC, "
+            "FLAC, OGG, OPUS, WMA và các định dạng phổ biến khác.",
         ):
             pass
         with ui.row().classes("w-full items-start gap-5 flex-wrap"):
