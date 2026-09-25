@@ -1149,7 +1149,9 @@ def create_add_audio_page():
             ).props("dense")
             ui_refs["recursive_switch"] = recursive_switch
             ui.label(
-                "Đặt tên file dạng VIDEO_ID.m4a hoặc VIDEO_ID__ghi-chú.mp3. "
+                "Đặt Video ID ở đầu tên file, ví dụ VIDEO_ID.m4a hoặc "
+                "VIDEO_ID__ghi-chú.flac. Phần đuôi có thể là MP3, M4A, WAV, "
+                "AAC, FLAC, OGG, OPUS, WMA, AIFF, APE và các định dạng được hỗ trợ khác. "
                 "Có thể dùng mapping.csv với hai cột video_id,audio_file."
             ).classes("text-xs text-gray-600")
             scan_preview_container = ui.column().classes("w-full gap-1")
