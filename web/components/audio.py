@@ -19,6 +19,7 @@ from src.audio_language import (
 )
 from src.module.audio_module import update_audio_module
 from src.module.list_videos_module import list_videos_module
+from src.module.model import Video
 from src.state_manager import state_manager
 from src.utils import get_channels_info, multiply_audio, normalize_path, validate_path_text
 from web.components.common import select_directory
@@ -91,6 +92,43 @@ def _fetch_all_channel_videos(channel_id: str):
             raise RuntimeError("YouTube trả về mã phân trang bị lặp; đã dừng quét để tránh treo.")
         seen_tokens.add(next_token)
         page_token = next_token
+
+
+def _select_videos_by_ids(videos: Iterable[Video], video_ids: Iterable[str]):
+    """Select channel videos in the exact order of the active ID source."""
+    by_id = {video.id: video for video in videos if video.id}
+    selected = []
+    missing = []
+    for video_id in dict.fromkeys(video_id for video_id in video_ids if video_id):
+        video = by_id.get(video_id)
+        if video is None:
+            missing.append(video_id)
+        else:
+            selected.append(video)
+    return selected, missing
+
+
+def _video_snapshot(video: Video) -> dict:
+    return {
+        "id": video.id,
+        "channel_id": video.channel_id,
+        "title": video.title,
+        "duration_ms": video.duration_ms,
+    }
+
+
+def _video_from_snapshot(snapshot: dict) -> Video:
+    return Video(
+        id=str(snapshot.get("id") or ""),
+        channel_id=str(snapshot.get("channel_id") or ""),
+        title=str(snapshot.get("title") or ""),
+        description=str(snapshot.get("description") or ""),
+        thumbnail=str(snapshot.get("thumbnail") or ""),
+        duration_ms=int(snapshot.get("duration_ms") or 0),
+        privacy=str(snapshot.get("privacy") or ""),
+        video_status=str(snapshot.get("video_status") or ""),
+        copyright_check_status=str(snapshot.get("copyright_check_status") or ""),
+    )
 
 
 def _cleanup_temp_audio_file(path: Path | None) -> None:
@@ -214,8 +252,17 @@ def create_add_audio_page():
         "issues": [],
         "extra_files": [],
     }
+    video_source_state = {
+        "mode": "manual",
+        "manual_ids": [],
+        "failed_channel": None,
+        "failed_videos": [],
+        "scan_total": 0,
+        "scan_skipped": 0,
+    }
     right_panel_container = None
     scan_preview_container = None
+    video_source_status_container = None
     suppress_autosave = {"value": False}
     ui_refs = {
         "ids_textarea": None,
@@ -232,6 +279,8 @@ def create_add_audio_page():
         "sequential_button": None,
         "rename_button": None,
         "duration_tolerance_input": None,
+        "video_source_toggle": None,
+        "failed_video_scan_button": None,
     }
 
     def configuration_change_blocked() -> bool:
@@ -263,6 +312,7 @@ def create_add_audio_page():
                 "selected_channel": selected_channel["id"],
                 "performance_settings": performance_settings,
                 "batch_scan_state": batch_scan_state,
+                "video_source_state": video_source_state,
             }
             return state_manager.save_state("audio_add", state)
         except Exception as e:
@@ -274,6 +324,7 @@ def create_add_audio_page():
             state = state_manager.load_state("audio_add")
             if not state:
                 return
+            needs_checkpoint_save = False
             if "video_ids" in state:
                 video_ids_state["ids"] = state["video_ids"]
             if "id_to_path" in state:
@@ -290,7 +341,7 @@ def create_add_audio_page():
                 video_processing_status.clear()
                 video_processing_status.update(restored_statuses)
                 if restored_statuses != state["video_processing_status"]:
-                    save_right_panel_state()
+                    needs_checkpoint_save = True
             if "video_processing_errors" in state:
                 video_processing_errors.update(state["video_processing_errors"])
             if "selected_languages" in state:
@@ -303,6 +354,15 @@ def create_add_audio_page():
                 performance_settings.update(state["performance_settings"])
             if "batch_scan_state" in state:
                 batch_scan_state.update(state["batch_scan_state"])
+            if "video_source_state" in state:
+                saved_source = state["video_source_state"] or {}
+                video_source_state.update(saved_source)
+            else:
+                video_source_state["manual_ids"] = list(video_ids_state["ids"])
+            if video_source_state.get("mode") not in {"manual", "failed"}:
+                video_source_state["mode"] = "manual"
+            if needs_checkpoint_save:
+                save_right_panel_state()
             # Audio languages for one video must be registered sequentially.
             performance_settings["max_concurrency"] = 1
             def update_ui():
@@ -325,6 +385,7 @@ def create_add_audio_page():
                         ui_refs["duration_tolerance_input"].value = batch_scan_state[
                             "duration_tolerance"
                         ]
+                    refresh_video_source_controls()
                     refresh_right_panel()
                     refresh_scan_preview()
                     refresh_rename_button()
@@ -342,6 +403,17 @@ def create_add_audio_page():
             return False
         selected_channel["id"] = channel_id
 
+        if (
+            video_source_state.get("mode") == "failed"
+            and video_source_state.get("failed_channel") != channel_id
+        ):
+            video_source_state["failed_channel"] = None
+            video_source_state["failed_videos"] = []
+            video_source_state["scan_total"] = 0
+            video_source_state["scan_skipped"] = 0
+            replace_active_video_list([])
+
+        refresh_video_source_controls()
         save_right_panel_state()
         return True
     def create_language_input_and_chips():
@@ -435,6 +507,98 @@ def create_add_audio_page():
             seen.add(vid)
             result.append(vid)
         return result
+
+    def replace_active_video_list(
+        video_ids: Iterable[str], *, videos: Iterable[Video] = ()
+    ) -> None:
+        """Replace the active source and discard matches from the previous source."""
+        new_ids = list(dict.fromkeys(video_id for video_id in video_ids if video_id))
+        snapshots_by_id = {video.id: video for video in videos if video.id}
+        video_ids_state["ids"] = new_ids
+        id_to_path.clear()
+        video_titles.clear()
+        video_titles.update(
+            {
+                video_id: snapshots_by_id[video_id].title
+                for video_id in new_ids
+                if video_id in snapshots_by_id
+            }
+        )
+        auto_match_info.clear()
+        video_processing_status.clear()
+        video_processing_errors.clear()
+        batch_scan_state["result_channel"] = selected_channel["id"]
+        batch_scan_state["summary"] = {}
+        batch_scan_state["issues"] = []
+        batch_scan_state["extra_files"] = []
+        if ui_refs["ids_textarea"]:
+            ui_refs["ids_textarea"].value = "\n".join(new_ids)
+        refresh_right_panel()
+        refresh_scan_preview()
+        refresh_rename_button()
+
+    def refresh_video_source_controls() -> None:
+        mode = video_source_state.get("mode", "manual")
+        toggle = ui_refs.get("video_source_toggle")
+        if toggle and toggle.value != mode:
+            toggle.value = mode
+
+        scan_button = ui_refs.get("failed_video_scan_button")
+        if scan_button:
+            if mode == "failed" and not scan_runtime["running"]:
+                scan_button.props(remove="disable")
+            else:
+                scan_button.props("disable")
+
+        match_ready = bool(video_ids_state["ids"]) and bool(selected_channel["id"]) and (
+            mode == "manual"
+            or video_source_state.get("failed_channel") == selected_channel["id"]
+        )
+        for key in ("scan_button", "title_button", "sequential_button"):
+            match_button = ui_refs.get(key)
+            if not match_button:
+                continue
+            if match_ready and not scan_runtime["running"]:
+                match_button.props(remove="disable")
+            else:
+                match_button.props("disable")
+
+        textarea = ui_refs.get("ids_textarea")
+        if textarea:
+            if mode == "failed":
+                textarea.props("readonly")
+            else:
+                textarea.props(remove="readonly")
+
+        if not video_source_status_container:
+            return
+        video_source_status_container.clear()
+        with video_source_status_container:
+            if mode == "manual":
+                ui.label(
+                    f"Đang dùng {len(video_ids_state['ids'])} Video ID nhập thủ công."
+                ).classes("text-xs text-gray-600")
+                return
+            failed_channel = video_source_state.get("failed_channel")
+            if not failed_channel:
+                ui.label(
+                    "Chưa quét. Hãy chọn kênh rồi bấm Quét ID lỗi audio."
+                ).classes("text-xs text-orange-600")
+                return
+            if failed_channel != selected_channel["id"]:
+                ui.label(
+                    "Kết quả quét thuộc kênh khác. Hãy quét lại kênh đang chọn."
+                ).classes("text-xs text-orange-600")
+                return
+            ui.label(
+                f"Đã tìm thấy {len(video_source_state.get('failed_videos') or [])}/"
+                f"{video_source_state.get('scan_total', 0)} video có audio xử lý lỗi."
+            ).classes("text-xs font-medium text-emerald-700")
+            if video_source_state.get("scan_skipped", 0):
+                ui.label(
+                    f"YouTube không cho đọc trạng thái của "
+                    f"{video_source_state['scan_skipped']} video."
+                ).classes("text-xs text-orange-600")
 
     def refresh_scan_preview():
         if not scan_preview_container:
@@ -537,19 +701,14 @@ def create_add_audio_page():
         batch_scan_state["issues"] = issues[:200]
         batch_scan_state["extra_files"] = list(result.extra_files[:200])
 
-        if not matched:
-            refresh_scan_preview()
-            refresh_rename_button()
-            save_right_panel_state()
-            return 0
-
         old_paths = dict(id_to_path)
-        new_ids = [item.video_id for item in matched]
-        new_paths = {item.video_id: item.path or "" for item in matched}
-        new_titles = {item.video_id: item.title for item in matched}
+        new_ids = [item.video_id for item in result.matches]
+        new_paths = {item.video_id: item.path or "" for item in result.matches}
+        new_titles = {item.video_id: item.title for item in result.matches}
         new_match_info = {
             item.video_id: {"status": item.status, "detail": item.detail}
-            for item in matched
+            for item in result.matches
+            if item.path
         }
 
         for video_id in set(video_ids_state["ids"]) | set(new_ids):
@@ -575,6 +734,115 @@ def create_add_audio_page():
 
     scan_runtime = {"running": False}
 
+    def set_scan_controls_busy(busy: bool, *, loading_key: str | None = None) -> None:
+        for key in (
+            "failed_video_scan_button",
+            "scan_button",
+            "title_button",
+            "sequential_button",
+        ):
+            button = ui_refs.get(key)
+            if not button:
+                continue
+            if busy:
+                button.props("disable")
+            else:
+                button.props(remove="disable")
+            if key == loading_key:
+                if busy:
+                    button.props("loading")
+                else:
+                    button.props(remove="loading")
+        if not busy:
+            refresh_video_source_controls()
+
+    def source_videos_for_matching(channel_id: str) -> list[Video]:
+        active_ids = list(video_ids_state["ids"])
+        if not active_ids:
+            raise ValueError("Danh sách Video ID đang trống.")
+
+        if video_source_state.get("mode") == "failed":
+            if video_source_state.get("failed_channel") != channel_id:
+                raise ValueError("Hãy quét lại danh sách video lỗi audio cho kênh đang chọn.")
+            cached = [
+                _video_from_snapshot(item)
+                for item in video_source_state.get("failed_videos") or []
+                if isinstance(item, dict)
+            ]
+            selected, missing = _select_videos_by_ids(cached, active_ids)
+        else:
+            channel_videos = _fetch_all_channel_videos(channel_id)
+            selected, missing = _select_videos_by_ids(channel_videos, active_ids)
+
+        if missing:
+            preview = ", ".join(missing[:5])
+            suffix = f" và {len(missing) - 5} ID khác" if len(missing) > 5 else ""
+            raise ValueError(
+                f"Không tìm thấy thông tin video cho ID: {preview}{suffix}. Hãy quét lại kênh."
+            )
+        return selected
+
+    async def handle_failed_video_scan():
+        if configuration_change_blocked():
+            return
+        if scan_runtime["running"]:
+            ui.notify("Một tác vụ quét đang chạy.", type="warning")
+            return
+        if video_source_state.get("mode") != "failed":
+            ui.notify("Hãy chọn chế độ Quét ID lỗi audio trước.", type="warning")
+            return
+        if not selected_channel["id"]:
+            ui.notify("Hãy chọn kênh trước khi quét", type="warning")
+            return
+
+        scan_runtime["running"] = True
+        set_scan_controls_busy(True, loading_key="failed_video_scan_button")
+        try:
+            channel_id = selected_channel["id"]
+            ui.notify("Đang đọc video và trạng thái audio trên kênh...", type="info")
+            videos = await asyncio.to_thread(_fetch_all_channel_videos, channel_id)
+            unreadable_ids: list[str] = []
+            failed_ids = await asyncio.to_thread(
+                update_audio_module.get_failed_audio_video_ids,
+                [video.id for video in videos],
+                channel_id,
+                unreadable_ids,
+            )
+            failed_videos = [video for video in videos if video.id in failed_ids]
+
+            video_source_state["failed_channel"] = channel_id
+            video_source_state["failed_videos"] = [
+                _video_snapshot(video) for video in failed_videos
+            ]
+            video_source_state["scan_total"] = len(videos)
+            video_source_state["scan_skipped"] = len(unreadable_ids)
+            replace_active_video_list(
+                [video.id for video in failed_videos], videos=failed_videos
+            )
+            refresh_video_source_controls()
+            save_right_panel_state()
+            if failed_videos:
+                ui.notify(
+                    f"Đã lấy {len(failed_videos)}/{len(videos)} Video ID có audio xử lý lỗi. "
+                    "Bây giờ hãy chọn cách ghép.",
+                    type="positive",
+                )
+            else:
+                ui.notify(
+                    f"Đã quét {len(videos)} video, không thấy audio nào ở trạng thái xử lý lỗi.",
+                    type="warning",
+                )
+        except Exception as exc:
+            logger.exception("Failed to scan videos with audio processing errors")
+            if _is_youtube_auth_error(exc):
+                message = "Phiên đăng nhập YouTube đã hết hạn. Hãy đăng nhập và quét lại kênh."
+            else:
+                message = f"Không thể quét ID lỗi audio: {exc}"
+            ui.notify(message, type="negative")
+        finally:
+            scan_runtime["running"] = False
+            set_scan_controls_busy(False, loading_key="failed_video_scan_button")
+
     async def run_folder_scan(*, mode: str):
         if configuration_change_blocked():
             return
@@ -596,17 +864,11 @@ def create_add_audio_page():
             "title": "title_button",
             "sequential": "sequential_button",
         }[mode]
-        active_button = ui_refs.get(active_button_key)
-        for key in ("scan_button", "title_button", "sequential_button"):
-            button = ui_refs.get(key)
-            if button:
-                button.props("disable")
-        if active_button:
-            active_button.props("loading")
+        set_scan_controls_busy(True, loading_key=active_button_key)
         try:
-            ui.notify("Đang quét toàn bộ video của kênh...", type="info")
+            ui.notify("Đang đọc thông tin các Video ID đã chọn...", type="info")
             videos = await asyncio.to_thread(
-                _fetch_all_channel_videos, selected_channel["id"]
+                source_videos_for_matching, selected_channel["id"]
             )
             matcher = {
                 "duration": match_audio_files,
@@ -653,12 +915,7 @@ def create_add_audio_page():
             ui.notify(message, type="negative")
         finally:
             scan_runtime["running"] = False
-            if active_button:
-                active_button.props(remove="loading")
-            for key in ("scan_button", "title_button", "sequential_button"):
-                button = ui_refs.get(key)
-                if button:
-                    button.props(remove="disable")
+            set_scan_controls_busy(False, loading_key=active_button_key)
 
     async def handle_auto_scan():
         await run_folder_scan(mode="duration")
@@ -860,8 +1117,21 @@ def create_add_audio_page():
                             auto_match_info.pop(video_id, None)
                             video_processing_status.pop(video_id, None)
                             video_processing_errors.pop(video_id, None)
+                            if video_source_state.get("mode") == "manual":
+                                video_source_state["manual_ids"] = list(
+                                    video_ids_state["ids"]
+                                )
+                            else:
+                                active_ids = set(video_ids_state["ids"])
+                                video_source_state["failed_videos"] = [
+                                    item
+                                    for item in video_source_state.get("failed_videos") or []
+                                    if isinstance(item, dict)
+                                    and item.get("id") in active_ids
+                                ]
                             refresh_right_panel()
                             refresh_rename_button()
+                            refresh_video_source_controls()
                             if video_ids_state["ids"]:
                                 ids_textarea.value = "\n".join(video_ids_state["ids"])
                             else:
@@ -1299,7 +1569,64 @@ def create_add_audio_page():
                 input_ref.value = value
             save_right_panel_state()
 
+        def on_video_source_change(e):
+            requested_mode = str(e.value or "manual")
+            current_mode = video_source_state.get("mode", "manual")
+            if requested_mode not in {"manual", "failed"}:
+                requested_mode = "manual"
+            if configuration_change_blocked():
+                if ui_refs["video_source_toggle"]:
+                    ui_refs["video_source_toggle"].value = current_mode
+                return
+            if scan_runtime["running"]:
+                ui.notify("Hãy chờ tác vụ quét hoàn tất.", type="warning")
+                if ui_refs["video_source_toggle"]:
+                    ui_refs["video_source_toggle"].value = current_mode
+                return
+            if requested_mode == current_mode:
+                return
+
+            if current_mode == "manual":
+                video_source_state["manual_ids"] = list(video_ids_state["ids"])
+            video_source_state["mode"] = requested_mode
+            if requested_mode == "manual":
+                replace_active_video_list(video_source_state.get("manual_ids") or [])
+            elif video_source_state.get("failed_channel") == selected_channel["id"]:
+                cached_videos = [
+                    _video_from_snapshot(item)
+                    for item in video_source_state.get("failed_videos") or []
+                    if isinstance(item, dict)
+                ]
+                replace_active_video_list(
+                    [video.id for video in cached_videos], videos=cached_videos
+                )
+            else:
+                replace_active_video_list([])
+            refresh_video_source_controls()
+            save_right_panel_state()
+
         with ui.card().classes("w-full bg-emerald-50 border border-emerald-200 p-3 mb-4"):
+            with ui.row().classes("w-full items-center justify-between gap-3 flex-wrap"):
+                with ui.column().classes("gap-1"):
+                    ui.label("Nguồn Video ID").classes("text-sm font-semibold text-gray-700")
+                    source_toggle = ui.toggle(
+                        {
+                            "manual": "Nhập ID thủ công",
+                            "failed": "Quét ID lỗi audio",
+                        },
+                        value=video_source_state["mode"],
+                        on_change=on_video_source_change,
+                    ).props("no-caps")
+                    ui_refs["video_source_toggle"] = source_toggle
+                failed_video_scan_button = ui.button(
+                    "Quét ID lỗi audio",
+                    icon="report_problem",
+                    on_click=handle_failed_video_scan,
+                ).props("outline disable")
+                ui_refs["failed_video_scan_button"] = failed_video_scan_button
+            video_source_status_container = ui.column().classes("w-full gap-0")
+            refresh_video_source_controls()
+            ui.separator().classes("my-1")
             with ui.row().classes("w-full items-end gap-2 flex-wrap"):
                 music_folder_input = ui.input(
                     "Thư mục nhạc",
@@ -1363,12 +1690,16 @@ def create_add_audio_page():
             scan_preview_container = ui.column().classes("w-full gap-1")
             refresh_scan_preview()
             refresh_rename_button()
+            refresh_video_source_controls()
 
         with ui.row().classes("w-full items-start gap-5 flex-wrap"):
             with ui.column().classes("w-72 shrink-0"):
                 def handle_ids_textarea_change(e=None):
                     on_ids_input()
-                ids_textarea = ui.textarea(on_change=handle_ids_textarea_change).props('outlined autogrow color=green placeholder="Nhập mỗi dòng một ID"').classes("w-full")
+                ids_textarea = ui.textarea(
+                    label="Danh sách Video ID",
+                    on_change=handle_ids_textarea_change,
+                ).props('outlined autogrow color=green placeholder="Nhập mỗi dòng một ID"').classes("w-full")
                 ui_refs["ids_textarea"] = ids_textarea
             with ui.column().classes("flex-1 min-w-[560px]"):
                 right_panel_container = ui.column().classes("audio-add-table w-full gap-1")
@@ -1376,7 +1707,11 @@ def create_add_audio_page():
                     if configuration_change_blocked():
                         ids_textarea.value = "\n".join(video_ids_state["ids"])
                         return
+                    if video_source_state.get("mode") != "manual":
+                        ids_textarea.value = "\n".join(video_ids_state["ids"])
+                        return
                     video_ids_state["ids"] = parse_ids_from_text(ids_textarea.value or "")
+                    video_source_state["manual_ids"] = list(video_ids_state["ids"])
                     batch_scan_state["result_channel"] = selected_channel["id"]
                     to_delete_path = [k for k in id_to_path.keys() if k not in video_ids_state["ids"]]
                     for k in to_delete_path:
@@ -1387,6 +1722,7 @@ def create_add_audio_page():
                         video_processing_errors.pop(k, None)
                     refresh_right_panel()
                     refresh_rename_button()
+                    refresh_video_source_controls()
                     save_right_panel_state()
                 refresh_right_panel()
         load_right_panel_state()
@@ -1480,9 +1816,16 @@ def create_add_audio_page():
                 batch_scan_state["summary"] = {}
                 batch_scan_state["issues"] = []
                 batch_scan_state["extra_files"] = []
+                video_source_state["mode"] = "manual"
+                video_source_state["manual_ids"] = []
+                video_source_state["failed_channel"] = None
+                video_source_state["failed_videos"] = []
+                video_source_state["scan_total"] = 0
+                video_source_state["scan_skipped"] = 0
                 refresh_right_panel()
                 refresh_scan_preview()
                 refresh_rename_button()
+                refresh_video_source_controls()
                 if ui_refs["refresh_language_chips"]:
                     ui_refs["refresh_language_chips"]()
                 if ui_refs["refresh_channel_display"]:

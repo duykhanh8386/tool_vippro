@@ -114,6 +114,132 @@ class AudioUploadTests(unittest.TestCase):
                 {"en", "vi"},
             )
 
+    def test_failed_audio_scan_selects_processing_failures_only(self):
+        module = UpdateAudioModule()
+        groups = [
+            {
+                "videoId": "failed-video",
+                "translations": [
+                    {
+                        "languageCode": "en",
+                        "audioTranslation": {
+                            "audioTrackProcessingStatus": "AUDIO_TRACK_PROCESSING_STATUS_FAILED"
+                        },
+                    }
+                ],
+            },
+            {
+                "videoId": "ineligible-video",
+                "translations": [
+                    {
+                        "languageCode": "fr",
+                        "audioTranslation": {
+                            "status": "AUDIO_TRACK_STATUS_FAILED_INELIGIBLE"
+                        },
+                    }
+                ],
+            },
+            {
+                "videoId": "ready-video",
+                "translations": [
+                    {
+                        "languageCode": "ja",
+                        "audioTranslation": {
+                            "audioTrackId": "track",
+                            "status": "AUDIO_TRACK_STATUS_READY",
+                            "errorCode": "AUDIO_TRACK_ERROR_NONE",
+                        },
+                    }
+                ],
+            },
+            {
+                "videoId": "no-speech-video",
+                "translations": [
+                    {
+                        "captionsTranslations": [
+                            {
+                                "status": "TRANSLATION_STATUS_PROCESSING",
+                                "processingEta": {
+                                    "status": "PROCESSING_ETA_STATUS_SPEECH_NOT_DETECTED"
+                                },
+                            }
+                        ]
+                    }
+                ],
+            },
+        ]
+        with patch.object(module, "_get_video_translation_groups", return_value=groups) as fetch:
+            failed = module.get_failed_audio_video_ids(
+                [
+                    "failed-video",
+                    "ineligible-video",
+                    "ready-video",
+                    "no-speech-video",
+                ],
+                "channel",
+            )
+
+        self.assertEqual(failed, {"failed-video", "no-speech-video"})
+        fetch.assert_called_once_with(
+            [
+                "failed-video",
+                "ineligible-video",
+                "ready-video",
+                "no-speech-video",
+            ],
+            "channel",
+        )
+
+    def test_failed_audio_scan_recognizes_nested_error_reason(self):
+        module = UpdateAudioModule()
+        item = {
+            "title": "A failed experiment",
+            "audioTranslation": {
+                "processingError": {"reasonCode": "MEDIA_COULD_NOT_PROCESS"}
+            },
+        }
+
+        self.assertTrue(module._audio_translation_has_processing_failure(item))
+
+    def test_failed_word_outside_audio_status_is_ignored(self):
+        module = UpdateAudioModule()
+        item = {
+            "title": "Failed sleep music",
+            "audioTranslation": {"status": "AUDIO_TRACK_STATUS_READY"},
+        }
+
+        self.assertFalse(module._audio_translation_has_processing_failure(item))
+
+    def test_failed_audio_scan_splits_precondition_batch_and_reports_unreadable(self):
+        module = UpdateAudioModule()
+
+        def fetch(video_ids, _channel):
+            if len(video_ids) > 1:
+                raise AudioUpdateError("Precondition check failed", status_code=400)
+            if video_ids[0] == "unreadable":
+                raise AudioUpdateError("Precondition check failed", status_code=400)
+            return [
+                {
+                    "videoId": video_ids[0],
+                    "translations": [
+                        {
+                            "audioTranslation": {
+                                "status": "AUDIO_TRACK_PROCESSING_STATUS_FAILED"
+                            }
+                        }
+                    ],
+                }
+            ]
+
+        unreadable = []
+        with patch.object(module, "_get_video_translation_groups", side_effect=fetch):
+            failed = module.get_failed_audio_video_ids(
+                ["failed", "unreadable"], "channel", unreadable
+            )
+
+        self.assertEqual(failed, {"failed"})
+        self.assertEqual(unreadable, ["unreadable"])
+
 
 class AudioDeleteTests(unittest.TestCase):
     def _channel(self):

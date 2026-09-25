@@ -12,7 +12,11 @@ from web.components.audio import (
     _is_youtube_auth_error,
     _restore_language_statuses,
     _run_sequentially_isolated,
+    _select_videos_by_ids,
+    _video_from_snapshot,
+    _video_snapshot,
 )
+from src.module.model import Video
 from web.components.remove_audio import (
     _best_effort_ui as remove_audio_best_effort_ui,
     _gather_isolated,
@@ -42,6 +46,34 @@ class AudioPageLifecycleTests(unittest.IsolatedAsyncioTestCase):
         ):
             with self.assertRaisesRegex(RuntimeError, "phân trang bị lặp"):
                 _fetch_all_channel_videos("channel")
+
+    def test_manual_source_filters_channel_videos_in_entered_id_order(self):
+        videos = [SimpleNamespace(id="A"), SimpleNamespace(id="B")]
+
+        selected, missing = _select_videos_by_ids(videos, ["B", "A", "B", "X"])
+
+        self.assertEqual([video.id for video in selected], ["B", "A"])
+        self.assertEqual(missing, ["X"])
+
+    def test_failed_video_snapshot_preserves_matching_metadata(self):
+        original = Video(
+            id="video-id",
+            channel_id="channel",
+            title="Video title",
+            description="Description",
+            thumbnail="thumbnail",
+            duration_ms=123000,
+            privacy="PUBLIC",
+            video_status="UPLOADED",
+            copyright_check_status="DONE",
+        )
+
+        restored = _video_from_snapshot(_video_snapshot(original))
+
+        self.assertEqual(restored.id, original.id)
+        self.assertEqual(restored.channel_id, original.channel_id)
+        self.assertEqual(restored.title, original.title)
+        self.assertEqual(restored.duration_ms, original.duration_ms)
 
     def test_add_audio_restart_only_retries_interrupted_languages(self):
         restored = _restore_language_statuses(

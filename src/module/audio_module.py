@@ -45,6 +45,7 @@ class UpdateAudioModule(IModule):
     _CHUNK_SIZE = 8 * 1024 * 1024
     _MAX_UPLOAD_RETRIES = 5
     _UPLOAD_TIMEOUT = (30, 900)
+    _TRANSLATION_BATCH_SIZE = 50
 
     def add(self, id_video: str, channel_id: str, file_name: str, language: str, data: bytes):
         check_stopped()
@@ -169,13 +170,18 @@ class UpdateAudioModule(IModule):
                     retryable=response.status_code == 429 or response.status_code >= 500,
                 )
         return 200
-    def _get_audio_translation_items(self, id_video: str, channel_id: str) -> list[dict]:
+    def _get_video_translation_groups(
+        self, video_ids: list[str], channel_id: str
+    ) -> list[dict]:
+        """Fetch Studio translation data for one batch of videos."""
+        if not video_ids:
+            return []
         url = "https://studio.youtube.com/youtubei/v1/crowdsourcing/get_video_translations?alt=json"
         channel_info = get_channels_info(channel_id)
         cookie_string = "; ".join([f"{cookie['name']}={cookie['value']}" for cookie in channel_info.cookies])
         session_token = self._get_session_token(channel_info)
-        headers = {"Host": "studio.youtube.com", "Cookie": cookie_string, "Authorization": f"SAPISIDHASH {channel_info.sapisidhash}", "Content-Type": "application/json", "Origin": "https://studio.youtube.com", "Referer": f"https://studio.youtube.com/video/{id_video}/translations", "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36"}
-        payload = payload = {"context": {"client": {"clientName": 62, "clientVersion": "1.20250902.04.00", "hl": "en", "gl": "VN", "experimentsToken": "", "utcOffsetMinutes": 420, "userInterfaceTheme": "USER_INTERFACE_THEME_DARK", "screenWidthPoints": 1920, "screenHeightPoints": 945, "screenPixelDensity": 1, "screenDensityFloat": 1}, "request": {"returnLogEntry": True, "internalExperimentFlags": [], "eats": "AWSNWa3PV1e-JQRiHlmMmNXCMA9Kt6en05uq7bbw9WnQgnJdNT8RNsEfMheyglxoOPf_TMIzUzU80CM9khDsuy6zp2Uz9ROtcC5RGvGrdEkSa_rIL5z6FDB2wAAYVWg=", "sessionInfo": {"token": session_token}, "consistencyTokenJars": []}, "user": {"onBehalfOfUser": channel_info.delegated_session_id, "delegationContext": {"externalChannelId": channel_info.id, "roleType": {"channelRoleType": channel_info.role}}, "serializedDelegationContext": ""}, "clientScreenNonce": "7nFa5dcSfcGGJAJS"}, "videoIds": [id_video], "filters": [], "fetchAloudData": False, "fetchAutoDubbingData": False, "fetchAutoDubbingAsrData": False, "fetchBulkActionsStatus": False}
+        headers = {"Host": "studio.youtube.com", "Cookie": cookie_string, "Authorization": f"SAPISIDHASH {channel_info.sapisidhash}", "Content-Type": "application/json", "Origin": "https://studio.youtube.com", "Referer": f"https://studio.youtube.com/video/{video_ids[0]}/translations", "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36"}
+        payload = {"context": {"client": {"clientName": 62, "clientVersion": "1.20250902.04.00", "hl": "en", "gl": "VN", "experimentsToken": "", "utcOffsetMinutes": 420, "userInterfaceTheme": "USER_INTERFACE_THEME_DARK", "screenWidthPoints": 1920, "screenHeightPoints": 945, "screenPixelDensity": 1, "screenDensityFloat": 1}, "request": {"returnLogEntry": True, "internalExperimentFlags": [], "eats": "AWSNWa3PV1e-JQRiHlmMmNXCMA9Kt6en05uq7bbw9WnQgnJdNT8RNsEfMheyglxoOPf_TMIzUzU80CM9khDsuy6zp2Uz9ROtcC5RGvGrdEkSa_rIL5z6FDB2wAAYVWg=", "sessionInfo": {"token": session_token}, "consistencyTokenJars": []}, "user": {"onBehalfOfUser": channel_info.delegated_session_id, "delegationContext": {"externalChannelId": channel_info.id, "roleType": {"channelRoleType": channel_info.role}}, "serializedDelegationContext": ""}, "clientScreenNonce": "7nFa5dcSfcGGJAJS"}, "videoIds": video_ids, "filters": [], "fetchAloudData": False, "fetchAutoDubbingData": False, "fetchAutoDubbingAsrData": False, "fetchBulkActionsStatus": False}
         response = post_with_stop(url, headers=headers, json=payload)
         if response.status_code != 200:
             raise AudioUpdateError(
@@ -183,10 +189,175 @@ class UpdateAudioModule(IModule):
                 status_code=response.status_code,
                 retryable=response.status_code == 429 or response.status_code >= 500,
             )
-        video_translations = response.json().get("videoTranslations") or []
-        if not video_translations:
+        return response.json().get("videoTranslations") or []
+
+    @staticmethod
+    def _translation_group_video_id(group: dict) -> str | None:
+        for key in ("videoId", "video_id", "id"):
+            value = group.get(key)
+            if isinstance(value, str) and value:
+                return value
+        video = group.get("video") or {}
+        value = video.get("videoId") if isinstance(video, dict) else None
+        return value if isinstance(value, str) and value else None
+
+    def _get_audio_translation_items(self, id_video: str, channel_id: str) -> list[dict]:
+        groups = self._get_video_translation_groups([id_video], channel_id)
+        if not groups:
             return []
-        return video_translations[0].get("translations") or []
+        for group in groups:
+            if self._translation_group_video_id(group) == id_video:
+                return group.get("translations") or []
+        return groups[0].get("translations") or []
+
+    @staticmethod
+    def _status_value_is_failure(key: str, value) -> bool:
+        """Recognize YouTube Studio failure enums without treating ineligible as failed."""
+        normalized_key = "".join(ch for ch in str(key).upper() if ch.isalnum())
+        status_key = any(
+            marker in normalized_key
+            for marker in (
+                "STATUS",
+                "STATE",
+                "ERROR",
+                "FAIL",
+                "REASON",
+                "AVAILABILITY",
+            )
+        )
+        if isinstance(value, bool):
+            return value and any(marker in normalized_key for marker in ("ERROR", "FAIL"))
+        if not status_key or not isinstance(value, str):
+            return False
+
+        normalized_value = "".join(ch for ch in value.upper() if ch.isalnum())
+        if not normalized_value or any(
+            marker in normalized_value
+            for marker in ("INELIGIBLE", "NOTELIGIBLE", "INSUFFICIENTELIGIBILITY")
+        ):
+            return False
+        if normalized_value in {
+            "0",
+            "FALSE",
+            "NONE",
+            "NOERROR",
+            "OK",
+            "READY",
+            "SUCCESS",
+            "SUCCEEDED",
+            "UNSPECIFIED",
+        } or any(
+            normalized_value.endswith(marker)
+            for marker in ("ERRORNONE", "STATUSOK", "STATUSREADY", "STATUSSUCCEEDED")
+        ):
+            return False
+        if any(
+            marker in normalized_value
+            for marker in (
+                "FAILED",
+                "FAILURE",
+                "ERROR",
+                "UNPROCESSABLE",
+                "UNABLETOPROCESS",
+                "CANNOTPROCESS",
+                "COULDNOTPROCESS",
+                "REJECTED",
+                "SPEECHNOTDETECTED",
+            )
+        ):
+            return True
+
+        # Some Studio payloads put a reason code below an error/failure object.
+        if any(marker in normalized_key for marker in ("ERROR", "FAIL")):
+            return True
+        return False
+
+    @classmethod
+    def _audio_translation_has_processing_failure(cls, item: dict) -> bool:
+        """Return true for an audio row rendered by Studio as processing failed."""
+        audio = item.get("audioTranslation") or {}
+        automatic_audio_rows = item.get("captionsTranslations") or []
+
+        def walk(value, parent_key: str = "") -> bool:
+            if cls._status_value_is_failure(parent_key, value):
+                return True
+            if isinstance(value, dict):
+                return any(
+                    walk(child, f"{parent_key}.{key}" if parent_key else str(key))
+                    for key, child in value.items()
+                )
+            if isinstance(value, (list, tuple)):
+                return any(walk(child, parent_key) for child in value)
+            return False
+
+        # Studio currently exposes uploaded audio as audioTranslation and some
+        # automatic dubbing failures through captionsTranslations/processingEta.
+        # Limit inspection to these objects so titles cannot cause a false match.
+        if isinstance(audio, dict) and walk(audio):
+            return True
+        return isinstance(automatic_audio_rows, list) and any(
+            isinstance(row, dict) and walk(row) for row in automatic_audio_rows
+        )
+
+    def get_failed_audio_video_ids(
+        self,
+        video_ids: list[str],
+        channel_id: str,
+        unreadable_ids: list[str] | None = None,
+    ) -> set[str]:
+        """Return videos which contain at least one failed audio translation row."""
+        unique_ids = list(dict.fromkeys(video_id for video_id in video_ids if video_id))
+        failed_ids: set[str] = set()
+        skipped = unreadable_ids if unreadable_ids is not None else []
+
+        def scan_chunk(chunk: list[str]) -> None:
+            try:
+                groups = self._get_video_translation_groups(
+                    chunk, channel_id
+                )
+            except AudioUpdateError as exc:
+                if exc.status_code != 400:
+                    raise
+                if len(chunk) > 1:
+                    midpoint = len(chunk) // 2
+                    scan_chunk(chunk[:midpoint])
+                    scan_chunk(chunk[midpoint:])
+                    return
+                skipped.append(chunk[0])
+                logger.warning(
+                    "YouTube translation status is unavailable for video {}: {}",
+                    chunk[0],
+                    exc,
+                )
+                return
+
+            group_ids = [self._translation_group_video_id(group) for group in groups]
+
+            if groups and any(group_id is None for group_id in group_ids):
+                if len(groups) == len(chunk):
+                    group_ids = chunk
+                elif len(chunk) == 1:
+                    group_ids = chunk
+                else:
+                    # A response without videoId cannot safely be paired when
+                    # YouTube omitted one or more clean videos from the batch.
+                    for video_id in chunk:
+                        scan_chunk([video_id])
+                    return
+
+            for group_id, group in zip(group_ids, groups):
+                if not group_id:
+                    continue
+                items = group.get("translations") or []
+                if any(
+                    self._audio_translation_has_processing_failure(item)
+                    for item in items
+                ):
+                    failed_ids.add(group_id)
+
+        for start in range(0, len(unique_ids), self._TRANSLATION_BATCH_SIZE):
+            scan_chunk(unique_ids[start : start + self._TRANSLATION_BATCH_SIZE])
+        return failed_ids
 
     def get_existing_audio_languages(self, id_video: str, channel_id: str) -> set[str]:
         """Return normalized language codes which already have an audio track."""
