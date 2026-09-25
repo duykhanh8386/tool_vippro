@@ -4,7 +4,13 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-from src.audio_batch_matcher import match_audio_files, normalize_title
+from src.audio_batch_matcher import (
+    build_audio_rename_plan,
+    execute_audio_rename_plan,
+    match_audio_files,
+    match_audio_files_sequentially,
+    normalize_title,
+)
 
 
 def video(video_id: str, title: str):
@@ -81,6 +87,43 @@ class AudioBatchMatcherTests(unittest.TestCase):
 
         self.assertEqual(result.unmatched[0].video_id, "abcdefghijk")
         self.assertEqual(result.extra_files, (str(extra),))
+
+    def test_sequential_match_uses_channel_order_and_natural_filename_order(self):
+        first = self.touch("track1.mp3")
+        second = self.touch("track2.m4a")
+        extra = self.touch("track10.wav")
+
+        result = match_audio_files_sequentially(
+            [video("video000001", "Newest"), video("video000002", "Older")],
+            self.root,
+        )
+
+        self.assertEqual(
+            [(item.video_id, item.path) for item in result.matched],
+            [("video000001", str(first)), ("video000002", str(second))],
+        )
+        self.assertEqual(result.extra_files, (str(extra),))
+
+    def test_rename_plan_preserves_extension_and_renames_file(self):
+        source = self.touch("track 01.M4A")
+        plan = build_audio_rename_plan([("RQ1sE4Oo-8Y", source)])
+
+        changed = execute_audio_rename_plan(plan)
+
+        expected = source.with_name("RQ1sE4Oo-8Y.m4a")
+        self.assertEqual(changed, {"RQ1sE4Oo-8Y": str(expected)})
+        self.assertTrue(expected.is_file())
+        self.assertFalse(source.exists())
+
+    def test_rename_plan_rejects_existing_target_without_mutating_files(self):
+        source = self.touch("track.mp3")
+        target = self.touch("RQ1sE4Oo-8Y.mp3")
+
+        with self.assertRaisesRegex(ValueError, "đã tồn tại"):
+            build_audio_rename_plan([("RQ1sE4Oo-8Y", source)])
+
+        self.assertTrue(source.is_file())
+        self.assertTrue(target.is_file())
 
 
 if __name__ == "__main__":

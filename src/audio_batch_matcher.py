@@ -48,6 +48,13 @@ class AudioBatchMatchResult:
         return tuple(item for item in self.matches if item.status == "ambiguous")
 
 
+@dataclass(frozen=True)
+class AudioRename:
+    video_id: str
+    source: Path
+    target: Path
+
+
 def normalize_title(value: str) -> str:
     """Normalize a title for conservative, exact fallback matching."""
     decomposed = unicodedata.normalize("NFKD", value or "")
@@ -64,6 +71,92 @@ def scan_audio_files(folder: str | Path, *, recursive: bool = True) -> list[Path
         (path.resolve() for path in iterator if path.is_file() and path.suffix.lower() in AUDIO_INPUT_EXTENSIONS),
         key=lambda path: str(path).casefold(),
     )
+
+
+def _natural_path_key(path: Path) -> tuple:
+    parts = re.split(r"(\d+)", str(path).casefold())
+    return tuple(int(part) if part.isdigit() else part for part in parts)
+
+
+def match_audio_files_sequentially(
+    videos: Iterable["Video"],
+    folder: str | Path,
+    *,
+    recursive: bool = True,
+) -> AudioBatchMatchResult:
+    """Pair channel order with natural filename order for explicit preview."""
+    videos = [video for video in videos if (video.id or "").strip()]
+    files = sorted(scan_audio_files(folder, recursive=recursive), key=_natural_path_key)
+    matched_count = min(len(videos), len(files))
+    matches = [
+        AudioMatch(
+            video.id.strip(),
+            video.title or "",
+            str(files[index]),
+            "sequential",
+            f"Ghép lần lượt #{index + 1}",
+        )
+        for index, video in enumerate(videos[:matched_count])
+    ]
+    matches.extend(
+        AudioMatch(
+            video.id.strip(),
+            video.title or "",
+            None,
+            "unmatched",
+            "Không còn file nhạc để ghép lần lượt",
+        )
+        for video in videos[matched_count:]
+    )
+    return AudioBatchMatchResult(
+        tuple(matches),
+        len(files),
+        tuple(str(path) for path in files[matched_count:]),
+    )
+
+
+def build_audio_rename_plan(
+    assignments: Iterable[tuple[str, str | Path]],
+) -> tuple[AudioRename, ...]:
+    """Validate a safe plan which renames assigned files to VIDEO_ID.ext."""
+    plan: list[AudioRename] = []
+    target_keys: set[str] = set()
+    for video_id, source_value in assignments:
+        source = Path(source_value).expanduser().resolve()
+        if not source.is_file():
+            raise ValueError(f"File không tồn tại: {source}")
+        target = source.with_name(f"{video_id}{source.suffix.lower()}")
+        if source.name.casefold() == target.name.casefold():
+            continue
+        target_key = str(target).casefold()
+        if target_key in target_keys:
+            raise ValueError(f"Nhiều file sẽ trùng tên đích: {target}")
+        if target.exists():
+            raise ValueError(f"Tên đích đã tồn tại: {target}")
+        target_keys.add(target_key)
+        plan.append(AudioRename(video_id, source, target))
+    return tuple(plan)
+
+
+def execute_audio_rename_plan(plan: Iterable[AudioRename]) -> dict[str, str]:
+    """Execute a validated plan and roll completed renames back on failure."""
+    plan = tuple(plan)
+    # Revalidate immediately before the first filesystem mutation.
+    build_audio_rename_plan((item.video_id, item.source) for item in plan)
+    completed: list[AudioRename] = []
+    try:
+        for item in plan:
+            item.source.rename(item.target)
+            completed.append(item)
+    except Exception:
+        for item in reversed(completed):
+            try:
+                if item.target.exists() and not item.source.exists():
+                    item.target.rename(item.source)
+            except OSError:
+                pass
+        raise
+    return {item.video_id: str(item.target) for item in plan}
 
 
 def _read_csv_rows(path: Path) -> list[dict[str, str]]:

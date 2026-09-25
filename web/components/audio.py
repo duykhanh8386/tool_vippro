@@ -4,7 +4,13 @@ from pathlib import Path
 from typing import Awaitable, Callable, Iterable, TypeVar
 from loguru import logger
 from nicegui import context, ui
-from src.audio_batch_matcher import AudioBatchMatchResult, match_audio_files
+from src.audio_batch_matcher import (
+    AudioBatchMatchResult,
+    build_audio_rename_plan,
+    execute_audio_rename_plan,
+    match_audio_files,
+    match_audio_files_sequentially,
+)
 from src.audio_language import (
     call_audio_update_with_retry,
     invalid_language_codes,
@@ -220,6 +226,8 @@ def create_add_audio_page():
         "music_folder_input": None,
         "recursive_switch": None,
         "scan_button": None,
+        "sequential_button": None,
+        "rename_button": None,
     }
 
     def configuration_change_blocked() -> bool:
@@ -311,6 +319,7 @@ def create_add_audio_page():
                         ui_refs["recursive_switch"].value = batch_scan_state["recursive"]
                     refresh_right_panel()
                     refresh_scan_preview()
+                    refresh_rename_button()
                     if ui_refs["refresh_language_chips"]:
                         ui_refs["refresh_language_chips"]()
                     if selected_channel["id"] and ui_refs["refresh_channel_display"]:
@@ -441,6 +450,10 @@ def create_add_audio_page():
                     f"trùng {summary.get('ambiguous', 0)} · "
                     f"file dư {summary.get('extra_files', 0)}"
                 ).classes("text-xs text-gray-500")
+                if summary.get("mode") == "sequential":
+                    ui.label("Chế độ: ghép lần lượt").classes(
+                        "text-xs font-medium text-blue-600"
+                    )
             if issues:
                 total_issues = summary.get("unmatched", 0) + summary.get("ambiguous", 0)
                 with ui.expansion(
@@ -469,7 +482,21 @@ def create_add_audio_page():
                             "text-xs text-orange-600"
                         )
 
-    def apply_batch_match(result: AudioBatchMatchResult) -> int:
+    def refresh_rename_button():
+        button = ui_refs.get("rename_button")
+        if not button:
+            return
+        has_sequential_matches = any(
+            (auto_match_info.get(video_id) or {}).get("status") == "sequential"
+            and id_to_path.get(video_id)
+            for video_id in video_ids_state["ids"]
+        )
+        if has_sequential_matches:
+            button.props(remove="disable")
+        else:
+            button.props("disable")
+
+    def apply_batch_match(result: AudioBatchMatchResult, *, mode: str) -> int:
         matched = list(result.matched)
         issues = [
             {
@@ -489,6 +516,7 @@ def create_add_audio_page():
             "unmatched": len(result.unmatched),
             "ambiguous": len(result.ambiguous),
             "extra_files": len(result.extra_files),
+            "mode": mode,
         }
         # Keep the checkpoint compact for very large channels while retaining
         # totals in the summary above.
@@ -497,6 +525,7 @@ def create_add_audio_page():
 
         if not matched:
             refresh_scan_preview()
+            refresh_rename_button()
             save_right_panel_state()
             return 0
 
@@ -526,12 +555,13 @@ def create_add_audio_page():
             ui_refs["ids_textarea"].value = "\n".join(new_ids)
         refresh_right_panel()
         refresh_scan_preview()
+        refresh_rename_button()
         save_right_panel_state()
         return len(matched)
 
     scan_runtime = {"running": False}
 
-    async def handle_auto_scan():
+    async def run_folder_scan(*, sequential: bool):
         if configuration_change_blocked():
             return
         if scan_runtime["running"]:
@@ -547,31 +577,41 @@ def create_add_audio_page():
             return
 
         scan_runtime["running"] = True
-        scan_button = ui_refs.get("scan_button")
-        if scan_button:
-            scan_button.props("loading disable")
+        active_button_key = "sequential_button" if sequential else "scan_button"
+        active_button = ui_refs.get(active_button_key)
+        for key in ("scan_button", "sequential_button"):
+            button = ui_refs.get(key)
+            if button:
+                button.props("disable")
+        if active_button:
+            active_button.props("loading")
         try:
             ui.notify("Đang quét toàn bộ video của kênh...", type="info")
             videos = await asyncio.to_thread(
                 _fetch_all_channel_videos, selected_channel["id"]
             )
             result = await asyncio.to_thread(
-                match_audio_files,
+                match_audio_files_sequentially if sequential else match_audio_files,
                 videos,
                 folder,
                 recursive=bool(batch_scan_state.get("recursive", True)),
             )
-            matched_count = apply_batch_match(result)
+            matched_count = apply_batch_match(
+                result, mode="sequential" if sequential else "automatic"
+            )
             if matched_count:
+                action = "ghép lần lượt" if sequential else "tự ghép"
                 ui.notify(
-                    f"Đã tự ghép {matched_count}/{len(videos)} video. Hãy kiểm tra bảng rồi cập nhật audio.",
+                    f"Đã {action} {matched_count}/{len(videos)} video. Hãy kiểm tra bảng rồi cập nhật audio.",
                     type="positive",
                 )
             else:
-                ui.notify(
-                    "Không tìm thấy file khớp. Hãy đặt Video ID ở đầu tên file hoặc dùng mapping.csv.",
-                    type="warning",
+                message = (
+                    "Thư mục không có file âm thanh để ghép lần lượt."
+                    if sequential
+                    else "Không tìm thấy file khớp. Hãy đặt Video ID ở đầu tên file hoặc dùng mapping.csv."
                 )
+                ui.notify(message, type="warning")
         except Exception as exc:
             logger.exception("Automatic audio scan failed")
             if _is_youtube_auth_error(exc):
@@ -581,8 +621,86 @@ def create_add_audio_page():
             ui.notify(message, type="negative")
         finally:
             scan_runtime["running"] = False
-            if scan_button:
-                scan_button.props(remove="loading disable")
+            if active_button:
+                active_button.props(remove="loading")
+            for key in ("scan_button", "sequential_button"):
+                button = ui_refs.get(key)
+                if button:
+                    button.props(remove="disable")
+
+    async def handle_auto_scan():
+        await run_folder_scan(sequential=False)
+
+    async def handle_sequential_scan():
+        await run_folder_scan(sequential=True)
+
+    def open_rename_dialog():
+        if configuration_change_blocked():
+            return
+        if scan_runtime["running"]:
+            ui.notify("Hãy chờ quét video và thư mục nhạc hoàn tất.", type="warning")
+            return
+        assignments = [
+            (video_id, id_to_path[video_id])
+            for video_id in video_ids_state["ids"]
+            if id_to_path.get(video_id)
+            and (auto_match_info.get(video_id) or {}).get("status") == "sequential"
+        ]
+        if not assignments:
+            ui.notify("Chưa có kết quả Ghép lần lượt để đổi tên.", type="warning")
+            return
+        try:
+            plan = build_audio_rename_plan(assignments)
+        except Exception as exc:
+            ui.notify(f"Không thể tạo kế hoạch đổi tên: {exc}", type="negative")
+            return
+        if not plan:
+            ui.notify("Các file đã mang đúng Video ID.", type="info")
+            return
+
+        with ui.dialog() as rename_dialog, ui.card().classes("app-card w-[680px] max-w-[95vw]"):
+            ui.label("Đổi tên file nhạc theo Video ID?").classes("text-lg font-semibold")
+            ui.label(
+                f"{len(plan)} file sẽ được đổi tên thật trên ổ đĩa. Định dạng file được giữ nguyên."
+            ).classes("text-sm text-gray-600")
+            with ui.scroll_area().classes("w-full h-64 border rounded p-2"):
+                for item in plan[:100]:
+                    ui.label(f"{item.source.name}  →  {item.target.name}").classes(
+                        "text-xs text-gray-700 break-all"
+                    )
+                if len(plan) > 100:
+                    ui.label(f"Còn {len(plan) - 100} file khác.").classes(
+                        "text-xs text-orange-600"
+                    )
+
+            def confirm_rename():
+                try:
+                    changed_paths = execute_audio_rename_plan(plan)
+                except Exception as exc:
+                    logger.exception("Could not rename sequential audio files")
+                    ui.notify(f"Đổi tên thất bại: {exc}", type="negative")
+                    return
+                for video_id, new_path in changed_paths.items():
+                    id_to_path[video_id] = new_path
+                    auto_match_info[video_id] = {
+                        "status": "video_id",
+                        "detail": "Đã đổi tên theo Video ID",
+                    }
+                batch_scan_state["summary"]["mode"] = "renamed"
+                refresh_right_panel()
+                refresh_rename_button()
+                save_right_panel_state()
+                rename_dialog.close()
+                ui.notify(f"Đã đổi tên {len(changed_paths)} file.", type="positive")
+
+            with ui.row().classes("w-full justify-end gap-2"):
+                ui.button("Hủy", on_click=rename_dialog.close).props("flat")
+                ui.button(
+                    "Đổi tên file",
+                    icon="drive_file_rename_outline",
+                    on_click=confirm_rename,
+                ).classes("app-button-primary")
+        rename_dialog.open()
 
     def refresh_right_panel():
         if not right_panel_container:
@@ -647,6 +765,7 @@ def create_add_audio_page():
                                 "mapping": "mapping.csv",
                                 "video_id": "Khớp ID",
                                 "title": "Khớp tiêu đề",
+                                "sequential": "Ghép lần lượt",
                                 "manual": "Thủ công",
                             }.get(match.get("status"), match.get("detail", ""))
                             ui.label(match_label).classes(
@@ -668,6 +787,7 @@ def create_add_audio_page():
                                 "detail": "Đã sửa đường dẫn thủ công",
                             }
                             refresh_right_panel()
+                            refresh_rename_button()
                             save_right_panel_state()
 
                         return _on_change
@@ -704,6 +824,7 @@ def create_add_audio_page():
                             video_processing_status.pop(video_id, None)
                             video_processing_errors.pop(video_id, None)
                             refresh_right_panel()
+                            refresh_rename_button()
                             if video_ids_state["ids"]:
                                 ids_textarea.value = "\n".join(video_ids_state["ids"])
                             else:
@@ -1124,11 +1245,11 @@ def create_add_audio_page():
             save_right_panel_state()
 
         with ui.card().classes("w-full bg-emerald-50 border border-emerald-200 p-3 mb-4"):
-            with ui.row().classes("w-full items-end gap-2 flex-nowrap"):
+            with ui.row().classes("w-full items-end gap-2 flex-wrap"):
                 music_folder_input = ui.input(
                     "Thư mục nhạc",
                     value=batch_scan_state["music_folder"],
-                ).props('outlined clearable placeholder="Chọn thư mục chứa các file mang Video ID"').classes("flex-1")
+                ).props('outlined clearable placeholder="Chọn thư mục chứa file âm thanh"').classes("flex-1 min-w-[320px]")
                 music_folder_input.on("change", on_music_folder_change)
                 ui_refs["music_folder_input"] = music_folder_input
                 ui.button(
@@ -1136,26 +1257,42 @@ def create_add_audio_page():
                     icon="folder_open",
                     on_click=pick_music_folder,
                 ).props("outline")
-                scan_button = ui.button(
-                    "Quét video & nhạc",
-                    icon="manage_search",
-                    on_click=handle_auto_scan,
-                ).classes("app-button-primary")
-                ui_refs["scan_button"] = scan_button
-            recursive_switch = ui.switch(
-                "Quét cả thư mục con",
-                value=batch_scan_state["recursive"],
-                on_change=on_recursive_change,
-            ).props("dense")
-            ui_refs["recursive_switch"] = recursive_switch
+            with ui.row().classes("w-full items-center justify-between gap-2 flex-wrap"):
+                recursive_switch = ui.switch(
+                    "Quét cả thư mục con",
+                    value=batch_scan_state["recursive"],
+                    on_change=on_recursive_change,
+                ).props("dense")
+                ui_refs["recursive_switch"] = recursive_switch
+                with ui.row().classes("items-center gap-2 flex-wrap"):
+                    scan_button = ui.button(
+                        "Tự ghép theo ID",
+                        icon="manage_search",
+                        on_click=handle_auto_scan,
+                    ).props("outline")
+                    ui_refs["scan_button"] = scan_button
+                    sequential_button = ui.button(
+                        "Ghép lần lượt",
+                        icon="format_list_numbered",
+                        on_click=handle_sequential_scan,
+                    ).classes("app-button-primary")
+                    ui_refs["sequential_button"] = sequential_button
+                    rename_button = ui.button(
+                        "Đổi tên theo Video ID",
+                        icon="drive_file_rename_outline",
+                        on_click=open_rename_dialog,
+                    ).props("outline disable")
+                    ui_refs["rename_button"] = rename_button
             ui.label(
                 "Đặt Video ID ở đầu tên file, ví dụ VIDEO_ID.m4a hoặc "
                 "VIDEO_ID__ghi-chú.flac. Phần đuôi có thể là MP3, M4A, WAV, "
                 "AAC, FLAC, OGG, OPUS, WMA, AIFF, APE và các định dạng được hỗ trợ khác. "
-                "Có thể dùng mapping.csv với hai cột video_id,audio_file."
+                "Nếu tên file bất kỳ, dùng Ghép lần lượt để xem trước mà không cần đổi tên file; "
+                "hoặc dùng mapping.csv với hai cột video_id,audio_file."
             ).classes("text-xs text-gray-600")
             scan_preview_container = ui.column().classes("w-full gap-1")
             refresh_scan_preview()
+            refresh_rename_button()
 
         with ui.row().classes("w-full items-start gap-5 flex-wrap"):
             with ui.column().classes("w-72 shrink-0"):
@@ -1179,6 +1316,7 @@ def create_add_audio_page():
                         video_processing_status.pop(k, None)
                         video_processing_errors.pop(k, None)
                     refresh_right_panel()
+                    refresh_rename_button()
                     save_right_panel_state()
                 refresh_right_panel()
         load_right_panel_state()
@@ -1271,6 +1409,7 @@ def create_add_audio_page():
                 batch_scan_state["extra_files"] = []
                 refresh_right_panel()
                 refresh_scan_preview()
+                refresh_rename_button()
                 if ui_refs["refresh_language_chips"]:
                     ui_refs["refresh_language_chips"]()
                 if ui_refs["refresh_channel_display"]:
