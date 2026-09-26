@@ -310,8 +310,14 @@ class UpdateAudioModule(IModule):
         return groups[0].get("translations") or []
 
     @staticmethod
-    def _status_value_is_failure(key: str, value) -> bool:
-        """Recognize YouTube Studio failure enums without treating ineligible as failed."""
+    def _status_value_needs_attention(key: str, value) -> bool:
+        """Recognize the four audio states selected by the channel scanner.
+
+        Studio returns enum-like strings whose prefixes can themselves contain
+        words such as ``PROCESSING`` (for example
+        ``AUDIO_TRACK_PROCESSING_STATUS_READY``).  Match the terminal state,
+        not just that prefix, so a ready track is never selected accidentally.
+        """
         normalized_key = "".join(ch for ch in str(key).upper() if ch.isalnum())
         status_key = any(
             marker in normalized_key
@@ -322,18 +328,18 @@ class UpdateAudioModule(IModule):
                 "FAIL",
                 "REASON",
                 "AVAILABILITY",
+                "PROCESSING",
             )
         )
         if isinstance(value, bool):
-            return value and any(marker in normalized_key for marker in ("ERROR", "FAIL"))
+            return value and any(
+                marker in normalized_key for marker in ("ERROR", "FAIL", "PROCESSING")
+            )
         if not status_key or not isinstance(value, str):
             return False
 
         normalized_value = "".join(ch for ch in value.upper() if ch.isalnum())
-        if not normalized_value or any(
-            marker in normalized_value
-            for marker in ("INELIGIBLE", "NOTELIGIBLE", "INSUFFICIENTELIGIBILITY")
-        ):
+        if not normalized_value:
             return False
         if normalized_value in {
             "0",
@@ -344,10 +350,20 @@ class UpdateAudioModule(IModule):
             "READY",
             "SUCCESS",
             "SUCCEEDED",
+            "COMPLETE",
+            "COMPLETED",
             "UNSPECIFIED",
         } or any(
             normalized_value.endswith(marker)
-            for marker in ("ERRORNONE", "STATUSOK", "STATUSREADY", "STATUSSUCCEEDED")
+            for marker in (
+                "ERRORNONE",
+                "STATUSOK",
+                "STATUSREADY",
+                "STATUSSUCCESS",
+                "STATUSSUCCEEDED",
+                "STATUSCOMPLETE",
+                "STATUSCOMPLETED",
+            )
         ):
             return False
         if any(
@@ -362,6 +378,36 @@ class UpdateAudioModule(IModule):
                 "COULDNOTPROCESS",
                 "REJECTED",
                 "SPEECHNOTDETECTED",
+                "INELIGIBLE",
+                "NOTELIGIBLE",
+                "INSUFFICIENTELIGIBILITY",
+                "DELETED",
+                "REMOVED",
+            )
+        ):
+            return True
+
+        # These are the non-terminal states rendered by Studio as "Đang xử lý".
+        # endswith() avoids matching READY/COMPLETED values whose enum namespace
+        # happens to contain AUDIO_TRACK_PROCESSING_STATUS.
+        if normalized_value in {
+            "PROCESSING",
+            "PENDING",
+            "TRANSCODING",
+            "UPLOADING",
+            "INPROGRESS",
+        } or normalized_value.endswith(
+            (
+                "STATUSPROCESSING",
+                "STATEPROCESSING",
+                "STATUSPENDING",
+                "STATEPENDING",
+                "STATUSTRANSCODING",
+                "STATETRANSCODING",
+                "STATUSUPLOADING",
+                "STATEUPLOADING",
+                "STATUSINPROGRESS",
+                "STATEINPROGRESS",
             )
         ):
             return True
@@ -372,13 +418,13 @@ class UpdateAudioModule(IModule):
         return False
 
     @classmethod
-    def _audio_translation_has_processing_failure(cls, item: dict) -> bool:
-        """Return true for an audio row rendered by Studio as processing failed."""
+    def _audio_translation_needs_attention(cls, item: dict) -> bool:
+        """Return true for processing, failed, ineligible, or deleted audio rows."""
         audio = item.get("audioTranslation") or {}
         automatic_audio_rows = item.get("captionsTranslations") or []
 
         def walk(value, parent_key: str = "") -> bool:
-            if cls._status_value_is_failure(parent_key, value):
+            if cls._status_value_needs_attention(parent_key, value):
                 return True
             if isinstance(value, dict):
                 return any(
@@ -398,13 +444,18 @@ class UpdateAudioModule(IModule):
             isinstance(row, dict) and walk(row) for row in automatic_audio_rows
         )
 
-    def get_failed_audio_video_ids(
+    # Compatibility aliases for callers/tests created before the scanner was
+    # expanded beyond failed-only rows.
+    _status_value_is_failure = _status_value_needs_attention
+    _audio_translation_has_processing_failure = _audio_translation_needs_attention
+
+    def get_audio_attention_video_ids(
         self,
         video_ids: list[str],
         channel_id: str,
         unreadable_ids: list[str] | None = None,
     ) -> set[str]:
-        """Return videos which contain at least one failed audio translation row."""
+        """Return videos with processing, failed, ineligible, or deleted audio."""
         unique_ids = list(dict.fromkeys(video_id for video_id in video_ids if video_id))
         failed_ids: set[str] = set()
         skipped = unreadable_ids if unreadable_ids is not None else []
@@ -449,7 +500,7 @@ class UpdateAudioModule(IModule):
                     continue
                 items = group.get("translations") or []
                 if any(
-                    self._audio_translation_has_processing_failure(item)
+                    self._audio_translation_needs_attention(item)
                     for item in items
                 ):
                     failed_ids.add(group_id)
@@ -457,6 +508,17 @@ class UpdateAudioModule(IModule):
         for start in range(0, len(unique_ids), self._TRANSLATION_BATCH_SIZE):
             scan_chunk(unique_ids[start : start + self._TRANSLATION_BATCH_SIZE])
         return failed_ids
+
+    def get_failed_audio_video_ids(
+        self,
+        video_ids: list[str],
+        channel_id: str,
+        unreadable_ids: list[str] | None = None,
+    ) -> set[str]:
+        """Backward-compatible name for the expanded audio-state scanner."""
+        return self.get_audio_attention_video_ids(
+            video_ids, channel_id, unreadable_ids
+        )
 
     def get_existing_audio_languages(self, id_video: str, channel_id: str) -> set[str]:
         """Return normalized language codes which already have an audio track."""

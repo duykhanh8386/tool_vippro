@@ -192,7 +192,7 @@ class AudioUploadTests(unittest.TestCase):
                 {"en", "vi"},
             )
 
-    def test_failed_audio_scan_selects_processing_failures_only(self):
+    def test_audio_scan_selects_all_four_requested_studio_states(self):
         module = UpdateAudioModule()
         groups = [
             {
@@ -212,7 +212,7 @@ class AudioUploadTests(unittest.TestCase):
                     {
                         "languageCode": "fr",
                         "audioTranslation": {
-                            "status": "AUDIO_TRACK_STATUS_FAILED_INELIGIBLE"
+                            "status": "AUDIO_TRACK_STATUS_INELIGIBLE"
                         },
                     }
                 ],
@@ -226,6 +226,28 @@ class AudioUploadTests(unittest.TestCase):
                             "audioTrackId": "track",
                             "status": "AUDIO_TRACK_STATUS_READY",
                             "errorCode": "AUDIO_TRACK_ERROR_NONE",
+                        },
+                    }
+                ],
+            },
+            {
+                "videoId": "processing-video",
+                "translations": [
+                    {
+                        "languageCode": "de",
+                        "audioTranslation": {
+                            "audioTrackProcessingStatus": "AUDIO_TRACK_PROCESSING_STATUS_PROCESSING"
+                        },
+                    }
+                ],
+            },
+            {
+                "videoId": "deleted-video",
+                "translations": [
+                    {
+                        "languageCode": "es",
+                        "audioTranslation": {
+                            "status": "AUDIO_TRACK_STATUS_DELETED"
                         },
                     }
                 ],
@@ -252,20 +274,46 @@ class AudioUploadTests(unittest.TestCase):
                     "failed-video",
                     "ineligible-video",
                     "ready-video",
+                    "processing-video",
+                    "deleted-video",
                     "no-speech-video",
                 ],
                 "channel",
             )
 
-        self.assertEqual(failed, {"failed-video", "no-speech-video"})
+        self.assertEqual(
+            failed,
+            {
+                "failed-video",
+                "ineligible-video",
+                "processing-video",
+                "deleted-video",
+                "no-speech-video",
+            },
+        )
         fetch.assert_called_once_with(
             [
                 "failed-video",
                 "ineligible-video",
                 "ready-video",
+                "processing-video",
+                "deleted-video",
                 "no-speech-video",
             ],
             "channel",
+        )
+
+    def test_processing_enum_namespace_does_not_select_completed_audio(self):
+        module = UpdateAudioModule()
+
+        self.assertFalse(
+            module._audio_translation_needs_attention(
+                {
+                    "audioTranslation": {
+                        "audioTrackProcessingStatus": "AUDIO_TRACK_PROCESSING_STATUS_COMPLETED"
+                    }
+                }
+            )
         )
 
     def test_failed_audio_scan_recognizes_nested_error_reason(self):

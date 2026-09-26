@@ -29,8 +29,9 @@ from web.theme import app_card, page_header, section_header
 _T = TypeVar("_T")
 _ADD_AUDIO_RUN_GUARD = threading.Lock()
 DEFAULT_AUDIO_UPLOAD_CONCURRENCY = 3
-MAX_AUDIO_UPLOAD_CONCURRENCY = 3
-_AUDIO_UPLOAD_CONCURRENCY_MODE = "parallel_v1"
+MIN_AUDIO_UPLOAD_CONCURRENCY = 3
+MAX_AUDIO_UPLOAD_CONCURRENCY = 5
+_AUDIO_UPLOAD_CONCURRENCY_MODE = "delete_then_add_parallel_v2"
 
 
 def _best_effort_ui(
@@ -115,7 +116,7 @@ def _clamp_upload_concurrency(value: object) -> int:
         parsed = int(value)
     except (TypeError, ValueError):
         parsed = DEFAULT_AUDIO_UPLOAD_CONCURRENCY
-    return max(1, min(MAX_AUDIO_UPLOAD_CONCURRENCY, parsed))
+    return max(MIN_AUDIO_UPLOAD_CONCURRENCY, min(MAX_AUDIO_UPLOAD_CONCURRENCY, parsed))
 
 
 def _restore_audio_performance_settings(saved: dict | None) -> tuple[dict, bool]:
@@ -257,6 +258,36 @@ def _restore_language_statuses(
     return restored
 
 
+def _restore_cleanup_statuses(
+    statuses: dict | None, *, reset_processing: bool
+) -> dict:
+    """Restore per-video delete checkpoints and retry interrupted cleanup."""
+    restored = dict(statuses or {})
+    if reset_processing:
+        for video_id, status in restored.items():
+            if status == "processing":
+                restored[video_id] = "pending"
+    return restored
+
+
+def _audio_workflow_signature(
+    *,
+    channel_id: str,
+    audio_path: str,
+    languages: Iterable[str],
+    repeat_times: int,
+    extra_minutes: float,
+) -> dict:
+    """Describe inputs which require a fresh delete-before-add run."""
+    return {
+        "channel_id": channel_id,
+        "audio_path": audio_path.strip(),
+        "languages": list(languages),
+        "repeat_times": int(repeat_times),
+        "extra_minutes": float(extra_minutes),
+    }
+
+
 def create_channel_selection(channels, on_channel_select):
     """Create a channel selection interface similar to studio page"""
     selected_channel = {"id": None}
@@ -340,6 +371,9 @@ def create_add_audio_page():
     auto_match_info = {}
     video_processing_status = {}
     video_processing_errors = {}
+    video_cleanup_status = {}
+    delete_requested = {}
+    video_workflow_signatures = {}
     repeat_settings = {"times": 2, "extra_minutes": 0}
     performance_settings = {
         "max_concurrency": DEFAULT_AUDIO_UPLOAD_CONCURRENCY,
@@ -392,7 +426,8 @@ def create_add_audio_page():
         best_effort_ui(
             "notify locked add-audio configuration",
             lambda: ui.notify(
-                "Thêm audio đang chạy; chưa thể thay đổi dữ liệu.", type="warning"
+                "Quy trình xóa và thêm audio đang chạy; chưa thể thay đổi dữ liệu.",
+                type="warning",
             ),
         )
         return True
@@ -409,6 +444,9 @@ def create_add_audio_page():
                 "auto_match_info": auto_match_info,
                 "video_processing_status": video_processing_status,
                 "video_processing_errors": video_processing_errors,
+                "video_cleanup_status": video_cleanup_status,
+                "delete_requested": delete_requested,
+                "video_workflow_signatures": video_workflow_signatures,
                 "selected_languages": selected_languages["languages"],
                 "repeat_settings": repeat_settings,
                 "selected_channel": selected_channel["id"],
@@ -446,6 +484,20 @@ def create_add_audio_page():
                     needs_checkpoint_save = True
             if "video_processing_errors" in state:
                 video_processing_errors.update(state["video_processing_errors"])
+            restored_cleanup = _restore_cleanup_statuses(
+                state.get("video_cleanup_status"),
+                reset_processing=not _ADD_AUDIO_RUN_GUARD.locked(),
+            )
+            video_cleanup_status.clear()
+            video_cleanup_status.update(restored_cleanup)
+            delete_requested.clear()
+            delete_requested.update(state.get("delete_requested") or {})
+            video_workflow_signatures.clear()
+            video_workflow_signatures.update(
+                state.get("video_workflow_signatures") or {}
+            )
+            if restored_cleanup != (state.get("video_cleanup_status") or {}):
+                needs_checkpoint_save = True
             if "selected_languages" in state:
                 selected_languages["languages"] = state["selected_languages"]
             if "repeat_settings" in state:
@@ -601,7 +653,7 @@ def create_add_audio_page():
                 concurrency_input = ui.number(
                     label="Video song song",
                     value=performance_settings["max_concurrency"],
-                    min=1,
+                    min=MIN_AUDIO_UPLOAD_CONCURRENCY,
                     max=MAX_AUDIO_UPLOAD_CONCURRENCY,
                     step=1,
                 ).props("outlined").classes("w-36")
@@ -618,7 +670,7 @@ def create_add_audio_page():
 
                 concurrency_input.on("change", update_concurrency)
                 ui.label(
-                    "Mỗi video có thể chạy song song; các mã ngôn ngữ trong cùng video vẫn chạy lần lượt."
+                    "Chạy đồng thời 3–5 video; mỗi video luôn xóa audio cũ trước rồi mới thêm lần lượt các ngôn ngữ."
                 ).classes("app-section-copy flex-1")
 
     def parse_ids_from_text(text: str) -> list[str]:
@@ -655,6 +707,9 @@ def create_add_audio_page():
         auto_match_info.clear()
         video_processing_status.clear()
         video_processing_errors.clear()
+        video_cleanup_status.clear()
+        delete_requested.clear()
+        video_workflow_signatures.clear()
         batch_scan_state["result_channel"] = selected_channel["id"]
         batch_scan_state["summary"] = {}
         batch_scan_state["issues"] = []
@@ -710,7 +765,7 @@ def create_add_audio_page():
             failed_channel = video_source_state.get("failed_channel")
             if not failed_channel:
                 ui.label(
-                    "Chưa quét. Hãy chọn kênh rồi bấm Quét ID lỗi audio."
+                    "Chưa quét. Hãy chọn kênh rồi bấm Quét ID audio cần xử lý."
                 ).classes("text-xs text-orange-600")
                 return
             if failed_channel != selected_channel["id"]:
@@ -720,7 +775,7 @@ def create_add_audio_page():
                 return
             ui.label(
                 f"Đã tìm thấy {len(video_source_state.get('failed_videos') or [])}/"
-                f"{video_source_state.get('scan_total', 0)} video có audio xử lý lỗi."
+                f"{video_source_state.get('scan_total', 0)} video có audio cần xử lý."
             ).classes("text-xs font-medium text-emerald-700")
             if video_source_state.get("scan_skipped", 0):
                 ui.label(
@@ -843,6 +898,9 @@ def create_add_audio_page():
             if video_id not in new_paths or old_paths.get(video_id) != new_paths.get(video_id):
                 video_processing_status.pop(video_id, None)
                 video_processing_errors.pop(video_id, None)
+                video_cleanup_status.pop(video_id, None)
+                delete_requested.pop(video_id, None)
+                video_workflow_signatures.pop(video_id, None)
 
         video_ids_state["ids"] = new_ids
         batch_scan_state["result_channel"] = selected_channel["id"]
@@ -891,7 +949,7 @@ def create_add_audio_page():
 
         if video_source_state.get("mode") == "failed":
             if video_source_state.get("failed_channel") != channel_id:
-                raise ValueError("Hãy quét lại danh sách video lỗi audio cho kênh đang chọn.")
+                raise ValueError("Hãy quét lại danh sách video cần xử lý audio cho kênh đang chọn.")
             cached = [
                 _video_from_snapshot(item)
                 for item in video_source_state.get("failed_videos") or []
@@ -917,7 +975,7 @@ def create_add_audio_page():
             ui.notify("Một tác vụ quét đang chạy.", type="warning")
             return
         if video_source_state.get("mode") != "failed":
-            ui.notify("Hãy chọn chế độ Quét ID lỗi audio trước.", type="warning")
+            ui.notify("Hãy chọn chế độ Quét ID audio cần xử lý trước.", type="warning")
             return
         if not selected_channel["id"]:
             ui.notify("Hãy chọn kênh trước khi quét", type="warning")
@@ -931,7 +989,7 @@ def create_add_audio_page():
             videos = await asyncio.to_thread(_fetch_all_channel_videos, channel_id)
             unreadable_ids: list[str] = []
             failed_ids = await asyncio.to_thread(
-                update_audio_module.get_failed_audio_video_ids,
+                update_audio_module.get_audio_attention_video_ids,
                 [video.id for video in videos],
                 channel_id,
                 unreadable_ids,
@@ -951,13 +1009,14 @@ def create_add_audio_page():
             save_right_panel_state()
             if failed_videos:
                 ui.notify(
-                    f"Đã lấy {len(failed_videos)}/{len(videos)} Video ID có audio xử lý lỗi. "
+                    f"Đã lấy {len(failed_videos)}/{len(videos)} Video ID có audio cần xử lý. "
                     "Bây giờ hãy chọn cách ghép.",
                     type="positive",
                 )
             else:
                 ui.notify(
-                    f"Đã quét {len(videos)} video, không thấy audio nào ở trạng thái xử lý lỗi.",
+                    f"Đã quét {len(videos)} video, không thấy audio Đang xử lý / "
+                    "Không xử lý được / Không đủ điều kiện / Đã xoá.",
                     type="warning",
                 )
         except Exception as exc:
@@ -965,7 +1024,7 @@ def create_add_audio_page():
             if _is_youtube_auth_error(exc):
                 message = "Phiên đăng nhập YouTube đã hết hạn. Hãy đăng nhập và quét lại kênh."
             else:
-                message = f"Không thể quét ID lỗi audio: {exc}"
+                message = f"Không thể quét ID audio cần xử lý: {exc}"
             ui.notify(message, type="negative")
         finally:
             scan_runtime["running"] = False
@@ -1140,10 +1199,12 @@ def create_add_audio_page():
                 video_status = video_processing_status.get(vid, {})
                 active_languages = list(selected_languages["languages"])
                 active_language_set = set(active_languages)
+                cleanup_status = video_cleanup_status.get(vid, "pending")
                 video_errors = {
                     language: message
                     for language, message in video_processing_errors.get(vid, {}).items()
-                    if language in active_language_set or language == "xử lý"
+                    if language in active_language_set
+                    or language in {"xử lý", "xóa audio"}
                 }
                 active_statuses = [video_status.get(language) for language in active_languages]
                 total_languages = len(active_languages)
@@ -1155,11 +1216,14 @@ def create_add_audio_page():
                     overall_status = "pending"
                     status_color = "text-yellow-600"
                     status_icon = "schedule"
-                elif effective_success == total_languages:
+                elif (
+                    cleanup_status == "successful"
+                    and effective_success == total_languages
+                ):
                     overall_status = "successful"
                     status_color = "text-green-600"
                     status_icon = "check_circle"
-                elif unsuccessful_count > 0:
+                elif cleanup_status == "unsuccessful" or unsuccessful_count > 0:
                     overall_status = "unsuccessful"
                     status_color = "text-red-600"
                     status_icon = "error"
@@ -1193,6 +1257,15 @@ def create_add_audio_page():
                             ui.label(match_label).classes(
                                 "px-2 text-[10px] font-medium text-emerald-600"
                             )
+                        cleanup_text, cleanup_color = {
+                            "pending": ("Chờ xóa audio cũ", "text-gray-500"),
+                            "processing": ("Đang xóa audio cũ", "text-blue-600"),
+                            "successful": ("Đã xóa audio cũ", "text-emerald-600"),
+                            "unsuccessful": ("Xóa audio thất bại", "text-red-600"),
+                        }.get(cleanup_status, ("Chờ xóa audio cũ", "text-gray-500"))
+                        ui.label(cleanup_text).classes(
+                            f"px-2 text-[10px] font-medium {cleanup_color}"
+                        )
 
                     def make_path_on_change(video_id: str, input_ref):
                         def _on_change(e=None):
@@ -1203,6 +1276,9 @@ def create_add_audio_page():
                             if id_to_path.get(video_id, "") != new_path:
                                 video_processing_status.pop(video_id, None)
                                 video_processing_errors.pop(video_id, None)
+                                video_cleanup_status.pop(video_id, None)
+                                delete_requested.pop(video_id, None)
+                                video_workflow_signatures.pop(video_id, None)
                             id_to_path[video_id] = new_path
                             auto_match_info[video_id] = {
                                 "status": "manual",
@@ -1245,6 +1321,9 @@ def create_add_audio_page():
                             auto_match_info.pop(video_id, None)
                             video_processing_status.pop(video_id, None)
                             video_processing_errors.pop(video_id, None)
+                            video_cleanup_status.pop(video_id, None)
+                            delete_requested.pop(video_id, None)
+                            video_workflow_signatures.pop(video_id, None)
                             if video_source_state.get("mode") == "manual":
                                 video_source_state["manual_ids"] = list(
                                     video_ids_state["ids"]
@@ -1280,7 +1359,7 @@ def create_add_audio_page():
                             ui.label(f"Ngôn ngữ {error_lang}: {error_message}").classes("text-sm text-red-700 whitespace-normal break-words")
     async def handle_add_audio():
         if _ADD_AUDIO_RUN_GUARD.locked():
-            ui.notify("Thêm audio đang chạy ở một trang khác.", type="warning")
+            ui.notify("Quy trình xóa và thêm audio đang chạy ở một trang khác.", type="warning")
             return None
         if not selected_channel["id"]:
             ui.notify("Hãy chọn kênh", type="warning")
@@ -1318,7 +1397,7 @@ def create_add_audio_page():
                 logger.error(err)
             return None
         if not _ADD_AUDIO_RUN_GUARD.acquire(blocking=False):
-            ui.notify("Thêm audio đang chạy ở một trang khác.", type="warning")
+            ui.notify("Quy trình xóa và thêm audio đang chạy ở một trang khác.", type="warning")
             return None
         channel_id = selected_channel["id"]
         repeat_times = repeat_settings["times"]
@@ -1330,7 +1409,7 @@ def create_add_audio_page():
             return None
         with ui.dialog() as progress_dialog:
             with ui.card().classes("app-card w-96"):
-                ui.label("Đang thêm âm thanh...").classes("text-base font-semibold")
+                ui.label("Đang xóa và thêm âm thanh...").classes("text-base font-semibold")
                 current_video_label = ui.label("").classes("text-sm font-medium text-blue-600")
                 status_label = ui.label("").classes("text-sm text-gray-600")
                 remaining_label = ui.label("").classes("text-xs text-gray-500")
@@ -1339,8 +1418,12 @@ def create_add_audio_page():
         progress_dialog.props("persistent")
         best_effort_ui("open progress dialog", progress_dialog.open)
         total_videos = len(video_ids_state["ids"])
-        total_tasks = total_videos * len(languages_to_process)
+        tasks_per_video = len(languages_to_process) + 1
+        total_tasks = total_videos * tasks_per_video
         completed_tasks = 0
+        completed_by_video = {
+            video_id: 0 for video_id in video_ids_state["ids"]
+        }
         overall_errors = []
         max_concurrency = _clamp_upload_concurrency(
             performance_settings.get("max_concurrency")
@@ -1421,7 +1504,102 @@ def create_add_audio_page():
             video_index, vid = item
             temp_audio_path: Path | None = None
             try:
+                workflow_signature = _audio_workflow_signature(
+                    channel_id=channel_id,
+                    audio_path=id_to_path.get(vid) or "",
+                    languages=languages_to_process,
+                    repeat_times=repeat_times,
+                    extra_minutes=extra_minutes,
+                )
+                if video_workflow_signatures.get(vid) != workflow_signature:
+                    video_processing_status.pop(vid, None)
+                    video_processing_errors.pop(vid, None)
+                    video_cleanup_status.pop(vid, None)
+                    delete_requested.pop(vid, None)
+                    video_workflow_signatures[vid] = workflow_signature
+
                 existing_status = video_processing_status.setdefault(vid, {})
+                if video_cleanup_status.get(vid) == "successful":
+                    completed_tasks += 1
+                    completed_by_video[vid] += 1
+                else:
+                    # A fresh cleanup invalidates every earlier language result:
+                    # all selected languages must be added again after deletion.
+                    existing_status.clear()
+                    video_processing_errors.pop(vid, None)
+                    video_cleanup_status[vid] = "processing"
+                    delete_requested[vid] = True
+                    if save_right_panel_state() is False:
+                        raise RuntimeError(
+                            "Không thể lưu checkpoint trước khi xóa audio cũ"
+                        )
+                    best_effort_ui(
+                        "render audio cleanup state",
+                        lambda: (
+                            current_video_label.set_text(
+                                f"Video {video_index}/{total_videos}: {vid}"
+                            ),
+                            status_label.set_text(
+                                "Bước 1/2: Đang xóa toàn bộ audio cũ..."
+                            ),
+                            refresh_right_panel(),
+                        ),
+                    )
+
+                    def delete_old_audio():
+                        return update_audio_module.delete(
+                            id_video=vid,
+                            channel_id=channel_id,
+                        )
+
+                    def log_delete_retry(attempt, delay, exc):
+                        logger.warning(
+                            "Retry delete {}/3 for {} in {}s: {}",
+                            attempt,
+                            vid,
+                            delay,
+                            exc,
+                        )
+
+                    try:
+                        await call_audio_update_with_retry(
+                            delete_old_audio,
+                            on_retry=log_delete_retry,
+                        )
+                        video_cleanup_status[vid] = "successful"
+                        delete_requested.pop(vid, None)
+                        if save_right_panel_state() is False:
+                            video_cleanup_status[vid] = "pending"
+                            delete_requested[vid] = True
+                            raise RuntimeError(
+                                "Không thể lưu checkpoint sau khi xóa audio cũ"
+                            )
+                    except Exception as exc:
+                        video_cleanup_status[vid] = "unsuccessful"
+                        delete_requested[vid] = True
+                        video_processing_errors.setdefault(vid, {})[
+                            "xóa audio"
+                        ] = str(exc)
+                        save_right_panel_state()
+                        raise
+
+                    completed_tasks += 1
+                    completed_by_video[vid] += 1
+                    best_effort_ui(
+                        "render completed audio cleanup",
+                        lambda: (
+                            setattr(
+                                progress_bar,
+                                "value",
+                                completed_tasks / total_tasks,
+                            ),
+                            status_label.set_text(
+                                "Bước 1/2 hoàn tất — chuẩn bị audio mới..."
+                            ),
+                            refresh_right_panel(),
+                        ),
+                    )
+
                 missing_languages = [
                     lang
                     for lang in languages_to_process
@@ -1430,6 +1608,7 @@ def create_add_audio_page():
                 skipped_count = len(languages_to_process) - len(missing_languages)
                 if skipped_count:
                     completed_tasks += skipped_count
+                    completed_by_video[vid] += skipped_count
                     best_effort_ui(
                         "update skipped-language progress",
                         lambda: setattr(progress_bar, "value", completed_tasks / total_tasks),
@@ -1449,53 +1628,6 @@ def create_add_audio_page():
                     )
                     return
 
-                try:
-                    existing_remote_languages = await asyncio.to_thread(
-                        update_audio_module.get_existing_audio_languages,
-                        vid,
-                        channel_id,
-                    )
-                except Exception as exc:
-                    if _is_youtube_auth_error(exc):
-                        raise
-                    logger.warning(
-                        "Could not inspect existing audio tracks for {}: {}", vid, exc
-                    )
-                else:
-                    already_on_youtube = [
-                        lang
-                        for lang in missing_languages
-                        if lang.casefold() in existing_remote_languages
-                    ]
-                    for lang in already_on_youtube:
-                        existing_status[lang] = "already_added"
-                        video_processing_errors.setdefault(vid, {}).pop(lang, None)
-                    if already_on_youtube:
-                        completed_tasks += len(already_on_youtube)
-                        save_right_panel_state()
-                        best_effort_ui(
-                            "render remote audio tracks",
-                            lambda: (
-                                setattr(
-                                    progress_bar,
-                                    "value",
-                                    completed_tasks / total_tasks,
-                                ),
-                                refresh_right_panel(),
-                            ),
-                        )
-                    missing_languages = [
-                        lang for lang in missing_languages if lang not in already_on_youtube
-                    ]
-                    if not missing_languages:
-                        best_effort_ui(
-                            "render remotely complete video",
-                            lambda: status_label.set_text(
-                                "YouTube đã có đủ audio track — đã bỏ qua"
-                            ),
-                        )
-                        return
-
                 file_path = Path((id_to_path.get(vid) or "").strip())
                 best_effort_ui(
                     "render current audio video",
@@ -1506,7 +1638,7 @@ def create_add_audio_page():
                         remaining_label.set_text(
                             f"Còn lại: {total_videos - video_index} video"
                         ),
-                        status_label.set_text("Đang lấy thông tin video..."),
+                        status_label.set_text("Bước 2/2: Đang lấy thông tin video..."),
                     ),
                 )
                 video_info = await asyncio.to_thread(
@@ -1557,6 +1689,7 @@ def create_add_audio_page():
                         temp_audio_path=temp_audio_path,
                     )
                     completed_tasks += 1
+                    completed_by_video[vid] += 1
                     save_right_panel_state()
                     best_effort_ui(
                         "render completed language",
@@ -1585,10 +1718,14 @@ def create_add_audio_page():
             logger.error("Error processing video {}: {}", vid, vid_exc)
             overall_errors.append(f"{vid}: {vid_exc}")
             video_processing_errors.setdefault(vid, {})["xử lý"] = str(vid_exc)
+            remaining_for_video = max(
+                0, tasks_per_video - completed_by_video.get(vid, 0)
+            )
             completed_tasks = min(
                 total_tasks,
-                completed_tasks + len(languages_to_process),
+                completed_tasks + remaining_for_video,
             )
+            completed_by_video[vid] = tasks_per_video
             save_right_panel_state()
             best_effort_ui(
                 "render failed audio video",
@@ -1651,8 +1788,8 @@ def create_add_audio_page():
     page = ui.column().classes("app-page audio-add-page")
     with page:
         with page_header(
-            "Thêm audio",
-            "Thêm audio track theo ngôn ngữ vào video YouTube đã có trên kênh.",
+            "Xóa & thêm audio",
+            "Quét video cần xử lý, xóa audio cũ trước rồi thêm audio mới theo ngôn ngữ.",
             eyebrow="Tác vụ",
         ):
             pass
@@ -1769,14 +1906,14 @@ def create_add_audio_page():
                     source_toggle = ui.toggle(
                         {
                             "manual": "Nhập ID thủ công",
-                            "failed": "Quét ID lỗi audio",
+                            "failed": "Quét ID audio cần xử lý",
                         },
                         value=video_source_state["mode"],
                         on_change=on_video_source_change,
                     ).props("no-caps")
                     ui_refs["video_source_toggle"] = source_toggle
                 failed_video_scan_button = ui.button(
-                    "Quét ID lỗi audio",
+                    "Quét ID audio cần xử lý",
                     icon="report_problem",
                     on_click=handle_failed_video_scan,
                 ).props("outline disable")
@@ -1877,6 +2014,9 @@ def create_add_audio_page():
                         auto_match_info.pop(k, None)
                         video_processing_status.pop(k, None)
                         video_processing_errors.pop(k, None)
+                        video_cleanup_status.pop(k, None)
+                        delete_requested.pop(k, None)
+                        video_workflow_signatures.pop(k, None)
                     refresh_right_panel()
                     refresh_rename_button()
                     refresh_video_source_controls()
@@ -1916,14 +2056,28 @@ def create_add_audio_page():
                     state.get("video_processing_status"), reset_processing=False
                 )
                 refreshed_errors = state.get("video_processing_errors") or {}
+                refreshed_cleanup = _restore_cleanup_statuses(
+                    state.get("video_cleanup_status"), reset_processing=False
+                )
+                refreshed_delete_requests = state.get("delete_requested") or {}
+                refreshed_signatures = state.get("video_workflow_signatures") or {}
                 if (
                     refreshed_statuses != video_processing_status
                     or refreshed_errors != video_processing_errors
+                    or refreshed_cleanup != video_cleanup_status
+                    or refreshed_delete_requests != delete_requested
+                    or refreshed_signatures != video_workflow_signatures
                 ):
                     video_processing_status.clear()
                     video_processing_status.update(refreshed_statuses)
                     video_processing_errors.clear()
                     video_processing_errors.update(refreshed_errors)
+                    video_cleanup_status.clear()
+                    video_cleanup_status.update(refreshed_cleanup)
+                    delete_requested.clear()
+                    delete_requested.update(refreshed_delete_requests)
+                    video_workflow_signatures.clear()
+                    video_workflow_signatures.update(refreshed_signatures)
                     refresh_right_panel()
             except Exception as exc:
                 logger.warning("Failed to sync add-audio checkpoint: {}", exc)
@@ -1961,6 +2115,9 @@ def create_add_audio_page():
                 auto_match_info.clear()
                 video_processing_status.clear()
                 video_processing_errors.clear()
+                video_cleanup_status.clear()
+                delete_requested.clear()
+                video_workflow_signatures.clear()
                 selected_channel["id"] = None
                 selected_languages["languages"] = []
                 repeat_settings["times"] = 2
@@ -1994,5 +2151,9 @@ def create_add_audio_page():
             save_right_panel_state()
 
         with ui.row().classes("w-full gap-2 mt-3"):
-            ui.button("Cập nhật audio", icon="play_arrow", on_click=handle_add_audio).classes("app-button-primary flex-1")
+            ui.button(
+                "Bắt đầu xóa & thêm audio",
+                icon="play_arrow",
+                on_click=handle_add_audio,
+            ).classes("app-button-primary flex-1")
             ui.button("Xóa dữ liệu", icon="delete_sweep", on_click=clear_all_inputs).classes("audio-add-destructive flex-1")

@@ -8,12 +8,15 @@ from unittest.mock import patch
 from web.components.audio import (
     DEFAULT_AUDIO_UPLOAD_CONCURRENCY,
     MAX_AUDIO_UPLOAD_CONCURRENCY,
+    MIN_AUDIO_UPLOAD_CONCURRENCY,
+    _audio_workflow_signature,
     _best_effort_ui as audio_best_effort_ui,
     _clamp_upload_concurrency,
     _cleanup_temp_audio_file,
     _fetch_all_channel_videos,
     _is_youtube_auth_error,
     _restore_audio_performance_settings,
+    _restore_cleanup_statuses,
     _restore_language_statuses,
     _run_concurrently_isolated,
     _run_sequentially_isolated,
@@ -24,16 +27,23 @@ from web.components.audio import (
 )
 from src.module.model import Video
 from web.components.remove_audio import (
+    DEFAULT_REMOVE_AUDIO_CONCURRENCY,
+    MAX_REMOVE_AUDIO_CONCURRENCY,
+    MIN_REMOVE_AUDIO_CONCURRENCY,
     _best_effort_ui as remove_audio_best_effort_ui,
+    _clamp_remove_concurrency,
+    _fetch_all_channel_videos as fetch_all_remove_audio_channel_videos,
     _gather_isolated,
     _restore_remove_statuses,
 )
 
 
 class AudioPageLifecycleTests(unittest.IsolatedAsyncioTestCase):
-    def test_upload_concurrency_defaults_to_three_and_is_capped_at_three(self):
+    def test_combined_workflow_concurrency_is_limited_to_three_through_five(self):
         self.assertEqual(_clamp_upload_concurrency(None), DEFAULT_AUDIO_UPLOAD_CONCURRENCY)
-        self.assertEqual(_clamp_upload_concurrency(0), 1)
+        self.assertEqual(
+            _clamp_upload_concurrency(0), MIN_AUDIO_UPLOAD_CONCURRENCY
+        )
         self.assertEqual(
             _clamp_upload_concurrency(99), MAX_AUDIO_UPLOAD_CONCURRENCY
         )
@@ -46,10 +56,49 @@ class AudioPageLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(changed)
         self.assertEqual(settings["max_concurrency"], DEFAULT_AUDIO_UPLOAD_CONCURRENCY)
 
-        settings["max_concurrency"] = 1
+        settings["max_concurrency"] = MIN_AUDIO_UPLOAD_CONCURRENCY
         restored, changed_again = _restore_audio_performance_settings(settings)
         self.assertFalse(changed_again)
-        self.assertEqual(restored["max_concurrency"], 1)
+        self.assertEqual(
+            restored["max_concurrency"], MIN_AUDIO_UPLOAD_CONCURRENCY
+        )
+
+    def test_cleanup_checkpoint_retries_only_interrupted_delete(self):
+        restored = _restore_cleanup_statuses(
+            {"A": "successful", "B": "processing", "C": "unsuccessful"},
+            reset_processing=True,
+        )
+
+        self.assertEqual(
+            restored,
+            {"A": "successful", "B": "pending", "C": "unsuccessful"},
+        )
+
+    def test_workflow_signature_changes_when_delete_then_add_inputs_change(self):
+        base = _audio_workflow_signature(
+            channel_id="channel",
+            audio_path="music.mp3",
+            languages=["en", "vi"],
+            repeat_times=2,
+            extra_minutes=0,
+        )
+        changed_audio = _audio_workflow_signature(
+            channel_id="channel",
+            audio_path="replacement.mp3",
+            languages=["en", "vi"],
+            repeat_times=2,
+            extra_minutes=0,
+        )
+        changed_languages = _audio_workflow_signature(
+            channel_id="channel",
+            audio_path="music.mp3",
+            languages=["en"],
+            repeat_times=2,
+            extra_minutes=0,
+        )
+
+        self.assertNotEqual(base, changed_audio)
+        self.assertNotEqual(base, changed_languages)
 
     def test_upload_progress_summary_reports_combined_speed_and_bytes(self):
         summary = _upload_progress_summary(
@@ -90,11 +139,11 @@ class AudioPageLifecycleTests(unittest.IsolatedAsyncioTestCase):
             range(8),
             process,
             lambda _item, _exc: None,
-            max_concurrency=2,
+            max_concurrency=3,
         )
 
         self.assertEqual(failures, [])
-        self.assertEqual(peak, 2)
+        self.assertEqual(peak, 3)
 
     async def test_concurrent_audio_queue_stops_claiming_items_after_auth_error(self):
         attempted = []
@@ -113,17 +162,21 @@ class AudioPageLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 await first_started.wait()
                 auth_failed.set()
                 raise AuthError("HTTP 401")
+            else:
+                await auth_failed.wait()
 
         with self.assertRaises(AuthError):
             await _run_concurrently_isolated(
                 ["A", "B", "C", "D"],
                 process,
                 lambda _item, _exc: None,
-                max_concurrency=2,
+                max_concurrency=3,
                 stop_on_error=_is_youtube_auth_error,
             )
 
-        self.assertCountEqual(attempted, ["A", "B"])
+        self.assertIn("A", attempted)
+        self.assertIn("B", attempted)
+        self.assertTrue(set(attempted).issubset({"A", "B", "C"}))
 
     def test_channel_scan_follows_pagination_and_deduplicates_video_ids(self):
         pages = [
@@ -319,6 +372,26 @@ class AudioPageLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
 
 class RemoveAudioPageLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    def test_remove_audio_concurrency_is_limited_to_three_through_five(self):
+        self.assertEqual(
+            _clamp_remove_concurrency(None), DEFAULT_REMOVE_AUDIO_CONCURRENCY
+        )
+        self.assertEqual(_clamp_remove_concurrency(1), MIN_REMOVE_AUDIO_CONCURRENCY)
+        self.assertEqual(_clamp_remove_concurrency(99), MAX_REMOVE_AUDIO_CONCURRENCY)
+
+    def test_remove_audio_channel_scan_paginates_and_deduplicates(self):
+        pages = [
+            ([SimpleNamespace(id="A"), SimpleNamespace(id="A")], "next"),
+            ([SimpleNamespace(id="B")], None),
+        ]
+        with patch(
+            "web.components.remove_audio.list_videos_module.list_all_videos",
+            side_effect=pages,
+        ):
+            videos = fetch_all_remove_audio_channel_videos("channel")
+
+        self.assertEqual([video.id for video in videos], ["A", "B"])
+
     def test_remove_audio_restart_only_retries_interrupted_videos(self):
         restored = _restore_remove_statuses(
             {"A": "successful", "B": "processing", "C": "unsuccessful"},

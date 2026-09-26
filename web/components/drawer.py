@@ -93,9 +93,7 @@ def create_drawer():
                     pass
 
                 ui.label("Tác vụ").classes("app-nav-label")
-                with nav_item("/audio/add", "Thêm audio", "o_library_music"):
-                    pass
-                with nav_item("/audio/remove", "Xóa audio", "o_layers_clear"):
+                with nav_item("/audio/add", "Xóa & thêm audio", "o_library_music"):
                     pass
                 with nav_item("/reup/delete-video", "Xóa - Back", "o_delete_sweep"):
                     pass
