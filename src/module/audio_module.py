@@ -439,10 +439,11 @@ class UpdateAudioModule(IModule):
     def _audio_payload_needs_attention(cls, payload) -> bool:
         """Inspect only audio/dubbing status containers in a Studio payload.
 
-        Depending on the channel feature rollout, Studio can return the audio
-        column through legacy ``audioTranslation`` data or through newer Aloud
-        and automatic-dubbing containers. Traversal stays inside those
-        containers so unrelated subtitle/video errors cannot select a video.
+        Depending on the channel feature rollout, a translation row can return
+        the audio column through legacy ``audioTranslation`` data or through
+        newer Aloud and automatic-dubbing containers. Traversal stays inside
+        those containers so caption-editor and video-level eligibility states
+        cannot select a video.
         """
 
         def normalize_key(raw) -> str:
@@ -457,7 +458,6 @@ class UpdateAudioModule(IModule):
                     "DUBBING",
                     "AUTODUB",
                     "ALOUD",
-                    "CAPTIONSTRANSLATIONS",
                 )
             )
 
@@ -506,10 +506,16 @@ class UpdateAudioModule(IModule):
                 skipped.append(video_id)
 
         def scan_group(video_id: str, group: dict) -> None:
-            # The matcher enters only audio/dubbing containers, so scanning the
-            # full group also covers group-level Aloud data without matching an
-            # unrelated subtitle or video status.
-            if self._audio_payload_needs_attention(group):
+            # Only translation rows render the Studio table's Audio column.
+            # Group-level auto-dubbing eligibility and captionsTranslations
+            # belong to the source caption editor and must not select a video.
+            translations = group.get("translations") or []
+            if not isinstance(translations, list):
+                return
+            if any(
+                self._audio_translation_needs_attention(item)
+                for item in translations
+            ):
                 failed_ids.add(video_id)
 
         def scan_chunk(chunk: list[str]) -> None:

@@ -281,14 +281,11 @@ class AudioUploadTests(unittest.TestCase):
                 "videoId": "no-speech-video",
                 "translations": [
                     {
-                        "captionsTranslations": [
-                            {
-                                "status": "TRANSLATION_STATUS_PROCESSING",
-                                "processingEta": {
-                                    "status": "PROCESSING_ETA_STATUS_SPEECH_NOT_DETECTED"
-                                },
+                        "audioTranslation": {
+                            "processingError": {
+                                "reasonCode": "SPEECH_NOT_DETECTED"
                             }
-                        ]
+                        }
                     }
                 ],
             },
@@ -341,12 +338,24 @@ class AudioUploadTests(unittest.TestCase):
             )
         )
 
-    def test_audio_scan_recognizes_new_group_level_auto_dubbing_status(self):
+    def test_group_level_auto_dubbing_eligibility_without_audio_rows_is_ignored(self):
         module = UpdateAudioModule()
         groups = [
             {
-                "videoId": "auto-dub-failed",
-                "translations": [],
+                "videoId": "caption-editor-only",
+                "translations": [
+                    {
+                        "languageCode": "en",
+                        "captionsTranslations": [
+                            {
+                                "status": "TRANSLATION_STATUS_PROCESSING",
+                                "processingEta": {
+                                    "status": "PROCESSING_ETA_STATUS_SPEECH_NOT_DETECTED"
+                                },
+                            }
+                        ],
+                    }
+                ],
                 "autoDubbingData": {
                     "languageDubbings": [
                         {
@@ -355,6 +364,29 @@ class AudioUploadTests(unittest.TestCase):
                         }
                     ]
                 },
+            }
+        ]
+
+        with patch.object(module, "_get_video_translation_groups", return_value=groups):
+            selected = module.get_audio_attention_video_ids(
+                ["caption-editor-only"], "channel"
+            )
+
+        self.assertEqual(selected, set())
+
+    def test_translation_row_auto_dubbing_status_is_selected(self):
+        module = UpdateAudioModule()
+        groups = [
+            {
+                "videoId": "auto-dub-failed",
+                "translations": [
+                    {
+                        "languageCode": "es",
+                        "autoDubbingData": {
+                            "status": "AUTO_DUBBING_STATUS_FAILED"
+                        },
+                    }
+                ],
             }
         ]
 
@@ -452,9 +484,13 @@ class AudioUploadTests(unittest.TestCase):
                 return [
                     {
                         "videoId": "failed",
-                        "autoDubbingData": {
-                            "status": "AUTO_DUBBING_STATUS_FAILED"
-                        },
+                        "translations": [
+                            {
+                                "autoDubbingData": {
+                                    "status": "AUTO_DUBBING_STATUS_FAILED"
+                                }
+                            }
+                        ],
                     }
                 ]
             return []
