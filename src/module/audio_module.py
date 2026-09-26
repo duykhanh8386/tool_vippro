@@ -1,6 +1,7 @@
 # RECOVERED: depyo output corrected from CPython 3.12 disassembly
 import os
 import time
+import unicodedata
 from urllib.parse import quote
 import requests
 from loguru import logger
@@ -280,7 +281,7 @@ class UpdateAudioModule(IModule):
         cookie_string = "; ".join([f"{cookie['name']}={cookie['value']}" for cookie in channel_info.cookies])
         session_token = self._get_session_token(channel_info)
         headers = {"Host": "studio.youtube.com", "Cookie": cookie_string, "Authorization": f"SAPISIDHASH {channel_info.sapisidhash}", "Content-Type": "application/json", "Origin": "https://studio.youtube.com", "Referer": f"https://studio.youtube.com/video/{video_ids[0]}/translations", "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36"}
-        payload = {"context": {"client": {"clientName": 62, "clientVersion": "1.20250902.04.00", "hl": "en", "gl": "VN", "experimentsToken": "", "utcOffsetMinutes": 420, "userInterfaceTheme": "USER_INTERFACE_THEME_DARK", "screenWidthPoints": 1920, "screenHeightPoints": 945, "screenPixelDensity": 1, "screenDensityFloat": 1}, "request": {"returnLogEntry": True, "internalExperimentFlags": [], "eats": "AWSNWa3PV1e-JQRiHlmMmNXCMA9Kt6en05uq7bbw9WnQgnJdNT8RNsEfMheyglxoOPf_TMIzUzU80CM9khDsuy6zp2Uz9ROtcC5RGvGrdEkSa_rIL5z6FDB2wAAYVWg=", "sessionInfo": {"token": session_token}, "consistencyTokenJars": []}, "user": {"onBehalfOfUser": channel_info.delegated_session_id, "delegationContext": {"externalChannelId": channel_info.id, "roleType": {"channelRoleType": channel_info.role}}, "serializedDelegationContext": ""}, "clientScreenNonce": "7nFa5dcSfcGGJAJS"}, "videoIds": video_ids, "filters": [], "fetchAloudData": False, "fetchAutoDubbingData": False, "fetchAutoDubbingAsrData": False, "fetchBulkActionsStatus": False}
+        payload = {"context": {"client": {"clientName": 62, "clientVersion": "1.20260520.00.00", "hl": "en", "gl": "VN", "experimentsToken": "", "utcOffsetMinutes": 420, "userInterfaceTheme": "USER_INTERFACE_THEME_DARK", "screenWidthPoints": 1920, "screenHeightPoints": 945, "screenPixelDensity": 1, "screenDensityFloat": 1}, "request": {"returnLogEntry": True, "internalExperimentFlags": [], "eats": self.EATS, "sessionInfo": {"token": session_token}, "consistencyTokenJars": []}, "user": {"onBehalfOfUser": channel_info.delegated_session_id, "delegationContext": {"externalChannelId": channel_info.id, "roleType": {"channelRoleType": channel_info.role}}, "serializedDelegationContext": ""}, "clientScreenNonce": self.CLIENT_SCREEN_NONCE}, "videoIds": video_ids, "filters": [], "fetchAloudData": True, "fetchAutoDubbingData": True, "fetchAutoDubbingAsrData": True, "fetchBulkActionsStatus": True}
         response = post_with_stop(url, headers=headers, json=payload)
         if response.status_code != 200:
             raise AudioUpdateError(
@@ -318,7 +319,19 @@ class UpdateAudioModule(IModule):
         ``AUDIO_TRACK_PROCESSING_STATUS_READY``).  Match the terminal state,
         not just that prefix, so a ready track is never selected accidentally.
         """
-        normalized_key = "".join(ch for ch in str(key).upper() if ch.isalnum())
+        def normalize(raw) -> str:
+            # Unicode NFKD strips Vietnamese tone marks but does not decompose
+            # the distinct letter Đ, so normalize that one explicitly too.
+            decomposed = unicodedata.normalize(
+                "NFKD", str(raw).upper().replace("Đ", "D")
+            )
+            return "".join(
+                ch
+                for ch in decomposed
+                if ch.isalnum() and not unicodedata.combining(ch)
+            )
+
+        normalized_key = normalize(key)
         status_key = any(
             marker in normalized_key
             for marker in (
@@ -338,7 +351,7 @@ class UpdateAudioModule(IModule):
         if not status_key or not isinstance(value, str):
             return False
 
-        normalized_value = "".join(ch for ch in value.upper() if ch.isalnum())
+        normalized_value = normalize(value)
         if not normalized_value:
             return False
         if normalized_value in {
@@ -381,8 +394,12 @@ class UpdateAudioModule(IModule):
                 "INELIGIBLE",
                 "NOTELIGIBLE",
                 "INSUFFICIENTELIGIBILITY",
+                "UNSUPPORTED",
                 "DELETED",
                 "REMOVED",
+                "KHONGXULYDUOC",
+                "KHONGDUDIEUKIEN",
+                "DAXOA",
             )
         ):
             return True
@@ -396,6 +413,7 @@ class UpdateAudioModule(IModule):
             "TRANSCODING",
             "UPLOADING",
             "INPROGRESS",
+            "DANGXULY",
         } or normalized_value.endswith(
             (
                 "STATUSPROCESSING",
@@ -418,31 +436,54 @@ class UpdateAudioModule(IModule):
         return False
 
     @classmethod
-    def _audio_translation_needs_attention(cls, item: dict) -> bool:
-        """Return true for processing, failed, ineligible, or deleted audio rows."""
-        audio = item.get("audioTranslation") or {}
-        automatic_audio_rows = item.get("captionsTranslations") or []
+    def _audio_payload_needs_attention(cls, payload) -> bool:
+        """Inspect only audio/dubbing status containers in a Studio payload.
 
-        def walk(value, parent_key: str = "") -> bool:
-            if cls._status_value_needs_attention(parent_key, value):
+        Depending on the channel feature rollout, Studio can return the audio
+        column through legacy ``audioTranslation`` data or through newer Aloud
+        and automatic-dubbing containers. Traversal stays inside those
+        containers so unrelated subtitle/video errors cannot select a video.
+        """
+
+        def normalize_key(raw) -> str:
+            return "".join(ch for ch in str(raw).upper() if ch.isalnum())
+
+        def is_audio_container(key: str) -> bool:
+            normalized = normalize_key(key)
+            return any(
+                marker in normalized
+                for marker in (
+                    "AUDIO",
+                    "DUBBING",
+                    "AUTODUB",
+                    "ALOUD",
+                    "CAPTIONSTRANSLATIONS",
+                )
+            )
+
+        def walk(value, parent_key: str = "", in_audio: bool = False) -> bool:
+            audio_context = in_audio or is_audio_container(parent_key)
+            if audio_context and cls._status_value_needs_attention(parent_key, value):
                 return True
             if isinstance(value, dict):
                 return any(
-                    walk(child, f"{parent_key}.{key}" if parent_key else str(key))
+                    walk(
+                        child,
+                        f"{parent_key}.{key}" if parent_key else str(key),
+                        audio_context or is_audio_container(str(key)),
+                    )
                     for key, child in value.items()
                 )
             if isinstance(value, (list, tuple)):
-                return any(walk(child, parent_key) for child in value)
+                return any(walk(child, parent_key, audio_context) for child in value)
             return False
 
-        # Studio currently exposes uploaded audio as audioTranslation and some
-        # automatic dubbing failures through captionsTranslations/processingEta.
-        # Limit inspection to these objects so titles cannot cause a false match.
-        if isinstance(audio, dict) and walk(audio):
-            return True
-        return isinstance(automatic_audio_rows, list) and any(
-            isinstance(row, dict) and walk(row) for row in automatic_audio_rows
-        )
+        return walk(payload)
+
+    @classmethod
+    def _audio_translation_needs_attention(cls, item: dict) -> bool:
+        """Return true for processing, failed, ineligible, or deleted audio rows."""
+        return isinstance(item, dict) and cls._audio_payload_needs_attention(item)
 
     # Compatibility aliases for callers/tests created before the scanner was
     # expanded beyond failed-only rows.
@@ -460,6 +501,17 @@ class UpdateAudioModule(IModule):
         failed_ids: set[str] = set()
         skipped = unreadable_ids if unreadable_ids is not None else []
 
+        def mark_unreadable(video_id: str) -> None:
+            if video_id not in skipped:
+                skipped.append(video_id)
+
+        def scan_group(video_id: str, group: dict) -> None:
+            # The matcher enters only audio/dubbing containers, so scanning the
+            # full group also covers group-level Aloud data without matching an
+            # unrelated subtitle or video status.
+            if self._audio_payload_needs_attention(group):
+                failed_ids.add(video_id)
+
         def scan_chunk(chunk: list[str]) -> None:
             try:
                 groups = self._get_video_translation_groups(
@@ -473,7 +525,7 @@ class UpdateAudioModule(IModule):
                     scan_chunk(chunk[:midpoint])
                     scan_chunk(chunk[midpoint:])
                     return
-                skipped.append(chunk[0])
+                mark_unreadable(chunk[0])
                 logger.warning(
                     "YouTube translation status is unavailable for video {}: {}",
                     chunk[0],
@@ -481,29 +533,47 @@ class UpdateAudioModule(IModule):
                 )
                 return
 
-            group_ids = [self._translation_group_video_id(group) for group in groups]
+            valid_groups = [group for group in groups if isinstance(group, dict)]
+            group_ids = [
+                self._translation_group_video_id(group) for group in valid_groups
+            ]
+            pairs: list[tuple[str, dict]] = []
 
-            if groups and any(group_id is None for group_id in group_ids):
-                if len(groups) == len(chunk):
-                    group_ids = chunk
+            if valid_groups and all(group_id is None for group_id in group_ids):
+                if len(valid_groups) == len(chunk):
+                    pairs = list(zip(chunk, valid_groups))
                 elif len(chunk) == 1:
-                    group_ids = chunk
-                else:
-                    # A response without videoId cannot safely be paired when
-                    # YouTube omitted one or more clean videos from the batch.
-                    for video_id in chunk:
-                        scan_chunk([video_id])
-                    return
+                    pairs = [(chunk[0], valid_groups[0])]
+            else:
+                requested = set(chunk)
+                pairs = [
+                    (group_id, group)
+                    for group_id, group in zip(group_ids, valid_groups)
+                    if group_id in requested
+                ]
 
-            for group_id, group in zip(group_ids, groups):
-                if not group_id:
-                    continue
-                items = group.get("translations") or []
-                if any(
-                    self._audio_translation_needs_attention(item)
-                    for item in items
-                ):
-                    failed_ids.add(group_id)
+            matched_ids = set()
+            for group_id, group in pairs:
+                matched_ids.add(group_id)
+                scan_group(group_id, group)
+
+            missing_ids = [
+                video_id for video_id in chunk if video_id not in matched_ids
+            ]
+            if not missing_ids:
+                return
+            if len(chunk) > 1:
+                # A successful batch response can still omit individual videos.
+                # Retry only those IDs so missing data is not reported as clean.
+                for video_id in missing_ids:
+                    scan_chunk([video_id])
+                return
+
+            mark_unreadable(chunk[0])
+            logger.warning(
+                "YouTube translation response omitted video {}",
+                chunk[0],
+            )
 
         for start in range(0, len(unique_ids), self._TRANSLATION_BATCH_SIZE):
             scan_chunk(unique_ids[start : start + self._TRANSLATION_BATCH_SIZE])

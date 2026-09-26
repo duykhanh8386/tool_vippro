@@ -875,8 +875,9 @@ def create_add_audio_page():
                     "video đăng gần nhất"
                 )
             ui.label(
-                f"Đã tìm thấy {len(video_source_state.get('failed_videos') or [])}/"
-                f"{video_source_state.get('scan_total', 0)} trong phạm vi {scope_label}."
+                f"Đã tìm thấy {len(video_source_state.get('failed_videos') or [])} video lỗi; "
+                f"đọc được {max(0, video_source_state.get('scan_total', 0) - video_source_state.get('scan_skipped', 0))}/"
+                f"{video_source_state.get('scan_total', 0)} video trong phạm vi {scope_label}."
             ).classes("text-xs font-medium text-emerald-700")
             if video_source_state.get("scan_skipped", 0):
                 ui.label(
@@ -1127,9 +1128,16 @@ def create_add_audio_page():
             save_right_panel_state()
             if failed_videos:
                 ui.notify(
-                    f"Đã lấy {len(failed_videos)}/{len(videos)} Video ID từ {scan_label}. "
+                    f"Đã lấy {len(failed_videos)} video lỗi; đọc được "
+                    f"{len(videos) - len(unreadable_ids)}/{len(videos)} video từ {scan_label}. "
                     "Bây giờ hãy chọn cách ghép.",
                     type="positive",
+                )
+            elif unreadable_ids:
+                ui.notify(
+                    f"Không thấy audio lỗi trong {len(videos) - len(unreadable_ids)} video đọc được; "
+                    f"{len(unreadable_ids)} video không được YouTube trả trạng thái audio.",
+                    type="warning",
                 )
             else:
                 ui.notify(

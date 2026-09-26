@@ -192,6 +192,31 @@ class AudioUploadTests(unittest.TestCase):
                 {"en", "vi"},
             )
 
+    def test_translation_request_enables_all_automatic_dubbing_data(self):
+        module = UpdateAudioModule()
+        channel = SimpleNamespace(
+            cookies=[],
+            sapisidhash="hash",
+            id="channel",
+            delegated_session_id="delegated",
+            role="OWNER",
+        )
+        with (
+            patch("src.module.audio_module.get_channels_info", return_value=channel),
+            patch.object(module, "_get_session_token", return_value="token"),
+            patch(
+                "src.module.audio_module.post_with_stop",
+                return_value=Response(200, body={"videoTranslations": []}),
+            ) as post,
+        ):
+            module._get_video_translation_groups(["video"], "channel")
+
+        payload = post.call_args.kwargs["json"]
+        self.assertTrue(payload["fetchAloudData"])
+        self.assertTrue(payload["fetchAutoDubbingData"])
+        self.assertTrue(payload["fetchAutoDubbingAsrData"])
+        self.assertTrue(payload["fetchBulkActionsStatus"])
+
     def test_audio_scan_selects_all_four_requested_studio_states(self):
         module = UpdateAudioModule()
         groups = [
@@ -316,6 +341,46 @@ class AudioUploadTests(unittest.TestCase):
             )
         )
 
+    def test_audio_scan_recognizes_new_group_level_auto_dubbing_status(self):
+        module = UpdateAudioModule()
+        groups = [
+            {
+                "videoId": "auto-dub-failed",
+                "translations": [],
+                "autoDubbingData": {
+                    "languageDubbings": [
+                        {
+                            "languageCode": "en",
+                            "availabilityStatus": "DUBBING_AVAILABILITY_STATUS_INELIGIBLE",
+                        }
+                    ]
+                },
+            }
+        ]
+
+        with patch.object(module, "_get_video_translation_groups", return_value=groups):
+            selected = module.get_audio_attention_video_ids(
+                ["auto-dub-failed"], "channel"
+            )
+
+        self.assertEqual(selected, {"auto-dub-failed"})
+
+    def test_audio_scan_recognizes_localized_audio_status_labels(self):
+        module = UpdateAudioModule()
+
+        for label in (
+            "Đang xử lý",
+            "Không xử lý được",
+            "Không đủ điều kiện",
+            "Đã xoá",
+        ):
+            with self.subTest(label=label):
+                self.assertTrue(
+                    module._audio_payload_needs_attention(
+                        {"autoDubbingData": {"statusLabel": label}}
+                    )
+                )
+
     def test_failed_audio_scan_recognizes_nested_error_reason(self):
         module = UpdateAudioModule()
         item = {
@@ -365,6 +430,49 @@ class AudioUploadTests(unittest.TestCase):
 
         self.assertEqual(failed, {"failed"})
         self.assertEqual(unreadable, ["unreadable"])
+
+    def test_partial_success_response_retries_missing_videos_individually(self):
+        module = UpdateAudioModule()
+
+        def fetch(video_ids, _channel):
+            if len(video_ids) > 1:
+                return [
+                    {
+                        "videoId": "clean",
+                        "translations": [
+                            {
+                                "audioTranslation": {
+                                    "status": "AUDIO_TRACK_STATUS_READY"
+                                }
+                            }
+                        ],
+                    }
+                ]
+            if video_ids == ["failed"]:
+                return [
+                    {
+                        "videoId": "failed",
+                        "autoDubbingData": {
+                            "status": "AUTO_DUBBING_STATUS_FAILED"
+                        },
+                    }
+                ]
+            return []
+
+        unreadable = []
+        with patch.object(
+            module, "_get_video_translation_groups", side_effect=fetch
+        ) as request:
+            selected = module.get_audio_attention_video_ids(
+                ["clean", "failed", "missing"], "channel", unreadable
+            )
+
+        self.assertEqual(selected, {"failed"})
+        self.assertEqual(unreadable, ["missing"])
+        self.assertEqual(
+            [call.args[0] for call in request.call_args_list],
+            [["clean", "failed", "missing"], ["failed"], ["missing"]],
+        )
 
 
 class AudioDeleteTests(unittest.TestCase):
