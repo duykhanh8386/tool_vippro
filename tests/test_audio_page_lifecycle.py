@@ -7,14 +7,18 @@ from unittest.mock import patch
 
 from web.components.audio import (
     DEFAULT_AUDIO_UPLOAD_CONCURRENCY,
+    DEFAULT_RECENT_VIDEO_LIMIT,
     MAX_AUDIO_UPLOAD_CONCURRENCY,
+    MAX_RECENT_VIDEO_LIMIT,
     MIN_AUDIO_UPLOAD_CONCURRENCY,
     _audio_workflow_signature,
     _best_effort_ui as audio_best_effort_ui,
     _clamp_upload_concurrency,
     _cleanup_temp_audio_file,
+    _fetch_channel_videos,
     _fetch_all_channel_videos,
     _is_youtube_auth_error,
+    _normalize_recent_video_limit,
     _restore_audio_performance_settings,
     _restore_cleanup_statuses,
     _restore_language_statuses,
@@ -199,6 +203,47 @@ class AudioPageLifecycleTests(unittest.IsolatedAsyncioTestCase):
         ):
             with self.assertRaisesRegex(RuntimeError, "phân trang bị lặp"):
                 _fetch_all_channel_videos("channel")
+
+    def test_public_scan_keeps_only_public_videos(self):
+        videos = [
+            SimpleNamespace(id="public", privacy="VIDEO_PRIVACY_PUBLIC"),
+            SimpleNamespace(id="private", privacy="VIDEO_PRIVACY_PRIVATE"),
+            SimpleNamespace(id="unlisted", privacy="VIDEO_PRIVACY_UNLISTED"),
+        ]
+        with patch(
+            "web.components.audio.list_videos_module.list_all_videos",
+            return_value=(videos, None),
+        ):
+            selected = _fetch_channel_videos("channel", scope="public")
+
+        self.assertEqual([video.id for video in selected], ["public"])
+
+    def test_recent_scan_stops_at_selected_newest_video_count(self):
+        pages = [
+            ([SimpleNamespace(id="A"), SimpleNamespace(id="B")], "next"),
+            ([SimpleNamespace(id="C"), SimpleNamespace(id="D")], None),
+        ]
+        with patch(
+            "web.components.audio.list_videos_module.list_all_videos",
+            side_effect=pages,
+        ) as list_videos:
+            selected = _fetch_channel_videos(
+                "channel", scope="recent", recent_limit=3
+            )
+
+        self.assertEqual([video.id for video in selected], ["A", "B", "C"])
+        self.assertEqual(list_videos.call_args_list[0].kwargs["limit"], 3)
+        self.assertEqual(list_videos.call_args_list[1].kwargs["limit"], 1)
+
+    def test_recent_scan_limit_is_bounded(self):
+        self.assertEqual(
+            _normalize_recent_video_limit(None), DEFAULT_RECENT_VIDEO_LIMIT
+        )
+        self.assertEqual(_normalize_recent_video_limit(0), 1)
+        self.assertEqual(
+            _normalize_recent_video_limit(MAX_RECENT_VIDEO_LIMIT + 1),
+            MAX_RECENT_VIDEO_LIMIT,
+        )
 
     def test_manual_source_filters_channel_videos_in_entered_id_order(self):
         videos = [SimpleNamespace(id="A"), SimpleNamespace(id="B")]

@@ -32,6 +32,14 @@ DEFAULT_AUDIO_UPLOAD_CONCURRENCY = 3
 MIN_AUDIO_UPLOAD_CONCURRENCY = 3
 MAX_AUDIO_UPLOAD_CONCURRENCY = 5
 _AUDIO_UPLOAD_CONCURRENCY_MODE = "delete_then_add_parallel_v2"
+DEFAULT_RECENT_VIDEO_LIMIT = 50
+MAX_RECENT_VIDEO_LIMIT = 10_000
+VIDEO_SCAN_SCOPES = {"all", "public", "recent"}
+VIDEO_SCAN_SCOPE_LABELS = {
+    "all": "tất cả video",
+    "public": "video công khai",
+    "recent": "video đăng gần nhất",
+}
 
 
 def _best_effort_ui(
@@ -172,26 +180,59 @@ def _is_youtube_auth_error(exc: BaseException) -> bool:
     return "http 401" in message or "authentication credential" in message
 
 
-def _fetch_all_channel_videos(channel_id: str):
-    """Fetch every channel page and guard against a repeated continuation token."""
+def _normalize_recent_video_limit(value: object) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = DEFAULT_RECENT_VIDEO_LIMIT
+    return max(1, min(MAX_RECENT_VIDEO_LIMIT, parsed))
+
+
+def _is_public_video(video: object) -> bool:
+    privacy = str(getattr(video, "privacy", "") or "").upper()
+    return privacy in {"PUBLIC", "VIDEO_PRIVACY_PUBLIC", "PRIVACY_PUBLIC"}
+
+
+def _fetch_channel_videos(
+    channel_id: str,
+    *,
+    scope: str = "all",
+    recent_limit: int = DEFAULT_RECENT_VIDEO_LIMIT,
+):
+    """Fetch videos newest-first for all, public-only, or recent-N scans."""
+    normalized_scope = scope if scope in VIDEO_SCAN_SCOPES else "all"
+    normalized_limit = _normalize_recent_video_limit(recent_limit)
     videos = []
     seen_ids = set()
     seen_tokens = set()
     page_token = None
     while True:
+        page_size = 50
+        if normalized_scope == "recent":
+            page_size = min(50, normalized_limit - len(videos))
         page, next_token = list_videos_module.list_all_videos(
-            channel_id, limit=50, page_token=page_token
+            channel_id, limit=page_size, page_token=page_token
         )
         for video in page:
-            if video.id and video.id not in seen_ids:
-                seen_ids.add(video.id)
-                videos.append(video)
+            if not video.id or video.id in seen_ids:
+                continue
+            seen_ids.add(video.id)
+            if normalized_scope == "public" and not _is_public_video(video):
+                continue
+            videos.append(video)
+            if normalized_scope == "recent" and len(videos) >= normalized_limit:
+                return videos
         if not next_token:
             return videos
         if next_token in seen_tokens:
             raise RuntimeError("YouTube trả về mã phân trang bị lặp; đã dừng quét để tránh treo.")
         seen_tokens.add(next_token)
         page_token = next_token
+
+
+def _fetch_all_channel_videos(channel_id: str):
+    """Backward-compatible all-video scan used by manual matching."""
+    return _fetch_channel_videos(channel_id, scope="all")
 
 
 def _select_videos_by_ids(videos: Iterable[Video], video_ids: Iterable[str]):
@@ -395,10 +436,15 @@ def create_add_audio_page():
         "failed_videos": [],
         "scan_total": 0,
         "scan_skipped": 0,
+        "scan_scope": "all",
+        "recent_limit": DEFAULT_RECENT_VIDEO_LIMIT,
+        "last_scan_scope": None,
+        "last_scan_limit": None,
     }
     right_panel_container = None
     scan_preview_container = None
     video_source_status_container = None
+    scan_runtime = {"running": False}
     suppress_autosave = {"value": False}
     ui_refs = {
         "ids_textarea": None,
@@ -417,20 +463,30 @@ def create_add_audio_page():
         "duration_tolerance_input": None,
         "video_source_toggle": None,
         "failed_video_scan_button": None,
+        "scan_scope_toggle": None,
+        "recent_limit_input": None,
     }
 
     def configuration_change_blocked() -> bool:
         """Do not let a form edit overwrite a checkpoint owned by a live run."""
-        if not _ADD_AUDIO_RUN_GUARD.locked():
-            return False
-        best_effort_ui(
-            "notify locked add-audio configuration",
-            lambda: ui.notify(
-                "Quy trình xóa và thêm audio đang chạy; chưa thể thay đổi dữ liệu.",
-                type="warning",
-            ),
-        )
-        return True
+        if _ADD_AUDIO_RUN_GUARD.locked():
+            best_effort_ui(
+                "notify locked add-audio configuration",
+                lambda: ui.notify(
+                    "Quy trình xóa và thêm audio đang chạy; chưa thể thay đổi dữ liệu.",
+                    type="warning",
+                ),
+            )
+            return True
+        if scan_runtime["running"]:
+            best_effort_ui(
+                "notify locked audio scan configuration",
+                lambda: ui.notify(
+                    "Tác vụ quét đang chạy; vui lòng chờ hoàn tất.", type="warning"
+                ),
+            )
+            return True
+        return False
 
     def save_right_panel_state() -> bool:
         """Save the current state of right_panel_container to file"""
@@ -522,6 +578,15 @@ def create_add_audio_page():
                 video_source_state["manual_ids"] = list(video_ids_state["ids"])
             if video_source_state.get("mode") not in {"manual", "failed"}:
                 video_source_state["mode"] = "manual"
+            if video_source_state.get("scan_scope") not in VIDEO_SCAN_SCOPES:
+                video_source_state["scan_scope"] = "all"
+                needs_checkpoint_save = True
+            restored_recent_limit = _normalize_recent_video_limit(
+                video_source_state.get("recent_limit")
+            )
+            if restored_recent_limit != video_source_state.get("recent_limit"):
+                video_source_state["recent_limit"] = restored_recent_limit
+                needs_checkpoint_save = True
             if needs_checkpoint_save:
                 save_right_panel_state()
             def update_ui():
@@ -543,6 +608,14 @@ def create_add_audio_page():
                     if ui_refs["duration_tolerance_input"]:
                         ui_refs["duration_tolerance_input"].value = batch_scan_state[
                             "duration_tolerance"
+                        ]
+                    if ui_refs["scan_scope_toggle"]:
+                        ui_refs["scan_scope_toggle"].value = video_source_state[
+                            "scan_scope"
+                        ]
+                    if ui_refs["recent_limit_input"]:
+                        ui_refs["recent_limit_input"].value = video_source_state[
+                            "recent_limit"
                         ]
                     refresh_video_source_controls()
                     refresh_right_panel()
@@ -570,6 +643,8 @@ def create_add_audio_page():
             video_source_state["failed_videos"] = []
             video_source_state["scan_total"] = 0
             video_source_state["scan_skipped"] = 0
+            video_source_state["last_scan_scope"] = None
+            video_source_state["last_scan_limit"] = None
             replace_active_video_list([])
 
         refresh_video_source_controls()
@@ -733,6 +808,25 @@ def create_add_audio_page():
             else:
                 scan_button.props("disable")
 
+        scope_toggle = ui_refs.get("scan_scope_toggle")
+        if scope_toggle:
+            if mode == "failed" and not scan_runtime["running"]:
+                scope_toggle.props(remove="disable")
+            else:
+                scope_toggle.props("disable")
+
+        recent_limit_input = ui_refs.get("recent_limit_input")
+        if recent_limit_input:
+            recent_enabled = (
+                mode == "failed"
+                and video_source_state.get("scan_scope") == "recent"
+                and not scan_runtime["running"]
+            )
+            if recent_enabled:
+                recent_limit_input.props(remove="disable")
+            else:
+                recent_limit_input.props("disable")
+
         match_ready = bool(video_ids_state["ids"]) and bool(selected_channel["id"]) and (
             mode == "manual"
             or video_source_state.get("failed_channel") == selected_channel["id"]
@@ -773,9 +867,16 @@ def create_add_audio_page():
                     "Kết quả quét thuộc kênh khác. Hãy quét lại kênh đang chọn."
                 ).classes("text-xs text-orange-600")
                 return
+            last_scope = video_source_state.get("last_scan_scope") or "all"
+            scope_label = VIDEO_SCAN_SCOPE_LABELS.get(last_scope, "video")
+            if last_scope == "recent":
+                scope_label = (
+                    f"{video_source_state.get('last_scan_limit') or 0} "
+                    "video đăng gần nhất"
+                )
             ui.label(
                 f"Đã tìm thấy {len(video_source_state.get('failed_videos') or [])}/"
-                f"{video_source_state.get('scan_total', 0)} video có audio cần xử lý."
+                f"{video_source_state.get('scan_total', 0)} trong phạm vi {scope_label}."
             ).classes("text-xs font-medium text-emerald-700")
             if video_source_state.get("scan_skipped", 0):
                 ui.label(
@@ -918,8 +1019,6 @@ def create_add_audio_page():
         save_right_panel_state()
         return len(matched)
 
-    scan_runtime = {"running": False}
-
     def set_scan_controls_busy(busy: bool, *, loading_key: str | None = None) -> None:
         for key in (
             "failed_video_scan_button",
@@ -939,8 +1038,7 @@ def create_add_audio_page():
                     button.props("loading")
                 else:
                     button.props(remove="loading")
-        if not busy:
-            refresh_video_source_controls()
+        refresh_video_source_controls()
 
     def source_videos_for_matching(channel_id: str) -> list[Video]:
         active_ids = list(video_ids_state["ids"])
@@ -985,8 +1083,24 @@ def create_add_audio_page():
         set_scan_controls_busy(True, loading_key="failed_video_scan_button")
         try:
             channel_id = selected_channel["id"]
-            ui.notify("Đang đọc video và trạng thái audio trên kênh...", type="info")
-            videos = await asyncio.to_thread(_fetch_all_channel_videos, channel_id)
+            scan_scope = video_source_state.get("scan_scope", "all")
+            if scan_scope not in VIDEO_SCAN_SCOPES:
+                scan_scope = "all"
+            recent_limit = _normalize_recent_video_limit(
+                video_source_state.get("recent_limit")
+            )
+            scan_label = VIDEO_SCAN_SCOPE_LABELS[scan_scope]
+            if scan_scope == "recent":
+                scan_label = f"{recent_limit} video đăng gần nhất"
+            ui.notify(
+                f"Đang đọc {scan_label} và trạng thái audio...", type="info"
+            )
+            videos = await asyncio.to_thread(
+                _fetch_channel_videos,
+                channel_id,
+                scope=scan_scope,
+                recent_limit=recent_limit,
+            )
             unreadable_ids: list[str] = []
             failed_ids = await asyncio.to_thread(
                 update_audio_module.get_audio_attention_video_ids,
@@ -1002,6 +1116,10 @@ def create_add_audio_page():
             ]
             video_source_state["scan_total"] = len(videos)
             video_source_state["scan_skipped"] = len(unreadable_ids)
+            video_source_state["last_scan_scope"] = scan_scope
+            video_source_state["last_scan_limit"] = (
+                recent_limit if scan_scope == "recent" else None
+            )
             replace_active_video_list(
                 [video.id for video in failed_videos], videos=failed_videos
             )
@@ -1009,13 +1127,13 @@ def create_add_audio_page():
             save_right_panel_state()
             if failed_videos:
                 ui.notify(
-                    f"Đã lấy {len(failed_videos)}/{len(videos)} Video ID có audio cần xử lý. "
+                    f"Đã lấy {len(failed_videos)}/{len(videos)} Video ID từ {scan_label}. "
                     "Bây giờ hãy chọn cách ghép.",
                     type="positive",
                 )
             else:
                 ui.notify(
-                    f"Đã quét {len(videos)} video, không thấy audio Đang xử lý / "
+                    f"Đã quét {len(videos)} video trong {scan_label}, không thấy audio Đang xử lý / "
                     "Không xử lý được / Không đủ điều kiện / Đã xoá.",
                     type="warning",
                 )
@@ -1899,6 +2017,33 @@ def create_add_audio_page():
             refresh_video_source_controls()
             save_right_panel_state()
 
+        def on_scan_scope_change(e):
+            current_scope = video_source_state.get("scan_scope", "all")
+            requested_scope = str(e.value or "all")
+            if requested_scope not in VIDEO_SCAN_SCOPES:
+                requested_scope = "all"
+            if configuration_change_blocked():
+                if ui_refs["scan_scope_toggle"]:
+                    ui_refs["scan_scope_toggle"].value = current_scope
+                return
+            video_source_state["scan_scope"] = requested_scope
+            refresh_video_source_controls()
+            save_right_panel_state()
+
+        def on_recent_limit_change(e=None):
+            input_ref = ui_refs.get("recent_limit_input")
+            if configuration_change_blocked():
+                if input_ref:
+                    input_ref.value = video_source_state["recent_limit"]
+                return
+            value = _normalize_recent_video_limit(
+                input_ref.value if input_ref else DEFAULT_RECENT_VIDEO_LIMIT
+            )
+            video_source_state["recent_limit"] = value
+            if input_ref:
+                input_ref.value = value
+            save_right_panel_state()
+
         with ui.card().classes("w-full bg-emerald-50 border border-emerald-200 p-3 mb-4"):
             with ui.row().classes("w-full items-center justify-between gap-3 flex-wrap"):
                 with ui.column().classes("gap-1"):
@@ -1918,6 +2063,30 @@ def create_add_audio_page():
                     on_click=handle_failed_video_scan,
                 ).props("outline disable")
                 ui_refs["failed_video_scan_button"] = failed_video_scan_button
+            with ui.row().classes("w-full items-end gap-3 flex-wrap"):
+                with ui.column().classes("gap-1"):
+                    ui.label("Phạm vi quét trên kênh").classes(
+                        "text-xs font-semibold text-gray-700"
+                    )
+                    scan_scope_toggle = ui.toggle(
+                        {
+                            "all": "Tất cả video",
+                            "public": "Chỉ công khai",
+                            "recent": "Đăng gần nhất",
+                        },
+                        value=video_source_state["scan_scope"],
+                        on_change=on_scan_scope_change,
+                    ).props("no-caps disable")
+                    ui_refs["scan_scope_toggle"] = scan_scope_toggle
+                recent_limit_input = ui.number(
+                    "Số video gần nhất",
+                    value=video_source_state["recent_limit"],
+                    min=1,
+                    max=MAX_RECENT_VIDEO_LIMIT,
+                    step=1,
+                    on_change=on_recent_limit_change,
+                ).props("outlined disable").classes("w-44")
+                ui_refs["recent_limit_input"] = recent_limit_input
             video_source_status_container = ui.column().classes("w-full gap-0")
             refresh_video_source_controls()
             ui.separator().classes("my-1")
@@ -2109,6 +2278,10 @@ def create_add_audio_page():
                     ui_refs["recursive_switch"].value = True
                 if ui_refs["duration_tolerance_input"]:
                     ui_refs["duration_tolerance_input"].value = 2.0
+                if ui_refs["scan_scope_toggle"]:
+                    ui_refs["scan_scope_toggle"].value = "all"
+                if ui_refs["recent_limit_input"]:
+                    ui_refs["recent_limit_input"].value = DEFAULT_RECENT_VIDEO_LIMIT
                 video_ids_state["ids"] = []
                 id_to_path.clear()
                 video_titles.clear()
@@ -2137,6 +2310,10 @@ def create_add_audio_page():
                 video_source_state["failed_videos"] = []
                 video_source_state["scan_total"] = 0
                 video_source_state["scan_skipped"] = 0
+                video_source_state["scan_scope"] = "all"
+                video_source_state["recent_limit"] = DEFAULT_RECENT_VIDEO_LIMIT
+                video_source_state["last_scan_scope"] = None
+                video_source_state["last_scan_limit"] = None
                 refresh_right_panel()
                 refresh_scan_preview()
                 refresh_rename_button()
