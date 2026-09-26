@@ -247,11 +247,22 @@ def run_owned_process(
     return completed
 
 
-def post_with_stop(url: str, **kwargs: Any) -> requests.Response:
-    """Perform a bounded HTTP POST with cooperative stop checks."""
+def post_with_stop(
+    url: str,
+    *,
+    session: requests.Session | None = None,
+    **kwargs: Any,
+) -> requests.Response:
+    """Perform a bounded HTTP POST with cooperative stop checks.
+
+    Callers which send several requests to the same upload session can pass a
+    ``requests.Session`` so HTTPS connections are reused instead of negotiated
+    again for every chunk.
+    """
     check_stopped()
     kwargs.setdefault("timeout", (15, 60))
-    response = requests.post(url, **kwargs)
+    http_client = session if session is not None else requests
+    response = http_client.post(url, **kwargs)
     check_stopped()
     return response
 

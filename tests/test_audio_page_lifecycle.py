@@ -6,13 +6,19 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from web.components.audio import (
+    DEFAULT_AUDIO_UPLOAD_CONCURRENCY,
+    MAX_AUDIO_UPLOAD_CONCURRENCY,
     _best_effort_ui as audio_best_effort_ui,
+    _clamp_upload_concurrency,
     _cleanup_temp_audio_file,
     _fetch_all_channel_videos,
     _is_youtube_auth_error,
+    _restore_audio_performance_settings,
     _restore_language_statuses,
+    _run_concurrently_isolated,
     _run_sequentially_isolated,
     _select_videos_by_ids,
+    _upload_progress_summary,
     _video_from_snapshot,
     _video_snapshot,
 )
@@ -25,6 +31,100 @@ from web.components.remove_audio import (
 
 
 class AudioPageLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    def test_upload_concurrency_defaults_to_three_and_is_capped_at_three(self):
+        self.assertEqual(_clamp_upload_concurrency(None), DEFAULT_AUDIO_UPLOAD_CONCURRENCY)
+        self.assertEqual(_clamp_upload_concurrency(0), 1)
+        self.assertEqual(
+            _clamp_upload_concurrency(99), MAX_AUDIO_UPLOAD_CONCURRENCY
+        )
+
+    def test_old_serial_setting_is_migrated_once_then_user_choice_is_kept(self):
+        settings, changed = _restore_audio_performance_settings(
+            {"max_concurrency": 1}
+        )
+
+        self.assertTrue(changed)
+        self.assertEqual(settings["max_concurrency"], DEFAULT_AUDIO_UPLOAD_CONCURRENCY)
+
+        settings["max_concurrency"] = 1
+        restored, changed_again = _restore_audio_performance_settings(settings)
+        self.assertFalse(changed_again)
+        self.assertEqual(restored["max_concurrency"], 1)
+
+    def test_upload_progress_summary_reports_combined_speed_and_bytes(self):
+        summary = _upload_progress_summary(
+            [
+                {
+                    "sent": 1024 * 1024,
+                    "total": 2 * 1024 * 1024,
+                    "started_at": 90.0,
+                    "status": "uploading",
+                },
+                {
+                    "sent": 1024 * 1024,
+                    "total": 2 * 1024 * 1024,
+                    "started_at": 90.0,
+                    "status": "uploading",
+                },
+            ],
+            now=100.0,
+        )
+
+        self.assertIn("2 luồng tải", summary)
+        self.assertIn("2.0/4.0 MB (50%)", summary)
+        self.assertIn("0.2 MB/s", summary)
+        self.assertIn("còn khoảng 10 giây", summary)
+
+    async def test_concurrent_audio_queue_respects_worker_limit(self):
+        active = 0
+        peak = 0
+
+        async def process(_item):
+            nonlocal active, peak
+            active += 1
+            peak = max(peak, active)
+            await asyncio.sleep(0.01)
+            active -= 1
+
+        failures = await _run_concurrently_isolated(
+            range(8),
+            process,
+            lambda _item, _exc: None,
+            max_concurrency=2,
+        )
+
+        self.assertEqual(failures, [])
+        self.assertEqual(peak, 2)
+
+    async def test_concurrent_audio_queue_stops_claiming_items_after_auth_error(self):
+        attempted = []
+        first_started = asyncio.Event()
+        auth_failed = asyncio.Event()
+
+        class AuthError(RuntimeError):
+            status_code = 401
+
+        async def process(item):
+            attempted.append(item)
+            if item == "A":
+                first_started.set()
+                await auth_failed.wait()
+            elif item == "B":
+                await first_started.wait()
+                auth_failed.set()
+                raise AuthError("HTTP 401")
+
+        with self.assertRaises(AuthError):
+            await _run_concurrently_isolated(
+                ["A", "B", "C", "D"],
+                process,
+                lambda _item, _exc: None,
+                max_concurrency=2,
+                stop_on_error=_is_youtube_auth_error,
+            )
+
+        self.assertCountEqual(attempted, ["A", "B"])
+
     def test_channel_scan_follows_pagination_and_deduplicates_video_ids(self):
         pages = [
             ([SimpleNamespace(id="A")], "next"),

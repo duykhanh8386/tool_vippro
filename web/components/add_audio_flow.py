@@ -856,10 +856,10 @@ def create_add_audio_flow_page():
                     extra_minutes=0,
                     video_duration_seconds=video_dur,
                 )
-                data = await asyncio.to_thread(Path(matched_path).read_bytes)
+                upload_audio_path = matched_path
             else:
                 logger.warning(f"Không lấy được thời lượng video {video_id}, dùng nhạc gốc.")
-                data = await asyncio.to_thread(Path(audio_path).read_bytes)
+                upload_audio_path = normalize_path(audio_path)
 
             language_errors = []
             language_results = dict(item.get("audio_language_results") or {})
@@ -883,7 +883,8 @@ def create_add_audio_flow_page():
                         channel_id=channel_id,
                         file_name=audio_path,
                         language=lang,
-                        data=data,
+                        data=None,
+                        upload_path=upload_audio_path,
                     )
 
                 def log_retry(attempt, delay, exc, lang=lang):

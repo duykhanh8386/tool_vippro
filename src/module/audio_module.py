@@ -1,5 +1,6 @@
 # RECOVERED: depyo output corrected from CPython 3.12 disassembly
 import os
+import time
 from urllib.parse import quote
 import requests
 from loguru import logger
@@ -42,35 +43,70 @@ def _youtube_error_message(response: requests.Response, action: str) -> str:
 
 
 class UpdateAudioModule(IModule):
-    _CHUNK_SIZE = 8 * 1024 * 1024
+    _CHUNK_SIZE = 16 * 1024 * 1024
     _MAX_UPLOAD_RETRIES = 5
     _UPLOAD_TIMEOUT = (30, 900)
     _TRANSLATION_BATCH_SIZE = 50
 
-    def add(self, id_video: str, channel_id: str, file_name: str, language: str, data: bytes):
+    def add(
+        self,
+        id_video: str,
+        channel_id: str,
+        file_name: str,
+        language: str,
+        data: bytes | None = None,
+        progress: dict | None = None,
+        upload_path: str | None = None,
+    ):
         check_stopped()
         channel_info = get_channels_info(channel_id)
         cookie_string = "; ".join([f"{cookie['name']}={cookie['value']}" for cookie in channel_info.cookies])
         session_token = self._get_session_token(channel_info)
         fname_header = quote(os.path.basename(file_name), safe="")
-        upload_url, scotty_resource_id = self._upload_http(fname_header=fname_header, cookie_string=cookie_string)
-        # YouTube's audio-track flow first registers the pending Scotty resource
-        # with the video, then uploads/finalizes the resource bytes.  Keep the
-        # upload synchronous so callers only see success after it has completed.
-        res = self._update(video_id=id_video, scotty_resource_id=scotty_resource_id, channel_info=channel_info, session_token=session_token, cookie_string=cookie_string, language=language)
-        if res == 409:
-            if self._has_audio_track(id_video, channel_id, language):
-                logger.info("Audio track already exists: video={} language={}", id_video, language)
-                return 409
-            raise AudioUpdateError(
-                "YouTube báo xung đột (409) nhưng không tìm thấy audio track tương ứng; "
-                "không tự động coi là thành công.",
-                status_code=409,
+        with requests.Session() as session:
+            upload_url, scotty_resource_id = self._upload_http(
+                fname_header=fname_header,
+                cookie_string=cookie_string,
+                session=session,
             )
-        self._next_upload_http(next_url=upload_url, fname_header=fname_header, cookie_string=cookie_string, data=data)
-        return res
-    def _upload_http(self, fname_header: str, cookie_string: str):
-        url = "https://upload.youtube.com/upload/audiotrack?authuser=0"; headers = {"Host": "upload.youtube.com", "Cookie": cookie_string, "Content-Length": "2", "Sec-Ch-Ua-Platform": '"Windows"', "Sec-Ch-Ua": '"Chromium";v="139", "Not;A=Brand";v="99"', "Sec-Ch-Ua-Mobile": "?0", "X-Goog-Upload-Protocol": "resumable", "X-Goog-Upload-File-Name": fname_header, "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8", "Accept-Language": "en-US,en;q=0.9", "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36", "X-Goog-Upload-Command": "start", "Accept": "*/*", "Origin": "https://studio.youtube.com", "Referer": "https://studio.youtube.com/", "Accept-Encoding": "gzip, deflate, br", "Priority": "u=1, i"}; response = post_with_stop(url, headers=headers, data="{}")
+            # YouTube's audio-track flow first registers the pending Scotty resource
+            # with the video, then uploads/finalizes the resource bytes.  Keep the
+            # upload synchronous so callers only see success after it has completed.
+            res = self._update(
+                video_id=id_video,
+                scotty_resource_id=scotty_resource_id,
+                channel_info=channel_info,
+                session_token=session_token,
+                cookie_string=cookie_string,
+                language=language,
+                session=session,
+            )
+            if res == 409:
+                if self._has_audio_track(id_video, channel_id, language):
+                    logger.info("Audio track already exists: video={} language={}", id_video, language)
+                    return 409
+                raise AudioUpdateError(
+                    "YouTube báo xung đột (409) nhưng không tìm thấy audio track tương ứng; "
+                    "không tự động coi là thành công.",
+                    status_code=409,
+                )
+            self._next_upload_http(
+                next_url=upload_url,
+                fname_header=fname_header,
+                cookie_string=cookie_string,
+                data=data,
+                file_path=(upload_path or file_name) if data is None else None,
+                progress=progress,
+                session=session,
+            )
+            return res
+    def _upload_http(
+        self,
+        fname_header: str,
+        cookie_string: str,
+        session: requests.Session | None = None,
+    ):
+        url = "https://upload.youtube.com/upload/audiotrack?authuser=0"; headers = {"Host": "upload.youtube.com", "Cookie": cookie_string, "Content-Length": "2", "Sec-Ch-Ua-Platform": '"Windows"', "Sec-Ch-Ua": '"Chromium";v="139", "Not;A=Brand";v="99"', "Sec-Ch-Ua-Mobile": "?0", "X-Goog-Upload-Protocol": "resumable", "X-Goog-Upload-File-Name": fname_header, "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8", "Accept-Language": "en-US,en;q=0.9", "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36", "X-Goog-Upload-Command": "start", "Accept": "*/*", "Origin": "https://studio.youtube.com", "Referer": "https://studio.youtube.com/", "Accept-Encoding": "gzip, deflate, br", "Priority": "u=1, i"}; response = post_with_stop(url, headers=headers, data="{}", session=session)
         if response.status_code != 200:
             raise AudioUpdateError(_youtube_error_message(response, "khởi tạo tải audio"), status_code=response.status_code, retryable=response.status_code == 429 or response.status_code >= 500)
         upload_url = response.headers["X-Goog-Upload-URL"]; scotty_id = response.headers["X-Goog-Upload-Header-Scotty-Resource-Id"]
@@ -88,11 +124,22 @@ class UpdateAudioModule(IModule):
             "Referer": "https://studio.youtube.com/",
         }
 
-    def _query_upload_offset(self, next_url: str, base_headers: dict) -> int | None:
+    def _query_upload_offset(
+        self,
+        next_url: str,
+        base_headers: dict,
+        session: requests.Session | None = None,
+    ) -> int | None:
         try:
             headers = dict(base_headers)
             headers["X-Goog-Upload-Command"] = "query"
-            response = post_with_stop(next_url, headers=headers, data=b"", timeout=(15, 60))
+            response = post_with_stop(
+                next_url,
+                headers=headers,
+                data=b"",
+                timeout=(15, 60),
+                session=session,
+            )
             if response.status_code != 200:
                 return None
             received = response.headers.get("X-Goog-Upload-Size-Received")
@@ -103,57 +150,109 @@ class UpdateAudioModule(IModule):
             logger.warning("Cannot query audio upload offset: {}", exc)
             return None
 
-    def _next_upload_http(self, next_url: str, fname_header: str, cookie_string: str, data: bytes) -> str:
+    def _next_upload_http(
+        self,
+        next_url: str,
+        fname_header: str,
+        cookie_string: str,
+        data: bytes | None = None,
+        *,
+        file_path: str | None = None,
+        progress: dict | None = None,
+        session: requests.Session | None = None,
+    ) -> str:
         """Upload in chunks and resume the same Scotty session after a timeout."""
         base_headers = self._base_upload_headers(fname_header, cookie_string)
-        total = len(data)
+        if data is None and not file_path:
+            raise AudioUpdateError("Không có dữ liệu audio để tải lên")
+        total = len(data) if data is not None else os.path.getsize(str(file_path))
+        if total <= 0:
+            raise AudioUpdateError("File audio rỗng, không thể tải lên")
         offset = 0
         retries = 0
-        while offset < total:
-            check_stopped()
-            end = min(offset + self._CHUNK_SIZE, total)
-            headers = dict(base_headers)
-            headers["X-Goog-Upload-Offset"] = str(offset)
-            headers["X-Goog-Upload-Command"] = "upload, finalize" if end == total else "upload"
-            try:
-                response = post_with_stop(
-                    next_url,
-                    headers=headers,
-                    data=data[offset:end],
-                    timeout=self._UPLOAD_TIMEOUT,
-                )
-                if response.status_code != 200:
-                    retryable = response.status_code == 429 or response.status_code >= 500
+        started_at = time.monotonic()
+        if progress is not None:
+            progress.update(
+                sent=0,
+                total=total,
+                started_at=started_at,
+                updated_at=started_at,
+                status="uploading",
+            )
+        source_file = open(file_path, "rb") if data is None else None
+        try:
+            while offset < total:
+                check_stopped()
+                end = min(offset + self._CHUNK_SIZE, total)
+                if source_file is not None:
+                    source_file.seek(offset)
+                    chunk = source_file.read(end - offset)
+                else:
+                    chunk = data[offset:end]
+                if not chunk:
                     raise AudioUpdateError(
-                        _youtube_error_message(response, "tải audio"),
-                        status_code=response.status_code,
-                        retryable=retryable,
+                        f"Không đọc được audio tại vị trí {offset}/{total} byte"
                     )
-                offset = end
-                retries = 0
-            except TaskStopped:
-                raise
-            except Exception as exc:
-                if isinstance(exc, AudioUpdateError) and not exc.retryable:
+                headers = dict(base_headers)
+                headers["X-Goog-Upload-Offset"] = str(offset)
+                headers["X-Goog-Upload-Command"] = "upload, finalize" if end == total else "upload"
+                try:
+                    response = post_with_stop(
+                        next_url,
+                        headers=headers,
+                        data=chunk,
+                        timeout=self._UPLOAD_TIMEOUT,
+                        session=session,
+                    )
+                    if response.status_code != 200:
+                        retryable = response.status_code == 429 or response.status_code >= 500
+                        raise AudioUpdateError(
+                            _youtube_error_message(response, "tải audio"),
+                            status_code=response.status_code,
+                            retryable=retryable,
+                        )
+                    offset += len(chunk)
+                    retries = 0
+                    if progress is not None:
+                        progress["sent"] = offset
+                        progress["updated_at"] = time.monotonic()
+                        progress["status"] = "complete" if offset >= total else "uploading"
+                except TaskStopped:
                     raise
-                retries += 1
-                if retries > self._MAX_UPLOAD_RETRIES:
-                    raise AudioUpdateError(
-                        f"Tải audio bị gián đoạn tại {offset}/{total} byte sau "
-                        f"{self._MAX_UPLOAD_RETRIES} lần thử: {exc}",
-                        status_code=getattr(exc, "status_code", None),
-                    ) from exc
-                server_offset = self._query_upload_offset(next_url, base_headers)
-                if server_offset is not None and 0 <= server_offset <= total:
-                    offset = server_offset
-                logger.warning(
-                    "Retry audio upload in same session: offset={}/{} attempt={}/{} error={}",
-                    offset, total, retries, self._MAX_UPLOAD_RETRIES, exc,
-                )
-                wait_interruptibly(min(2**retries, 10))
+                except Exception as exc:
+                    if isinstance(exc, AudioUpdateError) and not exc.retryable:
+                        raise
+                    retries += 1
+                    if retries > self._MAX_UPLOAD_RETRIES:
+                        raise AudioUpdateError(
+                            f"Tải audio bị gián đoạn tại {offset}/{total} byte sau "
+                            f"{self._MAX_UPLOAD_RETRIES} lần thử: {exc}",
+                            status_code=getattr(exc, "status_code", None),
+                        ) from exc
+                    server_offset = self._query_upload_offset(
+                        next_url,
+                        base_headers,
+                        session=session,
+                    )
+                    if server_offset is not None and 0 <= server_offset <= total:
+                        offset = server_offset
+                    if progress is not None:
+                        progress["sent"] = offset
+                        progress["updated_at"] = time.monotonic()
+                        progress["status"] = "retrying"
+                    logger.warning(
+                        "Retry audio upload in same session: offset={}/{} attempt={}/{} error={}",
+                        offset, total, retries, self._MAX_UPLOAD_RETRIES, exc,
+                    )
+                    wait_interruptibly(min(2**retries, 10))
+                    if progress is not None:
+                        progress["status"] = "uploading"
+        finally:
+            if source_file is not None:
+                source_file.close()
         return "final"
-    def _update(self, video_id: str, scotty_resource_id: str, channel_info: ChannelInfo, cookie_string: str, session_token: str, language: str):
-        url = "https://studio.youtube.com/youtubei/v1/creator/add_audio_track?alt=json"; headers = {"Host": "studio.youtube.com", "Cookie": cookie_string, "Authorization": f"SAPISIDHASH {channel_info.sapisidhash}", "Content-Type": "application/json", "Origin": "https://studio.youtube.com", "Referer": f"https://studio.youtube.com/video/{video_id}/translations", "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36", "Accept": "*/*", "Accept-Language": "en-US,en;q=0.9"}; payload = {"videoId": video_id, "resourceId": {"scottyResourceId": {"id": scotty_resource_id}}, "language": language, "audioContentTypeString": "dubbed", "audioTrackSource": "AUDIO_TRACK_SOURCE_CREATOR", "context": {"client": {"clientName": 62, "clientVersion": "1.20250902.04.00", "hl": "en", "gl": "VN", "utcOffsetMinutes": 420, "userInterfaceTheme": "USER_INTERFACE_THEME_DARK", "screenWidthPoints": 1920, "screenHeightPoints": 945, "screenPixelDensity": 1, "screenDensityFloat": 1}, "request": {"returnLogEntry": True, "internalExperimentFlags": [], "eats": "AWSNWa0l7AGlCHtnt233UutuGGeh33lZ817vfraxpNhL8LY5gqkpaiN73HzUXyRRQ2ApQuCVRfHRtr9rlEQ8rczpjRVn_mm0nP74Qdc4IR95HbzJKhorwIoTVAqfC4o=", "sessionInfo": {"token": session_token}}, "user": {"onBehalfOfUser": channel_info.delegated_session_id, "delegationContext": {"externalChannelId": channel_info.id, "roleType": {"channelRoleType": channel_info.role}}, "serializedDelegationContext": ""}, "clickTracking": {"visualElement": {"veType": 74_618}}, "clientScreenNonce": "UUFKQY_AX3QaOzkG"}}; response = post_with_stop(url, headers=headers, json=payload)
+    def _update(self, video_id: str, scotty_resource_id: str, channel_info: ChannelInfo, cookie_string: str, session_token: str, language: str, session: requests.Session | None = None):
+        url = "https://studio.youtube.com/youtubei/v1/creator/add_audio_track?alt=json"; headers = {"Host": "studio.youtube.com", "Cookie": cookie_string, "Authorization": f"SAPISIDHASH {channel_info.sapisidhash}", "Content-Type": "application/json", "Origin": "https://studio.youtube.com", "Referer": f"https://studio.youtube.com/video/{video_id}/translations", "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36", "Accept": "*/*", "Accept-Language": "en-US,en;q=0.9"}; payload = {"videoId": video_id, "resourceId": {"scottyResourceId": {"id": scotty_resource_id}}, "language": language, "audioContentTypeString": "dubbed", "audioTrackSource": "AUDIO_TRACK_SOURCE_CREATOR", "context": {"client": {"clientName": 62, "clientVersion": "1.20250902.04.00", "hl": "en", "gl": "VN", "utcOffsetMinutes": 420, "userInterfaceTheme": "USER_INTERFACE_THEME_DARK", "screenWidthPoints": 1920, "screenHeightPoints": 945, "screenPixelDensity": 1, "screenDensityFloat": 1}, "request": {"returnLogEntry": True, "internalExperimentFlags": [], "eats": "AWSNWa0l7AGlCHtnt233UutuGGeh33lZ817vfraxpNhL8LY5gqkpaiN73HzUXyRRQ2ApQuCVRfHRtr9rlEQ8rczpjRVn_mm0nP74Qdc4IR95HbzJKhorwIoTVAqfC4o=", "sessionInfo": {"token": session_token}}, "user": {"onBehalfOfUser": channel_info.delegated_session_id, "delegationContext": {"externalChannelId": channel_info.id, "roleType": {"channelRoleType": channel_info.role}}, "serializedDelegationContext": ""}, "clickTracking": {"visualElement": {"veType": 74_618}}, "clientScreenNonce": "UUFKQY_AX3QaOzkG"}}; response = post_with_stop(url, headers=headers, json=payload, session=session)
         if response.status_code not in (200, 409):
             logger.error("YouTube add_audio_track failed: status={} body={}", response.status_code, response.text[:1000])
             raise AudioUpdateError(_youtube_error_message(response, "gắn audio vào video"), status_code=response.status_code, retryable=response.status_code == 429 or response.status_code >= 500)

@@ -1,5 +1,5 @@
 # RECOVERED: partial depyo recovery; unresolved regions marked below
-import asyncio, tempfile, threading
+import asyncio, tempfile, threading, time
 from pathlib import Path
 from typing import Awaitable, Callable, Iterable, TypeVar
 from loguru import logger
@@ -28,6 +28,9 @@ from web.theme import app_card, page_header, section_header
 
 _T = TypeVar("_T")
 _ADD_AUDIO_RUN_GUARD = threading.Lock()
+DEFAULT_AUDIO_UPLOAD_CONCURRENCY = 3
+MAX_AUDIO_UPLOAD_CONCURRENCY = 3
+_AUDIO_UPLOAD_CONCURRENCY_MODE = "parallel_v1"
 
 
 def _best_effort_ui(
@@ -63,6 +66,102 @@ async def _run_sequentially_isolated(
             if stop_on_error is not None and stop_on_error(exc):
                 raise
     return failures
+
+
+async def _run_concurrently_isolated(
+    items: Iterable[_T],
+    process_item: Callable[[_T], Awaitable[None]],
+    on_error: Callable[[_T, Exception], None],
+    *,
+    max_concurrency: int,
+    stop_on_error: Callable[[Exception], bool] | None = None,
+) -> list[tuple[_T, Exception]]:
+    """Process independent videos concurrently while isolating item failures."""
+    pending = list(items)
+    if not pending:
+        return []
+
+    queue: asyncio.Queue = asyncio.Queue()
+    for item in pending:
+        queue.put_nowait(item)
+    failures: list[tuple[_T, Exception]] = []
+    fatal_errors: list[Exception] = []
+
+    async def worker() -> None:
+        while not fatal_errors:
+            try:
+                item = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            try:
+                await process_item(item)
+            except Exception as exc:
+                failures.append((item, exc))
+                on_error(item, exc)
+                if stop_on_error is not None and stop_on_error(exc):
+                    fatal_errors.append(exc)
+            finally:
+                queue.task_done()
+
+    worker_count = min(_clamp_upload_concurrency(max_concurrency), len(pending))
+    await asyncio.gather(*(worker() for _ in range(worker_count)))
+    if fatal_errors:
+        raise fatal_errors[0]
+    return failures
+
+
+def _clamp_upload_concurrency(value: object) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = DEFAULT_AUDIO_UPLOAD_CONCURRENCY
+    return max(1, min(MAX_AUDIO_UPLOAD_CONCURRENCY, parsed))
+
+
+def _restore_audio_performance_settings(saved: dict | None) -> tuple[dict, bool]:
+    """Migrate the former forced-serial setting without overriding later choices."""
+    settings = dict(saved or {})
+    migrated = settings.get("mode") != _AUDIO_UPLOAD_CONCURRENCY_MODE
+    if migrated:
+        settings["max_concurrency"] = DEFAULT_AUDIO_UPLOAD_CONCURRENCY
+        settings["mode"] = _AUDIO_UPLOAD_CONCURRENCY_MODE
+    normalized = _clamp_upload_concurrency(settings.get("max_concurrency"))
+    changed = migrated or normalized != settings.get("max_concurrency")
+    settings["max_concurrency"] = normalized
+    return settings, changed
+
+
+def _upload_progress_summary(
+    progress_items: Iterable[dict], *, now: float | None = None
+) -> str:
+    snapshots = [dict(item) for item in progress_items]
+    if not snapshots:
+        return ""
+    timestamp = time.monotonic() if now is None else now
+    sent = sum(max(0, int(item.get("sent") or 0)) for item in snapshots)
+    total = sum(max(0, int(item.get("total") or 0)) for item in snapshots)
+    speed = 0.0
+    for item in snapshots:
+        started_at = float(item.get("started_at") or timestamp)
+        elapsed = max(0.001, timestamp - started_at)
+        speed += max(0, int(item.get("sent") or 0)) / elapsed
+    sent_mb = sent / (1024 * 1024)
+    total_mb = total / (1024 * 1024)
+    speed_mb = speed / (1024 * 1024)
+    percent = sent / total * 100 if total else 0.0
+    retrying = sum(item.get("status") == "retrying" for item in snapshots)
+    retry_text = f" · đang thử lại {retrying}" if retrying else ""
+    eta_text = ""
+    if speed > 0 and total > sent:
+        remaining_seconds = max(1, int((total - sent) / speed))
+        if remaining_seconds >= 60:
+            eta_text = f" · còn khoảng {(remaining_seconds + 59) // 60} phút"
+        else:
+            eta_text = f" · còn khoảng {remaining_seconds} giây"
+    return (
+        f"{len(snapshots)} luồng tải · {sent_mb:.1f}/{total_mb:.1f} MB "
+        f"({percent:.0f}%) · {speed_mb:.1f} MB/s{eta_text}{retry_text}"
+    )
 
 
 def _is_youtube_auth_error(exc: BaseException) -> bool:
@@ -242,7 +341,10 @@ def create_add_audio_page():
     video_processing_status = {}
     video_processing_errors = {}
     repeat_settings = {"times": 2, "extra_minutes": 0}
-    performance_settings = {"max_concurrency": 1}
+    performance_settings = {
+        "max_concurrency": DEFAULT_AUDIO_UPLOAD_CONCURRENCY,
+        "mode": _AUDIO_UPLOAD_CONCURRENCY_MODE,
+    }
     batch_scan_state = {
         "music_folder": "",
         "recursive": True,
@@ -350,8 +452,15 @@ def create_add_audio_page():
                 repeat_settings.update(state["repeat_settings"])
             if "selected_channel" in state:
                 selected_channel["id"] = state["selected_channel"]
-            if "performance_settings" in state:
-                performance_settings.update(state["performance_settings"])
+            restored_performance, performance_changed = (
+                _restore_audio_performance_settings(
+                    state.get("performance_settings")
+                )
+            )
+            performance_settings.clear()
+            performance_settings.update(restored_performance)
+            if performance_changed:
+                needs_checkpoint_save = True
             if "batch_scan_state" in state:
                 batch_scan_state.update(state["batch_scan_state"])
             if "video_source_state" in state:
@@ -363,8 +472,6 @@ def create_add_audio_page():
                 video_source_state["mode"] = "manual"
             if needs_checkpoint_save:
                 save_right_panel_state()
-            # Audio languages for one video must be registered sequentially.
-            performance_settings["max_concurrency"] = 1
             def update_ui():
                 try:
                     if ui_refs["ids_textarea"]:
@@ -491,7 +598,28 @@ def create_add_audio_page():
 
                     minutes_input.value = value; save_right_panel_state()
                 minutes_input.on("change", update_minutes)
-                ui.label("Âm thanh sẽ được lặp lại n lần, với m phút bổ sung từ đầu âm thanh gốc").classes("app-section-copy flex-1")
+                concurrency_input = ui.number(
+                    label="Video song song",
+                    value=performance_settings["max_concurrency"],
+                    min=1,
+                    max=MAX_AUDIO_UPLOAD_CONCURRENCY,
+                    step=1,
+                ).props("outlined").classes("w-36")
+                ui_refs["concurrency_input"] = concurrency_input
+
+                def update_concurrency(e):
+                    if configuration_change_blocked():
+                        concurrency_input.value = performance_settings["max_concurrency"]
+                        return
+                    value = _clamp_upload_concurrency(e.args)
+                    performance_settings["max_concurrency"] = value
+                    concurrency_input.value = value
+                    save_right_panel_state()
+
+                concurrency_input.on("change", update_concurrency)
+                ui.label(
+                    "Mỗi video có thể chạy song song; các mã ngôn ngữ trong cùng video vẫn chạy lần lượt."
+                ).classes("app-section-copy flex-1")
 
     def parse_ids_from_text(text: str) -> list[str]:
         """Parse newline-separated IDs, strip, deduplicate preserving order."""
@@ -1214,8 +1342,31 @@ def create_add_audio_page():
         total_tasks = total_videos * len(languages_to_process)
         completed_tasks = 0
         overall_errors = []
+        max_concurrency = _clamp_upload_concurrency(
+            performance_settings.get("max_concurrency")
+        )
+        active_uploads: dict[str, dict] = {}
 
-        async def run_upload(vid: str, lang: str, temp_audio_path: Path, file_bytes: bytes):
+        def refresh_upload_progress() -> None:
+            summary = _upload_progress_summary(active_uploads.values())
+            if summary:
+                best_effort_ui(
+                    "render byte upload progress",
+                    lambda: concurrent_label.set_text(summary),
+                )
+
+        upload_progress_timer = ui.timer(0.5, refresh_upload_progress)
+
+        async def run_upload(vid: str, lang: str, temp_audio_path: Path):
+            progress_key = f"{vid}:{lang}"
+            upload_progress = {
+                "sent": 0,
+                "total": 0,
+                "started_at": time.monotonic(),
+                "updated_at": time.monotonic(),
+                "status": "preparing",
+            }
+            active_uploads[progress_key] = upload_progress
             try:
                 if vid not in video_processing_status:
                     video_processing_status[vid] = {}
@@ -1231,7 +1382,8 @@ def create_add_audio_page():
                         channel_id=channel_id,
                         file_name=str(temp_audio_path),
                         language=lang,
-                        data=file_bytes,
+                        data=None,
+                        progress=upload_progress,
                     )
 
                 def log_retry(attempt, delay, exc):
@@ -1261,6 +1413,8 @@ def create_add_audio_page():
                 save_right_panel_state()
                 if _is_youtube_auth_error(exc):
                     raise
+            finally:
+                active_uploads.pop(progress_key, None)
 
         async def process_video(item: tuple[int, str]) -> None:
             nonlocal completed_tasks
@@ -1384,11 +1538,10 @@ def create_add_audio_page():
                     extra_minutes=extra_minutes,
                     video_duration_seconds=video_duration_seconds,
                 )
-                file_bytes = await asyncio.to_thread(temp_audio_path.read_bytes)
                 best_effort_ui(
-                    "render sequential upload state",
+                    "render concurrent upload state",
                     lambda: concurrent_label.set_text(
-                        "Đang xử lý tuần tự để YouTube nhận đủ từng ngôn ngữ"
+                        f"Tối đa {max_concurrency} video song song; ngôn ngữ chạy lần lượt"
                     ),
                 )
                 for language_index, lang in enumerate(missing_languages, 1):
@@ -1402,7 +1555,6 @@ def create_add_audio_page():
                         vid=vid,
                         lang=lang,
                         temp_audio_path=temp_audio_path,
-                        file_bytes=file_bytes,
                     )
                     completed_tasks += 1
                     save_right_panel_state()
@@ -1447,16 +1599,21 @@ def create_add_audio_page():
             )
 
         try:
-            await _run_sequentially_isolated(
+            await _run_concurrently_isolated(
                 enumerate(list(video_ids_state["ids"]), 1),
                 process_video,
                 handle_video_error,
+                max_concurrency=max_concurrency,
                 stop_on_error=_is_youtube_auth_error,
             )
         except Exception as main_exc:
             logger.error("Main processing error: {}", main_exc)
             overall_errors.append(f"Main process: {main_exc}")
         finally:
+            try:
+                upload_progress_timer.deactivate()
+            except RuntimeError:
+                pass
             save_right_panel_state()
             best_effort_ui("close progress dialog", progress_dialog.close)
             best_effort_ui("render final audio state", refresh_right_panel)
@@ -1791,7 +1948,7 @@ def create_add_audio_page():
                 if ui_refs["minutes_input"]:
                     ui_refs["minutes_input"].value = 0
                 if ui_refs["concurrency_input"]:
-                    ui_refs["concurrency_input"].value = 1
+                    ui_refs["concurrency_input"].value = DEFAULT_AUDIO_UPLOAD_CONCURRENCY
                 if ui_refs["music_folder_input"]:
                     ui_refs["music_folder_input"].value = ""
                 if ui_refs["recursive_switch"]:
@@ -1808,7 +1965,8 @@ def create_add_audio_page():
                 selected_languages["languages"] = []
                 repeat_settings["times"] = 2
                 repeat_settings["extra_minutes"] = 0
-                performance_settings["max_concurrency"] = 1
+                performance_settings["max_concurrency"] = DEFAULT_AUDIO_UPLOAD_CONCURRENCY
+                performance_settings["mode"] = _AUDIO_UPLOAD_CONCURRENCY_MODE
                 batch_scan_state["music_folder"] = ""
                 batch_scan_state["recursive"] = True
                 batch_scan_state["duration_tolerance"] = 2.0

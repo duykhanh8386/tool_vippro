@@ -1,4 +1,6 @@
 import unittest
+import tempfile
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -19,6 +21,82 @@ class Response:
 
 
 class AudioUploadTests(unittest.TestCase):
+    def test_audio_upload_uses_sixteen_megabyte_chunks(self):
+        self.assertEqual(UpdateAudioModule._CHUNK_SIZE, 16 * 1024 * 1024)
+
+    def test_file_upload_streams_chunks_and_reports_progress(self):
+        module = UpdateAudioModule()
+        module._CHUNK_SIZE = 4
+        progress = {}
+        session = Mock()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            audio_path = Path(temp_dir) / "audio.mp3"
+            audio_path.write_bytes(b"abcdefghij")
+            with patch(
+                "src.module.audio_module.post_with_stop",
+                return_value=Response(200),
+            ) as post:
+                result = module._next_upload_http(
+                    "https://session",
+                    "audio.mp3",
+                    "cookie",
+                    data=None,
+                    file_path=str(audio_path),
+                    progress=progress,
+                    session=session,
+                )
+
+        self.assertEqual(result, "final")
+        self.assertEqual(
+            [call.kwargs["data"] for call in post.call_args_list],
+            [b"abcd", b"efgh", b"ij"],
+        )
+        self.assertTrue(
+            all(call.kwargs["session"] is session for call in post.call_args_list)
+        )
+        self.assertEqual(progress["sent"], 10)
+        self.assertEqual(progress["total"], 10)
+        self.assertEqual(progress["status"], "complete")
+
+    def test_add_reuses_one_http_session_for_start_register_and_upload(self):
+        module = UpdateAudioModule()
+        channel = SimpleNamespace(cookies=[], sapisidhash="hash")
+        session = Mock()
+        session_context = Mock()
+        session_context.__enter__ = Mock(return_value=session)
+        session_context.__exit__ = Mock(return_value=False)
+
+        with (
+            patch("src.module.audio_module.get_channels_info", return_value=channel),
+            patch.object(module, "_get_session_token", return_value="token"),
+            patch("src.module.audio_module.requests.Session", return_value=session_context),
+            patch.object(
+                module,
+                "_upload_http",
+                return_value=("https://session", "resource"),
+            ) as start,
+            patch.object(module, "_update", return_value=200) as register,
+            patch.object(module, "_next_upload_http", return_value="final") as upload,
+        ):
+            self.assertEqual(
+                module.add(
+                    "video",
+                    "channel",
+                    "audio.mp3",
+                    "vi",
+                    data=None,
+                    upload_path="rendered.mp3",
+                ),
+                200,
+            )
+
+        self.assertIs(start.call_args.kwargs["session"], session)
+        self.assertIs(register.call_args.kwargs["session"], session)
+        self.assertIs(upload.call_args.kwargs["session"], session)
+        self.assertIsNone(upload.call_args.kwargs["data"])
+        self.assertEqual(upload.call_args.kwargs["file_path"], "rendered.mp3")
+
     def test_timeout_queries_offset_and_resumes_same_session(self):
         module = UpdateAudioModule()
         data = b"x" * (10 * 1024 * 1024)
