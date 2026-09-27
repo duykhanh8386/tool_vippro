@@ -270,18 +270,18 @@ class UpdateAudioModule(IModule):
                     retryable=response.status_code == 429 or response.status_code >= 500,
                 )
         return 200
-    def _get_video_translation_groups(
+    def _get_video_translation_payload(
         self, video_ids: list[str], channel_id: str
-    ) -> list[dict]:
-        """Fetch Studio translation data for one batch of videos."""
+    ) -> dict:
+        """Fetch the complete Studio translation/audio response for a batch."""
         if not video_ids:
-            return []
+            return {"videoTranslations": [], "audioTracks": []}
         url = "https://studio.youtube.com/youtubei/v1/crowdsourcing/get_video_translations?alt=json"
         channel_info = get_channels_info(channel_id)
         cookie_string = "; ".join([f"{cookie['name']}={cookie['value']}" for cookie in channel_info.cookies])
         session_token = self._get_session_token(channel_info)
         headers = {"Host": "studio.youtube.com", "Cookie": cookie_string, "Authorization": f"SAPISIDHASH {channel_info.sapisidhash}", "Content-Type": "application/json", "Origin": "https://studio.youtube.com", "Referer": f"https://studio.youtube.com/video/{video_ids[0]}/translations", "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36"}
-        payload = {"context": {"client": {"clientName": 62, "clientVersion": "1.20260520.00.00", "hl": "en", "gl": "VN", "experimentsToken": "", "utcOffsetMinutes": 420, "userInterfaceTheme": "USER_INTERFACE_THEME_DARK", "screenWidthPoints": 1920, "screenHeightPoints": 945, "screenPixelDensity": 1, "screenDensityFloat": 1}, "request": {"returnLogEntry": True, "internalExperimentFlags": [], "eats": self.EATS, "sessionInfo": {"token": session_token}, "consistencyTokenJars": []}, "user": {"onBehalfOfUser": channel_info.delegated_session_id, "delegationContext": {"externalChannelId": channel_info.id, "roleType": {"channelRoleType": channel_info.role}}, "serializedDelegationContext": ""}, "clientScreenNonce": self.CLIENT_SCREEN_NONCE}, "videoIds": video_ids, "filters": [], "fetchAloudData": True, "fetchAutoDubbingData": True, "fetchAutoDubbingAsrData": True, "fetchBulkActionsStatus": True}
+        payload = {"context": {"client": {"clientName": 62, "clientVersion": "1.20260924.00.01", "hl": "vi", "gl": "VN", "experimentsToken": "", "utcOffsetMinutes": 420, "userInterfaceTheme": "USER_INTERFACE_THEME_LIGHT", "screenWidthPoints": 1920, "screenHeightPoints": 945, "screenPixelDensity": 1, "screenDensityFloat": 1}, "request": {"returnLogEntry": True, "internalExperimentFlags": [], "eats": self.EATS, "sessionInfo": {"token": session_token}, "consistencyTokenJars": []}, "user": {"onBehalfOfUser": channel_info.delegated_session_id, "delegationContext": {"externalChannelId": channel_info.id, "roleType": {"channelRoleType": channel_info.role}}, "serializedDelegationContext": ""}, "clientScreenNonce": self.CLIENT_SCREEN_NONCE}, "videoIds": video_ids, "filters": ["TRANSLATION_FILTER_DRAFT", "TRANSLATION_FILTER_PUBLISHED"], "fetchAloudData": False, "fetchAutoDubbingData": False, "fetchAutoDubbingAsrData": False, "fetchBulkActionsStatus": False, "fetchDataFromInternalService": False}
         response = post_with_stop(url, headers=headers, json=payload)
         if response.status_code != 200:
             raise AudioUpdateError(
@@ -289,7 +289,27 @@ class UpdateAudioModule(IModule):
                 status_code=response.status_code,
                 retryable=response.status_code == 429 or response.status_code >= 500,
             )
-        return response.json().get("videoTranslations") or []
+        try:
+            result = response.json()
+        except (ValueError, AttributeError) as exc:
+            raise AudioUpdateError(
+                "YouTube trả dữ liệu trạng thái audio không hợp lệ.",
+                status_code=response.status_code,
+            ) from exc
+        if not isinstance(result, dict):
+            raise AudioUpdateError(
+                "YouTube trả cấu trúc trạng thái audio không hợp lệ.",
+                status_code=response.status_code,
+            )
+        return result
+
+    def _get_video_translation_groups(
+        self, video_ids: list[str], channel_id: str
+    ) -> list[dict]:
+        """Compatibility helper returning only translation groups."""
+        return self._get_video_translation_payload(video_ids, channel_id).get(
+            "videoTranslations"
+        ) or []
 
     @staticmethod
     def _translation_group_video_id(group: dict) -> str | None:
@@ -436,7 +456,9 @@ class UpdateAudioModule(IModule):
         return False
 
     @classmethod
-    def _audio_payload_needs_attention(cls, payload) -> bool:
+    def _audio_payload_needs_attention(
+        cls, payload, *, assume_audio: bool = False
+    ) -> bool:
         """Inspect only audio/dubbing status containers in a Studio payload.
 
         Depending on the channel feature rollout, a translation row can return
@@ -478,7 +500,7 @@ class UpdateAudioModule(IModule):
                 return any(walk(child, parent_key, audio_context) for child in value)
             return False
 
-        return walk(payload)
+        return walk(payload, in_audio=assume_audio)
 
     @classmethod
     def _audio_translation_needs_attention(cls, item: dict) -> bool:
@@ -518,9 +540,29 @@ class UpdateAudioModule(IModule):
             ):
                 failed_ids.add(video_id)
 
+        def scan_audio_tracks(chunk: list[str], payload: dict) -> set[str]:
+            requested = set(chunk)
+            returned_video_ids: set[str] = set()
+            tracks = payload.get("audioTracks") or []
+            if not isinstance(tracks, list):
+                return returned_video_ids
+            for track in tracks:
+                if not isinstance(track, dict):
+                    continue
+                video_id = track.get("videoId")
+                if video_id not in requested:
+                    continue
+                returned_video_ids.add(video_id)
+                # audioTracks[] is the canonical source for the status rendered
+                # in Studio's Audio column. It is separate from
+                # videoTranslations[], which only contains the audioTrackId.
+                if self._audio_payload_needs_attention(track, assume_audio=True):
+                    failed_ids.add(video_id)
+            return returned_video_ids
+
         def scan_chunk(chunk: list[str]) -> None:
             try:
-                groups = self._get_video_translation_groups(
+                payload = self._get_video_translation_payload(
                     chunk, channel_id
                 )
             except AudioUpdateError as exc:
@@ -539,6 +581,10 @@ class UpdateAudioModule(IModule):
                 )
                 return
 
+            groups = payload.get("videoTranslations") or []
+            if not isinstance(groups, list):
+                groups = []
+            audio_track_video_ids = scan_audio_tracks(chunk, payload)
             valid_groups = [group for group in groups if isinstance(group, dict)]
             group_ids = [
                 self._translation_group_video_id(group) for group in valid_groups
@@ -558,7 +604,7 @@ class UpdateAudioModule(IModule):
                     if group_id in requested
                 ]
 
-            matched_ids = set()
+            matched_ids = set(audio_track_video_ids)
             for group_id, group in pairs:
                 matched_ids.add(group_id)
                 scan_group(group_id, group)

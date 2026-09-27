@@ -192,7 +192,7 @@ class AudioUploadTests(unittest.TestCase):
                 {"en", "vi"},
             )
 
-    def test_translation_request_enables_all_automatic_dubbing_data(self):
+    def test_translation_request_matches_studio_audio_table_request(self):
         module = UpdateAudioModule()
         channel = SimpleNamespace(
             cookies=[],
@@ -209,13 +209,18 @@ class AudioUploadTests(unittest.TestCase):
                 return_value=Response(200, body={"videoTranslations": []}),
             ) as post,
         ):
-            module._get_video_translation_groups(["video"], "channel")
+            module._get_video_translation_payload(["video"], "channel")
 
         payload = post.call_args.kwargs["json"]
-        self.assertTrue(payload["fetchAloudData"])
-        self.assertTrue(payload["fetchAutoDubbingData"])
-        self.assertTrue(payload["fetchAutoDubbingAsrData"])
-        self.assertTrue(payload["fetchBulkActionsStatus"])
+        self.assertFalse(payload["fetchAloudData"])
+        self.assertFalse(payload["fetchAutoDubbingData"])
+        self.assertFalse(payload["fetchAutoDubbingAsrData"])
+        self.assertFalse(payload["fetchBulkActionsStatus"])
+        self.assertFalse(payload["fetchDataFromInternalService"])
+        self.assertEqual(
+            payload["filters"],
+            ["TRANSLATION_FILTER_DRAFT", "TRANSLATION_FILTER_PUBLISHED"],
+        )
 
     def test_audio_scan_selects_all_four_requested_studio_states(self):
         module = UpdateAudioModule()
@@ -290,7 +295,11 @@ class AudioUploadTests(unittest.TestCase):
                 ],
             },
         ]
-        with patch.object(module, "_get_video_translation_groups", return_value=groups) as fetch:
+        with patch.object(
+            module,
+            "_get_video_translation_payload",
+            return_value={"videoTranslations": groups, "audioTracks": []},
+        ) as fetch:
             failed = module.get_failed_audio_video_ids(
                 [
                     "failed-video",
@@ -324,6 +333,61 @@ class AudioUploadTests(unittest.TestCase):
             ],
             "channel",
         )
+
+    def test_audio_scan_uses_root_audio_tracks_status_from_real_studio_shape(self):
+        module = UpdateAudioModule()
+        payload = {
+            "videoTranslations": [
+                {
+                    "videoId": "failed-video",
+                    "translations": [
+                        {
+                            "languageCode": "en",
+                            "audioTranslation": {
+                                "videoId": "failed-video",
+                                "audioTrackId": "track-failed",
+                            },
+                        }
+                    ],
+                    "status": "VIDEO_TRANSLATIONS_STATUS_OK",
+                },
+                {
+                    "videoId": "ready-video",
+                    "translations": [
+                        {
+                            "languageCode": "es",
+                            "audioTranslation": {
+                                "videoId": "ready-video",
+                                "audioTrackId": "track-ready",
+                            },
+                        }
+                    ],
+                    "status": "VIDEO_TRANSLATIONS_STATUS_OK",
+                },
+            ],
+            "audioTracks": [
+                {
+                    "videoId": "failed-video",
+                    "audioTrackId": "track-failed",
+                    "status": "AUDIO_TRACK_STATUS_FAILED",
+                    "rejectedReason": "AUDIO_TRACK_REJECTED_REASON_CLAIM_COMPATIBILITY_MISMATCH",
+                },
+                {
+                    "videoId": "ready-video",
+                    "audioTrackId": "track-ready",
+                    "status": "AUDIO_TRACK_STATUS_READY",
+                },
+            ],
+        }
+
+        with patch.object(
+            module, "_get_video_translation_payload", return_value=payload
+        ):
+            selected = module.get_audio_attention_video_ids(
+                ["failed-video", "ready-video"], "channel"
+            )
+
+        self.assertEqual(selected, {"failed-video"})
 
     def test_processing_enum_namespace_does_not_select_completed_audio(self):
         module = UpdateAudioModule()
@@ -367,7 +431,11 @@ class AudioUploadTests(unittest.TestCase):
             }
         ]
 
-        with patch.object(module, "_get_video_translation_groups", return_value=groups):
+        with patch.object(
+            module,
+            "_get_video_translation_payload",
+            return_value={"videoTranslations": groups, "audioTracks": []},
+        ):
             selected = module.get_audio_attention_video_ids(
                 ["caption-editor-only"], "channel"
             )
@@ -390,7 +458,11 @@ class AudioUploadTests(unittest.TestCase):
             }
         ]
 
-        with patch.object(module, "_get_video_translation_groups", return_value=groups):
+        with patch.object(
+            module,
+            "_get_video_translation_payload",
+            return_value={"videoTranslations": groups, "audioTracks": []},
+        ):
             selected = module.get_audio_attention_video_ids(
                 ["auto-dub-failed"], "channel"
             )
@@ -441,21 +513,24 @@ class AudioUploadTests(unittest.TestCase):
                 raise AudioUpdateError("Precondition check failed", status_code=400)
             if video_ids[0] == "unreadable":
                 raise AudioUpdateError("Precondition check failed", status_code=400)
-            return [
-                {
-                    "videoId": video_ids[0],
-                    "translations": [
-                        {
-                            "audioTranslation": {
-                                "status": "AUDIO_TRACK_PROCESSING_STATUS_FAILED"
+            return {
+                "videoTranslations": [
+                    {
+                        "videoId": video_ids[0],
+                        "translations": [
+                            {
+                                "audioTranslation": {
+                                    "status": "AUDIO_TRACK_PROCESSING_STATUS_FAILED"
+                                }
                             }
-                        }
-                    ],
-                }
-            ]
+                        ],
+                    }
+                ],
+                "audioTracks": [],
+            }
 
         unreadable = []
-        with patch.object(module, "_get_video_translation_groups", side_effect=fetch):
+        with patch.object(module, "_get_video_translation_payload", side_effect=fetch):
             failed = module.get_failed_audio_video_ids(
                 ["failed", "unreadable"], "channel", unreadable
             )
@@ -468,36 +543,42 @@ class AudioUploadTests(unittest.TestCase):
 
         def fetch(video_ids, _channel):
             if len(video_ids) > 1:
-                return [
-                    {
-                        "videoId": "clean",
-                        "translations": [
-                            {
-                                "audioTranslation": {
-                                    "status": "AUDIO_TRACK_STATUS_READY"
+                return {
+                    "videoTranslations": [
+                        {
+                            "videoId": "clean",
+                            "translations": [
+                                {
+                                    "audioTranslation": {
+                                        "status": "AUDIO_TRACK_STATUS_READY"
+                                    }
                                 }
-                            }
-                        ],
-                    }
-                ]
+                            ],
+                        }
+                    ],
+                    "audioTracks": [],
+                }
             if video_ids == ["failed"]:
-                return [
-                    {
-                        "videoId": "failed",
-                        "translations": [
-                            {
-                                "autoDubbingData": {
-                                    "status": "AUTO_DUBBING_STATUS_FAILED"
+                return {
+                    "videoTranslations": [
+                        {
+                            "videoId": "failed",
+                            "translations": [
+                                {
+                                    "autoDubbingData": {
+                                        "status": "AUTO_DUBBING_STATUS_FAILED"
+                                    }
                                 }
-                            }
-                        ],
-                    }
-                ]
-            return []
+                            ],
+                        }
+                    ],
+                    "audioTracks": [],
+                }
+            return {"videoTranslations": [], "audioTracks": []}
 
         unreadable = []
         with patch.object(
-            module, "_get_video_translation_groups", side_effect=fetch
+            module, "_get_video_translation_payload", side_effect=fetch
         ) as request:
             selected = module.get_audio_attention_video_ids(
                 ["clean", "failed", "missing"], "channel", unreadable
