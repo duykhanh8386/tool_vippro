@@ -231,11 +231,8 @@ def match_audio_files(
     videos = list(videos)
     files = scan_audio_files(folder, recursive=recursive)
     mappings, mapping_errors = load_mapping_csv(folder)
-    mapped_paths = set(mappings.values())
     durations: dict[Path, float] = {}
     for path in files:
-        if path in mapped_paths:
-            continue
         try:
             duration = float(duration_reader(str(path)))
             if duration > 0:
@@ -278,45 +275,29 @@ def match_audio_files(
             continue
         eligible.append((video_index, video, video_duration))
 
-    # Rank every possible audio/video pair globally. This prevents whichever
-    # video happens to be visited first from stealing a file that is closer to
-    # another video with a similar duration.
-    candidate_paths: dict[int, list[Path]] = {}
-    ranked_pairs = []
+    # Match every video independently. One source file may intentionally serve
+    # multiple videos when all of their durations are within the tolerance.
+    # The upload flow creates a separate temporary MP3 for every video, so the
+    # source file is only read and is safe to reuse.
     for video_index, video, video_duration in eligible:
         title = video.title or ""
+        candidates = []
         for path, audio_duration in durations.items():
-            if path in used_paths:
-                continue
             delta = abs(audio_duration - video_duration)
             if delta > tolerance_seconds:
                 continue
-            candidate_paths.setdefault(video_index, []).append(path)
-            ranked_pairs.append(
+            candidates.append(
                 (
                     delta,
                     0 if _title_is_in_filename(title, path) else 1,
-                    video_index,
                     _natural_path_key(path),
                     path,
-                    video_duration,
                     audio_duration,
                 )
             )
-
-    ranked_pairs.sort(key=lambda item: item[:4])
-    for (
-        delta,
-        title_penalty,
-        video_index,
-        _path_key,
-        path,
-        video_duration,
-        audio_duration,
-    ) in ranked_pairs:
-        if video_index in assigned or path in used_paths:
+        if not candidates:
             continue
-        video = videos[video_index]
+        delta, title_penalty, _path_key, path, audio_duration = min(candidates)
         video_id = (video.id or "").strip()
         title_hint = " · tên file chứa tiêu đề" if title_penalty == 0 else ""
         assigned[video_index] = AudioMatch(
@@ -337,10 +318,7 @@ def match_audio_files(
         if video_index in assigned:
             results.append(assigned[video_index])
             continue
-        if candidate_paths.get(video_index):
-            detail = "Audio phù hợp đã được ghép cho video có thời lượng gần hơn"
-        else:
-            detail = f"Không có audio lệch tối đa {tolerance_seconds:g} giây"
+        detail = f"Không có audio lệch tối đa {tolerance_seconds:g} giây"
         results.append(AudioMatch(video_id, video.title or "", None, "unmatched", detail))
 
     extra_files = tuple(str(path) for path in files if path not in used_paths)

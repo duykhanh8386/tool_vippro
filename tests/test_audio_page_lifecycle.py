@@ -21,18 +21,21 @@ from web.components.audio import (
     _is_youtube_auth_error,
     _normalize_recent_video_limit,
     _restore_audio_performance_settings,
+    _restore_audio_path_history,
     _restore_cleanup_statuses,
     _restore_language_statuses,
     _run_concurrently_isolated,
     _run_client_independent,
     _run_in_target_slot,
     _run_sequentially_isolated,
+    _remember_audio_path_history,
     _select_videos_by_ids,
     _upload_progress_summary,
     _video_from_snapshot,
     _video_snapshot,
 )
 from src.module.model import Video
+from src.module.list_videos_module import ListVideosModule
 from src.utils import multiply_audio
 from web.components.remove_audio import (
     DEFAULT_REMOVE_AUDIO_CONCURRENCY,
@@ -222,7 +225,7 @@ class AudioPageLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual([video.id for video in selected], ["public"])
 
-    def test_draft_scan_uses_draft_status_not_privacy(self):
+    def test_draft_scan_requests_the_server_side_draft_filter(self):
         videos = [
             SimpleNamespace(
                 id="draft-enum",
@@ -235,16 +238,6 @@ class AudioPageLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 draft_status={"isDraft": True},
             ),
             SimpleNamespace(
-                id="ordinary-private",
-                privacy="VIDEO_PRIVACY_PRIVATE",
-                draft_status="VIDEO_DRAFT_STATUS_NONE",
-            ),
-            SimpleNamespace(
-                id="public",
-                privacy="VIDEO_PRIVACY_PUBLIC",
-                draft_status="",
-            ),
-            SimpleNamespace(
                 id="draft-status-fallback",
                 privacy="VIDEO_PRIVACY_PRIVATE",
                 draft_status="",
@@ -254,14 +247,49 @@ class AudioPageLifecycleTests(unittest.IsolatedAsyncioTestCase):
         with patch(
             "web.components.audio.list_videos_module.list_all_videos",
             return_value=(videos, None),
-        ):
+        ) as list_videos:
             selected = _fetch_channel_videos("channel", scope="draft")
 
         self.assertEqual(
             [video.id for video in selected],
             ["draft-enum", "draft-object", "draft-status-fallback"],
         )
-        self.assertFalse(_is_draft_video(videos[2]))
+        self.assertTrue(list_videos.call_args.kwargs["draft_only"])
+        self.assertFalse(
+            _is_draft_video(
+                SimpleNamespace(
+                    privacy="VIDEO_PRIVACY_PRIVATE",
+                    draft_status="VIDEO_DRAFT_STATUS_NONE",
+                )
+            )
+        )
+
+    def test_studio_draft_request_contains_is_draft_operand(self):
+        channel = SimpleNamespace(
+            id="channel",
+            delegated_session_id="delegate",
+            role="CREATOR_CHANNEL_ROLE_TYPE_OWNER",
+            sapisidhash="hash",
+            cookie_string=lambda: "SID=value",
+        )
+        response = SimpleNamespace(status_code=200, json=lambda: {"videos": []})
+        module = ListVideosModule()
+
+        with (
+            patch(
+                "src.module.list_videos_module.get_channels_info",
+                return_value=channel,
+            ),
+            patch.object(module, "_get_session_token", return_value="token"),
+            patch(
+                "src.module.list_videos_module.post_with_stop",
+                return_value=response,
+            ) as post,
+        ):
+            module.list_all_videos("channel", draft_only=True)
+
+        operands = post.call_args.kwargs["json"]["filter"]["and"]["operands"]
+        self.assertIn({"isDraft": {}}, operands)
 
     def test_recent_scan_stops_at_selected_newest_video_count(self):
         pages = [
@@ -319,6 +347,24 @@ class AudioPageLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(restored.title, original.title)
         self.assertEqual(restored.duration_ms, original.duration_ms)
         self.assertEqual(restored.draft_status, original.draft_status)
+
+    def test_previous_audio_path_is_restored_when_failed_video_is_scanned_again(self):
+        history = {}
+        remembered = _remember_audio_path_history(
+            history,
+            "channel-a",
+            {"video-a": "D:/music/shared.mp3", "video-b": ""},
+        )
+
+        restored = _restore_audio_path_history(
+            history, "channel-a", ["video-a", "video-c"]
+        )
+
+        self.assertEqual(remembered, 1)
+        self.assertEqual(restored, {"video-a": "D:/music/shared.mp3"})
+        self.assertEqual(
+            _restore_audio_path_history(history, "channel-b", ["video-a"]), {}
+        )
 
     async def test_client_cancellation_does_not_cancel_backend_audio_job(self):
         started = asyncio.Event()

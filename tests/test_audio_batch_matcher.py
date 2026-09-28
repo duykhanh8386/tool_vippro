@@ -82,7 +82,7 @@ class AudioBatchMatcherTests(unittest.TestCase):
         self.assertEqual(result.matched[0].path, str(first))
         self.assertEqual(result.extra_files, (str(second),))
 
-    def test_one_audio_is_assigned_to_the_closest_of_similar_videos(self):
+    def test_one_audio_can_be_reused_for_multiple_similar_video_durations(self):
         audio = self.touch("shared.mp3")
 
         result = match_audio_files(
@@ -96,9 +96,13 @@ class AudioBatchMatcherTests(unittest.TestCase):
 
         self.assertEqual(
             [(item.video_id, item.path) for item in result.matched],
-            [("video000002", str(audio))],
+            [
+                ("video000001", str(audio)),
+                ("video000002", str(audio)),
+            ],
         )
-        self.assertIn("gần hơn", result.unmatched[0].detail)
+        self.assertEqual(result.unmatched, ())
+        self.assertEqual(result.extra_files, ())
 
     def test_equal_video_durations_use_title_then_channel_order(self):
         audio = self.touch("Second official audio.mp3")
@@ -112,8 +116,13 @@ class AudioBatchMatcherTests(unittest.TestCase):
             duration_reader=lambda _path: 100,
         )
 
-        self.assertEqual(result.matched[0].video_id, "video000002")
-        self.assertEqual(result.matched[0].path, str(audio))
+        self.assertEqual(
+            [(item.video_id, item.path) for item in result.matched],
+            [
+                ("video000001", str(audio)),
+                ("video000002", str(audio)),
+            ],
+        )
 
     def test_youtube_title_only_needs_to_be_contained_in_filename(self):
         expected = self.touch("001 - nhac dem thu gian - final mix.flac")

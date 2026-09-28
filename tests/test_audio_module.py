@@ -292,6 +292,7 @@ class AudioUploadTests(unittest.TestCase):
                     {
                         "languageCode": "fr",
                         "audioTranslation": {
+                            "audioTrackId": "track-ineligible",
                             "status": "AUDIO_TRACK_STATUS_INELIGIBLE"
                         },
                     }
@@ -419,12 +420,16 @@ class AudioUploadTests(unittest.TestCase):
                 {
                     "videoId": "failed-video",
                     "audioTrackId": "track-failed",
+                    "source": "AUDIO_TRACK_SOURCE_CREATOR",
+                    "audioContentTypeString": "dubbed",
                     "status": "AUDIO_TRACK_STATUS_FAILED",
                     "rejectedReason": "AUDIO_TRACK_REJECTED_REASON_CLAIM_COMPATIBILITY_MISMATCH",
                 },
                 {
                     "videoId": "ready-video",
                     "audioTrackId": "track-ready",
+                    "source": "AUDIO_TRACK_SOURCE_CREATOR",
+                    "audioContentTypeString": "dubbed",
                     "status": "AUDIO_TRACK_STATUS_READY",
                 },
             ],
@@ -438,6 +443,152 @@ class AudioUploadTests(unittest.TestCase):
             )
 
         self.assertEqual(selected, {"failed-video"})
+
+    def test_source_audio_black_ineligible_lock_is_not_selected(self):
+        module = UpdateAudioModule()
+        payload = {
+            "videoTranslations": [
+                {
+                    "videoId": "healthy-video",
+                    "translations": [
+                        {
+                            "languageCode": "pcm",
+                            "audioTranslation": {
+                                "audioTrackId": "source-original",
+                                "status": "AUDIO_TRACK_STATUS_INELIGIBLE",
+                            },
+                        },
+                        {
+                            "languageCode": "en",
+                            "audioTranslation": {
+                                "videoId": "healthy-video",
+                                "audioTrackId": "creator-ready",
+                            },
+                        },
+                    ],
+                }
+            ],
+            "audioTracks": [
+                {
+                    "videoId": "healthy-video",
+                    "audioTrackId": "source-original",
+                    "source": "AUDIO_TRACK_SOURCE_UPLOAD",
+                    "audioContentTypeString": "original",
+                    "status": "AUDIO_TRACK_STATUS_INELIGIBLE",
+                },
+                {
+                    "videoId": "healthy-video",
+                    "audioTrackId": "creator-ready",
+                    "source": "AUDIO_TRACK_SOURCE_CREATOR",
+                    "audioContentTypeString": "dubbed",
+                    "status": "AUDIO_TRACK_STATUS_READY",
+                },
+            ],
+        }
+
+        with patch.object(
+            module, "_get_video_translation_payload", return_value=payload
+        ):
+            selected = module.get_audio_attention_video_ids(
+                ["healthy-video"], "channel"
+            )
+
+        self.assertEqual(selected, set())
+
+    def test_red_creator_dub_ineligible_is_selected(self):
+        module = UpdateAudioModule()
+        payload = {
+            "videoTranslations": [],
+            "audioTracks": [
+                {
+                    "videoId": "rejected-video",
+                    "audioTrackId": "creator-failed",
+                    "source": "AUDIO_TRACK_SOURCE_CREATOR",
+                    "audioContentTypeString": "dubbed",
+                    "status": "AUDIO_TRACK_STATUS_FAILED",
+                    "rejectedReason": (
+                        "AUDIO_TRACK_REJECTED_REASON_CLAIM_COMPATIBILITY_MISMATCH"
+                    ),
+                }
+            ],
+        }
+
+        with patch.object(
+            module, "_get_video_translation_payload", return_value=payload
+        ):
+            selected = module.get_audio_attention_video_ids(
+                ["rejected-video"], "channel"
+            )
+
+        self.assertEqual(selected, {"rejected-video"})
+
+    def test_source_black_lock_does_not_hide_another_failed_creator_dub(self):
+        module = UpdateAudioModule()
+        payload = {
+            "videoTranslations": [
+                {
+                    "videoId": "mixed-video",
+                    "translations": [
+                        {
+                            "languageCode": "pcm",
+                            "audioTranslation": {
+                                "videoId": "mixed-video",
+                                "audioTrackId": "source-original",
+                                "status": "AUDIO_TRACK_STATUS_INELIGIBLE",
+                            },
+                        },
+                        {
+                            "languageCode": "es",
+                            "audioTranslation": {
+                                "videoId": "mixed-video",
+                                "audioTrackId": "failed-es",
+                            },
+                        },
+                    ],
+                }
+            ],
+            "audioTracks": [
+                {
+                    "videoId": "mixed-video",
+                    "audioTrackId": "source-original",
+                    "language": "pcm",
+                    "source": "AUDIO_TRACK_SOURCE_UPLOAD",
+                    "audioContentTypeString": "original",
+                    "status": "AUDIO_TRACK_STATUS_INELIGIBLE",
+                },
+                {
+                    "videoId": "mixed-video",
+                    "audioTrackId": "failed-es",
+                    "language": "es",
+                    "source": "AUDIO_TRACK_SOURCE_CREATOR",
+                    "audioContentTypeString": "dubbed",
+                    "status": "AUDIO_TRACK_STATUS_FAILED",
+                },
+            ],
+        }
+
+        with patch.object(
+            module, "_get_video_translation_payload", return_value=payload
+        ):
+            selected = module.get_audio_attention_video_ids(
+                ["mixed-video"], "channel"
+            )
+
+        self.assertEqual(selected, {"mixed-video"})
+
+    def test_trackless_translation_ineligible_is_source_row_and_is_ignored(self):
+        module = UpdateAudioModule()
+
+        self.assertFalse(
+            module._audio_translation_needs_attention(
+                {
+                    "languageCode": "pcm",
+                    "audioTranslation": {
+                        "status": "AUDIO_TRACK_STATUS_INELIGIBLE"
+                    },
+                }
+            )
+        )
 
     def test_processing_enum_namespace_does_not_select_completed_audio(self):
         module = UpdateAudioModule()
@@ -662,6 +813,23 @@ class AudioDeleteTests(unittest.TestCase):
         ):
             self.assertEqual(module.delete("video", "channel"), 200)
         self.assertEqual(post.call_count, 2)
+
+    def test_delete_track_ids_does_not_discover_or_delete_healthy_tracks(self):
+        module = UpdateAudioModule()
+        with (
+            patch("src.module.audio_module.get_channels_info", return_value=self._channel()),
+            patch.object(module, "_get_session_token", return_value="token"),
+            patch.object(module, "_get_all_audio_track_ids") as discover,
+            patch("src.module.audio_module.post_with_stop", return_value=Response(200)) as post,
+        ):
+            self.assertEqual(
+                module.delete_track_ids("video", "channel", ["failed-track"]),
+                200,
+            )
+
+        discover.assert_not_called()
+        self.assertEqual(post.call_count, 1)
+        self.assertEqual(post.call_args.kwargs["json"]["audioTrackId"], "failed-track")
 
     def test_delete_propagates_youtube_failure(self):
         module = UpdateAudioModule()

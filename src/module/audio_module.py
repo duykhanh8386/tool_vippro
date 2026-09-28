@@ -258,9 +258,23 @@ class UpdateAudioModule(IModule):
             logger.error("YouTube add_audio_track failed: status={} body={}", response.status_code, response.text[:1000])
             raise AudioUpdateError(_youtube_error_message(response, "gắn audio vào video"), status_code=response.status_code, retryable=response.status_code == 429 or response.status_code >= 500)
         return response.status_code
-    def delete(self, id_video: str, channel_id: str):
-        channel_info = get_channels_info(channel_id); url = "https://studio.youtube.com/youtubei/v1/creator/delete_audio_track?alt=json"; cookie_string = "; ".join([f"{cookie['name']}={cookie['value']}" for cookie in channel_info.cookies]); session_token = self._get_session_token(channel_info); all_track_ids = self._get_all_audio_track_ids(id_video, channel_id); headers = {"Host": "studio.youtube.com", "Cookie": cookie_string, "Authorization": f"SAPISIDHASH {channel_info.sapisidhash}", "Content-Type": "application/json", "Origin": "https://studio.youtube.com", "Referer": f"https://studio.youtube.com/video/{id_video}/translations", "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36"}
-        for track_id in all_track_ids:
+    def delete_track_ids(
+        self, id_video: str, channel_id: str, track_ids: list[str]
+    ) -> int:
+        """Delete only the explicitly selected creator audio tracks.
+
+        Automatic recovery uses this narrow operation so a failed language can
+        be replaced without removing healthy/published languages on the same
+        video. ``delete`` below intentionally retains its historical
+        all-tracks behaviour for the manual "Xóa & thêm audio" action.
+        """
+        unique_track_ids = list(
+            dict.fromkeys(str(track_id).strip() for track_id in track_ids if track_id)
+        )
+        if not unique_track_ids:
+            return 200
+        channel_info = get_channels_info(channel_id); url = "https://studio.youtube.com/youtubei/v1/creator/delete_audio_track?alt=json"; cookie_string = "; ".join([f"{cookie['name']}={cookie['value']}" for cookie in channel_info.cookies]); session_token = self._get_session_token(channel_info); headers = {"Host": "studio.youtube.com", "Cookie": cookie_string, "Authorization": f"SAPISIDHASH {channel_info.sapisidhash}", "Content-Type": "application/json", "Origin": "https://studio.youtube.com", "Referer": f"https://studio.youtube.com/video/{id_video}/translations", "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36"}
+        for track_id in unique_track_ids:
             payload = {"videoId": id_video, "audioTrackId": track_id, "unpublishTrack": False, "context": {"client": {"clientName": 62, "clientVersion": "1.20250902.04.00", "hl": "en", "gl": "VN", "experimentsToken": "", "utcOffsetMinutes": 420, "userInterfaceTheme": "USER_INTERFACE_THEME_DARK", "screenWidthPoints": 1920, "screenHeightPoints": 945, "screenPixelDensity": 1, "screenDensityFloat": 1}, "request": {"returnLogEntry": True, "internalExperimentFlags": [], "eats": "AWSNWa3PV1e-JQRiHlmMmNXCMA9Kt6en05uq7bbw9WnQgnJdNT8RNsEfMheyglxoOPf_TMIzUzU80CM9khDsuy6zp2Uz9ROtcC5RGvGrdEkSa_rIL5z6FDB2wAAYVWg=", "sessionInfo": {"token": session_token}}, "user": {"onBehalfOfUser": channel_info.delegated_session_id, "delegationContext": {"externalChannelId": channel_info.id, "roleType": {"channelRoleType": channel_info.role}}, "serializedDelegationContext": ""}, "clientScreenNonce": "7nFa5dcSfcGGJAJS"}}
             response = post_with_stop(url, headers=headers, json=payload)
             if response.status_code != 200:
@@ -270,6 +284,13 @@ class UpdateAudioModule(IModule):
                     retryable=response.status_code == 429 or response.status_code >= 500,
                 )
         return 200
+
+    def delete(self, id_video: str, channel_id: str):
+        return self.delete_track_ids(
+            id_video,
+            channel_id,
+            self._get_all_audio_track_ids(id_video, channel_id),
+        )
     def _get_video_translation_payload(
         self, video_ids: list[str], channel_id: str
     ) -> dict:
@@ -502,10 +523,80 @@ class UpdateAudioModule(IModule):
 
         return walk(payload, in_audio=assume_audio)
 
+    @staticmethod
+    def _is_creator_dubbed_track(track: dict) -> bool:
+        """Return whether ``track`` represents a creator-uploaded dub.
+
+        Studio also exposes the source/original audio in the translations
+        response.  Its eligibility can be rendered as the black/grey locked
+        "Không đủ điều kiện" row, but that row is not a failed dub and
+        must never make the scanner select the video.  Failed uploads use the
+        canonical pair ``AUDIO_TRACK_SOURCE_CREATOR`` + ``dubbed``.
+
+        Older payloads occasionally omit one or both discriminator fields. In
+        that case keep the legacy behaviour and let the audio status decide;
+        whenever a discriminator is present it must explicitly describe a
+        creator dub.
+        """
+        if not isinstance(track, dict):
+            return False
+        source = str(
+            track.get("source")
+            or track.get("audioTrackSource")
+            or ""
+        ).upper()
+        content_type = str(
+            track.get("audioContentTypeString")
+            or track.get("audioContentType")
+            or ""
+        ).upper()
+        if source and "CREATOR" not in source:
+            return False
+        if content_type and "DUB" not in content_type:
+            return False
+        return True
+
+    @classmethod
+    def _is_trackless_source_ineligible_row(cls, item: dict) -> bool:
+        """Identify the locked source-language eligibility row.
+
+        A red rejected creator dub has an ``audioTrackId`` (and, in modern
+        responses, a matching entry in ``audioTracks``). The source-language
+        eligibility row does not. Restrict this exception to INELIGIBLE values
+        so trackless PROCESSING/FAILED legacy payloads remain detectable.
+        """
+        if not isinstance(item, dict):
+            return False
+        audio = item.get("audioTranslation")
+        if not isinstance(audio, dict) or audio.get("audioTrackId"):
+            return False
+
+        def contains_ineligible(value) -> bool:
+            if isinstance(value, dict):
+                return any(contains_ineligible(child) for child in value.values())
+            if isinstance(value, (list, tuple)):
+                return any(contains_ineligible(child) for child in value)
+            if not isinstance(value, str):
+                return False
+            normalized = "".join(ch for ch in value.upper() if ch.isalnum())
+            return any(
+                marker in normalized
+                for marker in (
+                    "INELIGIBLE",
+                    "NOTELIGIBLE",
+                    "INSUFFICIENTELIGIBILITY",
+                    "KHONGDUDIEUKIEN",
+                )
+            )
+
+        return contains_ineligible(audio)
+
     @classmethod
     def _audio_translation_needs_attention(cls, item: dict) -> bool:
         """Return true for processing, failed, ineligible, or deleted audio rows."""
-        return isinstance(item, dict) and cls._audio_payload_needs_attention(item)
+        if not isinstance(item, dict) or not cls._audio_payload_needs_attention(item):
+            return False
+        return not cls._is_trackless_source_ineligible_row(item)
 
     # Compatibility aliases for callers/tests created before the scanner was
     # expanded beyond failed-only rows.
@@ -527,25 +618,41 @@ class UpdateAudioModule(IModule):
             if video_id not in skipped:
                 skipped.append(video_id)
 
-        def scan_group(video_id: str, group: dict) -> None:
+        def scan_group(
+            video_id: str, group: dict, source_track_ids: set[str]
+        ) -> None:
             # Only translation rows render the Studio table's Audio column.
             # Group-level auto-dubbing eligibility and captionsTranslations
             # belong to the source caption editor and must not select a video.
             translations = group.get("translations") or []
             if not isinstance(translations, list):
                 return
-            if any(
-                self._audio_translation_needs_attention(item)
-                for item in translations
-            ):
+            candidate_items = []
+            for item in translations:
+                if not isinstance(item, dict):
+                    continue
+                audio = item.get("audioTranslation") or {}
+                track_id = (
+                    str(audio.get("audioTrackId") or "").strip()
+                    if isinstance(audio, dict)
+                    else ""
+                )
+                if track_id and track_id in source_track_ids:
+                    continue
+                candidate_items.append(item)
+            if any(self._audio_translation_needs_attention(item) for item in candidate_items):
                 failed_ids.add(video_id)
 
-        def scan_audio_tracks(chunk: list[str], payload: dict) -> set[str]:
+        def scan_audio_tracks(
+            chunk: list[str], payload: dict
+        ) -> tuple[set[str], set[str], dict[str, set[str]]]:
             requested = set(chunk)
             returned_video_ids: set[str] = set()
+            creator_dub_video_ids: set[str] = set()
+            source_track_ids: dict[str, set[str]] = {}
             tracks = payload.get("audioTracks") or []
             if not isinstance(tracks, list):
-                return returned_video_ids
+                return returned_video_ids, creator_dub_video_ids, source_track_ids
             for track in tracks:
                 if not isinstance(track, dict):
                     continue
@@ -553,12 +660,21 @@ class UpdateAudioModule(IModule):
                 if video_id not in requested:
                     continue
                 returned_video_ids.add(video_id)
+                if not self._is_creator_dubbed_track(track):
+                    # Original/source audio can itself be ineligible. It is
+                    # represented by the black lock in Studio and is not an
+                    # uploaded dub which this tool can repair.
+                    track_id = str(track.get("audioTrackId") or "").strip()
+                    if track_id:
+                        source_track_ids.setdefault(video_id, set()).add(track_id)
+                    continue
+                creator_dub_video_ids.add(video_id)
                 # audioTracks[] is the canonical source for the status rendered
                 # in Studio's Audio column. It is separate from
                 # videoTranslations[], which only contains the audioTrackId.
                 if self._audio_payload_needs_attention(track, assume_audio=True):
                     failed_ids.add(video_id)
-            return returned_video_ids
+            return returned_video_ids, creator_dub_video_ids, source_track_ids
 
         def scan_chunk(chunk: list[str]) -> None:
             try:
@@ -584,7 +700,11 @@ class UpdateAudioModule(IModule):
             groups = payload.get("videoTranslations") or []
             if not isinstance(groups, list):
                 groups = []
-            audio_track_video_ids = scan_audio_tracks(chunk, payload)
+            (
+                audio_track_video_ids,
+                creator_dub_video_ids,
+                source_track_ids,
+            ) = scan_audio_tracks(chunk, payload)
             valid_groups = [group for group in groups if isinstance(group, dict)]
             group_ids = [
                 self._translation_group_video_id(group) for group in valid_groups
@@ -607,7 +727,15 @@ class UpdateAudioModule(IModule):
             matched_ids = set(audio_track_video_ids)
             for group_id, group in pairs:
                 matched_ids.add(group_id)
-                scan_group(group_id, group)
+                # audioTracks[] is authoritative when Studio returned creator
+                # dubs for this video. Do not let the source-language row in
+                # videoTranslations[] override a READY creator track.
+                if group_id not in creator_dub_video_ids:
+                    scan_group(
+                        group_id,
+                        group,
+                        source_track_ids.get(group_id, set()),
+                    )
 
             missing_ids = [
                 video_id for video_id in chunk if video_id not in matched_ids

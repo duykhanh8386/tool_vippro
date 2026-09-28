@@ -66,6 +66,10 @@ def main() -> None:
     from nicegui import app, ui
 
     from src.route_manager import router
+    from src.audio_recovery import (
+        start_audio_recovery_monitor,
+        stop_audio_recovery_monitor,
+    )
     from src.task_runtime import stop_all_runs
     from web.nicegui_patches import apply_patches
     from web.theme import install_theme
@@ -79,6 +83,8 @@ def main() -> None:
     if brand_assets.is_dir():
         app.add_static_files("/tuat-videos-assets", str(brand_assets))
     router.setup_routes()
+    app.on_startup(start_audio_recovery_monitor)
+    app.on_shutdown(stop_audio_recovery_monitor)
     app.on_shutdown(stop_all_runs)
 
     @app.get(RUNTIME_HEALTH_PATH, include_in_schema=False)

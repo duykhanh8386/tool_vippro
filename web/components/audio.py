@@ -1,9 +1,14 @@
 # RECOVERED: partial depyo recovery; unresolved regions marked below
-import asyncio, tempfile, threading, time
+import asyncio, tempfile, time
 from pathlib import Path
 from typing import Awaitable, Callable, Iterable, TypeVar
 from loguru import logger
 from nicegui import context, ui
+from src.audio_recovery import (
+    AUDIO_MUTATION_GUARD,
+    clear_audio_recovery_registry,
+    register_audio_recovery,
+)
 from src.audio_batch_matcher import (
     AudioBatchMatchResult,
     build_audio_rename_plan,
@@ -27,7 +32,7 @@ from web.theme import app_card, page_header, section_header
 
 
 _T = TypeVar("_T")
-_ADD_AUDIO_RUN_GUARD = threading.Lock()
+_ADD_AUDIO_RUN_GUARD = AUDIO_MUTATION_GUARD
 _ADD_AUDIO_BACKGROUND_TASKS: set[asyncio.Task] = set()
 DEFAULT_AUDIO_UPLOAD_CONCURRENCY = 3
 MIN_AUDIO_UPLOAD_CONCURRENCY = 3
@@ -281,16 +286,17 @@ def _fetch_channel_videos(
         page_size = 50
         if normalized_scope == "recent":
             page_size = min(50, normalized_limit - len(videos))
+        list_kwargs = {"limit": page_size, "page_token": page_token}
+        if normalized_scope == "draft":
+            list_kwargs["draft_only"] = True
         page, next_token = list_videos_module.list_all_videos(
-            channel_id, limit=page_size, page_token=page_token
+            channel_id, **list_kwargs
         )
         for video in page:
             if not video.id or video.id in seen_ids:
                 continue
             seen_ids.add(video.id)
             if normalized_scope == "public" and not _is_public_video(video):
-                continue
-            if normalized_scope == "draft" and not _is_draft_video(video):
                 continue
             videos.append(video)
             if normalized_scope == "recent" and len(videos) >= normalized_limit:
@@ -348,6 +354,42 @@ def _video_from_snapshot(snapshot: dict) -> Video:
         copyright_check_status=str(snapshot.get("copyright_check_status") or ""),
         draft_status=snapshot.get("draft_status", ""),
     )
+
+
+def _remember_audio_path_history(
+    history: dict, channel_id: str | None, mappings: dict
+) -> int:
+    """Persist reusable video-to-audio mappings beyond the active scan list."""
+    if not channel_id:
+        return 0
+    bucket = history.get(channel_id)
+    if not isinstance(bucket, dict):
+        bucket = {}
+        history[channel_id] = bucket
+    remembered = 0
+    for video_id, path in mappings.items():
+        clean_id = str(video_id or "").strip()
+        clean_path = str(path or "").strip()
+        if clean_id and clean_path:
+            bucket[clean_id] = clean_path
+            remembered += 1
+    return remembered
+
+
+def _restore_audio_path_history(
+    history: dict, channel_id: str | None, video_ids: Iterable[str]
+) -> dict[str, str]:
+    """Return saved paths for videos which reappear in an error scan."""
+    bucket = history.get(channel_id) if channel_id else None
+    if not isinstance(bucket, dict):
+        return {}
+    restored = {}
+    for video_id in video_ids:
+        clean_id = str(video_id or "").strip()
+        clean_path = str(bucket.get(clean_id) or "").strip()
+        if clean_id and clean_path:
+            restored[clean_id] = clean_path
+    return restored
 
 
 def _cleanup_temp_audio_file(path: Path | None) -> None:
@@ -493,6 +535,7 @@ def create_add_audio_page():
     video_cleanup_status = {}
     delete_requested = {}
     video_workflow_signatures = {}
+    audio_path_history = {}
     repeat_settings = {"times": 2, "extra_minutes": 0}
     performance_settings = {
         "max_concurrency": DEFAULT_AUDIO_UPLOAD_CONCURRENCY,
@@ -572,6 +615,11 @@ def create_add_audio_page():
         try:
             if suppress_autosave["value"]:
                 return False
+            _remember_audio_path_history(
+                audio_path_history,
+                batch_scan_state.get("result_channel") or selected_channel["id"],
+                id_to_path,
+            )
             state = {
                 "video_ids": video_ids_state["ids"],
                 "id_to_path": id_to_path,
@@ -582,6 +630,7 @@ def create_add_audio_page():
                 "video_cleanup_status": video_cleanup_status,
                 "delete_requested": delete_requested,
                 "video_workflow_signatures": video_workflow_signatures,
+                "audio_path_history": audio_path_history,
                 "selected_languages": selected_languages["languages"],
                 "repeat_settings": repeat_settings,
                 "selected_channel": selected_channel["id"],
@@ -631,6 +680,9 @@ def create_add_audio_page():
             video_workflow_signatures.update(
                 state.get("video_workflow_signatures") or {}
             )
+            saved_history = state.get("audio_path_history") or {}
+            if isinstance(saved_history, dict):
+                audio_path_history.update(saved_history)
             if restored_cleanup != (state.get("video_cleanup_status") or {}):
                 needs_checkpoint_save = True
             if "selected_languages" in state:
@@ -843,11 +895,16 @@ def create_add_audio_page():
         return result
 
     def replace_active_video_list(
-        video_ids: Iterable[str], *, videos: Iterable[Video] = ()
+        video_ids: Iterable[str], *, videos: Iterable[Video] = (), restore_history: bool = False
     ) -> None:
         """Replace the active source and discard matches from the previous source."""
         new_ids = list(dict.fromkeys(video_id for video_id in video_ids if video_id))
         snapshots_by_id = {video.id: video for video in videos if video.id}
+        _remember_audio_path_history(
+            audio_path_history,
+            batch_scan_state.get("result_channel") or selected_channel["id"],
+            id_to_path,
+        )
         video_ids_state["ids"] = new_ids
         id_to_path.clear()
         video_titles.clear()
@@ -859,6 +916,20 @@ def create_add_audio_page():
             }
         )
         auto_match_info.clear()
+        if restore_history:
+            restored_paths = _restore_audio_path_history(
+                audio_path_history, selected_channel["id"], new_ids
+            )
+            id_to_path.update(restored_paths)
+            auto_match_info.update(
+                {
+                    video_id: {
+                        "status": "history",
+                        "detail": "Đã khôi phục file nhạc từ lần xử lý trước",
+                    }
+                    for video_id in restored_paths
+                }
+            )
         video_processing_status.clear()
         video_processing_errors.clear()
         video_cleanup_status.clear()
@@ -1201,7 +1272,12 @@ def create_add_audio_page():
                 recent_limit if scan_scope == "recent" else None
             )
             replace_active_video_list(
-                [video.id for video in failed_videos], videos=failed_videos
+                [video.id for video in failed_videos],
+                videos=failed_videos,
+                restore_history=True,
+            )
+            restored_audio_count = sum(
+                1 for video in failed_videos if id_to_path.get(video.id)
             )
             refresh_video_source_controls()
             save_right_panel_state()
@@ -1209,7 +1285,12 @@ def create_add_audio_page():
                 ui.notify(
                     f"Đã lấy {len(failed_videos)} video lỗi; đọc được "
                     f"{len(videos) - len(unreadable_ids)}/{len(videos)} video từ {scan_label}. "
-                    "Bây giờ hãy chọn cách ghép.",
+                    + (
+                        f"Đã tự khôi phục file nhạc cho {restored_audio_count} video; "
+                        "có thể bấm Bắt đầu xóa & thêm audio."
+                        if restored_audio_count
+                        else "Bây giờ hãy chọn cách ghép."
+                    ),
                     type="positive",
                 )
             elif unreadable_ids:
@@ -1324,15 +1405,31 @@ def create_add_audio_page():
         if scan_runtime["running"]:
             ui.notify("Hãy chờ quét video và thư mục nhạc hoàn tất.", type="warning")
             return
-        assignments = [
+        candidate_assignments = [
             (video_id, id_to_path[video_id])
             for video_id in video_ids_state["ids"]
             if id_to_path.get(video_id)
             and (auto_match_info.get(video_id) or {}).get("status")
             in {"duration", "title", "sequential"}
         ]
+        path_counts = {}
+        for _, path in candidate_assignments:
+            path_key = str(Path(path).resolve()).casefold()
+            path_counts[path_key] = path_counts.get(path_key, 0) + 1
+        assignments = [
+            (video_id, path)
+            for video_id, path in candidate_assignments
+            if path_counts[str(Path(path).resolve()).casefold()] == 1
+        ]
+        shared_count = len(candidate_assignments) - len(assignments)
         if not assignments:
-            ui.notify("Chưa có kết quả ghép tự động để đổi tên.", type="warning")
+            if shared_count:
+                ui.notify(
+                    "Các file đang được dùng chung cho nhiều Video ID nên được giữ nguyên tên.",
+                    type="info",
+                )
+            else:
+                ui.notify("Chưa có kết quả ghép tự động để đổi tên.", type="warning")
             return
         try:
             plan = build_audio_rename_plan(assignments)
@@ -1348,6 +1445,10 @@ def create_add_audio_page():
             ui.label(
                 f"{len(plan)} file sẽ được đổi tên thật trên ổ đĩa. Định dạng file được giữ nguyên."
             ).classes("text-sm text-gray-600")
+            if shared_count:
+                ui.label(
+                    f"Bỏ qua {shared_count} lượt ghép dùng file chung để không làm hỏng mapping."
+                ).classes("text-xs text-orange-600")
             with ui.scroll_area().classes("w-full h-64 border rounded p-2"):
                 for item in plan[:100]:
                     ui.label(f"{item.source.name}  →  {item.target.name}").classes(
@@ -1826,6 +1927,14 @@ def create_add_audio_page():
                         lambda: setattr(progress_bar, "value", completed_tasks / total_tasks),
                     )
                 if not missing_languages:
+                    register_audio_recovery(
+                        channel_id=channel_id,
+                        video_id=vid,
+                        audio_path=id_to_path.get(vid) or "",
+                        languages=languages_to_process,
+                        repeat_times=repeat_times,
+                        extra_minutes=extra_minutes,
+                    )
                     best_effort_ui(
                         "render already-complete video",
                         lambda: (
@@ -1916,6 +2025,19 @@ def create_add_audio_page():
                                 f"Hoàn thành {language_index}/{len(missing_languages)} mã còn thiếu cho video {vid}"
                             ),
                         ),
+                    )
+                if all(
+                    video_processing_status.get(vid, {}).get(language)
+                    in ("successful", "already_added")
+                    for language in languages_to_process
+                ):
+                    register_audio_recovery(
+                        channel_id=channel_id,
+                        video_id=vid,
+                        audio_path=id_to_path.get(vid) or "",
+                        languages=languages_to_process,
+                        repeat_times=repeat_times,
+                        extra_minutes=extra_minutes,
                     )
                 best_effort_ui(
                     "clear sequential upload state",
@@ -2109,7 +2231,9 @@ def create_add_audio_page():
                     if isinstance(item, dict)
                 ]
                 replace_active_video_list(
-                    [video.id for video in cached_videos], videos=cached_videos
+                    [video.id for video in cached_videos],
+                    videos=cached_videos,
+                    restore_history=True,
                 )
             else:
                 replace_active_video_list([])
@@ -2246,7 +2370,7 @@ def create_add_audio_page():
                     ui_refs["rename_button"] = rename_button
             ui.label(
                 "Ghép theo thời lượng dùng thời lượng video YouTube và mức sai lệch bên trên. "
-                "Nếu nhiều video cùng phù hợp một file, tool chọn video có thời lượng gần nhất. "
+                "Một file nhạc có thể tự ghép cho nhiều Video ID nếu từng video đều nằm trong mức sai lệch. "
                 "Ghép theo tiêu đề chỉ cần toàn bộ tiêu đề YouTube xuất hiện trong tên file, "
                 "không cần giống 100%. Vẫn có thể dùng Ghép lần lượt hoặc mapping.csv."
             ).classes("text-xs text-gray-600")
@@ -2391,6 +2515,8 @@ def create_add_audio_page():
                 video_cleanup_status.clear()
                 delete_requested.clear()
                 video_workflow_signatures.clear()
+                audio_path_history.clear()
+                clear_audio_recovery_registry()
                 selected_channel["id"] = None
                 selected_languages["languages"] = []
                 repeat_settings["times"] = 2
