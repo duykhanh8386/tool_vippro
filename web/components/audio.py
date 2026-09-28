@@ -148,6 +148,12 @@ async def _run_client_independent(job: Awaitable[None]) -> None:
         )
 
 
+async def _run_in_target_slot(container: object, job: Awaitable[None]) -> None:
+    """Keep NiceGUI's target slot available inside a detached backend task."""
+    with container:
+        await job
+
+
 def _clamp_upload_concurrency(value: object) -> int:
     try:
         parsed = int(value)
@@ -1992,7 +1998,9 @@ def create_add_audio_page():
             )
 
     async def handle_add_audio():
-        await _run_client_independent(_execute_add_audio())
+        await _run_client_independent(
+            _run_in_target_slot(page, _execute_add_audio())
+        )
 
     page = ui.column().classes("app-page audio-add-page")
     with page:

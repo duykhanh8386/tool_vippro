@@ -25,6 +25,7 @@ from web.components.audio import (
     _restore_language_statuses,
     _run_concurrently_isolated,
     _run_client_independent,
+    _run_in_target_slot,
     _run_sequentially_isolated,
     _select_videos_by_ids,
     _upload_progress_summary,
@@ -339,6 +340,24 @@ class AudioPageLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
         release.set()
         await asyncio.wait_for(finished.wait(), timeout=1)
+
+    async def test_detached_audio_job_enters_the_page_target_slot(self):
+        events = []
+
+        class FakeContainer:
+            def __enter__(self):
+                events.append("enter")
+                return self
+
+            def __exit__(self, *_args):
+                events.append("exit")
+
+        async def backend_job():
+            events.append("job")
+
+        await _run_in_target_slot(FakeContainer(), backend_job())
+
+        self.assertEqual(events, ["enter", "job", "exit"])
 
     def test_multiply_audio_encodes_one_mp3_audio_stream_directly(self):
         with (
