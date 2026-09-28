@@ -1,5 +1,6 @@
 import unittest
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -96,6 +97,55 @@ class AudioUploadTests(unittest.TestCase):
         self.assertIs(upload.call_args.kwargs["session"], session)
         self.assertIsNone(upload.call_args.kwargs["data"])
         self.assertEqual(upload.call_args.kwargs["file_path"], "rendered.mp3")
+
+    def test_parallel_workers_share_short_lived_session_token(self):
+        module = UpdateAudioModule()
+        channel = SimpleNamespace(
+            id="cache-test-channel",
+            role="CREATOR_CHANNEL_ROLE_TYPE_OWNER",
+            delegated_session_id="delegated",
+            challenge="challenge",
+            botguardResponse="botguard",
+            sapisidhash="hash",
+            cookie_string=lambda: "cookie=value",
+        )
+        cache_key = module._session_token_cache_key(channel)
+        with module._SESSION_TOKEN_CACHE_LOCK:
+            module._SESSION_TOKEN_CACHE.pop(cache_key, None)
+            module._SESSION_TOKEN_FETCH_LOCKS.pop(cache_key, None)
+
+        def fake_post(url, **_kwargs):
+            if "/att/esr" in url:
+                return Response(200, body={"ctx": "attestation"})
+            if "get_web_reauth_url" in url:
+                return Response(
+                    200,
+                    body={
+                        "encodedReauthProofToken": "proof",
+                        "sessionRiskCtx": "risk",
+                    },
+                )
+            if "/ars/grst" in url:
+                return Response(200, body={"sessionToken": "shared-token"})
+            raise AssertionError(url)
+
+        try:
+            with patch(
+                "src.module.base.post_with_stop", side_effect=fake_post
+            ) as post:
+                with ThreadPoolExecutor(max_workers=5) as executor:
+                    tokens = list(
+                        executor.map(
+                            lambda _index: module._get_session_token(channel),
+                            range(5),
+                        )
+                    )
+            self.assertEqual(tokens, ["shared-token"] * 5)
+            self.assertEqual(post.call_count, 3)
+        finally:
+            with module._SESSION_TOKEN_CACHE_LOCK:
+                module._SESSION_TOKEN_CACHE.pop(cache_key, None)
+                module._SESSION_TOKEN_FETCH_LOCKS.pop(cache_key, None)
 
     def test_timeout_queries_offset_and_resumes_same_session(self):
         module = UpdateAudioModule()

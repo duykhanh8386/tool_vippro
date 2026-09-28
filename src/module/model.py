@@ -58,6 +58,9 @@ class Video:
     privacy: str = ""
     video_status: str = ""
     copyright_check_status: str = ""
+    # Studio returns ``draftStatus`` independently from privacy/status and has
+    # used both enum and object shapes for this field.
+    draft_status: object = ""
 
 
 class AuthSignal(Enum):

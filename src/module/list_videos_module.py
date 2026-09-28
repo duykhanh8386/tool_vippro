@@ -75,7 +75,7 @@ class ListVideosModule(IModule):
                 if not copyright_status:
                     not_mon = prechecks.get("videoUploadChecksNotMonetized", {})
                     copyright_status = not_mon.get("copyrightCheck", {}).get("checkStatus", "")
-                videos.append(Video(id=item.get("videoId", ""), title=item.get("title", ""), description=item.get("description", ""), channel_id=item.get("channelId", ""), duration_ms=item.get("videoDurationMs", 0), thumbnail=item.get("thumbnailDetails", {}).get("thumbnails", [{}])[0].get("url", ""), privacy=item.get("privacy", ""), video_status=item.get("status", ""), copyright_check_status=copyright_status))
+                videos.append(Video(id=item.get("videoId", ""), title=item.get("title", ""), description=item.get("description", ""), channel_id=item.get("channelId", ""), duration_ms=item.get("videoDurationMs", 0), thumbnail=item.get("thumbnailDetails", {}).get("thumbnails", [{}])[0].get("url", ""), privacy=item.get("privacy", ""), video_status=item.get("status", ""), copyright_check_status=copyright_status, draft_status=item.get("draftStatus", "")))
             except Exception as exc:
                 logger.warning(f"Skipping malformed video entry: {exc}")
         return videos, next_page_token

@@ -1,6 +1,8 @@
 import asyncio
 import unittest
 
+import requests
+
 from src.audio_language import (
     call_audio_update_with_retry,
     invalid_language_codes,
@@ -71,6 +73,27 @@ class AudioLanguageTests(unittest.TestCase):
         asyncio.run(run_batch())
         self.assertEqual(attempted, ["en", "pt", "de", "ja"])
         self.assertEqual(failures, ["pt"])
+
+    def test_retries_transient_ssl_error(self):
+        calls = []
+        delays = []
+
+        def operation():
+            calls.append(1)
+            if len(calls) == 1:
+                raise requests.exceptions.SSLError("unexpected EOF")
+            return 200
+
+        async def fake_sleep(delay):
+            delays.append(delay)
+
+        status = asyncio.run(
+            call_audio_update_with_retry(operation, sleep=fake_sleep)
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(delays, [2.0])
 
 
 if __name__ == "__main__":

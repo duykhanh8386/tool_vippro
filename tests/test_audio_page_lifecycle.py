@@ -17,12 +17,14 @@ from web.components.audio import (
     _cleanup_temp_audio_file,
     _fetch_channel_videos,
     _fetch_all_channel_videos,
+    _is_draft_video,
     _is_youtube_auth_error,
     _normalize_recent_video_limit,
     _restore_audio_performance_settings,
     _restore_cleanup_statuses,
     _restore_language_statuses,
     _run_concurrently_isolated,
+    _run_client_independent,
     _run_sequentially_isolated,
     _select_videos_by_ids,
     _upload_progress_summary,
@@ -30,6 +32,7 @@ from web.components.audio import (
     _video_snapshot,
 )
 from src.module.model import Video
+from src.utils import multiply_audio
 from web.components.remove_audio import (
     DEFAULT_REMOVE_AUDIO_CONCURRENCY,
     MAX_REMOVE_AUDIO_CONCURRENCY,
@@ -218,6 +221,47 @@ class AudioPageLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual([video.id for video in selected], ["public"])
 
+    def test_draft_scan_uses_draft_status_not_privacy(self):
+        videos = [
+            SimpleNamespace(
+                id="draft-enum",
+                privacy="VIDEO_PRIVACY_PRIVATE",
+                draft_status="VIDEO_DRAFT_STATUS_DRAFT",
+            ),
+            SimpleNamespace(
+                id="draft-object",
+                privacy="VIDEO_PRIVACY_PRIVATE",
+                draft_status={"isDraft": True},
+            ),
+            SimpleNamespace(
+                id="ordinary-private",
+                privacy="VIDEO_PRIVACY_PRIVATE",
+                draft_status="VIDEO_DRAFT_STATUS_NONE",
+            ),
+            SimpleNamespace(
+                id="public",
+                privacy="VIDEO_PRIVACY_PUBLIC",
+                draft_status="",
+            ),
+            SimpleNamespace(
+                id="draft-status-fallback",
+                privacy="VIDEO_PRIVACY_PRIVATE",
+                draft_status="",
+                video_status="VIDEO_STATUS_DRAFT",
+            ),
+        ]
+        with patch(
+            "web.components.audio.list_videos_module.list_all_videos",
+            return_value=(videos, None),
+        ):
+            selected = _fetch_channel_videos("channel", scope="draft")
+
+        self.assertEqual(
+            [video.id for video in selected],
+            ["draft-enum", "draft-object", "draft-status-fallback"],
+        )
+        self.assertFalse(_is_draft_video(videos[2]))
+
     def test_recent_scan_stops_at_selected_newest_video_count(self):
         pages = [
             ([SimpleNamespace(id="A"), SimpleNamespace(id="B")], "next"),
@@ -264,6 +308,7 @@ class AudioPageLifecycleTests(unittest.IsolatedAsyncioTestCase):
             privacy="PUBLIC",
             video_status="UPLOADED",
             copyright_check_status="DONE",
+            draft_status="VIDEO_DRAFT_STATUS_DRAFT",
         )
 
         restored = _video_from_snapshot(_video_snapshot(original))
@@ -272,6 +317,43 @@ class AudioPageLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(restored.channel_id, original.channel_id)
         self.assertEqual(restored.title, original.title)
         self.assertEqual(restored.duration_ms, original.duration_ms)
+        self.assertEqual(restored.draft_status, original.draft_status)
+
+    async def test_client_cancellation_does_not_cancel_backend_audio_job(self):
+        started = asyncio.Event()
+        release = asyncio.Event()
+        finished = asyncio.Event()
+
+        async def backend_job():
+            started.set()
+            await release.wait()
+            finished.set()
+
+        client_task = asyncio.create_task(
+            _run_client_independent(backend_job())
+        )
+        await started.wait()
+        client_task.cancel()
+        await client_task
+        self.assertFalse(finished.is_set())
+
+        release.set()
+        await asyncio.wait_for(finished.wait(), timeout=1)
+
+    def test_multiply_audio_encodes_one_mp3_audio_stream_directly(self):
+        with (
+            patch("src.utils.get_video_duration", return_value=30),
+            patch("src.utils.run_owned_process") as run_process,
+        ):
+            multiply_audio("source.m4a", "output.mp3", times=2)
+
+        command = run_process.call_args.args[0]
+        self.assertIn("-map", command)
+        self.assertIn("0:a:0", command)
+        self.assertIn("-vn", command)
+        self.assertIn("libmp3lame", command)
+        self.assertNotIn("copy", command)
+        run_process.assert_called_once()
 
     def test_add_audio_restart_only_retries_interrupted_languages(self):
         restored = _restore_language_statuses(

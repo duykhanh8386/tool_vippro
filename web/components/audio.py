@@ -28,16 +28,18 @@ from web.theme import app_card, page_header, section_header
 
 _T = TypeVar("_T")
 _ADD_AUDIO_RUN_GUARD = threading.Lock()
+_ADD_AUDIO_BACKGROUND_TASKS: set[asyncio.Task] = set()
 DEFAULT_AUDIO_UPLOAD_CONCURRENCY = 3
 MIN_AUDIO_UPLOAD_CONCURRENCY = 3
 MAX_AUDIO_UPLOAD_CONCURRENCY = 5
 _AUDIO_UPLOAD_CONCURRENCY_MODE = "delete_then_add_parallel_v2"
 DEFAULT_RECENT_VIDEO_LIMIT = 50
 MAX_RECENT_VIDEO_LIMIT = 10_000
-VIDEO_SCAN_SCOPES = {"all", "public", "recent"}
+VIDEO_SCAN_SCOPES = {"all", "public", "draft", "recent"}
 VIDEO_SCAN_SCOPE_LABELS = {
     "all": "tất cả video",
     "public": "video công khai",
+    "draft": "video bản nháp",
     "recent": "video đăng gần nhất",
 }
 
@@ -119,6 +121,33 @@ async def _run_concurrently_isolated(
     return failures
 
 
+def _consume_background_audio_task(task: asyncio.Task) -> None:
+    """Keep detached jobs alive and consume their final exception."""
+    _ADD_AUDIO_BACKGROUND_TASKS.discard(task)
+    if task.cancelled():
+        logger.warning("Detached delete/add audio job was cancelled")
+        return
+    try:
+        task.result()
+    except Exception as exc:
+        logger.exception("Detached delete/add audio job failed: {}", exc)
+
+
+async def _run_client_independent(job: Awaitable[None]) -> None:
+    """Let backend processing survive a browser/NiceGUI client cancellation."""
+    task = asyncio.create_task(job)
+    _ADD_AUDIO_BACKGROUND_TASKS.add(task)
+    task.add_done_callback(_consume_background_audio_task)
+    try:
+        await asyncio.shield(task)
+    except asyncio.CancelledError:
+        # A page reconnect or JavaScript timeout may cancel the client event.
+        # Keep the guarded backend task alive so it can persist its checkpoints.
+        logger.warning(
+            "Audio page client task was cancelled; backend job continues detached"
+        )
+
+
 def _clamp_upload_concurrency(value: object) -> int:
     try:
         parsed = int(value)
@@ -193,6 +222,42 @@ def _is_public_video(video: object) -> bool:
     return privacy in {"PUBLIC", "VIDEO_PRIVACY_PUBLIC", "PRIVACY_PUBLIC"}
 
 
+def _draft_status_is_draft(value: object) -> bool:
+    """Recognize Studio draftStatus variants without treating PRIVATE as draft."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value == 1
+    if isinstance(value, dict):
+        for key in ("isDraft", "is_draft"):
+            if key in value:
+                return _draft_status_is_draft(value[key])
+        return any(
+            _draft_status_is_draft(value[key])
+            for key in ("draftStatus", "draftState", "status", "state", "value")
+            if key in value
+        )
+    if not isinstance(value, str):
+        return False
+    normalized = "".join(ch for ch in value.upper() if ch.isalnum())
+    if not normalized or normalized in {"0", "FALSE", "NONE", "PUBLISHED"}:
+        return False
+    if any(
+        marker in normalized
+        for marker in ("NOTDRAFT", "NONDRAFT", "STATUSNONE", "STATEPUBLISHED")
+    ):
+        return False
+    return normalized in {"1", "TRUE", "DRAFT"} or normalized.endswith(
+        ("STATUSDRAFT", "STATEDRAFT")
+    )
+
+
+def _is_draft_video(video: object) -> bool:
+    return _draft_status_is_draft(
+        getattr(video, "draft_status", "")
+    ) or _draft_status_is_draft(getattr(video, "video_status", ""))
+
+
 def _fetch_channel_videos(
     channel_id: str,
     *,
@@ -218,6 +283,8 @@ def _fetch_channel_videos(
                 continue
             seen_ids.add(video.id)
             if normalized_scope == "public" and not _is_public_video(video):
+                continue
+            if normalized_scope == "draft" and not _is_draft_video(video):
                 continue
             videos.append(video)
             if normalized_scope == "recent" and len(videos) >= normalized_limit:
@@ -255,6 +322,10 @@ def _video_snapshot(video: Video) -> dict:
         "channel_id": video.channel_id,
         "title": video.title,
         "duration_ms": video.duration_ms,
+        "privacy": video.privacy,
+        "video_status": video.video_status,
+        "copyright_check_status": video.copyright_check_status,
+        "draft_status": video.draft_status,
     }
 
 
@@ -269,6 +340,7 @@ def _video_from_snapshot(snapshot: dict) -> Video:
         privacy=str(snapshot.get("privacy") or ""),
         video_status=str(snapshot.get("video_status") or ""),
         copyright_check_status=str(snapshot.get("copyright_check_status") or ""),
+        draft_status=snapshot.get("draft_status", ""),
     )
 
 
@@ -445,6 +517,7 @@ def create_add_audio_page():
     scan_preview_container = None
     video_source_status_container = None
     scan_runtime = {"running": False}
+    right_panel_refresh = {"last": 0.0}
     suppress_autosave = {"value": False}
     ui_refs = {
         "ids_textarea": None,
@@ -1308,9 +1381,13 @@ def create_add_audio_page():
                 ).classes("app-button-primary")
         rename_dialog.open()
 
-    def refresh_right_panel():
+    def refresh_right_panel(*, force: bool = True):
         if not right_panel_container:
             return
+        now = time.monotonic()
+        if not force and now - right_panel_refresh["last"] < 1.0:
+            return
+        right_panel_refresh["last"] = now
         right_panel_container.clear()
 
         with right_panel_container:
@@ -1483,7 +1560,7 @@ def create_add_audio_page():
                             ui.label(f"Không thể cập nhật audio cho video {vid}").classes("font-semibold text-red-700")
                         for error_lang, error_message in video_errors.items():
                             ui.label(f"Ngôn ngữ {error_lang}: {error_message}").classes("text-sm text-red-700 whitespace-normal break-words")
-    async def handle_add_audio():
+    async def _execute_add_audio():
         if _ADD_AUDIO_RUN_GUARD.locked():
             ui.notify("Quy trình xóa và thêm audio đang chạy ở một trang khác.", type="warning")
             return None
@@ -1583,7 +1660,10 @@ def create_add_audio_page():
                 video_processing_errors.setdefault(vid, {}).pop(lang, None)
                 if save_right_panel_state() is False:
                     raise RuntimeError("Không thể lưu checkpoint trước khi thêm audio")
-                best_effort_ui("render pending language", refresh_right_panel)
+                best_effort_ui(
+                    "render pending language",
+                    lambda: refresh_right_panel(force=False),
+                )
 
                 def update_one_language():
                     return update_audio_module.add(
@@ -1668,7 +1748,7 @@ def create_add_audio_page():
                             status_label.set_text(
                                 "Bước 1/2: Đang xóa toàn bộ audio cũ..."
                             ),
-                            refresh_right_panel(),
+                            refresh_right_panel(force=False),
                         ),
                     )
 
@@ -1722,7 +1802,7 @@ def create_add_audio_page():
                             status_label.set_text(
                                 "Bước 1/2 hoàn tất — chuẩn bị audio mới..."
                             ),
-                            refresh_right_panel(),
+                            refresh_right_panel(force=False),
                         ),
                     )
 
@@ -1749,7 +1829,7 @@ def create_add_audio_page():
                             status_label.set_text(
                                 "Đã đủ audio track — không cần tải lại"
                             ),
-                            refresh_right_panel(),
+                            refresh_right_panel(force=False),
                         ),
                     )
                     return
@@ -1825,7 +1905,7 @@ def create_add_audio_page():
                                 "value",
                                 completed_tasks / total_tasks,
                             ),
-                            refresh_right_panel(),
+                            refresh_right_panel(force=False),
                             status_label.set_text(
                                 f"Hoàn thành {language_index}/{len(missing_languages)} mã còn thiếu cho video {vid}"
                             ),
@@ -1910,6 +1990,9 @@ def create_add_audio_page():
                     type="positive" if success_percentage >= 50 else "warning",
                 ),
             )
+
+    async def handle_add_audio():
+        await _run_client_independent(_execute_add_audio())
 
     page = ui.column().classes("app-page audio-add-page")
     with page:
@@ -2080,6 +2163,7 @@ def create_add_audio_page():
                         {
                             "all": "Tất cả video",
                             "public": "Chỉ công khai",
+                            "draft": "Bản nháp",
                             "recent": "Đăng gần nhất",
                         },
                         value=video_source_state["scan_scope"],
@@ -2255,7 +2339,7 @@ def create_add_audio_page():
                     delete_requested.update(refreshed_delete_requests)
                     video_workflow_signatures.clear()
                     video_workflow_signatures.update(refreshed_signatures)
-                    refresh_right_panel()
+                    refresh_right_panel(force=False)
             except Exception as exc:
                 logger.warning("Failed to sync add-audio checkpoint: {}", exc)
 

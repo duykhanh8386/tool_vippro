@@ -6,6 +6,8 @@ import asyncio
 import re
 from collections.abc import Awaitable, Callable
 
+import requests
+
 
 _LANGUAGE_SEPARATOR_RE = re.compile(r"[\s,;]+")
 _LANGUAGE_CODE_RE = re.compile(
@@ -75,7 +77,15 @@ async def call_audio_update_with_retry(
             error.retryable = status == 429 or status >= 500  # type: ignore[attr-defined]
             raise error
         except Exception as exc:
-            retryable = bool(getattr(exc, "retryable", False))
+            retryable = bool(getattr(exc, "retryable", False)) or isinstance(
+                exc,
+                (
+                    requests.exceptions.Timeout,
+                    requests.exceptions.ConnectionError,
+                    requests.exceptions.SSLError,
+                    requests.exceptions.ChunkedEncodingError,
+                ),
+            )
             if not retryable or attempt >= max_retries:
                 raise
             delay = base_delay * (2**attempt)
