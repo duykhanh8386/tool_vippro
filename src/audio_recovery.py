@@ -29,13 +29,28 @@ DEFAULT_RECOVERY_RETRY_COOLDOWN_SECONDS = 6 * 60 * 60
 INITIAL_RECOVERY_DELAY_SECONDS = 60
 REAUTH_ALERT_REASON = "encoded_reauth_proof_token_missing"
 
-# Shared with the manual add-audio page: a background repair and a manual
-# delete/add run must never mutate YouTube audio tracks at the same time.
-AUDIO_MUTATION_GUARD = threading.Lock()
+# Shared with the manual add-audio page. Mutations are serialized per channel,
+# so recovery on channel A can continue while the user works on channel B,
+# without ever allowing two delete/add flows to collide on the same channel.
+_AUDIO_MUTATION_GUARDS: dict[str, threading.Lock] = {}
+_AUDIO_MUTATION_GUARDS_LOCK = threading.RLock()
 
 _STATE_LOCK = threading.RLock()
 _MONITOR_TASK: asyncio.Task | None = None
 _MONITOR_STOP: asyncio.Event | None = None
+_RECOVERY_CLEAR_GENERATION = 0
+
+
+def get_audio_mutation_guard(channel_id: str) -> threading.Lock:
+    clean_channel_id = str(channel_id or "").strip()
+    if not clean_channel_id:
+        raise ValueError("channel_id is required for an audio mutation guard")
+    with _AUDIO_MUTATION_GUARDS_LOCK:
+        guard = _AUDIO_MUTATION_GUARDS.get(clean_channel_id)
+        if guard is None:
+            guard = threading.Lock()
+            _AUDIO_MUTATION_GUARDS[clean_channel_id] = guard
+        return guard
 
 
 def _default_state() -> dict:
@@ -135,13 +150,22 @@ def register_audio_recovery(
 
 def clear_audio_recovery_registry() -> bool:
     """Forget every automatic recovery mapping for the add-audio page."""
+    global _RECOVERY_CLEAR_GENERATION
     with _STATE_LOCK:
+        # A running cycle holds a snapshot of the old registry. Invalidate it
+        # so clearing data also stops any remaining automatic recovery work.
+        _RECOVERY_CLEAR_GENERATION += 1
         state = _load_state()
         state["entries"] = {}
         state["channel_refresh_alerts"] = {}
         state["last_cycle_at"] = None
         state["last_cycle_result"] = {}
         return state_manager.save_state(RECOVERY_STATE_NAME, state)
+
+
+def _recovery_was_cleared(generation: int) -> bool:
+    with _STATE_LOCK:
+        return generation != _RECOVERY_CLEAR_GENERATION
 
 
 def get_audio_recovery_state() -> dict:
@@ -398,13 +422,14 @@ def _cooldown_elapsed(entry: dict, language: str, now: float, cooldown: float) -
 async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
     """Scan the persistent registry once and selectively repair lost tracks."""
     cycle_time = float(now if now is not None else time.time())
-    if not AUDIO_MUTATION_GUARD.acquire(blocking=False):
-        logger.info("Audio auto-recovery skipped: another audio task is running.")
-        return {"skipped": "busy", "repaired": 0, "failed": 0}
-
     repaired = 0
     failed = 0
     unreadable: list[str] = []
+    deferred_busy = 0
+    cancelled_by_clear = False
+    owned_mutation_guard: threading.Lock | None = None
+    with _STATE_LOCK:
+        cycle_generation = _RECOVERY_CLEAR_GENERATION
     try:
         state = get_audio_recovery_state()
         if not state.get("enabled", True):
@@ -420,6 +445,9 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
 
         logger.info("Audio auto-recovery scan started for {} channel(s).", len(entries_by_channel))
         for channel_id, video_entries in list(entries_by_channel.items()):
+            if _recovery_was_cleared(cycle_generation):
+                cancelled_by_clear = True
+                break
             if not isinstance(video_entries, dict):
                 continue
             if channel_id in refresh_alerts:
@@ -433,6 +461,9 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
             channel_actions: list[dict] = []
             channel_requires_refresh = False
             for start in range(0, len(video_ids), batch_size):
+                if _recovery_was_cleared(cycle_generation):
+                    cancelled_by_clear = True
+                    break
                 chunk = video_ids[start : start + batch_size]
                 try:
                     payload = await asyncio.to_thread(
@@ -463,6 +494,8 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
                 channel_actions.extend(actions)
                 unreadable.extend(sorted(missing))
 
+            if cancelled_by_clear:
+                break
             if channel_requires_refresh:
                 continue
 
@@ -473,6 +506,9 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
                     actions_by_video.setdefault(action["video_id"], []).append(action)
 
             for video_id, actions in actions_by_video.items():
+                if _recovery_was_cleared(cycle_generation):
+                    cancelled_by_clear = True
+                    break
                 entry = video_entries.get(video_id) or {}
                 audio_path = Path(str(entry.get("audio_path") or ""))
                 if not audio_path.is_file():
@@ -518,8 +554,21 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
                         video_duration_seconds=duration_seconds,
                     )
 
-                    for action in actions:
+                    for action_index, action in enumerate(actions):
+                        if _recovery_was_cleared(cycle_generation):
+                            cancelled_by_clear = True
+                            break
                         language = action["language"]
+                        channel_mutation_guard = get_audio_mutation_guard(channel_id)
+                        if not channel_mutation_guard.acquire(blocking=False):
+                            deferred_busy += len(actions) - action_index
+                            logger.info(
+                                "Audio auto-recovery deferred for channel={}: "
+                                "another audio mutation has priority.",
+                                channel_id,
+                            )
+                            break
+                        owned_mutation_guard = channel_mutation_guard
                         try:
                             if action["track_ids"]:
                                 await call_audio_update_with_retry(
@@ -578,6 +627,9 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
                             )
                             if channel_requires_refresh:
                                 break
+                        finally:
+                            channel_mutation_guard.release()
+                            owned_mutation_guard = None
                 except Exception as exc:
                     if _requires_channel_refresh(exc):
                         mark_channel_refresh_required(channel_id, exc, now=cycle_time)
@@ -606,12 +658,19 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
                             logger.warning("Could not remove recovery temp file {}: {}", temp_audio_path, exc)
                 if channel_requires_refresh:
                     break
+                if cancelled_by_clear:
+                    break
+
+            if cancelled_by_clear:
+                break
 
         result = {
             "repaired": repaired,
             "failed": failed,
             "unreadable": list(dict.fromkeys(unreadable)),
             "reauth_required": sorted(get_channel_refresh_alerts()),
+            "deferred_busy": deferred_busy,
+            "cancelled_by_clear": cancelled_by_clear,
         }
         with _STATE_LOCK:
             latest = _load_state()
@@ -626,7 +685,10 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
         )
         return result
     finally:
-        AUDIO_MUTATION_GUARD.release()
+        # Defensive cleanup for cancellation between acquisition and the
+        # language-level mutation finally block.
+        if owned_mutation_guard is not None:
+            owned_mutation_guard.release()
 
 
 async def _monitor_loop(stop_event: asyncio.Event) -> None:
@@ -640,6 +702,8 @@ async def _monitor_loop(stop_event: asyncio.Event) -> None:
             0.0,
             DEFAULT_RECOVERY_INTERVAL_SECONDS - (time.time() - last_cycle_at),
         )
+        if (state.get("last_cycle_result") or {}).get("deferred_busy"):
+            initial_delay = min(initial_delay, 60.0)
     else:
         initial_delay = INITIAL_RECOVERY_DELAY_SECONDS
     try:
@@ -650,8 +714,9 @@ async def _monitor_loop(stop_event: asyncio.Event) -> None:
     except asyncio.TimeoutError:
         pass
     while not stop_event.is_set():
+        result: dict = {}
         try:
-            await run_audio_recovery_cycle()
+            result = await run_audio_recovery_cycle()
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -661,6 +726,8 @@ async def _monitor_loop(stop_event: asyncio.Event) -> None:
             interval = max(60.0, float(state.get("interval_seconds") or 0))
         except (TypeError, ValueError):
             interval = DEFAULT_RECOVERY_INTERVAL_SECONDS
+        if isinstance(result, dict) and result.get("deferred_busy"):
+            interval = 60.0
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=interval)
         except asyncio.TimeoutError:

@@ -10,6 +10,7 @@ from src.audio_recovery import (
     build_audio_recovery_plan,
     clear_audio_recovery_registry,
     get_channel_refresh_alerts,
+    get_audio_mutation_guard,
     mark_channel_refresh_required,
     register_audio_recovery,
     run_audio_recovery_cycle,
@@ -190,6 +191,187 @@ class AudioRecoveryRegistryTests(unittest.TestCase):
 
 
 class AudioRecoveryCycleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_read_only_recovery_scan_does_not_hold_mutation_guard(self):
+        state = {
+            "enabled": True,
+            "retry_cooldown_seconds": 0,
+            "entries": {
+                "channel": {
+                    "video": {
+                        "audio_path": "unused.mp3",
+                        "languages": ["en"],
+                    }
+                }
+            },
+            "channel_refresh_alerts": {},
+        }
+
+        def fetch(_video_ids, _channel_id):
+            self.assertFalse(get_audio_mutation_guard("channel").locked())
+            return {
+                "videoTranslations": [{"videoId": "video"}],
+                "audioTracks": [
+                    {
+                        "videoId": "video",
+                        "audioTrackId": "healthy-en",
+                        "language": "en",
+                        "source": "AUDIO_TRACK_SOURCE_CREATOR",
+                        "audioContentTypeString": "dubbed",
+                        "status": "AUDIO_TRACK_STATUS_READY",
+                    }
+                ],
+            }
+
+        with (
+            patch("src.audio_recovery.get_audio_recovery_state", return_value=state),
+            patch("src.audio_recovery._load_state", return_value=state),
+            patch("src.audio_recovery.state_manager.save_state", return_value=True),
+            patch.object(
+                __import__("src.audio_recovery", fromlist=["update_audio_module"]).update_audio_module,
+                "_get_video_translation_payload",
+                side_effect=fetch,
+            ),
+        ):
+            result = await run_audio_recovery_cycle(now=2000)
+
+        self.assertEqual(result["repaired"], 0)
+        self.assertFalse(get_audio_mutation_guard("channel").locked())
+
+    async def test_recovery_on_one_channel_continues_while_another_is_busy(self):
+        with tempfile.TemporaryDirectory() as folder:
+            source = Path(folder) / "source.mp3"
+            source.write_bytes(b"source")
+            state = {
+                "enabled": True,
+                "retry_cooldown_seconds": 0,
+                "entries": {
+                    channel_id: {
+                        video_id: {
+                            "audio_path": str(source),
+                            "languages": ["en"],
+                            "repeat_times": 1,
+                            "extra_minutes": 0,
+                            "attempts": {},
+                        }
+                    }
+                    for channel_id, video_id in (
+                        ("channel-a", "video-a"),
+                        ("channel-b", "video-b"),
+                    )
+                },
+                "channel_refresh_alerts": {},
+            }
+
+            def fetch(video_ids, _channel_id):
+                return {
+                    "videoTranslations": [
+                        {"videoId": video_id} for video_id in video_ids
+                    ],
+                    "audioTracks": [],
+                }
+
+            def render_audio(*, output_file, **_kwargs):
+                Path(output_file).write_bytes(b"rendered")
+
+            async def run_retry(operation, **_kwargs):
+                return operation()
+
+            added = Mock(return_value=200)
+            busy_guard = get_audio_mutation_guard("channel-b")
+            busy_guard.acquire()
+            try:
+                with (
+                    patch("src.audio_recovery.get_audio_recovery_state", return_value=state),
+                    patch("src.audio_recovery._load_state", return_value=state),
+                    patch("src.audio_recovery.state_manager.save_state", return_value=True),
+                    patch("src.audio_recovery._record_recovery_attempt"),
+                    patch.object(
+                        __import__("src.audio_recovery", fromlist=["update_audio_module"]).update_audio_module,
+                        "_get_video_translation_payload",
+                        side_effect=fetch,
+                    ),
+                    patch.object(
+                        __import__("src.audio_recovery", fromlist=["update_audio_module"]).update_audio_module,
+                        "_get_video_info",
+                        return_value=SimpleNamespace(duration_ms=60_000),
+                    ),
+                    patch.object(
+                        __import__("src.audio_recovery", fromlist=["update_audio_module"]).update_audio_module,
+                        "add",
+                        added,
+                    ),
+                    patch("src.audio_recovery.multiply_audio", side_effect=render_audio),
+                    patch(
+                        "src.audio_recovery.call_audio_update_with_retry",
+                        new=AsyncMock(side_effect=run_retry),
+                    ),
+                ):
+                    result = await run_audio_recovery_cycle(now=2000)
+            finally:
+                busy_guard.release()
+
+        self.assertEqual(result["repaired"], 1)
+        self.assertEqual(result["deferred_busy"], 1)
+        self.assertEqual(added.call_args.kwargs["id_video"], "video-a")
+
+    async def test_clearing_registry_cancels_running_recovery_snapshot(self):
+        stored = {
+            "enabled": True,
+            "retry_cooldown_seconds": 0,
+            "entries": {
+                "channel": {
+                    "video": {
+                        "audio_path": "unused.mp3",
+                        "languages": ["en"],
+                    }
+                }
+            },
+            "channel_refresh_alerts": {},
+        }
+
+        def load(_name):
+            return stored.copy()
+
+        def save(_name, state):
+            stored.clear()
+            stored.update(state)
+            return True
+
+        def fetch(_video_ids, _channel_id):
+            clear_audio_recovery_registry()
+            return {
+                "videoTranslations": [{"videoId": "video"}],
+                "audioTracks": [],
+            }
+
+        added = Mock()
+        deleted = Mock()
+        with (
+            patch("src.audio_recovery.state_manager.load_state", side_effect=load),
+            patch("src.audio_recovery.state_manager.save_state", side_effect=save),
+            patch.object(
+                __import__("src.audio_recovery", fromlist=["update_audio_module"]).update_audio_module,
+                "_get_video_translation_payload",
+                side_effect=fetch,
+            ),
+            patch.object(
+                __import__("src.audio_recovery", fromlist=["update_audio_module"]).update_audio_module,
+                "delete_track_ids",
+                deleted,
+            ),
+            patch.object(
+                __import__("src.audio_recovery", fromlist=["update_audio_module"]).update_audio_module,
+                "add",
+                added,
+            ),
+        ):
+            result = await run_audio_recovery_cycle(now=2000)
+
+        self.assertTrue(result["cancelled_by_clear"])
+        self.assertEqual(stored["entries"], {})
+        deleted.assert_not_called()
+        added.assert_not_called()
+
     async def test_non_token_scan_error_does_not_request_login(self):
         stored = {
             "enabled": True,

@@ -1,12 +1,12 @@
 # RECOVERED: partial depyo recovery; unresolved regions marked below
-import asyncio, tempfile, time
+import asyncio, tempfile, threading, time
 from pathlib import Path
 from typing import Awaitable, Callable, Iterable, TypeVar
 from loguru import logger
 from nicegui import context, ui
 from src.audio_recovery import (
-    AUDIO_MUTATION_GUARD,
     clear_audio_recovery_registry,
+    get_audio_mutation_guard,
     register_audio_recovery,
 )
 from src.audio_batch_matcher import (
@@ -32,7 +32,10 @@ from web.theme import app_card, page_header, section_header
 
 
 _T = TypeVar("_T")
-_ADD_AUDIO_RUN_GUARD = AUDIO_MUTATION_GUARD
+# This lock represents only the manual page job. Automatic recovery uses the
+# shared mutation guard, but its read-only scan must not make restored manual
+# checkpoints look like a live job in another browser tab.
+_ADD_AUDIO_RUN_GUARD = threading.Lock()
 _ADD_AUDIO_BACKGROUND_TASKS: set[asyncio.Task] = set()
 DEFAULT_AUDIO_UPLOAD_CONCURRENCY = 3
 MIN_AUDIO_UPLOAD_CONCURRENCY = 3
@@ -1709,11 +1712,21 @@ def create_add_audio_page():
         if not _ADD_AUDIO_RUN_GUARD.acquire(blocking=False):
             ui.notify("Quy trình xóa và thêm audio đang chạy ở một trang khác.", type="warning")
             return None
+        channel_mutation_guard = get_audio_mutation_guard(selected_channel["id"])
+        if not channel_mutation_guard.acquire(blocking=False):
+            _ADD_AUDIO_RUN_GUARD.release()
+            ui.notify(
+                "Tự động khôi phục audio đang cập nhật một track. "
+                "Vui lòng thử lại sau ít giây.",
+                type="warning",
+            )
+            return None
         channel_id = selected_channel["id"]
         repeat_times = repeat_settings["times"]
         extra_minutes = repeat_settings["extra_minutes"]
         video_processing_errors.clear()
         if save_right_panel_state() is False:
+            channel_mutation_guard.release()
             _ADD_AUDIO_RUN_GUARD.release()
             ui.notify("Không thể lưu phiên xử lý. Vui lòng thử lại.", type="negative")
             return None
@@ -2088,6 +2101,7 @@ def create_add_audio_page():
             save_right_panel_state()
             best_effort_ui("close progress dialog", progress_dialog.close)
             best_effort_ui("render final audio state", refresh_right_panel)
+            channel_mutation_guard.release()
             _ADD_AUDIO_RUN_GUARD.release()
         total_videos = len(video_ids_state["ids"])
         successful_videos = 0

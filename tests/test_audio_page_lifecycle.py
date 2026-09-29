@@ -12,6 +12,7 @@ from web.components.audio import (
     MAX_RECENT_VIDEO_LIMIT,
     MIN_AUDIO_UPLOAD_CONCURRENCY,
     _audio_workflow_signature,
+    _ADD_AUDIO_RUN_GUARD,
     _best_effort_ui as audio_best_effort_ui,
     _clamp_upload_concurrency,
     _cleanup_temp_audio_file,
@@ -34,6 +35,7 @@ from web.components.audio import (
     _video_from_snapshot,
     _video_snapshot,
 )
+from src.audio_recovery import get_audio_mutation_guard
 from src.module.model import Video
 from src.module.list_videos_module import ListVideosModule
 from src.utils import multiply_audio
@@ -50,6 +52,9 @@ from web.components.remove_audio import (
 
 
 class AudioPageLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    def test_manual_run_state_is_separate_from_automatic_recovery_guard(self):
+        self.assertIsNot(_ADD_AUDIO_RUN_GUARD, get_audio_mutation_guard("channel"))
+
     def test_combined_workflow_concurrency_is_limited_to_three_through_five(self):
         self.assertEqual(_clamp_upload_concurrency(None), DEFAULT_AUDIO_UPLOAD_CONCURRENCY)
         self.assertEqual(
