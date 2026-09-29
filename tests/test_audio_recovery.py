@@ -1,3 +1,4 @@
+import asyncio
 import tempfile
 import unittest
 from pathlib import Path
@@ -5,7 +6,10 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 from src.audio_recovery import (
+    DEFAULT_INITIAL_RECOVERY_GRACE_SECONDS,
     DEFAULT_RECOVERY_INTERVAL_SECONDS,
+    DEFAULT_RECOVERY_RETRY_COOLDOWN_SECONDS,
+    _monitor_loop,
     acknowledge_channel_refresh,
     build_audio_recovery_plan,
     clear_audio_recovery_registry,
@@ -18,8 +22,10 @@ from src.audio_recovery import (
 
 
 class AudioRecoveryPlanTests(unittest.TestCase):
-    def test_default_monitor_interval_is_six_hours(self):
-        self.assertEqual(DEFAULT_RECOVERY_INTERVAL_SECONDS, 6 * 60 * 60)
+    def test_default_monitor_checks_and_retries_every_fifteen_minutes(self):
+        self.assertEqual(DEFAULT_RECOVERY_INTERVAL_SECONDS, 15 * 60)
+        self.assertEqual(DEFAULT_RECOVERY_RETRY_COOLDOWN_SECONDS, 15 * 60)
+        self.assertEqual(DEFAULT_INITIAL_RECOVERY_GRACE_SECONDS, 15 * 60)
 
     def test_plan_ignores_source_lock_and_healthy_or_processing_dubs(self):
         entries = {
@@ -191,6 +197,78 @@ class AudioRecoveryRegistryTests(unittest.TestCase):
 
 
 class AudioRecoveryCycleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_monitor_runs_immediately_after_restart_despite_recent_cycle(self):
+        stop_event = asyncio.Event()
+        state = {
+            "enabled": True,
+            "interval_seconds": 15 * 60,
+            "last_cycle_at": 10**12,
+            "last_cycle_result": {},
+        }
+
+        async def run_once():
+            stop_event.set()
+            return {"repaired": 0, "failed": 0}
+
+        cycle = AsyncMock(side_effect=run_once)
+        with (
+            patch("src.audio_recovery.get_audio_recovery_state", return_value=state),
+            patch("src.audio_recovery.run_audio_recovery_cycle", cycle),
+        ):
+            await asyncio.wait_for(_monitor_loop(stop_event), timeout=0.2)
+
+        cycle.assert_awaited_once_with()
+
+    async def test_new_registration_first_scans_when_initial_grace_elapses(self):
+        state = {
+            "enabled": True,
+            "retry_cooldown_seconds": 0,
+            "initial_grace_seconds": 15 * 60,
+            "entries": {
+                "channel": {
+                    "video": {
+                        "audio_path": "unused.mp3",
+                        "languages": ["en"],
+                        "registered_at": 1000,
+                    }
+                }
+            },
+            "channel_refresh_alerts": {},
+        }
+        fetch = Mock(
+            return_value={
+                "videoTranslations": [{"videoId": "video"}],
+                "audioTracks": [
+                    {
+                        "videoId": "video",
+                        "audioTrackId": "healthy-en",
+                        "language": "en",
+                        "source": "AUDIO_TRACK_SOURCE_CREATOR",
+                        "audioContentTypeString": "dubbed",
+                        "status": "AUDIO_TRACK_STATUS_READY",
+                    }
+                ],
+            }
+        )
+        with (
+            patch("src.audio_recovery.get_audio_recovery_state", return_value=state),
+            patch("src.audio_recovery._load_state", return_value=state),
+            patch("src.audio_recovery.state_manager.save_state", return_value=True),
+            patch.object(
+                __import__("src.audio_recovery", fromlist=["update_audio_module"]).update_audio_module,
+                "_get_video_translation_payload",
+                fetch,
+            ),
+        ):
+            result = await run_audio_recovery_cycle(now=1000 + 14 * 60)
+            due_result = await run_audio_recovery_cycle(now=1000 + 15 * 60)
+
+        fetch.assert_called_once_with(["video"], "channel")
+        self.assertEqual(result["deferred_initial_grace"], 1)
+        self.assertEqual(result["repaired"], 0)
+        self.assertEqual(due_result["deferred_initial_grace"], 0)
+        self.assertEqual(due_result["repaired"], 0)
+
     async def test_read_only_recovery_scan_does_not_hold_mutation_guard(self):
         state = {
             "enabled": True,
@@ -277,6 +355,13 @@ class AudioRecoveryCycleTests(unittest.IsolatedAsyncioTestCase):
                 return operation()
 
             added = Mock(return_value=200)
+            scanned_channels = []
+            original_fetch = fetch
+
+            def record_fetch(video_ids, channel_id):
+                scanned_channels.append(channel_id)
+                return original_fetch(video_ids, channel_id)
+
             busy_guard = get_audio_mutation_guard("channel-b")
             busy_guard.acquire()
             try:
@@ -288,7 +373,7 @@ class AudioRecoveryCycleTests(unittest.IsolatedAsyncioTestCase):
                     patch.object(
                         __import__("src.audio_recovery", fromlist=["update_audio_module"]).update_audio_module,
                         "_get_video_translation_payload",
-                        side_effect=fetch,
+                        side_effect=record_fetch,
                     ),
                     patch.object(
                         __import__("src.audio_recovery", fromlist=["update_audio_module"]).update_audio_module,
@@ -312,6 +397,7 @@ class AudioRecoveryCycleTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result["repaired"], 1)
         self.assertEqual(result["deferred_busy"], 1)
+        self.assertEqual(scanned_channels, ["channel-a"])
         self.assertEqual(added.call_args.kwargs["id_video"], "video-a")
 
     async def test_clearing_registry_cancels_running_recovery_snapshot(self):

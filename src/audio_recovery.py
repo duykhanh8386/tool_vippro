@@ -24,9 +24,9 @@ from src.utils import multiply_audio, normalize_path
 
 
 RECOVERY_STATE_NAME = "audio_recovery"
-DEFAULT_RECOVERY_INTERVAL_SECONDS = 6 * 60 * 60
-DEFAULT_RECOVERY_RETRY_COOLDOWN_SECONDS = 6 * 60 * 60
-INITIAL_RECOVERY_DELAY_SECONDS = 60
+DEFAULT_RECOVERY_INTERVAL_SECONDS = 15 * 60
+DEFAULT_RECOVERY_RETRY_COOLDOWN_SECONDS = 15 * 60
+DEFAULT_INITIAL_RECOVERY_GRACE_SECONDS = 15 * 60
 REAUTH_ALERT_REASON = "encoded_reauth_proof_token_missing"
 
 # Shared with the manual add-audio page. Mutations are serialized per channel,
@@ -58,6 +58,7 @@ def _default_state() -> dict:
         "enabled": True,
         "interval_seconds": DEFAULT_RECOVERY_INTERVAL_SECONDS,
         "retry_cooldown_seconds": DEFAULT_RECOVERY_RETRY_COOLDOWN_SECONDS,
+        "initial_grace_seconds": DEFAULT_INITIAL_RECOVERY_GRACE_SECONDS,
         "entries": {},
         "channel_refresh_alerts": {},
         "last_cycle_at": None,
@@ -84,9 +85,12 @@ def _load_state() -> dict:
             if isinstance(alert, dict)
             and alert.get("reason") == REAUTH_ALERT_REASON
         }
-    # The recovery cadence is a product-level safety limit rather than a
-    # per-page preference. Normalize older 15-minute state after an upgrade.
+    # Recovery cadence is a product-level safety limit rather than a per-page
+    # preference. Normalize older six-hour state after an upgrade so existing
+    # installations receive the faster verification and retry schedule.
     state["interval_seconds"] = DEFAULT_RECOVERY_INTERVAL_SECONDS
+    state["retry_cooldown_seconds"] = DEFAULT_RECOVERY_RETRY_COOLDOWN_SECONDS
+    state["initial_grace_seconds"] = DEFAULT_INITIAL_RECOVERY_GRACE_SECONDS
     return state
 
 
@@ -419,6 +423,28 @@ def _cooldown_elapsed(entry: dict, language: str, now: float, cooldown: float) -
     return now - attempted_at >= cooldown
 
 
+def _initial_grace_elapsed(entry: dict, now: float, grace: float) -> bool:
+    """Delay the first verification long enough for Studio to settle a new track.
+
+    Legacy entries do not have ``registered_at`` and remain immediately eligible.
+    With a 15-minute monitor cadence, a new entry is first checked between 15 and
+    30 minutes after it was registered.
+    """
+    try:
+        registered_at = float(entry.get("registered_at") or 0)
+    except (TypeError, ValueError):
+        registered_at = 0
+    return registered_at <= 0 or now - registered_at >= grace
+
+
+def _registered_language_count(video_entries: dict[str, dict]) -> int:
+    return sum(
+        len(entry.get("languages") or [])
+        for entry in video_entries.values()
+        if isinstance(entry, dict)
+    )
+
+
 async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
     """Scan the persistent registry once and selectively repair lost tracks."""
     cycle_time = float(now if now is not None else time.time())
@@ -426,6 +452,7 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
     failed = 0
     unreadable: list[str] = []
     deferred_busy = 0
+    deferred_initial_grace = 0
     cancelled_by_clear = False
     owned_mutation_guard: threading.Lock | None = None
     with _STATE_LOCK:
@@ -440,6 +467,19 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
             cooldown = max(0.0, float(state.get("retry_cooldown_seconds") or 0))
         except (TypeError, ValueError):
             cooldown = DEFAULT_RECOVERY_RETRY_COOLDOWN_SECONDS
+        try:
+            raw_initial_grace = state.get(
+                "initial_grace_seconds",
+                DEFAULT_INITIAL_RECOVERY_GRACE_SECONDS,
+            )
+            if raw_initial_grace is None:
+                raw_initial_grace = DEFAULT_INITIAL_RECOVERY_GRACE_SECONDS
+            initial_grace = max(
+                0.0,
+                float(raw_initial_grace),
+            )
+        except (TypeError, ValueError):
+            initial_grace = DEFAULT_INITIAL_RECOVERY_GRACE_SECONDS
         if not entries_by_channel:
             return {"skipped": "empty", "repaired": 0, "failed": 0}
 
@@ -456,7 +496,30 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
                     channel_id,
                 )
                 continue
-            video_ids = list(video_entries)
+            eligible_entries = {
+                video_id: entry
+                for video_id, entry in video_entries.items()
+                if isinstance(entry, dict)
+                and _initial_grace_elapsed(entry, cycle_time, initial_grace)
+            }
+            deferred_initial_grace += len(video_entries) - len(eligible_entries)
+            if not eligible_entries:
+                continue
+
+            # The normal/manual flow owns this guard for its entire channel
+            # batch. Do not even scan YouTube while it is active; defer this
+            # channel to keep recovery traffic and state decisions isolated.
+            channel_mutation_guard = get_audio_mutation_guard(channel_id)
+            if channel_mutation_guard.locked():
+                deferred_busy += _registered_language_count(eligible_entries)
+                logger.info(
+                    "Audio auto-recovery deferred for channel={}: "
+                    "manual audio flow has priority.",
+                    channel_id,
+                )
+                continue
+
+            video_ids = list(eligible_entries)
             batch_size = update_audio_module._TRANSLATION_BATCH_SIZE
             channel_actions: list[dict] = []
             channel_requires_refresh = False
@@ -488,7 +551,7 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
                     continue
                 actions, missing = build_audio_recovery_plan(
                     payload,
-                    {video_id: video_entries[video_id] for video_id in chunk},
+                    {video_id: eligible_entries[video_id] for video_id in chunk},
                     chunk,
                 )
                 channel_actions.extend(actions)
@@ -501,7 +564,7 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
 
             actions_by_video: dict[str, list[dict]] = {}
             for action in channel_actions:
-                entry = video_entries.get(action["video_id"]) or {}
+                entry = eligible_entries.get(action["video_id"]) or {}
                 if _cooldown_elapsed(entry, action["language"], cycle_time, cooldown):
                     actions_by_video.setdefault(action["video_id"], []).append(action)
 
@@ -509,7 +572,17 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
                 if _recovery_was_cleared(cycle_generation):
                     cancelled_by_clear = True
                     break
-                entry = video_entries.get(video_id) or {}
+                entry = eligible_entries.get(video_id) or {}
+                channel_mutation_guard = get_audio_mutation_guard(channel_id)
+                if channel_mutation_guard.locked():
+                    deferred_busy += len(actions)
+                    logger.info(
+                        "Audio auto-recovery deferred for channel={} video={}: "
+                        "another audio mutation has priority.",
+                        channel_id,
+                        video_id,
+                    )
+                    continue
                 audio_path = Path(str(entry.get("audio_path") or ""))
                 if not audio_path.is_file():
                     message = f"Không còn file audio: {audio_path}"
@@ -559,7 +632,6 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
                             cancelled_by_clear = True
                             break
                         language = action["language"]
-                        channel_mutation_guard = get_audio_mutation_guard(channel_id)
                         if not channel_mutation_guard.acquire(blocking=False):
                             deferred_busy += len(actions) - action_index
                             logger.info(
@@ -670,6 +742,7 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
             "unreadable": list(dict.fromkeys(unreadable)),
             "reauth_required": sorted(get_channel_refresh_alerts()),
             "deferred_busy": deferred_busy,
+            "deferred_initial_grace": deferred_initial_grace,
             "cancelled_by_clear": cancelled_by_clear,
         }
         with _STATE_LOCK:
@@ -692,27 +765,9 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
 
 
 async def _monitor_loop(stop_event: asyncio.Event) -> None:
-    state = get_audio_recovery_state()
-    try:
-        last_cycle_at = float(state.get("last_cycle_at") or 0)
-    except (TypeError, ValueError):
-        last_cycle_at = 0
-    if last_cycle_at > 0:
-        initial_delay = max(
-            0.0,
-            DEFAULT_RECOVERY_INTERVAL_SECONDS - (time.time() - last_cycle_at),
-        )
-        if (state.get("last_cycle_result") or {}).get("deferred_busy"):
-            initial_delay = min(initial_delay, 60.0)
-    else:
-        initial_delay = INITIAL_RECOVERY_DELAY_SECONDS
-    try:
-        await asyncio.wait_for(
-            stop_event.wait(), timeout=initial_delay
-        )
-        return
-    except asyncio.TimeoutError:
-        pass
+    # Always run one cycle as soon as the process starts. Persisted
+    # ``last_cycle_at`` is diagnostic only and must not postpone recovery after
+    # the tool has been closed and reopened.
     while not stop_event.is_set():
         result: dict = {}
         try:
@@ -744,8 +799,9 @@ def start_audio_recovery_monitor() -> None:
         _monitor_loop(_MONITOR_STOP), name="audio-auto-recovery"
     )
     logger.info(
-        "Audio auto-recovery monitor is running (interval={}h).",
-        DEFAULT_RECOVERY_INTERVAL_SECONDS / 3600,
+        "Audio auto-recovery monitor is running (interval={}m, initial_grace={}m).",
+        DEFAULT_RECOVERY_INTERVAL_SECONDS / 60,
+        DEFAULT_INITIAL_RECOVERY_GRACE_SECONDS / 60,
     )
 
 
