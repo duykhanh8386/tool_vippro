@@ -5,6 +5,10 @@ from datetime import datetime
 from loguru import logger
 from nicegui import context, ui
 
+from src.audio_recovery import (
+    acknowledge_channel_refresh,
+    run_audio_recovery_cycle,
+)
 from src.channel_scanner import (
     AUTHENTICATION_TIMEOUT_SECONDS,
     ChannelFetcher,
@@ -104,6 +108,13 @@ def create_studio_content():
                     password=password,
                     on_authenticated=lambda: scan_state.update(authenticated=True),
                 )
+            refreshed_channel_ids = [
+                str(channel.get("id") or "")
+                for channel in report.channels
+                if isinstance(channel, dict) and channel.get("id")
+            ]
+            if acknowledge_channel_refresh(refreshed_channel_ids):
+                asyncio.create_task(run_audio_recovery_cycle())
             if report.failures:
                 best_effort_ui(
                     "notify partial channel scan",

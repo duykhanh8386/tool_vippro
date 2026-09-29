@@ -27,6 +27,7 @@ RECOVERY_STATE_NAME = "audio_recovery"
 DEFAULT_RECOVERY_INTERVAL_SECONDS = 6 * 60 * 60
 DEFAULT_RECOVERY_RETRY_COOLDOWN_SECONDS = 6 * 60 * 60
 INITIAL_RECOVERY_DELAY_SECONDS = 60
+REAUTH_ALERT_REASON = "encoded_reauth_proof_token_missing"
 
 # Shared with the manual add-audio page: a background repair and a manual
 # delete/add run must never mutate YouTube audio tracks at the same time.
@@ -43,6 +44,7 @@ def _default_state() -> dict:
         "interval_seconds": DEFAULT_RECOVERY_INTERVAL_SECONDS,
         "retry_cooldown_seconds": DEFAULT_RECOVERY_RETRY_COOLDOWN_SECONDS,
         "entries": {},
+        "channel_refresh_alerts": {},
         "last_cycle_at": None,
         "last_cycle_result": {},
     }
@@ -55,6 +57,18 @@ def _load_state() -> dict:
         state.update(raw)
     if not isinstance(state.get("entries"), dict):
         state["entries"] = {}
+    if not isinstance(state.get("channel_refresh_alerts"), dict):
+        state["channel_refresh_alerts"] = {}
+    else:
+        # Discard alerts created by the short-lived implementation which
+        # required a refresh before every scheduled cycle.  Refresh is now
+        # required only after YouTube actually rejects the reauth proof flow.
+        state["channel_refresh_alerts"] = {
+            str(channel_id): alert
+            for channel_id, alert in state["channel_refresh_alerts"].items()
+            if isinstance(alert, dict)
+            and alert.get("reason") == REAUTH_ALERT_REASON
+        }
     # The recovery cadence is a product-level safety limit rather than a
     # per-page preference. Normalize older 15-minute state after an upgrade.
     state["interval_seconds"] = DEFAULT_RECOVERY_INTERVAL_SECONDS
@@ -124,6 +138,7 @@ def clear_audio_recovery_registry() -> bool:
     with _STATE_LOCK:
         state = _load_state()
         state["entries"] = {}
+        state["channel_refresh_alerts"] = {}
         state["last_cycle_at"] = None
         state["last_cycle_result"] = {}
         return state_manager.save_state(RECOVERY_STATE_NAME, state)
@@ -133,6 +148,84 @@ def get_audio_recovery_state() -> dict:
     """Expose a snapshot for diagnostics and tests."""
     with _STATE_LOCK:
         return _load_state()
+
+
+def get_channel_refresh_alerts() -> dict[str, dict]:
+    """Return channels which must be refreshed before automatic recovery."""
+    with _STATE_LOCK:
+        alerts = _load_state().get("channel_refresh_alerts") or {}
+        return {
+            str(channel_id): dict(alert)
+            for channel_id, alert in alerts.items()
+            if isinstance(alert, dict)
+        }
+
+
+def mark_channel_refresh_required(
+    channel_id: str,
+    error: BaseException | str,
+    *,
+    now: float | None = None,
+) -> bool:
+    """Persist a reload warning after YouTube rejects the reauth proof flow."""
+    clean_channel_id = str(channel_id or "").strip()
+    if not clean_channel_id:
+        return False
+    requested_at = float(now if now is not None else time.time())
+    with _STATE_LOCK:
+        state = _load_state()
+        alerts = state.setdefault("channel_refresh_alerts", {})
+        alerts[clean_channel_id] = {
+            "requested_at": requested_at,
+            "reason": REAUTH_ALERT_REASON,
+            "error": str(error),
+            "message": (
+                "YouTube không cấp token xác thực cho kênh. Vui lòng đăng nhập "
+                "và tải lại thông tin kênh để tiếp tục tự động khôi phục audio."
+            ),
+        }
+        saved = state_manager.save_state(RECOVERY_STATE_NAME, state)
+    if saved:
+        logger.warning(
+            "Audio auto-recovery paused for channel={}: missing encodedReauthProofToken; "
+            "login/channel reload required.",
+            clean_channel_id,
+        )
+    return saved
+
+
+def _requires_channel_refresh(error: BaseException) -> bool:
+    """Recognize the specific YouTube reauth failure through wrapped errors."""
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if "encodedreauthprooftoken" in str(current).casefold():
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+def acknowledge_channel_refresh(channel_ids: Iterable[str]) -> int:
+    """Clear alerts for channels successfully reloaded by ChannelFetcher."""
+    refreshed = {str(channel_id or "").strip() for channel_id in channel_ids}
+    refreshed.discard("")
+    if not refreshed:
+        return 0
+    with _STATE_LOCK:
+        state = _load_state()
+        alerts = state.setdefault("channel_refresh_alerts", {})
+        removed = sum(1 for channel_id in refreshed if channel_id in alerts)
+        for channel_id in refreshed:
+            alerts.pop(channel_id, None)
+        if removed:
+            state_manager.save_state(RECOVERY_STATE_NAME, state)
+    if removed:
+        logger.info(
+            "Channel refresh acknowledged for audio recovery: channels={}",
+            ",".join(sorted(refreshed)),
+        )
+    return removed
 
 
 def _track_language(track: dict) -> str:
@@ -317,6 +410,7 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
         if not state.get("enabled", True):
             return {"skipped": "disabled", "repaired": 0, "failed": 0}
         entries_by_channel = state.get("entries") or {}
+        refresh_alerts = state.get("channel_refresh_alerts") or {}
         try:
             cooldown = max(0.0, float(state.get("retry_cooldown_seconds") or 0))
         except (TypeError, ValueError):
@@ -328,9 +422,16 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
         for channel_id, video_entries in list(entries_by_channel.items()):
             if not isinstance(video_entries, dict):
                 continue
+            if channel_id in refresh_alerts:
+                logger.info(
+                    "Audio auto-recovery paused for channel={}: waiting for full channel refresh.",
+                    channel_id,
+                )
+                continue
             video_ids = list(video_entries)
             batch_size = update_audio_module._TRANSLATION_BATCH_SIZE
             channel_actions: list[dict] = []
+            channel_requires_refresh = False
             for start in range(0, len(video_ids), batch_size):
                 chunk = video_ids[start : start + batch_size]
                 try:
@@ -342,12 +443,17 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
                 except Exception as exc:
                     failed += len(chunk)
                     unreadable.extend(chunk)
+                    if _requires_channel_refresh(exc):
+                        mark_channel_refresh_required(channel_id, exc, now=cycle_time)
+                        channel_requires_refresh = True
                     logger.error(
                         "Audio auto-recovery could not scan channel={} videos={}: {}",
                         channel_id,
                         ",".join(chunk),
                         exc,
                     )
+                    if channel_requires_refresh:
+                        break
                     continue
                 actions, missing = build_audio_recovery_plan(
                     payload,
@@ -356,6 +462,9 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
                 )
                 channel_actions.extend(actions)
                 unreadable.extend(sorted(missing))
+
+            if channel_requires_refresh:
+                continue
 
             actions_by_video: dict[str, list[dict]] = {}
             for action in channel_actions:
@@ -447,6 +556,11 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
                             )
                         except Exception as exc:
                             failed += 1
+                            if _requires_channel_refresh(exc):
+                                mark_channel_refresh_required(
+                                    channel_id, exc, now=cycle_time
+                                )
+                                channel_requires_refresh = True
                             _record_recovery_attempt(
                                 channel_id,
                                 video_id,
@@ -462,7 +576,12 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
                                 language,
                                 exc,
                             )
+                            if channel_requires_refresh:
+                                break
                 except Exception as exc:
+                    if _requires_channel_refresh(exc):
+                        mark_channel_refresh_required(channel_id, exc, now=cycle_time)
+                        channel_requires_refresh = True
                     logger.error(
                         "Audio auto-recovery preparation failed: channel={} video={} error={}",
                         channel_id,
@@ -485,11 +604,14 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
                             temp_audio_path.unlink(missing_ok=True)
                         except OSError as exc:
                             logger.warning("Could not remove recovery temp file {}: {}", temp_audio_path, exc)
+                if channel_requires_refresh:
+                    break
 
         result = {
             "repaired": repaired,
             "failed": failed,
             "unreadable": list(dict.fromkeys(unreadable)),
+            "reauth_required": sorted(get_channel_refresh_alerts()),
         }
         with _STATE_LOCK:
             latest = _load_state()

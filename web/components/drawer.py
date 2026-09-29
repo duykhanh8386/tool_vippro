@@ -3,6 +3,7 @@ from typing import Iterator, Optional
 
 from nicegui import context, ui
 
+from src.audio_recovery import get_channel_refresh_alerts
 from web.components.update_dialog import create_update_control
 
 
@@ -86,6 +87,42 @@ def create_drawer():
                 with ui.column().classes("gap-0 min-w-0"):
                     ui.label("Tuất Videos").classes("app-brand-title")
                     ui.label("Operations workspace").classes("app-brand-copy")
+
+            recovery_alert_container = ui.column().classes("w-full gap-1")
+            recovery_alert_state = {"signature": None}
+
+            def refresh_recovery_alert() -> None:
+                alerts = get_channel_refresh_alerts()
+                signature = tuple(sorted(alerts))
+                recovery_alert_container.clear()
+                if not alerts:
+                    recovery_alert_state["signature"] = None
+                    return
+                with recovery_alert_container:
+                    with ui.card().classes(
+                        "w-full p-2 bg-amber-50 border border-amber-300 shadow-none"
+                    ):
+                        ui.label(
+                            f"YouTube thiếu token xác thực cho {len(alerts)} kênh. "
+                            "Hãy đăng nhập và tải lại thông tin kênh."
+                        ).classes("text-xs text-amber-900")
+                        ui.button(
+                            "Đăng nhập lại",
+                            icon="refresh",
+                            on_click=lambda: _navigate("/studio"),
+                        ).props("flat dense").classes("text-amber-800")
+                if recovery_alert_state["signature"] != signature:
+                    ui.notify(
+                        "Tự động khôi phục audio đang tạm dừng vì YouTube không "
+                        "cấp token. Vui lòng đăng nhập và tải lại kênh.",
+                        type="warning",
+                        timeout=0,
+                        close_button="Đóng",
+                    )
+                    recovery_alert_state["signature"] = signature
+
+            refresh_recovery_alert()
+            ui.timer(10.0, refresh_recovery_alert)
 
             with ui.column().classes("w-full gap-0 flex-1"):
                 ui.label("Tổng quan").classes("app-nav-label")
