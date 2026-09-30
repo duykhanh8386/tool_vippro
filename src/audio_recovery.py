@@ -1,9 +1,10 @@
 """Persistent background recovery for creator-uploaded YouTube audio tracks.
 
 The registry lives in the app SQLite database, so it survives browser/NiceGUI
-disconnects and process restarts on the same machine or VM.  The monitor only
-replaces the failed/missing languages recorded after a successful manual run;
-it never deletes healthy languages or the source/original audio track.
+disconnects and process restarts on the same machine or VM. The monitor only
+replaces registered languages for which Studio returns an explicit terminal
+failure; it never infers failure from an omitted row, deletes healthy languages,
+or touches the source/original audio track.
 """
 
 from __future__ import annotations
@@ -155,6 +156,7 @@ def register_audio_recovery(
     repeat_times: int,
     extra_minutes: float,
     registered_at: float | None = None,
+    merge_languages: bool = False,
 ) -> bool:
     """Persist one successfully matched/uploaded video for later recovery."""
     clean_channel = str(channel_id or "").strip()
@@ -177,14 +179,29 @@ def register_audio_recovery(
         previous = videos.get(clean_video)
         attempts = previous.get("attempts", {}) if isinstance(previous, dict) else {}
         if isinstance(previous, dict):
-            same_configuration = (
+            same_audio_configuration = (
                 str(previous.get("audio_path") or "") == clean_path
-                and list(previous.get("languages") or []) == clean_languages
                 and int(previous.get("repeat_times") or 1) == max(1, int(repeat_times))
                 and float(previous.get("extra_minutes") or 0)
                 == max(0.0, float(extra_minutes))
             )
-            if not same_configuration:
+            if merge_languages and same_audio_configuration:
+                clean_languages = list(
+                    dict.fromkeys(
+                        [
+                            str(language or "").strip()
+                            for language in previous.get("languages") or []
+                            if str(language or "").strip()
+                        ]
+                        + clean_languages
+                    )
+                )
+            languages_changed = (
+                list(previous.get("languages") or []) != clean_languages
+            )
+            if not same_audio_configuration or (
+                languages_changed and not merge_languages
+            ):
                 attempts = {}
         videos[clean_video] = {
             "audio_path": clean_path,
@@ -469,8 +486,16 @@ def build_audio_recovery_plan(
     """
     requested_order = requested_order or list(requested_entries)
     requested = set(requested_entries)
-    readable_ids: set[str] = set()
+    terminal_targets, unreadable_ids = (
+        update_audio_module._terminal_repair_targets_from_payload(
+            payload, requested_order
+        )
+    )
+    readable_ids = requested - unreadable_ids
+
     groups = payload.get("videoTranslations") or []
+    if not isinstance(groups, list):
+        groups = []
     valid_groups = [group for group in groups if isinstance(group, dict)]
     group_ids = [
         update_audio_module._translation_group_video_id(group)
@@ -478,78 +503,145 @@ def build_audio_recovery_plan(
     ]
     if valid_groups and all(group_id is None for group_id in group_ids):
         if len(valid_groups) == len(requested_order):
-            readable_ids.update(requested_order)
+            group_pairs = list(zip(requested_order, valid_groups))
         elif len(requested_order) == 1:
-            readable_ids.add(requested_order[0])
+            group_pairs = [(requested_order[0], valid_groups[0])]
+        else:
+            group_pairs = []
     else:
-        readable_ids.update(
-            group_id for group_id in group_ids if group_id in requested
-        )
+        group_pairs = [
+            (group_id, group)
+            for group_id, group in zip(group_ids, valid_groups)
+            if group_id in requested
+        ]
 
-    tracks_by_video: dict[str, list[dict]] = {}
+    translations_by_video: dict[str, list[dict]] = {}
+    translations_by_track: dict[tuple[str, str], dict] = {}
+    for video_id, group in group_pairs:
+        translations = group.get("translations") or []
+        if not isinstance(translations, list):
+            continue
+        clean_items = [item for item in translations if isinstance(item, dict)]
+        translations_by_video[video_id] = clean_items
+        for item in clean_items:
+            audio = item.get("audioTranslation") or {}
+            if not isinstance(audio, dict):
+                continue
+            track_id = str(audio.get("audioTrackId") or "").strip()
+            if track_id:
+                translations_by_track[(video_id, track_id)] = item
+
+    source_track_ids: dict[str, set[str]] = {}
+    creator_track_ids: dict[str, set[str]] = {}
+    observations: dict[str, dict[str, set[str]]] = {}
+
+    def observe(video_id: str, language: str, state: str) -> None:
+        clean_language = str(language or "").strip().casefold()
+        if clean_language:
+            observations.setdefault(video_id, {}).setdefault(
+                clean_language, set()
+            ).add(state)
+
     tracks = payload.get("audioTracks") or []
     if isinstance(tracks, list):
         for track in tracks:
             if not isinstance(track, dict):
                 continue
-            video_id = str(track.get("videoId") or "")
+            video_id = str(track.get("videoId") or "").strip()
             if video_id not in requested:
                 continue
-            readable_ids.add(video_id)
-            if update_audio_module._is_creator_dubbed_track(track):
-                tracks_by_video.setdefault(video_id, []).append(track)
+            track_id = str(track.get("audioTrackId") or "").strip()
+            if not update_audio_module._is_creator_dubbed_track(track):
+                if track_id:
+                    source_track_ids.setdefault(video_id, set()).add(track_id)
+                continue
+            if track_id:
+                creator_track_ids.setdefault(video_id, set()).add(track_id)
+            translation = translations_by_track.get((video_id, track_id), {})
+            language = (
+                update_audio_module._translation_language(track)
+                or update_audio_module._translation_language(translation)
+                or ""
+            )
+            if update_audio_module._audio_payload_has_terminal_failure(
+                track, assume_audio=True
+            ):
+                state = "terminal"
+            elif update_audio_module._audio_payload_needs_attention(
+                track, assume_audio=True
+            ):
+                state = "inflight"
+            else:
+                state = "healthy"
+            observe(video_id, language, state)
 
+    # Published tracks are not always repeated in root audioTracks. Treat the
+    # language row's audioTranslation as evidence too, otherwise a published
+    # language looks "missing" and is uploaded again.
+    for video_id, items in translations_by_video.items():
+        for item in items:
+            audio = item.get("audioTranslation") or {}
+            if not isinstance(audio, dict) or not audio:
+                continue
+            track_id = str(audio.get("audioTrackId") or "").strip()
+            if track_id in source_track_ids.get(video_id, set()):
+                continue
+            if track_id and track_id in creator_track_ids.get(video_id, set()):
+                continue
+            language = update_audio_module._translation_language(item) or ""
+            if update_audio_module._audio_translation_has_terminal_failure(item):
+                state = "terminal"
+            elif update_audio_module._audio_payload_needs_attention(item):
+                state = "inflight"
+            else:
+                state = "healthy"
+            observe(video_id, language, state)
+
+    terminal_by_video = {
+        video_id: {
+            str(action.get("language") or "").casefold(): action
+            for action in video_actions
+        }
+        for video_id, video_actions in terminal_targets.items()
+    }
     actions: list[dict] = []
     for video_id, entry in requested_entries.items():
         if video_id not in readable_ids or not isinstance(entry, dict):
             continue
-        creator_tracks = tracks_by_video.get(video_id, [])
-        by_language: dict[str, list[dict]] = {}
-        for track in creator_tracks:
-            language = _track_language(track).casefold()
-            if language:
-                by_language.setdefault(language, []).append(track)
-
         for language in entry.get("languages") or []:
             clean_language = str(language or "").strip()
             if not clean_language:
                 continue
-            matching = by_language.get(clean_language.casefold(), [])
-            if matching and any(
-                not update_audio_module._audio_payload_needs_attention(
-                    track, assume_audio=True
-                )
-                for track in matching
-            ):
+            language_key = clean_language.casefold()
+            states = observations.get(video_id, {}).get(language_key, set())
+            # One healthy copy wins over an old failed duplicate. An in-flight
+            # copy must also be allowed to finish without replacement.
+            if "healthy" in states or "inflight" in states:
                 continue
-            terminal = [track for track in matching if _track_has_terminal_failure(track)]
-            if matching and not terminal:
-                # PROCESSING/PENDING is not a terminal loss. Let YouTube finish
-                # instead of deleting a valid in-flight upload.
-                continue
-            if terminal:
+            terminal = terminal_by_video.get(video_id, {}).get(language_key)
+            if terminal is not None:
                 logger.warning(
-                    "Audio auto-recovery detected terminal track: video={} language={} details={}",
+                    "Audio auto-recovery detected terminal track: video={} "
+                    "language={} track_ids={}",
                     video_id,
                     clean_language,
-                    " | ".join(_terminal_failure_details(track) for track in terminal),
+                    ",".join(terminal.get("track_ids") or []) or "none",
                 )
-            actions.append(
-                {
-                    "video_id": video_id,
-                    "language": clean_language,
-                    "track_ids": list(
-                        dict.fromkeys(
-                            str(track.get("audioTrackId") or "").strip()
-                            for track in terminal
-                            if str(track.get("audioTrackId") or "").strip()
-                        )
-                    ),
-                    "reason": "terminal" if terminal else "missing",
-                }
-            )
+                actions.append(
+                    {
+                        "video_id": video_id,
+                        "language": clean_language,
+                        "track_ids": list(terminal.get("track_ids") or []),
+                        "reason": "terminal",
+                    }
+                )
+                continue
+            # Absence is not proof of failure. Studio may omit a published
+            # language from one response collection, so automatically adding a
+            # "missing" row can duplicate an already-published track. Wait for
+            # an explicit terminal status in a later scan instead.
 
-    return actions, requested - readable_ids
+    return actions, unreadable_ids
 
 
 def _record_recovery_attempt(
@@ -757,13 +849,13 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
                     if channel_requires_refresh:
                         break
                     continue
-                actions, missing = build_audio_recovery_plan(
+                actions, unreadable_chunk = build_audio_recovery_plan(
                     payload,
                     {video_id: eligible_entries[video_id] for video_id in chunk},
                     chunk,
                 )
                 channel_actions.extend(actions)
-                unreadable.extend(sorted(missing))
+                unreadable.extend(sorted(unreadable_chunk))
 
             if cancelled_by_clear:
                 break

@@ -524,6 +524,157 @@ class UpdateAudioModule(IModule):
         return walk(payload, in_audio=assume_audio)
 
     @staticmethod
+    def _status_value_is_terminal_failure(key: str, value) -> bool:
+        """Return true only for an audio state which has definitively failed.
+
+        The broader scanner intentionally treats PROCESSING/PENDING as needing
+        attention so it can show those videos in diagnostic views.  Repair
+        flows must be stricter: replacing a track which YouTube is still
+        processing can create a duplicate, and READY/PUBLISHED tracks must
+        never be touched.
+        """
+
+        def normalize(raw) -> str:
+            decomposed = unicodedata.normalize(
+                "NFKD", str(raw).upper().replace("Đ", "D")
+            )
+            return "".join(
+                ch
+                for ch in decomposed
+                if ch.isalnum() and not unicodedata.combining(ch)
+            )
+
+        normalized_key = normalize(key)
+        status_key = any(
+            marker in normalized_key
+            for marker in (
+                "STATUS",
+                "STATE",
+                "ERROR",
+                "FAIL",
+                "REASON",
+                "AVAILABILITY",
+                "PROCESSING",
+            )
+        )
+        if isinstance(value, bool):
+            return value and any(
+                marker in normalized_key for marker in ("ERROR", "FAIL")
+            )
+        if not status_key or not isinstance(value, str):
+            return False
+
+        normalized_value = normalize(value)
+        if not normalized_value:
+            return False
+        if normalized_value in {
+            "0",
+            "FALSE",
+            "NONE",
+            "NOERROR",
+            "OK",
+            "READY",
+            "SUCCESS",
+            "SUCCEEDED",
+            "COMPLETE",
+            "COMPLETED",
+            "PUBLISHED",
+            "PROCESSING",
+            "PENDING",
+            "TRANSCODING",
+            "UPLOADING",
+            "INPROGRESS",
+            "DANGXULY",
+            "UNSPECIFIED",
+        } or normalized_value.endswith(
+            (
+                "ERRORNONE",
+                "STATUSOK",
+                "STATUSREADY",
+                "STATUSSUCCESS",
+                "STATUSSUCCEEDED",
+                "STATUSCOMPLETE",
+                "STATUSCOMPLETED",
+                "STATUSPUBLISHED",
+                "STATEPUBLISHED",
+                "STATUSPROCESSING",
+                "STATEPROCESSING",
+                "STATUSPENDING",
+                "STATEPENDING",
+                "STATUSTRANSCODING",
+                "STATETRANSCODING",
+                "STATUSUPLOADING",
+                "STATEUPLOADING",
+                "STATUSINPROGRESS",
+                "STATEINPROGRESS",
+                "REASONUNSPECIFIED",
+            )
+        ):
+            return False
+        if any(
+            marker in normalized_value
+            for marker in (
+                "FAILED",
+                "FAILURE",
+                "ERROR",
+                "UNPROCESSABLE",
+                "UNABLETOPROCESS",
+                "CANNOTPROCESS",
+                "COULDNOTPROCESS",
+                "REJECTED",
+                "SPEECHNOTDETECTED",
+                "INELIGIBLE",
+                "NOTELIGIBLE",
+                "INSUFFICIENTELIGIBILITY",
+                "UNSUPPORTED",
+                "DELETED",
+                "REMOVED",
+                "KHONGXULYDUOC",
+                "KHONGDUDIEUKIEN",
+                "DAXOA",
+            )
+        ):
+            return True
+        return any(marker in normalized_key for marker in ("ERROR", "FAIL"))
+
+    @classmethod
+    def _audio_payload_has_terminal_failure(
+        cls, payload, *, assume_audio: bool = False
+    ) -> bool:
+        """Inspect audio containers for FAILED/REJECTED/etc., not in-flight states."""
+
+        def normalize_key(raw) -> str:
+            return "".join(ch for ch in str(raw).upper() if ch.isalnum())
+
+        def is_audio_container(key: str) -> bool:
+            normalized = normalize_key(key)
+            return any(
+                marker in normalized
+                for marker in ("AUDIO", "DUBBING", "AUTODUB", "ALOUD")
+            )
+
+        def walk(value, parent_key: str = "", in_audio: bool = False) -> bool:
+            audio_context = in_audio or is_audio_container(parent_key)
+            if audio_context and cls._status_value_is_terminal_failure(
+                parent_key, value
+            ):
+                return True
+            if isinstance(value, dict):
+                return any(
+                    walk(
+                        child,
+                        f"{parent_key}.{key}" if parent_key else str(key),
+                        audio_context or is_audio_container(str(key)),
+                    )
+                    for key, child in value.items()
+                )
+            if isinstance(value, (list, tuple)):
+                return any(walk(child, parent_key, audio_context) for child in value)
+            return False
+
+        return walk(payload, in_audio=assume_audio)
+
+    @staticmethod
     def _is_creator_dubbed_track(track: dict) -> bool:
         """Return whether ``track`` represents a creator-uploaded dub.
 
@@ -602,6 +753,233 @@ class UpdateAudioModule(IModule):
     # expanded beyond failed-only rows.
     _status_value_is_failure = _status_value_needs_attention
     _audio_translation_has_processing_failure = _audio_translation_needs_attention
+
+    @classmethod
+    def _audio_translation_has_terminal_failure(cls, item: dict) -> bool:
+        if not isinstance(item, dict):
+            return False
+        if cls._is_trackless_source_ineligible_row(item):
+            return False
+        return cls._audio_payload_has_terminal_failure(item)
+
+    @classmethod
+    def _terminal_repair_targets_from_payload(
+        cls,
+        payload: dict,
+        requested_order: list[str],
+    ) -> tuple[dict[str, list[dict]], set[str]]:
+        """Extract language-level creator-dub failures from one Studio response.
+
+        The returned mapping contains only terminal failures. READY/PUBLISHED
+        and PROCESSING/PENDING rows are deliberately absent. The second return
+        value contains requested video IDs which the response did not describe.
+        """
+        requested = set(requested_order)
+        readable_ids: set[str] = set()
+        groups = payload.get("videoTranslations") or []
+        if not isinstance(groups, list):
+            groups = []
+        valid_groups = [group for group in groups if isinstance(group, dict)]
+        group_ids = [cls._translation_group_video_id(group) for group in valid_groups]
+        if valid_groups and all(group_id is None for group_id in group_ids):
+            if len(valid_groups) == len(requested_order):
+                group_pairs = list(zip(requested_order, valid_groups))
+            elif len(requested_order) == 1:
+                group_pairs = [(requested_order[0], valid_groups[0])]
+            else:
+                group_pairs = []
+        else:
+            group_pairs = [
+                (group_id, group)
+                for group_id, group in zip(group_ids, valid_groups)
+                if group_id in requested
+            ]
+
+        translations_by_video: dict[str, list[dict]] = {}
+        translation_by_track_id: dict[tuple[str, str], dict] = {}
+        for video_id, group in group_pairs:
+            readable_ids.add(video_id)
+            translations = group.get("translations") or []
+            if not isinstance(translations, list):
+                continue
+            clean_items = [item for item in translations if isinstance(item, dict)]
+            translations_by_video[video_id] = clean_items
+            for item in clean_items:
+                audio = item.get("audioTranslation") or {}
+                if not isinstance(audio, dict):
+                    continue
+                track_id = str(audio.get("audioTrackId") or "").strip()
+                if track_id:
+                    translation_by_track_id[(video_id, track_id)] = item
+
+        source_track_ids: dict[str, set[str]] = {}
+        creator_tracks_by_video: dict[str, list[dict]] = {}
+        tracks = payload.get("audioTracks") or []
+        if isinstance(tracks, list):
+            for track in tracks:
+                if not isinstance(track, dict):
+                    continue
+                video_id = str(track.get("videoId") or "").strip()
+                if video_id not in requested:
+                    continue
+                readable_ids.add(video_id)
+                track_id = str(track.get("audioTrackId") or "").strip()
+                if not cls._is_creator_dubbed_track(track):
+                    if track_id:
+                        source_track_ids.setdefault(video_id, set()).add(track_id)
+                    continue
+                creator_tracks_by_video.setdefault(video_id, []).append(track)
+
+        target_maps: dict[str, dict[str, dict]] = {}
+
+        def add_target(video_id: str, language: str, track_id: str = "") -> None:
+            clean_language = str(language or "").strip()
+            if not clean_language:
+                return
+            language_key = clean_language.casefold()
+            target = target_maps.setdefault(video_id, {}).setdefault(
+                language_key,
+                {
+                    "language": clean_language,
+                    "track_ids": [],
+                    "reason": "terminal",
+                },
+            )
+            if track_id and track_id not in target["track_ids"]:
+                target["track_ids"].append(track_id)
+
+        for video_id in requested_order:
+            creator_track_ids: set[str] = set()
+            for track in creator_tracks_by_video.get(video_id, []):
+                track_id = str(track.get("audioTrackId") or "").strip()
+                if track_id:
+                    creator_track_ids.add(track_id)
+                if not cls._audio_payload_has_terminal_failure(
+                    track, assume_audio=True
+                ):
+                    continue
+                translation = translation_by_track_id.get((video_id, track_id), {})
+                language = cls._translation_language(track) or cls._translation_language(
+                    translation
+                )
+                if not language:
+                    logger.warning(
+                        "Ignoring terminal creator audio without a language: "
+                        "video={} track_id={}",
+                        video_id,
+                        track_id or "none",
+                    )
+                    continue
+                add_target(video_id, language, track_id)
+
+            # Some Studio variants put the terminal status only in the
+            # translation row. Root audioTracks remains authoritative whenever
+            # it returned the same creator track ID.
+            for item in translations_by_video.get(video_id, []):
+                audio = item.get("audioTranslation") or {}
+                if not isinstance(audio, dict):
+                    continue
+                track_id = str(audio.get("audioTrackId") or "").strip()
+                if track_id in source_track_ids.get(video_id, set()):
+                    continue
+                if track_id and track_id in creator_track_ids:
+                    continue
+                if not cls._audio_translation_has_terminal_failure(item):
+                    continue
+                language = cls._translation_language(item)
+                if not language:
+                    logger.warning(
+                        "Ignoring terminal audio translation without a language: "
+                        "video={} track_id={}",
+                        video_id,
+                        track_id or "none",
+                    )
+                    continue
+                add_target(video_id, language, track_id)
+
+        targets = {
+            video_id: list(target_maps.get(video_id, {}).values())
+            for video_id in requested_order
+            if target_maps.get(video_id)
+        }
+        return targets, requested - readable_ids
+
+    def get_terminal_audio_repair_targets(
+        self,
+        video_ids: list[str],
+        channel_id: str,
+        unreadable_ids: list[str] | None = None,
+    ) -> dict[str, list[dict]]:
+        """Return exact failed languages/track IDs which are safe to replace."""
+        unique_ids = list(dict.fromkeys(video_id for video_id in video_ids if video_id))
+        skipped = unreadable_ids if unreadable_ids is not None else []
+        targets: dict[str, list[dict]] = {}
+
+        def mark_unreadable(video_id: str) -> None:
+            if video_id not in skipped:
+                skipped.append(video_id)
+
+        def merge_targets(found: dict[str, list[dict]]) -> None:
+            for video_id, actions in found.items():
+                by_language = {
+                    str(action.get("language") or "").casefold(): action
+                    for action in targets.setdefault(video_id, [])
+                }
+                for action in actions:
+                    language = str(action.get("language") or "").strip()
+                    if not language:
+                        continue
+                    key = language.casefold()
+                    existing = by_language.get(key)
+                    if existing is None:
+                        copied = {
+                            "language": language,
+                            "track_ids": list(action.get("track_ids") or []),
+                            "reason": "terminal",
+                        }
+                        targets[video_id].append(copied)
+                        by_language[key] = copied
+                    else:
+                        for track_id in action.get("track_ids") or []:
+                            if track_id not in existing["track_ids"]:
+                                existing["track_ids"].append(track_id)
+
+        def scan_chunk(chunk: list[str]) -> None:
+            try:
+                payload = self._get_video_translation_payload(chunk, channel_id)
+            except AudioUpdateError as exc:
+                if exc.status_code != 400:
+                    raise
+                if len(chunk) > 1:
+                    midpoint = len(chunk) // 2
+                    scan_chunk(chunk[:midpoint])
+                    scan_chunk(chunk[midpoint:])
+                    return
+                mark_unreadable(chunk[0])
+                logger.warning(
+                    "YouTube terminal audio status is unavailable for video {}: {}",
+                    chunk[0],
+                    exc,
+                )
+                return
+
+            found, missing = self._terminal_repair_targets_from_payload(payload, chunk)
+            merge_targets(found)
+            if not missing:
+                return
+            if len(chunk) > 1:
+                for video_id in chunk:
+                    if video_id in missing:
+                        scan_chunk([video_id])
+                return
+            mark_unreadable(chunk[0])
+            logger.warning(
+                "YouTube terminal audio response omitted video {}", chunk[0]
+            )
+
+        for start in range(0, len(unique_ids), self._TRANSLATION_BATCH_SIZE):
+            scan_chunk(unique_ids[start : start + self._TRANSLATION_BATCH_SIZE])
+        return targets
 
     def get_audio_attention_video_ids(
         self,

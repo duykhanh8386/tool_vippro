@@ -31,6 +31,7 @@ from web.components.audio import (
     _run_sequentially_isolated,
     _remember_audio_path_history,
     _select_videos_by_ids,
+    _select_terminal_repair_actions,
     _upload_progress_summary,
     _video_from_snapshot,
     _video_snapshot,
@@ -115,6 +116,43 @@ class AudioPageLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertNotEqual(base, changed_audio)
         self.assertNotEqual(base, changed_languages)
+
+    def test_error_scan_plan_keeps_only_selected_terminal_languages(self):
+        targets = {
+            "video-a": [
+                {
+                    "language": "es",
+                    "track_ids": ["failed-es", "failed-es"],
+                    "reason": "terminal",
+                }
+            ],
+            "video-b": [
+                {
+                    "language": "pt-PT",
+                    "track_ids": ["failed-pt"],
+                    "reason": "terminal",
+                }
+            ],
+        }
+
+        selected = _select_terminal_repair_actions(
+            targets,
+            ["video-a", "video-b"],
+            ["en", "ES"],
+        )
+
+        self.assertEqual(
+            selected,
+            {
+                "video-a": [
+                    {
+                        "language": "ES",
+                        "track_ids": ["failed-es"],
+                        "reason": "terminal",
+                    }
+                ]
+            },
+        )
 
     def test_upload_progress_summary_reports_combined_speed_and_bytes(self):
         summary = _upload_progress_summary(

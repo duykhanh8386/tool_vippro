@@ -792,6 +792,126 @@ class AudioUploadTests(unittest.TestCase):
             [["clean", "failed", "missing"], ["failed"], ["missing"]],
         )
 
+    def test_terminal_repair_scan_returns_only_exact_failed_language(self):
+        module = UpdateAudioModule()
+        payload = {
+            "videoTranslations": [
+                {
+                    "videoId": "video",
+                    "translations": [
+                        {
+                            "languageCode": "en",
+                            "audioTranslation": {
+                                "audioTrackId": "ready-en",
+                                "status": "AUDIO_TRACK_STATUS_READY",
+                            },
+                        },
+                        {
+                            "languageCode": "es",
+                            "audioTranslation": {"audioTrackId": "failed-es"},
+                        },
+                        {
+                            "languageCode": "de",
+                            "audioTranslation": {
+                                "audioTrackId": "processing-de",
+                                "status": "AUDIO_TRACK_STATUS_PROCESSING",
+                            },
+                        },
+                        {
+                            "languageCode": "pt-PT",
+                            "audioTranslation": {
+                                "audioTrackId": "published-pt",
+                                "publishStatus": "PUBLISHED",
+                            },
+                        },
+                    ],
+                }
+            ],
+            "audioTracks": [
+                {
+                    "videoId": "video",
+                    "audioTrackId": "ready-en",
+                    "language": "en",
+                    "source": "AUDIO_TRACK_SOURCE_CREATOR",
+                    "audioContentTypeString": "dubbed",
+                    "status": "AUDIO_TRACK_STATUS_READY",
+                },
+                {
+                    "videoId": "video",
+                    "audioTrackId": "failed-es",
+                    # Real responses can require the translation row to supply
+                    # the language for a root audioTracks item.
+                    "source": "AUDIO_TRACK_SOURCE_CREATOR",
+                    "audioContentTypeString": "dubbed",
+                    "status": "AUDIO_TRACK_STATUS_FAILED",
+                },
+                {
+                    "videoId": "video",
+                    "audioTrackId": "processing-de",
+                    "language": "de",
+                    "source": "AUDIO_TRACK_SOURCE_CREATOR",
+                    "audioContentTypeString": "dubbed",
+                    "status": "AUDIO_TRACK_STATUS_PROCESSING",
+                },
+            ],
+        }
+
+        with patch.object(
+            module, "_get_video_translation_payload", return_value=payload
+        ):
+            targets = module.get_terminal_audio_repair_targets(
+                ["video"], "channel"
+            )
+
+        self.assertEqual(
+            targets,
+            {
+                "video": [
+                    {
+                        "language": "es",
+                        "track_ids": ["failed-es"],
+                        "reason": "terminal",
+                    }
+                ]
+            },
+        )
+
+    def test_terminal_repair_scan_ignores_processing_and_published_rows(self):
+        module = UpdateAudioModule()
+        payload = {
+            "videoTranslations": [
+                {
+                    "videoId": "video",
+                    "translations": [
+                        {
+                            "languageCode": "fr",
+                            "audioTranslation": {
+                                "audioTrackId": "published-fr",
+                                "statusLabel": "Đã xuất bản",
+                            },
+                        },
+                        {
+                            "languageCode": "it",
+                            "audioTranslation": {
+                                "audioTrackId": "processing-it",
+                                "statusLabel": "Đang xử lý... 95%",
+                            },
+                        },
+                    ],
+                }
+            ],
+            "audioTracks": [],
+        }
+
+        with patch.object(
+            module, "_get_video_translation_payload", return_value=payload
+        ):
+            targets = module.get_terminal_audio_repair_targets(
+                ["video"], "channel"
+            )
+
+        self.assertEqual(targets, {})
+
 
 class AudioDeleteTests(unittest.TestCase):
     def _channel(self):

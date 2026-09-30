@@ -331,6 +331,51 @@ def _select_videos_by_ids(videos: Iterable[Video], video_ids: Iterable[str]):
     return selected, missing
 
 
+def _select_terminal_repair_actions(
+    targets: dict | None,
+    video_ids: Iterable[str],
+    selected_languages: Iterable[str],
+) -> dict[str, list[dict]]:
+    """Restrict an error-scan result to configured languages, case-insensitively."""
+    configured = {
+        str(language or "").strip().casefold(): str(language or "").strip()
+        for language in selected_languages
+        if str(language or "").strip()
+    }
+    selected: dict[str, list[dict]] = {}
+    raw_targets = targets if isinstance(targets, dict) else {}
+    for video_id in dict.fromkeys(str(value or "").strip() for value in video_ids):
+        if not video_id:
+            continue
+        actions: list[dict] = []
+        seen_languages: set[str] = set()
+        for action in raw_targets.get(video_id) or []:
+            if not isinstance(action, dict):
+                continue
+            scanned_language = str(action.get("language") or "").strip()
+            language_key = scanned_language.casefold()
+            configured_language = configured.get(language_key)
+            if not configured_language or language_key in seen_languages:
+                continue
+            seen_languages.add(language_key)
+            actions.append(
+                {
+                    "language": configured_language,
+                    "track_ids": list(
+                        dict.fromkeys(
+                            str(track_id or "").strip()
+                            for track_id in action.get("track_ids") or []
+                            if str(track_id or "").strip()
+                        )
+                    ),
+                    "reason": "terminal",
+                }
+            )
+        if actions:
+            selected[video_id] = actions
+    return selected
+
+
 def _video_snapshot(video: Video) -> dict:
     return {
         "id": video.id,
@@ -441,6 +486,8 @@ def _audio_workflow_signature(
     languages: Iterable[str],
     repeat_times: int,
     extra_minutes: float,
+    selective_repair: bool = False,
+    repair_track_ids: Iterable[str] = (),
 ) -> dict:
     """Describe inputs which require a fresh delete-before-add run."""
     return {
@@ -449,6 +496,8 @@ def _audio_workflow_signature(
         "languages": list(languages),
         "repeat_times": int(repeat_times),
         "extra_minutes": float(extra_minutes),
+        "selective_repair": bool(selective_repair),
+        "repair_track_ids": list(repair_track_ids),
     }
 
 
@@ -558,6 +607,7 @@ def create_add_audio_page():
         "manual_ids": [],
         "failed_channel": None,
         "failed_videos": [],
+        "failed_targets": {},
         "scan_total": 0,
         "scan_skipped": 0,
         "scan_scope": "all",
@@ -712,6 +762,9 @@ def create_add_audio_page():
                 video_source_state["manual_ids"] = list(video_ids_state["ids"])
             if video_source_state.get("mode") not in {"manual", "failed"}:
                 video_source_state["mode"] = "manual"
+            if not isinstance(video_source_state.get("failed_targets"), dict):
+                video_source_state["failed_targets"] = {}
+                needs_checkpoint_save = True
             if video_source_state.get("scan_scope") not in VIDEO_SCAN_SCOPES:
                 video_source_state["scan_scope"] = "all"
                 needs_checkpoint_save = True
@@ -775,6 +828,7 @@ def create_add_audio_page():
         ):
             video_source_state["failed_channel"] = None
             video_source_state["failed_videos"] = []
+            video_source_state["failed_targets"] = {}
             video_source_state["scan_total"] = 0
             video_source_state["scan_skipped"] = 0
             video_source_state["last_scan_scope"] = None
@@ -1027,8 +1081,14 @@ def create_add_audio_page():
                     f"{video_source_state.get('last_scan_limit') or 0} "
                     "video đăng gần nhất"
                 )
+            failed_language_count = sum(
+                len(actions)
+                for actions in (video_source_state.get("failed_targets") or {}).values()
+                if isinstance(actions, list)
+            )
             ui.label(
                 f"Đã tìm thấy {len(video_source_state.get('failed_videos') or [])} video lỗi; "
+                f"{failed_language_count} audio cần sửa; "
                 f"đọc được {max(0, video_source_state.get('scan_total', 0) - video_source_state.get('scan_skipped', 0))}/"
                 f"{video_source_state.get('scan_total', 0)} video trong phạm vi {scope_label}."
             ).classes("text-xs font-medium text-emerald-700")
@@ -1256,18 +1316,20 @@ def create_add_audio_page():
                 recent_limit=recent_limit,
             )
             unreadable_ids: list[str] = []
-            failed_ids = await asyncio.to_thread(
-                update_audio_module.get_audio_attention_video_ids,
+            failed_targets = await asyncio.to_thread(
+                update_audio_module.get_terminal_audio_repair_targets,
                 [video.id for video in videos],
                 channel_id,
                 unreadable_ids,
             )
+            failed_ids = set(failed_targets)
             failed_videos = [video for video in videos if video.id in failed_ids]
 
             video_source_state["failed_channel"] = channel_id
             video_source_state["failed_videos"] = [
                 _video_snapshot(video) for video in failed_videos
             ]
+            video_source_state["failed_targets"] = failed_targets
             video_source_state["scan_total"] = len(videos)
             video_source_state["scan_skipped"] = len(unreadable_ids)
             video_source_state["last_scan_scope"] = scan_scope
@@ -1282,11 +1344,14 @@ def create_add_audio_page():
             restored_audio_count = sum(
                 1 for video in failed_videos if id_to_path.get(video.id)
             )
+            failed_language_count = sum(
+                len(actions) for actions in failed_targets.values()
+            )
             refresh_video_source_controls()
             save_right_panel_state()
             if failed_videos:
                 ui.notify(
-                    f"Đã lấy {len(failed_videos)} video lỗi; đọc được "
+                    f"Đã lấy {len(failed_videos)} video / {failed_language_count} audio lỗi; đọc được "
                     f"{len(videos) - len(unreadable_ids)}/{len(videos)} video từ {scan_label}. "
                     + (
                         f"Đã tự khôi phục file nhạc cho {restored_audio_count} video; "
@@ -1510,7 +1575,18 @@ def create_add_audio_page():
             for vid in video_ids_state["ids"]:
                 current_path_value = id_to_path.get(vid, "")
                 video_status = video_processing_status.get(vid, {})
-                active_languages = list(selected_languages["languages"])
+                if video_source_state.get("mode") == "failed":
+                    selected_repairs = _select_terminal_repair_actions(
+                        video_source_state.get("failed_targets"),
+                        [vid],
+                        selected_languages["languages"],
+                    )
+                    active_languages = [
+                        action["language"]
+                        for action in selected_repairs.get(vid, [])
+                    ]
+                else:
+                    active_languages = list(selected_languages["languages"])
                 active_language_set = set(active_languages)
                 cleanup_status = video_cleanup_status.get(vid, "pending")
                 video_errors = {
@@ -1570,12 +1646,23 @@ def create_add_audio_page():
                             ui.label(match_label).classes(
                                 "px-2 text-[10px] font-medium text-emerald-600"
                             )
-                        cleanup_text, cleanup_color = {
-                            "pending": ("Chờ xóa audio cũ", "text-gray-500"),
-                            "processing": ("Đang xóa audio cũ", "text-blue-600"),
-                            "successful": ("Đã xóa audio cũ", "text-emerald-600"),
-                            "unsuccessful": ("Xóa audio thất bại", "text-red-600"),
-                        }.get(cleanup_status, ("Chờ xóa audio cũ", "text-gray-500"))
+                        if video_source_state.get("mode") == "failed":
+                            cleanup_labels = {
+                                "pending": ("Chờ xóa đúng audio lỗi", "text-gray-500"),
+                                "processing": ("Đang xóa audio lỗi", "text-blue-600"),
+                                "successful": ("Đã xóa audio lỗi", "text-emerald-600"),
+                                "unsuccessful": ("Xóa audio lỗi thất bại", "text-red-600"),
+                            }
+                        else:
+                            cleanup_labels = {
+                                "pending": ("Chờ xóa audio cũ", "text-gray-500"),
+                                "processing": ("Đang xóa audio cũ", "text-blue-600"),
+                                "successful": ("Đã xóa audio cũ", "text-emerald-600"),
+                                "unsuccessful": ("Xóa audio thất bại", "text-red-600"),
+                            }
+                        cleanup_text, cleanup_color = cleanup_labels.get(
+                            cleanup_status, cleanup_labels["pending"]
+                        )
                         ui.label(cleanup_text).classes(
                             f"px-2 text-[10px] font-medium {cleanup_color}"
                         )
@@ -1610,6 +1697,12 @@ def create_add_audio_page():
 
                     with ui.column().classes("w-2/12 text-center ml-20"):
                         ui.label(f"{effective_success}/{total_languages}").classes("text-sm font-medium text-gray-700")
+                        if video_source_state.get("mode") == "failed":
+                            ui.label(
+                                ", ".join(active_languages)
+                                if active_languages
+                                else "Không có mã lỗi được chọn"
+                            ).classes("text-[10px] text-blue-600 break-all")
                         if already_added_count > 0:
                             ui.label(f"{already_added_count} đã có").classes("text-xs text-orange-500")
 
@@ -1649,6 +1742,12 @@ def create_add_audio_page():
                                     if isinstance(item, dict)
                                     and item.get("id") in active_ids
                                 ]
+                                failed_targets = video_source_state.get("failed_targets") or {}
+                                video_source_state["failed_targets"] = {
+                                    key: value
+                                    for key, value in failed_targets.items()
+                                    if key in active_ids
+                                }
                             refresh_right_panel()
                             refresh_rename_button()
                             refresh_video_source_controls()
@@ -1698,8 +1797,37 @@ def create_add_audio_page():
                 type="negative",
             )
             return None
+        selective_repair = video_source_state.get("mode") == "failed"
+        if selective_repair:
+            if video_source_state.get("failed_channel") != selected_channel["id"]:
+                ui.notify(
+                    "Kết quả quét lỗi không thuộc kênh đang chọn. Hãy quét lại.",
+                    type="warning",
+                )
+                return None
+            repair_actions_by_video = _select_terminal_repair_actions(
+                video_source_state.get("failed_targets"),
+                video_ids_state["ids"],
+                languages_to_process,
+            )
+            if not repair_actions_by_video:
+                ui.notify(
+                    "Không có ngôn ngữ lỗi kết thúc nào trùng với danh sách ngôn ngữ đã chọn. "
+                    "Audio đã xuất bản hoặc đang xử lý sẽ không được add lại.",
+                    type="warning",
+                )
+                return None
+        else:
+            repair_actions_by_video = {
+                video_id: [
+                    {"language": language, "track_ids": [], "reason": "manual"}
+                    for language in languages_to_process
+                ]
+                for video_id in video_ids_state["ids"]
+            }
+        job_video_ids = list(repair_actions_by_video)
         row_errors = []
-        for vid in video_ids_state["ids"]:
+        for vid in job_video_ids:
             path_text = (id_to_path.get(vid) or "").strip()
             ok, msg = validate_path_text(path_text)
             if not ok:
@@ -1740,12 +1868,15 @@ def create_add_audio_page():
                 progress_bar = ui.linear_progress(value=0)
         progress_dialog.props("persistent")
         best_effort_ui("open progress dialog", progress_dialog.open)
-        total_videos = len(video_ids_state["ids"])
-        tasks_per_video = len(languages_to_process) + 1
-        total_tasks = total_videos * tasks_per_video
+        total_videos = len(job_video_ids)
+        tasks_by_video = {
+            video_id: len(actions) + 1
+            for video_id, actions in repair_actions_by_video.items()
+        }
+        total_tasks = sum(tasks_by_video.values())
         completed_tasks = 0
         completed_by_video = {
-            video_id: 0 for video_id in video_ids_state["ids"]
+            video_id: 0 for video_id in job_video_ids
         }
         overall_errors = []
         max_concurrency = _clamp_upload_concurrency(
@@ -1830,12 +1961,54 @@ def create_add_audio_page():
             video_index, vid = item
             temp_audio_path: Path | None = None
             try:
+                planned_actions = repair_actions_by_video[vid]
+                languages_for_video = [
+                    action["language"] for action in planned_actions
+                ]
+                repair_actions = planned_actions
+                if (
+                    selective_repair
+                    and video_cleanup_status.get(vid) != "successful"
+                ):
+                    unreadable_now: list[str] = []
+                    current_targets = await asyncio.to_thread(
+                        update_audio_module.get_terminal_audio_repair_targets,
+                        [vid],
+                        channel_id,
+                        unreadable_now,
+                    )
+                    if unreadable_now:
+                        raise RuntimeError(
+                            "YouTube không trả trạng thái audio mới nhất; đã dừng để tránh add nhầm."
+                        )
+                    repair_actions = _select_terminal_repair_actions(
+                        current_targets,
+                        [vid],
+                        languages_for_video,
+                    ).get(vid, [])
+                current_failed_languages = {
+                    action["language"].casefold() for action in repair_actions
+                }
+                no_longer_failed = [
+                    language
+                    for language in languages_for_video
+                    if language.casefold() not in current_failed_languages
+                ]
+                failed_track_ids = list(
+                    dict.fromkeys(
+                        track_id
+                        for action in repair_actions
+                        for track_id in action.get("track_ids") or []
+                    )
+                )
                 workflow_signature = _audio_workflow_signature(
                     channel_id=channel_id,
                     audio_path=id_to_path.get(vid) or "",
-                    languages=languages_to_process,
+                    languages=languages_for_video,
                     repeat_times=repeat_times,
                     extra_minutes=extra_minutes,
+                    selective_repair=selective_repair,
+                    repair_track_ids=failed_track_ids,
                 )
                 if video_workflow_signatures.get(vid) != workflow_signature:
                     video_processing_status.pop(vid, None)
@@ -1849,8 +2022,8 @@ def create_add_audio_page():
                     completed_tasks += 1
                     completed_by_video[vid] += 1
                 else:
-                    # A fresh cleanup invalidates every earlier language result:
-                    # all selected languages must be added again after deletion.
+                    # In error-scan mode this invalidates only the exact failed
+                    # languages, never every configured language.
                     existing_status.clear()
                     video_processing_errors.pop(vid, None)
                     video_cleanup_status[vid] = "processing"
@@ -1866,13 +2039,21 @@ def create_add_audio_page():
                                 f"Video {video_index}/{total_videos}: {vid}"
                             ),
                             status_label.set_text(
-                                "Bước 1/2: Đang xóa toàn bộ audio cũ..."
+                                "Bước 1/2: Đang xóa đúng audio lỗi..."
+                                if selective_repair
+                                else "Bước 1/2: Đang xóa toàn bộ audio cũ..."
                             ),
                             refresh_right_panel(force=False),
                         ),
                     )
 
                     def delete_old_audio():
+                        if selective_repair:
+                            return update_audio_module.delete_track_ids(
+                                vid,
+                                channel_id,
+                                failed_track_ids,
+                            )
                         return update_audio_module.delete(
                             id_video=vid,
                             channel_id=channel_id,
@@ -1926,12 +2107,16 @@ def create_add_audio_page():
                         ),
                     )
 
+                for language in no_longer_failed:
+                    # It became READY/PUBLISHED or is still PROCESSING between
+                    # the scan and this click. Either way it must not be added.
+                    existing_status[language] = "already_added"
                 missing_languages = [
                     lang
-                    for lang in languages_to_process
+                    for lang in languages_for_video
                     if existing_status.get(lang) not in ("successful", "already_added")
                 ]
-                skipped_count = len(languages_to_process) - len(missing_languages)
+                skipped_count = len(languages_for_video) - len(missing_languages)
                 if skipped_count:
                     completed_tasks += skipped_count
                     completed_by_video[vid] += skipped_count
@@ -1944,9 +2129,10 @@ def create_add_audio_page():
                         channel_id=channel_id,
                         video_id=vid,
                         audio_path=id_to_path.get(vid) or "",
-                        languages=languages_to_process,
+                        languages=languages_for_video,
                         repeat_times=repeat_times,
                         extra_minutes=extra_minutes,
+                        merge_languages=selective_repair,
                     )
                     best_effort_ui(
                         "render already-complete video",
@@ -2042,15 +2228,16 @@ def create_add_audio_page():
                 if all(
                     video_processing_status.get(vid, {}).get(language)
                     in ("successful", "already_added")
-                    for language in languages_to_process
+                    for language in languages_for_video
                 ):
                     register_audio_recovery(
                         channel_id=channel_id,
                         video_id=vid,
                         audio_path=id_to_path.get(vid) or "",
-                        languages=languages_to_process,
+                        languages=languages_for_video,
                         repeat_times=repeat_times,
                         extra_minutes=extra_minutes,
+                        merge_languages=selective_repair,
                     )
                 best_effort_ui(
                     "clear sequential upload state",
@@ -2066,13 +2253,13 @@ def create_add_audio_page():
             overall_errors.append(f"{vid}: {vid_exc}")
             video_processing_errors.setdefault(vid, {})["xử lý"] = str(vid_exc)
             remaining_for_video = max(
-                0, tasks_per_video - completed_by_video.get(vid, 0)
+                0, tasks_by_video[vid] - completed_by_video.get(vid, 0)
             )
             completed_tasks = min(
                 total_tasks,
                 completed_tasks + remaining_for_video,
             )
-            completed_by_video[vid] = tasks_per_video
+            completed_by_video[vid] = tasks_by_video[vid]
             save_right_panel_state()
             best_effort_ui(
                 "render failed audio video",
@@ -2084,7 +2271,7 @@ def create_add_audio_page():
 
         try:
             await _run_concurrently_isolated(
-                enumerate(list(video_ids_state["ids"]), 1),
+                enumerate(job_video_ids, 1),
                 process_video,
                 handle_video_error,
                 max_concurrency=max_concurrency,
@@ -2103,14 +2290,17 @@ def create_add_audio_page():
             best_effort_ui("render final audio state", refresh_right_panel)
             channel_mutation_guard.release()
             _ADD_AUDIO_RUN_GUARD.release()
-        total_videos = len(video_ids_state["ids"])
+        total_videos = len(job_video_ids)
         successful_videos = 0
-        for vid in video_ids_state["ids"]:
+        for vid in job_video_ids:
             video_status = video_processing_status.get(vid, {})
-            total_languages = len(languages_to_process)
+            languages_for_video = [
+                action["language"] for action in repair_actions_by_video[vid]
+            ]
+            total_languages = len(languages_for_video)
             successful_count = sum(
                 1
-                for language in languages_to_process
+                for language in languages_for_video
                 if video_status.get(language) in ("successful", "already_added")
             )
             if total_languages > 0 and successful_count == total_languages:
@@ -2548,6 +2738,7 @@ def create_add_audio_page():
                 video_source_state["manual_ids"] = []
                 video_source_state["failed_channel"] = None
                 video_source_state["failed_videos"] = []
+                video_source_state["failed_targets"] = {}
                 video_source_state["scan_total"] = 0
                 video_source_state["scan_skipped"] = 0
                 video_source_state["scan_scope"] = "all"
