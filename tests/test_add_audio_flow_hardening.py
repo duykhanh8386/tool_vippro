@@ -1,12 +1,14 @@
 import asyncio
 import threading
 import unittest
+from unittest.mock import patch
 
 from web.components.add_audio_flow import (
     _best_effort_ui,
     _persist_then_ui,
     _replace_status_snapshot,
     _replace_video_items_unless_processing,
+    _register_add_audio_flow_recovery,
     _require_checkpoint,
     _restore_steps,
     _run_finalizers,
@@ -16,6 +18,35 @@ from web.components.add_audio_flow import (
 
 
 class AddAudioFlowHardeningTests(unittest.IsolatedAsyncioTestCase):
+    def test_successful_flow_languages_are_registered_for_recovery(self):
+        language_results = {
+            "en": {"status": "successful", "error": ""},
+            "es": {"status": "already_added", "error": ""},
+            "fr": {"status": "unsuccessful", "error": "rejected"},
+        }
+
+        with patch(
+            "web.components.add_audio_flow.register_audio_recovery",
+            return_value=True,
+        ) as register:
+            completed = _register_add_audio_flow_recovery(
+                channel_id="channel",
+                video_id="video",
+                audio_path=r"D:\\music\\source.mp3",
+                languages=["en", "es", "fr"],
+                language_results=language_results,
+            )
+
+        self.assertEqual(completed, ["en", "es"])
+        register.assert_called_once_with(
+            channel_id="channel",
+            video_id="video",
+            audio_path=r"D:\\music\\source.mp3",
+            languages=["en", "es"],
+            repeat_times=1,
+            extra_minutes=0,
+        )
+
     async def test_happy_path_drains_all_items_with_parallel_workers(self):
         processed = []
         state = {item: "pending" for item in range(12)}

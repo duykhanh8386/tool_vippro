@@ -9,6 +9,7 @@ from src.audio_language import (
     invalid_language_codes,
     parse_language_codes,
 )
+from src.audio_recovery import get_audio_mutation_guard, register_audio_recovery
 from src.channel_store import channel_store
 from src.module.audio_module import update_audio_module
 from src.module.upload_video_module import (
@@ -41,6 +42,55 @@ YOUTUBE_STATUS_MAX_CONSECUTIVE_TRANSIENT_ERRORS = 3
 _FLOW_RUN_GUARD = threading.Lock()
 _ACTIVE_FLOW_RUN = {"parent": None, "children": {}}
 _FLOW_STOP_REQUESTED = {"value": False}
+
+
+def _completed_audio_languages(languages, language_results: dict) -> list[str]:
+    """Return flow languages whose upload was accepted by YouTube."""
+    return [
+        str(language).strip()
+        for language in languages
+        if str(language).strip()
+        and isinstance(language_results.get(language), dict)
+        and language_results[language].get("status")
+        in ("successful", "already_added")
+    ]
+
+
+def _register_add_audio_flow_recovery(
+    *,
+    channel_id: str,
+    video_id: str,
+    audio_path: str,
+    languages,
+    language_results: dict,
+) -> list[str]:
+    """Persist successful Add Audio Flow tracks for background repair."""
+    completed = _completed_audio_languages(languages, language_results)
+    if not completed:
+        return []
+    if not register_audio_recovery(
+        channel_id=channel_id,
+        video_id=video_id,
+        audio_path=audio_path,
+        languages=completed,
+        repeat_times=1,
+        extra_minutes=0,
+    ):
+        raise RuntimeError(
+            "Không thể lưu lịch tự động khôi phục audio cho Add Audio Flow"
+        )
+    return completed
+
+
+async def _acquire_audio_mutation_guard(channel_id: str):
+    """Wait interruptibly until recovery/manual audio mutation is idle."""
+    guard = get_audio_mutation_guard(channel_id)
+    while not guard.acquire(blocking=False):
+        run_context = current_run_context()
+        if run_context is not None:
+            run_context.checkpoint()
+        await asyncio.sleep(0.25)
+    return guard
 
 
 class YouTubeProcessingWaitError(RuntimeError):
@@ -846,6 +896,7 @@ def create_add_audio_flow_page():
         if run_context is not None:
             run_context.register_cleanup_path(matched_path)
 
+        channel_mutation_guard = None
         try:
             if video_dur:
                 await asyncio.to_thread(
@@ -864,6 +915,7 @@ def create_add_audio_flow_page():
             language_errors = []
             language_results = dict(item.get("audio_language_results") or {})
             item["audio_language_results"] = language_results
+            channel_mutation_guard = await _acquire_audio_mutation_guard(channel_id)
             for language_index, lang in enumerate(languages, 1):
                 previous = language_results.get(lang) or {}
                 if previous.get("status") in ("successful", "already_added"):
@@ -938,12 +990,34 @@ def create_add_audio_flow_page():
                 else:
                     push_log(f"Đã thêm audio track: {lang}", "ok", indent=True)
 
+            recovery_languages = _register_add_audio_flow_recovery(
+                channel_id=channel_id,
+                video_id=video_id,
+                audio_path=audio_path,
+                languages=languages,
+                language_results=language_results,
+            )
+            if recovery_languages:
+                logger.info(
+                    "Add Audio Flow auto-recovery registered: channel={} video={} languages={}",
+                    channel_id,
+                    video_id,
+                    ",".join(recovery_languages),
+                )
+                push_log(
+                    "Đã bật tự động kiểm tra và thêm lại audio nếu YouTube xóa",
+                    "ok",
+                    indent=True,
+                )
+
             if language_errors:
                 raise Exception(
                     f"{len(language_errors)}/{len(languages)} ngôn ngữ thất bại: "
                     + "; ".join(language_errors)
                 )
         finally:
+            if channel_mutation_guard is not None:
+                channel_mutation_guard.release()
             try:
                 if Path(matched_path).exists():
                     Path(matched_path).unlink()

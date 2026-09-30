@@ -13,8 +13,10 @@ from src.audio_recovery import (
     acknowledge_channel_refresh,
     build_audio_recovery_plan,
     clear_audio_recovery_registry,
+    get_audio_recovery_runtime_status,
     get_channel_refresh_alerts,
     get_audio_mutation_guard,
+    import_add_audio_flow_recovery_state,
     mark_channel_refresh_required,
     register_audio_recovery,
     run_audio_recovery_cycle,
@@ -105,6 +107,47 @@ class AudioRecoveryPlanTests(unittest.TestCase):
 
 
 class AudioRecoveryRegistryTests(unittest.TestCase):
+    def test_imports_completed_legacy_add_audio_flow_items(self):
+        flow_state = {
+            "selected_channel": "channel",
+            "statuses": {
+                "source.mp4": {
+                    "video_id": "video",
+                    "music_path": r"D:\\music\\source.mp3",
+                    "audio_language_results": {
+                        "en": {"status": "successful"},
+                        "es": {"status": "already_added"},
+                        "fr": {"status": "unsuccessful"},
+                    },
+                }
+            },
+        }
+        recovery_state = {"entries": {}, "channel_refresh_alerts": {}}
+
+        with (
+            patch(
+                "src.audio_recovery.state_manager.load_state",
+                return_value=flow_state,
+            ),
+            patch("src.audio_recovery._load_state", return_value=recovery_state),
+            patch(
+                "src.audio_recovery.register_audio_recovery",
+                return_value=True,
+            ) as register,
+        ):
+            imported = import_add_audio_flow_recovery_state()
+
+        self.assertEqual(imported, 1)
+        register.assert_called_once_with(
+            channel_id="channel",
+            video_id="video",
+            audio_path=r"D:\\music\\source.mp3",
+            languages=["en", "es"],
+            repeat_times=1,
+            extra_minutes=0,
+            registered_at=0,
+        )
+
     def test_registration_persists_mapping_and_language_configuration(self):
         stored = {}
 
@@ -667,6 +710,19 @@ class AudioRecoveryCycleTests(unittest.IsolatedAsyncioTestCase):
             [call.kwargs["language"] for call in added.call_args_list],
             ["es", "fr"],
         )
+        for call in added.call_args_list:
+            progress = call.kwargs["progress"]
+            self.assertEqual(progress["sent"], 0)
+            self.assertGreater(progress["total"], 0)
+            self.assertEqual(progress["status"], "starting")
+
+        runtime_status = get_audio_recovery_runtime_status()
+        self.assertFalse(runtime_status["active"])
+        self.assertEqual(runtime_status["phase"], "idle")
+        self.assertEqual(runtime_status["repaired"], 2)
+        self.assertEqual(runtime_status["failed"], 0)
+        self.assertEqual(runtime_status["upload_sent"], 0)
+        self.assertEqual(runtime_status["upload_total"], 0)
 
 
 if __name__ == "__main__":
