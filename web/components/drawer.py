@@ -242,6 +242,11 @@ def create_drawer():
                         f"Audio {repair_index}/{repair_total} · "
                         f"{_format_transfer_size(sent)} / {_format_transfer_size(total)}"
                     )
+                elif phase == "captioning" and active:
+                    recovery_detail_progress.set_value(0)
+                    recovery_detail_transfer.set_text(
+                        "Đang kiểm tra và add lại phụ đề có trạng thái failed"
+                    )
                 elif active:
                     current = int(status.get("channel_index") or 0)
                     total = int(status.get("channel_total") or 0)
@@ -251,11 +256,7 @@ def create_drawer():
                     recovery_detail_transfer.set_text(
                         f"Đang quét kênh {current}/{total}"
                         if phase == "scanning" and total
-                        else (
-                            "Đang đăng lại phụ đề còn thiếu"
-                            if phase == "captioning"
-                            else "Đang chuẩn bị audio để add lại"
-                        )
+                        else "Đang chuẩn bị audio để add lại"
                     )
                 else:
                     recovery_detail_progress.set_value(0)
@@ -340,9 +341,9 @@ def create_drawer():
                                 ui.label(
                                     f"Lần quét cuối {time.strftime('%H:%M:%S', time.localtime(finished_at))} · "
                                     f"đã gửi lại {status.get('repaired', 0)}, "
-                                    f"phụ đề {status.get('captions_repaired', 0)}, "
+                                    f"phụ đề failed đã sửa {status.get('captions_repaired', 0)}, "
                                     f"hoãn {deferred_visibility} chưa công khai, "
-                                    f"lỗi {int(status.get('failed', 0) or 0) + int(status.get('captions_failed', 0) or 0)}"
+                                    f"lỗi {int(status.get('failed') or 0) + int(status.get('captions_failed') or 0)}"
                                 ).classes("text-[10px] text-emerald-800")
                             else:
                                 ui.label("Đang chờ vòng quét đầu tiên").classes(
@@ -352,22 +353,22 @@ def create_drawer():
                                 "text-[10px] text-emerald-700 underline"
                             )
 
-                    quota_message = str(status.get("caption_quota_message") or "")
-                    if quota_message:
+                    caption_quota_message = str(
+                        status.get("caption_quota_message") or ""
+                    )
+                    if caption_quota_message:
                         with ui.card().classes(
                             "w-full p-2 bg-orange-50 border border-orange-300 shadow-none"
                         ):
-                            with ui.row().classes("items-start gap-2 no-wrap"):
-                                ui.icon("data_usage").classes("text-orange-700")
-                                ui.label(quota_message).classes(
-                                    "text-xs font-medium text-orange-900"
-                                )
+                            ui.label(caption_quota_message).classes(
+                                "text-[11px] text-orange-900"
+                            )
 
                 refresh_recovery_details(status)
 
                 if active and recovery_activity_state["notified_cycle"] != cycle_id:
                     ui.notify(
-                        "Đang tự động quét và kiểm tra audio đã đăng ký...",
+                        "Đang tự động quét audio và kiểm tra phụ đề vừa đăng...",
                         type="info",
                         timeout=3000,
                     )
@@ -382,23 +383,28 @@ def create_drawer():
                             str(status.get("message") or "Đã hoàn tất tự động khôi phục audio"),
                             type=(
                                 "positive"
-                                if failed + captions_failed == 0
+                                if failed == 0 and captions_failed == 0
                                 else "warning"
                             ),
                             timeout=5000,
                         )
-                quota_message = str(status.get("caption_quota_message") or "")
+                caption_quota_message = str(
+                    status.get("caption_quota_message") or ""
+                )
                 if (
-                    quota_message
-                    and recovery_activity_state["quota_signature"] != quota_message
+                    caption_quota_message
+                    and recovery_activity_state["quota_signature"]
+                    != caption_quota_message
                 ):
                     ui.notify(
-                        quota_message,
+                        caption_quota_message,
                         type="warning",
                         timeout=0,
                         close_button="Đóng",
                     )
-                    recovery_activity_state["quota_signature"] = quota_message
+                    recovery_activity_state["quota_signature"] = (
+                        caption_quota_message
+                    )
                 recovery_activity_state["was_active"] = active
 
             refresh_recovery_activity()

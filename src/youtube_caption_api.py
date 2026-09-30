@@ -345,7 +345,9 @@ def _raise_api_error(response: requests.Response, action: str) -> None:
     if response.status_code in {403, 429} and normalized.intersection(quota_markers):
         user_message = (
             "YouTube Data API đã hết quota phụ đề hôm nay. Tool đã dừng phần "
-            "phụ đề và Auto Registry sẽ thử tiếp sau khi quota được đặt lại."
+            "phụ đề; audio vẫn tiếp tục. Track đã tồn tại nhưng failed sẽ được "
+            "Auto Registry thử lại sau khi quota được đặt lại; phụ đề chưa được "
+            "tạo cần bấm chạy lại để đăng tiếp."
         )
         _mark_quota_exhausted(user_message)
         raise CaptionQuotaExceededError(
@@ -468,6 +470,17 @@ class YouTubeCaptionClient:
         snippet = track.get("snippet") or {}
         return str(snippet.get("language") or "").strip()
 
+    @staticmethod
+    def _raise_if_track_failed(track: dict, language: str) -> None:
+        snippet = track.get("snippet") or {}
+        if str(snippet.get("status") or "").casefold() != "failed":
+            return
+        reason = str(snippet.get("failureReason") or "processingFailed")
+        raise CaptionApiError(
+            f"YouTube xử lý phụ đề {language} thất bại: {reason}. "
+            "Auto Registry sẽ tự cập nhật lại track này."
+        )
+
     def upsert_track(
         self,
         *,
@@ -485,12 +498,22 @@ class YouTubeCaptionClient:
             ),
             None,
         )
-        if existing is not None and not replace_existing:
+        existing_failed = bool(
+            existing
+            and str((existing.get("snippet") or {}).get("status") or "").casefold()
+            == "failed"
+        )
+        if existing is not None and not replace_existing and not existing_failed:
             return str(existing.get("id") or ""), "already_added"
         if existing is not None:
             result = self.update_track(str(existing.get("id") or ""), srt_bytes)
+            self._raise_if_track_failed(result, language)
+            if result:
+                existing.clear()
+                existing.update(result)
             return str(result.get("id") or existing.get("id") or ""), "successful"
         result = self.insert_track(video_id, language, srt_bytes)
+        self._raise_if_track_failed(result, language)
         if result:
             existing_tracks.append(result)
         return str(result.get("id") or ""), "successful"
@@ -536,6 +559,22 @@ def publish_translated_caption(
         raise CaptionQuotaExceededError(quota["message"])
     client = YouTubeCaptionClient(channel_id)
     tracks = existing_tracks if existing_tracks is not None else client.list_tracks(video_id)
+    existing = next(
+        (
+            track
+            for track in tracks
+            if client.track_language(track).casefold()
+            == target_language.casefold()
+        ),
+        None,
+    )
+    if (
+        existing is not None
+        and not replace_existing
+        and str((existing.get("snippet") or {}).get("status") or "").casefold()
+        != "failed"
+    ):
+        return "already_added"
     if target_language.casefold() == source_language.casefold():
         srt_bytes = Path(source_srt_path).read_bytes()
     else:

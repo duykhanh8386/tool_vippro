@@ -10,7 +10,7 @@ from src.audio_recovery import (
     DEFAULT_RECOVERY_INTERVAL_SECONDS,
     DEFAULT_RECOVERY_RETRY_COOLDOWN_SECONDS,
     _get_registered_video_public_statuses,
-    _recover_registered_captions,
+    _monitor_failed_caption_tracks,
     _monitor_loop,
     acknowledge_channel_refresh,
     build_audio_recovery_plan,
@@ -21,6 +21,7 @@ from src.audio_recovery import (
     import_add_audio_flow_recovery_state,
     mark_channel_refresh_required,
     register_audio_recovery,
+    register_caption_monitor,
     run_audio_recovery_cycle,
 )
 
@@ -236,44 +237,85 @@ class AudioRecoveryRegistryTests(unittest.TestCase):
         self.assertEqual(entry["repeat_times"], 2)
         self.assertEqual(entry["extra_minutes"], 1.5)
 
-    def test_registration_persists_pending_caption_languages(self):
-        stored = {}
-
-        def load(_name):
-            return stored.copy() if stored else None
-
-        def save(_name, state):
-            stored.clear()
-            stored.update(state)
-            return True
+    def test_caption_monitor_is_attached_to_registered_audio_entry(self):
+        state = {
+            "enabled": True,
+            "entries": {
+                "channel": {
+                    "video": {
+                        "audio_path": "track.mp3",
+                        "languages": ["en"],
+                    }
+                }
+            },
+            "channel_refresh_alerts": {},
+        }
 
         with (
-            patch("src.audio_recovery.state_manager.load_state", side_effect=load),
-            patch("src.audio_recovery.state_manager.save_state", side_effect=save),
+            patch("src.audio_recovery._load_state", return_value=state),
+            patch(
+                "src.audio_recovery.state_manager.save_state",
+                return_value=True,
+            ) as save,
         ):
-            self.assertTrue(
-                register_audio_recovery(
-                    channel_id="channel",
-                    video_id="video",
-                    audio_path=r"D:\music\track.mp3",
-                    languages=["en", "fr"],
-                    repeat_times=1,
-                    extra_minutes=0,
-                    caption_config={
-                        "enabled": True,
-                        "source_srt_path": r"D:\cache\video.en.srt",
-                        "source_language": "en",
-                        "source_track_id": "source-caption",
-                        "languages": ["en", "fr"],
-                        "completed_languages": ["en"],
-                    },
-                )
+            saved = register_caption_monitor(
+                channel_id="channel",
+                video_id="video",
+                source_srt_path="source.en.srt",
+                source_language="en",
+                languages=["en", "fr", "fr"],
+                now=1000,
             )
 
-        caption = stored["entries"]["channel"]["video"]["caption"]
-        self.assertTrue(caption["enabled"])
-        self.assertEqual(caption["completed_languages"], ["en"])
-        self.assertEqual(caption["languages"], ["en", "fr"])
+        self.assertTrue(saved)
+        save.assert_called_once()
+        monitor = state["entries"]["channel"]["video"]["caption_monitor"]
+        self.assertEqual(monitor["languages"], ["en", "fr"])
+        self.assertEqual(monitor["next_check_at"], 1000 + 15 * 60)
+
+    def test_reregistering_audio_preserves_pending_caption_monitor(self):
+        monitor = {
+            "source_srt_path": "source.en.srt",
+            "source_language": "en",
+            "languages": ["fr"],
+            "next_check_at": 1900,
+        }
+        state = {
+            "enabled": True,
+            "entries": {
+                "channel": {
+                    "video": {
+                        "audio_path": "track.mp3",
+                        "languages": ["en"],
+                        "repeat_times": 1,
+                        "extra_minutes": 0,
+                        "attempts": {},
+                        "caption_monitor": monitor,
+                    }
+                }
+            },
+            "channel_refresh_alerts": {},
+        }
+
+        with (
+            patch("src.audio_recovery._load_state", return_value=state),
+            patch("src.audio_recovery.state_manager.save_state", return_value=True),
+        ):
+            saved = register_audio_recovery(
+                channel_id="channel",
+                video_id="video",
+                audio_path="track.mp3",
+                languages=["en"],
+                repeat_times=1,
+                extra_minutes=0,
+            )
+
+        self.assertTrue(saved)
+        self.assertEqual(
+            state["entries"]["channel"]["video"]["caption_monitor"],
+            monitor,
+        )
+
 
     def test_clear_registry_stops_future_automatic_recovery(self):
         stored = {
@@ -405,6 +447,171 @@ class AudioRecoveryCycleTests(unittest.IsolatedAsyncioTestCase):
         self.visibility_patch.start()
         self.addCleanup(self.visibility_patch.stop)
 
+    async def test_caption_monitor_repairs_only_explicit_failed_tracks(self):
+        with tempfile.TemporaryDirectory() as folder:
+            source = Path(folder) / "source.en.srt"
+            source.write_text("1\n00:00:00,000 --> 00:00:01,000\nHello\n", encoding="utf-8")
+            entries = {
+                "video": {
+                    "caption_monitor": {
+                        "source_srt_path": str(source),
+                        "source_language": "en",
+                        "languages": ["en", "fr", "es", "de"],
+                        "next_check_at": 0,
+                    }
+                }
+            }
+            tracks = [
+                {"id": "source", "snippet": {"language": "en", "status": "serving"}},
+                {"id": "failed-fr", "snippet": {"language": "fr", "status": "failed"}},
+                {"id": "serving-es", "snippet": {"language": "es", "status": "serving"}},
+            ]
+            client = SimpleNamespace(
+                list_tracks=Mock(return_value=tracks),
+                track_language=lambda track: str((track.get("snippet") or {}).get("language") or ""),
+                download_translation=Mock(return_value=b"translated srt"),
+                upsert_track=Mock(return_value=("failed-fr", "successful")),
+            )
+
+            with (
+                patch("src.audio_recovery.YouTubeCaptionClient", return_value=client),
+                patch(
+                    "src.audio_recovery.get_caption_quota_status",
+                    return_value={"blocked": False},
+                ),
+                patch("src.audio_recovery._save_caption_monitor_state") as save,
+            ):
+                result = await _monitor_failed_caption_tracks(
+                    channel_id="channel",
+                    entries=entries,
+                    cycle_time=1000,
+                )
+
+        self.assertEqual(result["repaired"], 1)
+        self.assertEqual(result["failed"], 0)
+        client.download_translation.assert_called_once_with("source", "fr")
+        client.upsert_track.assert_called_once()
+        self.assertEqual(client.upsert_track.call_args.kwargs["language"], "fr")
+        save.assert_called_once_with(
+            "channel",
+            "video",
+            languages=["fr"],
+            next_check_at=1000 + 15 * 60,
+        )
+
+    async def test_caption_monitor_waits_for_syncing_track_without_upload(self):
+        with tempfile.TemporaryDirectory() as folder:
+            source = Path(folder) / "source.en.srt"
+            source.write_text("source", encoding="utf-8")
+            entries = {
+                "video": {
+                    "caption_monitor": {
+                        "source_srt_path": str(source),
+                        "source_language": "en",
+                        "languages": ["fr"],
+                        "next_check_at": 0,
+                    }
+                }
+            }
+            client = SimpleNamespace(
+                list_tracks=Mock(
+                    return_value=[
+                        {"id": "fr", "snippet": {"language": "fr", "status": "syncing"}}
+                    ]
+                ),
+                track_language=lambda track: str((track.get("snippet") or {}).get("language") or ""),
+                download_translation=Mock(),
+                upsert_track=Mock(),
+            )
+
+            with (
+                patch("src.audio_recovery.YouTubeCaptionClient", return_value=client),
+                patch(
+                    "src.audio_recovery.get_caption_quota_status",
+                    return_value={"blocked": False},
+                ),
+                patch("src.audio_recovery._save_caption_monitor_state") as save,
+            ):
+                result = await _monitor_failed_caption_tracks(
+                    channel_id="channel",
+                    entries=entries,
+                    cycle_time=1000,
+                )
+
+        self.assertEqual(result["repaired"], 0)
+        client.download_translation.assert_not_called()
+        client.upsert_track.assert_not_called()
+        save.assert_called_once_with(
+            "channel",
+            "video",
+            languages=["fr"],
+            next_check_at=1000 + 6 * 60 * 60,
+        )
+
+    async def test_caption_monitor_receives_only_public_video_entries(self):
+        state = {
+            "enabled": True,
+            "retry_cooldown_seconds": 0,
+            "entries": {
+                "channel": {
+                    video_id: {
+                        "audio_path": "unused.mp3",
+                        "languages": ["en"],
+                    }
+                    for video_id in ("public-video", "private-video")
+                }
+            },
+            "channel_refresh_alerts": {},
+        }
+        caption_monitor = AsyncMock(
+            return_value={"repaired": 0, "failed": 0, "quota_message": ""}
+        )
+        fetch = Mock(
+            return_value={
+                "videoTranslations": [{"videoId": "public-video"}],
+                "audioTracks": [
+                    {
+                        "videoId": "public-video",
+                        "audioTrackId": "healthy-en",
+                        "language": "en",
+                        "source": "AUDIO_TRACK_SOURCE_CREATOR",
+                        "audioContentTypeString": "dubbed",
+                        "status": "AUDIO_TRACK_STATUS_READY",
+                    }
+                ],
+            }
+        )
+
+        with (
+            patch(
+                "src.audio_recovery._get_registered_video_public_statuses",
+                return_value=(
+                    {"public-video": True, "private-video": False},
+                    set(),
+                ),
+            ),
+            patch("src.audio_recovery.get_audio_recovery_state", return_value=state),
+            patch("src.audio_recovery._load_state", return_value=state),
+            patch("src.audio_recovery.state_manager.save_state", return_value=True),
+            patch(
+                "src.audio_recovery._monitor_failed_caption_tracks",
+                caption_monitor,
+            ),
+            patch.object(
+                __import__("src.audio_recovery", fromlist=["update_audio_module"]).update_audio_module,
+                "_get_video_translation_payload",
+                fetch,
+            ),
+        ):
+            result = await run_audio_recovery_cycle(now=2000)
+
+        self.assertEqual(result["deferred_non_public"], 1)
+        caption_monitor.assert_awaited_once()
+        self.assertEqual(
+            set(caption_monitor.await_args.kwargs["entries"]),
+            {"public-video"},
+        )
+
     async def test_monitor_runs_immediately_after_restart_despite_recent_cycle(self):
         stop_event = asyncio.Event()
         state = {
@@ -480,88 +687,6 @@ class AudioRecoveryCycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(public_result["deferred_non_public"], 0)
         self.assertIn("video", state["entries"]["channel"])
 
-    async def test_caption_auto_retry_receives_only_public_videos(self):
-        state = {
-            "enabled": True,
-            "retry_cooldown_seconds": 0,
-            "initial_grace_seconds": 0,
-            "entries": {
-                "channel": {
-                    "public": {"audio_path": "a.mp3", "languages": ["en"]},
-                    "private": {"audio_path": "b.mp3", "languages": ["en"]},
-                }
-            },
-            "channel_refresh_alerts": {},
-        }
-        caption_retry = AsyncMock(
-            return_value={
-                "repaired": 0,
-                "failed": 0,
-                "deferred_quota": 0,
-                "quota_message": "",
-            }
-        )
-        with (
-            patch(
-                "src.audio_recovery._get_registered_video_public_statuses",
-                return_value=({"public": True, "private": False}, set()),
-            ),
-            patch("src.audio_recovery.get_audio_recovery_state", return_value=state),
-            patch("src.audio_recovery._load_state", return_value=state),
-            patch("src.audio_recovery.state_manager.save_state", return_value=True),
-            patch("src.audio_recovery._recover_registered_captions", caption_retry),
-            patch.object(
-                __import__(
-                    "src.audio_recovery", fromlist=["update_audio_module"]
-                ).update_audio_module,
-                "_get_video_translation_payload",
-                return_value={
-                    "videoTranslations": [{"videoId": "public"}],
-                    "audioTracks": [],
-                },
-            ),
-        ):
-            result = await run_audio_recovery_cycle(now=2000)
-
-        caption_retry.assert_awaited_once()
-        self.assertEqual(
-            set(caption_retry.await_args.kwargs["entries"]), {"public"}
-        )
-        self.assertEqual(result["deferred_non_public"], 1)
-
-    async def test_caption_auto_retry_defers_every_pending_language_on_quota(self):
-        entries = {
-            "video": {
-                "caption": {
-                    "enabled": True,
-                    "source_srt_path": "unused.srt",
-                    "source_language": "en",
-                    "languages": ["en", "fr", "es"],
-                    "completed_languages": ["en"],
-                    "attempts": {},
-                }
-            }
-        }
-        with (
-            patch(
-                "src.audio_recovery.get_caption_quota_status",
-                return_value={
-                    "blocked": True,
-                    "message": "quota exhausted",
-                },
-            ),
-            patch("src.audio_recovery.prepare_source_caption") as prepare,
-        ):
-            result = await _recover_registered_captions(
-                channel_id="channel",
-                entries=entries,
-                cycle_time=2000,
-                cooldown=0,
-            )
-
-        self.assertEqual(result["deferred_quota"], 2)
-        self.assertEqual(result["quota_message"], "quota exhausted")
-        prepare.assert_not_called()
 
     async def test_new_registration_first_scans_when_initial_grace_elapses(self):
         state = {

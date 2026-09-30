@@ -8,6 +8,7 @@ from src.audio_recovery import (
     clear_audio_recovery_registry,
     get_audio_mutation_guard,
     register_audio_recovery,
+    register_caption_monitor,
 )
 from src.audio_batch_matcher import (
     AudioBatchMatchResult,
@@ -502,8 +503,6 @@ def _audio_workflow_signature(
     extra_minutes: float,
     selective_repair: bool = False,
     repair_track_ids: Iterable[str] = (),
-    subtitles_enabled: bool = False,
-    subtitle_languages: Iterable[str] = (),
 ) -> dict:
     """Describe inputs which require a fresh delete-before-add run."""
     return {
@@ -514,8 +513,6 @@ def _audio_workflow_signature(
         "extra_minutes": float(extra_minutes),
         "selective_repair": bool(selective_repair),
         "repair_track_ids": list(repair_track_ids),
-        "subtitles_enabled": bool(subtitles_enabled),
-        "subtitle_languages": list(subtitle_languages) if subtitles_enabled else [],
     }
 
 
@@ -605,6 +602,7 @@ def create_add_audio_page():
     video_caption_status = {}
     video_caption_errors = {}
     video_caption_sources = {}
+    video_caption_signatures = {}
     video_cleanup_status = {}
     delete_requested = {}
     video_workflow_signatures = {}
@@ -712,6 +710,7 @@ def create_add_audio_page():
                 "video_caption_status": video_caption_status,
                 "video_caption_errors": video_caption_errors,
                 "video_caption_sources": video_caption_sources,
+                "video_caption_signatures": video_caption_signatures,
                 "video_cleanup_status": video_cleanup_status,
                 "delete_requested": delete_requested,
                 "video_workflow_signatures": video_workflow_signatures,
@@ -766,6 +765,10 @@ def create_add_audio_page():
             video_caption_errors.update(state.get("video_caption_errors") or {})
             video_caption_sources.clear()
             video_caption_sources.update(state.get("video_caption_sources") or {})
+            video_caption_signatures.clear()
+            video_caption_signatures.update(
+                state.get("video_caption_signatures") or {}
+            )
             restored_cleanup = _restore_cleanup_statuses(
                 state.get("video_cleanup_status"),
                 reset_processing=not _ADD_AUDIO_RUN_GUARD.locked(),
@@ -1075,7 +1078,8 @@ def create_add_audio_page():
             ui_refs["caption_oauth_status"] = status_container
             refresh_caption_oauth_status()
             ui.label(
-                "Lần đầu model nhận dạng sẽ được tải về. Khi quota YouTube hết, audio vẫn chạy; phụ đề còn thiếu được Auto Registry giữ lại để thử tiếp."
+                "Lần đầu model nhận dạng sẽ được tải về. Khi quota YouTube hết, "
+                "audio vẫn chạy; lần sau bấm chạy lại sẽ tiếp tục các phụ đề còn thiếu."
             ).classes("text-[11px] text-gray-500")
 
     def create_repeat_settings():
@@ -1184,6 +1188,7 @@ def create_add_audio_page():
         video_caption_status.clear()
         video_caption_errors.clear()
         video_caption_sources.clear()
+        video_caption_signatures.clear()
         video_cleanup_status.clear()
         delete_requested.clear()
         video_workflow_signatures.clear()
@@ -1878,6 +1883,7 @@ def create_add_audio_page():
                                 video_caption_status.pop(video_id, None)
                                 video_caption_errors.pop(video_id, None)
                                 video_caption_sources.pop(video_id, None)
+                                video_caption_signatures.pop(video_id, None)
                                 video_cleanup_status.pop(video_id, None)
                                 delete_requested.pop(video_id, None)
                                 video_workflow_signatures.pop(video_id, None)
@@ -1932,6 +1938,7 @@ def create_add_audio_page():
                             video_caption_status.pop(video_id, None)
                             video_caption_errors.pop(video_id, None)
                             video_caption_sources.pop(video_id, None)
+                            video_caption_signatures.pop(video_id, None)
                             video_cleanup_status.pop(video_id, None)
                             delete_requested.pop(video_id, None)
                             video_workflow_signatures.pop(video_id, None)
@@ -1992,7 +1999,7 @@ def create_add_audio_page():
                         ):
                             ui.label("Hoàn tất").classes("text-xs text-emerald-700")
                         elif caption_status:
-                            ui.label("Còn chờ Auto Registry").classes(
+                            ui.label("Còn chờ chạy tiếp").classes(
                                 "text-xs text-orange-600"
                             )
 
@@ -2230,6 +2237,18 @@ def create_add_audio_page():
             if not subtitles_enabled:
                 return {"enabled": False}
 
+            caption_signature = {
+                "channel_id": channel_id,
+                "audio_path": str(audio_path),
+                "languages": list(languages),
+                "model": subtitle_settings["model"],
+            }
+            if video_caption_signatures.get(vid) != caption_signature:
+                video_caption_status.pop(vid, None)
+                video_caption_errors.pop(vid, None)
+                video_caption_sources.pop(vid, None)
+                video_caption_signatures[vid] = caption_signature
+
             statuses = video_caption_status.setdefault(vid, {})
             errors = video_caption_errors.setdefault(vid, {})
             missing = [
@@ -2242,7 +2261,7 @@ def create_add_audio_page():
             source_language = str(source.get("source_language") or "").strip()
             source_track_id = str(source.get("source_track_id") or "").strip()
 
-            if missing and (not source_path.is_file() or not source_language):
+            if not source_path.is_file() or not source_language:
                 try:
                     best_effort_ui(
                         "render subtitle transcription state",
@@ -2283,7 +2302,7 @@ def create_add_audio_page():
                     save_right_panel_state()
                 except Exception as exc:
                     message = str(exc)
-                    for language in missing:
+                    for language in languages:
                         statuses[language] = "unsuccessful"
                         errors[language] = message
                     overall_errors.append(f"{vid}-phụ đề: {message}")
@@ -2301,16 +2320,6 @@ def create_add_audio_page():
                 for language in languages
                 if statuses.get(language) in ("successful", "already_added")
             ]
-            if not missing:
-                return {
-                    "enabled": True,
-                    "source_srt_path": str(source_path),
-                    "source_language": source_language,
-                    "source_track_id": source_track_id,
-                    "languages": languages,
-                    "completed_languages": completed_languages,
-                }
-
             quota = get_caption_quota_status()
             if quota.get("blocked"):
                 message = str(quota.get("message") or "Đã hết quota phụ đề.")
@@ -2355,14 +2364,14 @@ def create_add_audio_page():
                 )
                 source["source_track_id"] = source_track_id
                 video_caption_sources[vid] = source
-                for language_index, language in enumerate(missing, 1):
+                for language_index, language in enumerate(languages, 1):
                     statuses[language] = "processing"
                     errors.pop(language, None)
                     save_right_panel_state()
                     best_effort_ui(
                         "render caption language state",
                         lambda language=language, language_index=language_index: status_label.set_text(
-                            f"Đang đăng phụ đề {language_index}/{len(missing)}: {language}"
+                            f"Đang kiểm tra/đăng phụ đề {language_index}/{len(languages)}: {language}"
                         ),
                     )
                     try:
@@ -2383,7 +2392,7 @@ def create_add_audio_page():
                         message = str(exc)
                         statuses[language] = "pending"
                         errors[language] = message
-                        for remaining in missing[language_index:]:
+                        for remaining in languages[language_index:]:
                             statuses[remaining] = "pending"
                             errors[remaining] = message
                         if not quota_notice["shown"]:
@@ -2443,6 +2452,28 @@ def create_add_audio_page():
                 "completed_languages": list(dict.fromkeys(completed_languages)),
             }
 
+        def sync_caption_monitor(vid: str, result: dict) -> None:
+            """Track submitted captions only until YouTube finishes them."""
+            enabled = bool(result.get("enabled"))
+            source_srt_path = str(result.get("source_srt_path") or "")
+            source_language = str(result.get("source_language") or "")
+            monitor_languages = (
+                list(
+                    dict.fromkeys(
+                        [source_language] + list(result.get("languages") or [])
+                    )
+                )
+                if enabled and source_srt_path and source_language
+                else []
+            )
+            register_caption_monitor(
+                channel_id=channel_id,
+                video_id=vid,
+                source_srt_path=source_srt_path,
+                source_language=source_language,
+                languages=monitor_languages,
+            )
+
         async def process_video(item: tuple[int, str]) -> None:
             nonlocal completed_tasks
             video_index, vid = item
@@ -2497,15 +2528,10 @@ def create_add_audio_page():
                     extra_minutes=extra_minutes,
                     selective_repair=selective_repair,
                     repair_track_ids=failed_track_ids,
-                    subtitles_enabled=subtitles_enabled,
-                    subtitle_languages=languages_to_process,
                 )
                 if video_workflow_signatures.get(vid) != workflow_signature:
                     video_processing_status.pop(vid, None)
                     video_processing_errors.pop(vid, None)
-                    video_caption_status.pop(vid, None)
-                    video_caption_errors.pop(vid, None)
-                    video_caption_sources.pop(vid, None)
                     video_cleanup_status.pop(vid, None)
                     delete_requested.pop(vid, None)
                     video_workflow_signatures[vid] = workflow_signature
@@ -2618,11 +2644,6 @@ def create_add_audio_page():
                         lambda: setattr(progress_bar, "value", completed_tasks / total_tasks),
                     )
                 if not missing_languages:
-                    caption_config = await run_caption_workflow(
-                        vid=vid,
-                        audio_path=file_path,
-                        languages=languages_to_process,
-                    )
                     register_audio_recovery(
                         channel_id=channel_id,
                         video_id=vid,
@@ -2631,8 +2652,13 @@ def create_add_audio_page():
                         repeat_times=repeat_times,
                         extra_minutes=extra_minutes,
                         merge_languages=selective_repair,
-                        caption_config=caption_config,
                     )
+                    caption_result = await run_caption_workflow(
+                        vid=vid,
+                        audio_path=file_path,
+                        languages=languages_to_process,
+                    )
+                    sync_caption_monitor(vid, caption_result)
                     best_effort_ui(
                         "render already-complete video",
                         lambda: (
@@ -2728,11 +2754,6 @@ def create_add_audio_page():
                     in ("successful", "already_added")
                     for language in languages_for_video
                 ):
-                    caption_config = await run_caption_workflow(
-                        vid=vid,
-                        audio_path=file_path,
-                        languages=languages_to_process,
-                    )
                     register_audio_recovery(
                         channel_id=channel_id,
                         video_id=vid,
@@ -2741,8 +2762,13 @@ def create_add_audio_page():
                         repeat_times=repeat_times,
                         extra_minutes=extra_minutes,
                         merge_languages=selective_repair,
-                        caption_config=caption_config,
                     )
+                    caption_result = await run_caption_workflow(
+                        vid=vid,
+                        audio_path=file_path,
+                        languages=languages_to_process,
+                    )
+                    sync_caption_monitor(vid, caption_result)
                 best_effort_ui(
                     "clear sequential upload state",
                     lambda: concurrent_label.set_text(""),
@@ -2814,8 +2840,8 @@ def create_add_audio_page():
             best_effort_ui(
                 "notify deferred caption quota",
                 lambda: ui.notify(
-                    "Audio đã xử lý xong. Phụ đề còn thiếu đã được lưu vào "
-                    "Auto Registry và sẽ tự thử lại sau khi quota được đặt lại.",
+                    "Audio đã xử lý xong. Phụ đề còn thiếu đã được lưu checkpoint; "
+                    "sau khi quota được đặt lại, bấm chạy lại để tiếp tục.",
                     type="warning",
                     timeout=10000,
                 ),
