@@ -327,9 +327,16 @@ def create_drawer():
                                 )
                             finished_at = status.get("last_cycle_finished_at")
                             if finished_at:
+                                deferred_visibility = int(
+                                    status.get("deferred_non_public") or 0
+                                ) + int(
+                                    status.get("deferred_visibility_unknown") or 0
+                                )
                                 ui.label(
                                     f"Lần quét cuối {time.strftime('%H:%M:%S', time.localtime(finished_at))} · "
-                                    f"đã gửi lại {status.get('repaired', 0)}, lỗi {status.get('failed', 0)}"
+                                    f"đã gửi lại {status.get('repaired', 0)}, "
+                                    f"hoãn {deferred_visibility} chưa công khai, "
+                                    f"lỗi {status.get('failed', 0)}"
                                 ).classes("text-[10px] text-emerald-800")
                             else:
                                 ui.label("Đang chờ vòng quét đầu tiên").classes(

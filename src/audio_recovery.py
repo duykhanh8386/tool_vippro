@@ -20,6 +20,7 @@ from loguru import logger
 
 from src.audio_language import call_audio_update_with_retry
 from src.module.audio_module import update_audio_module
+from src.module.list_videos_module import list_videos_module
 from src.state_manager import state_manager
 from src.utils import multiply_audio, normalize_path
 
@@ -29,6 +30,11 @@ DEFAULT_RECOVERY_INTERVAL_SECONDS = 15 * 60
 DEFAULT_RECOVERY_RETRY_COOLDOWN_SECONDS = 15 * 60
 DEFAULT_INITIAL_RECOVERY_GRACE_SECONDS = 15 * 60
 REAUTH_ALERT_REASON = "encoded_reauth_proof_token_missing"
+PUBLIC_VIDEO_PRIVACY_VALUES = {
+    "PUBLIC",
+    "VIDEO_PRIVACY_PUBLIC",
+    "PRIVACY_PUBLIC",
+}
 
 # Shared with the manual add-audio page. Mutations are serialized per channel,
 # so recovery on channel A can continue while the user works on channel B,
@@ -59,6 +65,8 @@ _RUNTIME_STATUS = {
     "repair_total": 0,
     "repaired": 0,
     "failed": 0,
+    "deferred_non_public": 0,
+    "deferred_visibility_unknown": 0,
     "_upload_progress": None,
 }
 
@@ -104,6 +112,97 @@ def get_audio_mutation_guard(channel_id: str) -> threading.Lock:
             guard = threading.Lock()
             _AUDIO_MUTATION_GUARDS[clean_channel_id] = guard
         return guard
+
+
+def _is_public_video_privacy(value: object) -> bool:
+    return str(value or "").strip().upper() in PUBLIC_VIDEO_PRIVACY_VALUES
+
+
+def _status_indicates_draft(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value == 1
+    if isinstance(value, dict):
+        for key in ("isDraft", "is_draft"):
+            if key in value:
+                return _status_indicates_draft(value[key])
+        return any(
+            _status_indicates_draft(child) for child in value.values()
+        )
+    normalized = "".join(ch for ch in str(value or "").upper() if ch.isalnum())
+    if not normalized or any(
+        marker in normalized
+        for marker in ("NOTDRAFT", "NONDRAFT", "STATUSNONE", "PUBLISHED")
+    ):
+        return False
+    return normalized in {"1", "TRUE", "DRAFT"} or normalized.endswith(
+        ("STATUSDRAFT", "STATEDRAFT")
+    )
+
+
+def _is_currently_public_video(video: object) -> bool:
+    if not _is_public_video_privacy(getattr(video, "privacy", "")):
+        return False
+    if _status_indicates_draft(getattr(video, "draft_status", "")):
+        return False
+    if _status_indicates_draft(getattr(video, "video_status", "")):
+        return False
+    # Studio omits this object after scheduled publication. A non-empty value
+    # means the video is still waiting for its public release time even if its
+    # target privacy is PUBLIC.
+    if getattr(video, "scheduled_publishing_details", None):
+        return False
+    return True
+
+
+def _get_registered_video_public_statuses(
+    channel_id: str,
+    video_ids: Iterable[str],
+) -> tuple[dict[str, bool], set[str]]:
+    """Resolve whether registered IDs are currently and actually public.
+
+    Returns ``(public_status_by_video_id, unresolved_video_ids)``. Draft rows
+    are not consistently returned by Studio's unfiltered listing; unresolved
+    IDs are therefore deferred just like known non-public videos and remain
+    registered for a later cycle.
+    """
+    requested = list(
+        dict.fromkeys(str(video_id or "").strip() for video_id in video_ids)
+    )
+    requested = [video_id for video_id in requested if video_id]
+    remaining = set(requested)
+    public_status_by_video_id: dict[str, bool] = {}
+    seen_page_tokens: set[str] = set()
+    page_token: str | None = None
+
+    while remaining:
+        videos, next_page_token = list_videos_module.list_all_videos(
+            channel_id,
+            limit=50,
+            page_token=page_token,
+        )
+        for video in videos:
+            video_id = str(getattr(video, "id", "") or "").strip()
+            if video_id not in remaining:
+                continue
+            public_status_by_video_id[video_id] = _is_currently_public_video(
+                video
+            )
+            remaining.discard(video_id)
+
+        if not next_page_token or not remaining:
+            break
+        clean_page_token = str(next_page_token)
+        if clean_page_token in seen_page_tokens:
+            raise RuntimeError(
+                "YouTube returned a repeated page token while checking "
+                "auto-recovery video visibility"
+            )
+        seen_page_tokens.add(clean_page_token)
+        page_token = clean_page_token
+
+    return public_status_by_video_id, remaining
 
 
 def _default_state() -> dict:
@@ -535,7 +634,11 @@ def build_audio_recovery_plan(
     creator_track_ids: dict[str, set[str]] = {}
     observations: dict[str, dict[str, set[str]]] = {}
 
-    def observe(video_id: str, language: str, state: str) -> None:
+    def observe(
+        video_id: str,
+        language: str,
+        state: str,
+    ) -> None:
         clean_language = str(language or "").strip().casefold()
         if clean_language:
             observations.setdefault(video_id, {}).setdefault(
@@ -715,6 +818,8 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
     unreadable: list[str] = []
     deferred_busy = 0
     deferred_initial_grace = 0
+    deferred_non_public = 0
+    deferred_visibility_unknown = 0
     cancelled_by_clear = False
     owned_mutation_guard: threading.Lock | None = None
     _update_runtime_status(
@@ -732,6 +837,8 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
         repair_total=0,
         repaired=0,
         failed=0,
+        deferred_non_public=0,
+        deferred_visibility_unknown=0,
         _upload_progress=None,
     )
     with _STATE_LOCK:
@@ -820,9 +927,62 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
                 continue
 
             video_ids = list(eligible_entries)
+            channel_requires_refresh = False
+            try:
+                (
+                    public_status_by_video_id,
+                    unresolved_video_ids,
+                ) = await asyncio.to_thread(
+                    _get_registered_video_public_statuses,
+                    channel_id,
+                    video_ids,
+                )
+            except Exception as exc:
+                failed += len(video_ids)
+                unreadable.extend(video_ids)
+                if _requires_channel_refresh(exc):
+                    mark_channel_refresh_required(channel_id, exc, now=cycle_time)
+                    channel_requires_refresh = True
+                logger.error(
+                    "Audio auto-recovery could not check video visibility: "
+                    "channel={} videos={} error={}",
+                    channel_id,
+                    ",".join(video_ids),
+                    exc,
+                )
+                continue
+
+            public_video_ids = [
+                video_id
+                for video_id in video_ids
+                if public_status_by_video_id.get(video_id) is True
+            ]
+            known_non_public = [
+                video_id
+                for video_id in video_ids
+                if video_id in public_status_by_video_id
+                and video_id not in public_video_ids
+            ]
+            deferred_non_public += len(known_non_public)
+            deferred_visibility_unknown += len(unresolved_video_ids)
+            if known_non_public or unresolved_video_ids:
+                logger.info(
+                    "Audio auto-recovery deferred non-public videos: channel={} "
+                    "non_public={} visibility_unresolved={}",
+                    channel_id,
+                    len(known_non_public),
+                    len(unresolved_video_ids),
+                )
+            if not public_video_ids:
+                continue
+
+            eligible_entries = {
+                video_id: eligible_entries[video_id]
+                for video_id in public_video_ids
+            }
+            video_ids = public_video_ids
             batch_size = update_audio_module._TRANSLATION_BATCH_SIZE
             channel_actions: list[dict] = []
-            channel_requires_refresh = False
             for start in range(0, len(video_ids), batch_size):
                 if _recovery_was_cleared(cycle_generation):
                     cancelled_by_clear = True
@@ -1086,6 +1246,8 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
             "reauth_required": sorted(get_channel_refresh_alerts()),
             "deferred_busy": deferred_busy,
             "deferred_initial_grace": deferred_initial_grace,
+            "deferred_non_public": deferred_non_public,
+            "deferred_visibility_unknown": deferred_visibility_unknown,
             "cancelled_by_clear": cancelled_by_clear,
         }
         with _STATE_LOCK:
@@ -1100,7 +1262,9 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
             len(result["unreadable"]),
         )
         final_message = (
-            f"Quét xong: đã gửi lại {repaired} audio, lỗi {failed}"
+            f"Quét xong: đã gửi lại {repaired}, hoãn "
+            f"{deferred_non_public + deferred_visibility_unknown} video chưa "
+            f"công khai, lỗi {failed}"
         )
         return result
     except asyncio.CancelledError:
@@ -1127,6 +1291,8 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
                     repair_total=0,
                     repaired=repaired,
                     failed=failed,
+                    deferred_non_public=deferred_non_public,
+                    deferred_visibility_unknown=deferred_visibility_unknown,
                     _upload_progress=None,
                 )
 

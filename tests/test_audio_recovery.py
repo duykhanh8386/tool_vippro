@@ -9,6 +9,7 @@ from src.audio_recovery import (
     DEFAULT_INITIAL_RECOVERY_GRACE_SECONDS,
     DEFAULT_RECOVERY_INTERVAL_SECONDS,
     DEFAULT_RECOVERY_RETRY_COOLDOWN_SECONDS,
+    _get_registered_video_public_statuses,
     _monitor_loop,
     acknowledge_channel_refresh,
     build_audio_recovery_plan,
@@ -293,7 +294,77 @@ class AudioRecoveryRegistryTests(unittest.TestCase):
         self.assertEqual(stored["channel_refresh_alerts"], {})
 
 
+class AudioRecoveryVisibilityTests(unittest.TestCase):
+    def test_visibility_lookup_pages_and_rejects_draft_or_scheduled_public(self):
+        with patch(
+            "src.audio_recovery.list_videos_module.list_all_videos",
+            side_effect=[
+                (
+                    [
+                        SimpleNamespace(
+                            id="private-video",
+                            privacy="VIDEO_PRIVACY_PRIVATE",
+                        ),
+                        SimpleNamespace(
+                            id="draft-video",
+                            privacy="VIDEO_PRIVACY_PUBLIC",
+                            draft_status="VIDEO_DRAFT_STATUS_DRAFT",
+                        ),
+                        SimpleNamespace(
+                            id="scheduled-video",
+                            privacy="VIDEO_PRIVACY_PUBLIC",
+                            scheduled_publishing_details={"time": "later"},
+                        ),
+                    ],
+                    "next-page",
+                ),
+                (
+                    [
+                        SimpleNamespace(
+                            id="public-video",
+                            privacy="VIDEO_PRIVACY_PUBLIC",
+                        )
+                    ],
+                    None,
+                ),
+            ],
+        ) as list_videos:
+            public_statuses, unresolved = _get_registered_video_public_statuses(
+                "channel",
+                [
+                    "public-video",
+                    "private-video",
+                    "draft-video",
+                    "scheduled-video",
+                    "missing-video",
+                ],
+            )
+
+        self.assertEqual(
+            public_statuses,
+            {
+                "private-video": False,
+                "draft-video": False,
+                "scheduled-video": False,
+                "public-video": True,
+            },
+        )
+        self.assertEqual(unresolved, {"missing-video"})
+        self.assertEqual(list_videos.call_count, 2)
+
+
 class AudioRecoveryCycleTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.visibility_patch = patch(
+            "src.audio_recovery._get_registered_video_public_statuses",
+            side_effect=lambda _channel_id, video_ids: (
+                {video_id: True for video_id in video_ids},
+                set(),
+            ),
+        )
+        self.visibility_patch.start()
+        self.addCleanup(self.visibility_patch.stop)
+
     async def test_monitor_runs_immediately_after_restart_despite_recent_cycle(self):
         stop_event = asyncio.Event()
         state = {
@@ -315,6 +386,59 @@ class AudioRecoveryCycleTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(_monitor_loop(stop_event), timeout=0.2)
 
         cycle.assert_awaited_once_with()
+
+    async def test_non_public_video_stays_registered_until_it_becomes_public(self):
+        state = {
+            "enabled": True,
+            "retry_cooldown_seconds": 0,
+            "entries": {
+                "channel": {
+                    "video": {
+                        "audio_path": "unused.mp3",
+                        "languages": ["en"],
+                    }
+                }
+            },
+            "channel_refresh_alerts": {},
+        }
+        visibility = Mock(
+            side_effect=[
+                ({"video": False}, set()),
+                ({"video": True}, set()),
+            ]
+        )
+        fetch = Mock(
+            return_value={
+                "videoTranslations": [
+                    {"videoId": "video", "translations": []}
+                ],
+                "audioTracks": [],
+            }
+        )
+
+        with (
+            patch(
+                "src.audio_recovery._get_registered_video_public_statuses",
+                visibility,
+            ),
+            patch("src.audio_recovery.get_audio_recovery_state", return_value=state),
+            patch("src.audio_recovery._load_state", return_value=state),
+            patch("src.audio_recovery.state_manager.save_state", return_value=True),
+            patch.object(
+                __import__(
+                    "src.audio_recovery", fromlist=["update_audio_module"]
+                ).update_audio_module,
+                "_get_video_translation_payload",
+                fetch,
+            ),
+        ):
+            private_result = await run_audio_recovery_cycle(now=1000)
+            public_result = await run_audio_recovery_cycle(now=2000)
+
+        fetch.assert_called_once_with(["video"], "channel")
+        self.assertEqual(private_result["deferred_non_public"], 1)
+        self.assertEqual(public_result["deferred_non_public"], 0)
+        self.assertIn("video", state["entries"]["channel"])
 
     async def test_new_registration_first_scans_when_initial_grace_elapses(self):
         state = {
