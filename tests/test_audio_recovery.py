@@ -10,6 +10,7 @@ from src.audio_recovery import (
     DEFAULT_RECOVERY_INTERVAL_SECONDS,
     DEFAULT_RECOVERY_RETRY_COOLDOWN_SECONDS,
     _get_registered_video_public_statuses,
+    _recover_registered_captions,
     _monitor_loop,
     acknowledge_channel_refresh,
     build_audio_recovery_plan,
@@ -235,6 +236,45 @@ class AudioRecoveryRegistryTests(unittest.TestCase):
         self.assertEqual(entry["repeat_times"], 2)
         self.assertEqual(entry["extra_minutes"], 1.5)
 
+    def test_registration_persists_pending_caption_languages(self):
+        stored = {}
+
+        def load(_name):
+            return stored.copy() if stored else None
+
+        def save(_name, state):
+            stored.clear()
+            stored.update(state)
+            return True
+
+        with (
+            patch("src.audio_recovery.state_manager.load_state", side_effect=load),
+            patch("src.audio_recovery.state_manager.save_state", side_effect=save),
+        ):
+            self.assertTrue(
+                register_audio_recovery(
+                    channel_id="channel",
+                    video_id="video",
+                    audio_path=r"D:\music\track.mp3",
+                    languages=["en", "fr"],
+                    repeat_times=1,
+                    extra_minutes=0,
+                    caption_config={
+                        "enabled": True,
+                        "source_srt_path": r"D:\cache\video.en.srt",
+                        "source_language": "en",
+                        "source_track_id": "source-caption",
+                        "languages": ["en", "fr"],
+                        "completed_languages": ["en"],
+                    },
+                )
+            )
+
+        caption = stored["entries"]["channel"]["video"]["caption"]
+        self.assertTrue(caption["enabled"])
+        self.assertEqual(caption["completed_languages"], ["en"])
+        self.assertEqual(caption["languages"], ["en", "fr"])
+
     def test_clear_registry_stops_future_automatic_recovery(self):
         stored = {
             "enabled": True,
@@ -439,6 +479,89 @@ class AudioRecoveryCycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(private_result["deferred_non_public"], 1)
         self.assertEqual(public_result["deferred_non_public"], 0)
         self.assertIn("video", state["entries"]["channel"])
+
+    async def test_caption_auto_retry_receives_only_public_videos(self):
+        state = {
+            "enabled": True,
+            "retry_cooldown_seconds": 0,
+            "initial_grace_seconds": 0,
+            "entries": {
+                "channel": {
+                    "public": {"audio_path": "a.mp3", "languages": ["en"]},
+                    "private": {"audio_path": "b.mp3", "languages": ["en"]},
+                }
+            },
+            "channel_refresh_alerts": {},
+        }
+        caption_retry = AsyncMock(
+            return_value={
+                "repaired": 0,
+                "failed": 0,
+                "deferred_quota": 0,
+                "quota_message": "",
+            }
+        )
+        with (
+            patch(
+                "src.audio_recovery._get_registered_video_public_statuses",
+                return_value=({"public": True, "private": False}, set()),
+            ),
+            patch("src.audio_recovery.get_audio_recovery_state", return_value=state),
+            patch("src.audio_recovery._load_state", return_value=state),
+            patch("src.audio_recovery.state_manager.save_state", return_value=True),
+            patch("src.audio_recovery._recover_registered_captions", caption_retry),
+            patch.object(
+                __import__(
+                    "src.audio_recovery", fromlist=["update_audio_module"]
+                ).update_audio_module,
+                "_get_video_translation_payload",
+                return_value={
+                    "videoTranslations": [{"videoId": "public"}],
+                    "audioTracks": [],
+                },
+            ),
+        ):
+            result = await run_audio_recovery_cycle(now=2000)
+
+        caption_retry.assert_awaited_once()
+        self.assertEqual(
+            set(caption_retry.await_args.kwargs["entries"]), {"public"}
+        )
+        self.assertEqual(result["deferred_non_public"], 1)
+
+    async def test_caption_auto_retry_defers_every_pending_language_on_quota(self):
+        entries = {
+            "video": {
+                "caption": {
+                    "enabled": True,
+                    "source_srt_path": "unused.srt",
+                    "source_language": "en",
+                    "languages": ["en", "fr", "es"],
+                    "completed_languages": ["en"],
+                    "attempts": {},
+                }
+            }
+        }
+        with (
+            patch(
+                "src.audio_recovery.get_caption_quota_status",
+                return_value={
+                    "blocked": True,
+                    "message": "quota exhausted",
+                },
+            ),
+            patch("src.audio_recovery.prepare_source_caption") as prepare,
+        ):
+            result = await _recover_registered_captions(
+                channel_id="channel",
+                entries=entries,
+                cycle_time=2000,
+                cooldown=0,
+            )
+
+        self.assertEqual(result["deferred_quota"], 2)
+        self.assertEqual(result["quota_message"], "quota exhausted")
+        prepare.assert_not_called()
 
     async def test_new_registration_first_scans_when_initial_grace_elapses(self):
         state = {

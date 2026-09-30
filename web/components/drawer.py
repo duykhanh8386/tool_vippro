@@ -142,6 +142,7 @@ def create_drawer():
             recovery_activity_state = {
                 "notified_cycle": None,
                 "was_active": False,
+                "quota_signature": None,
             }
             recovery_channel_names: dict[str, str] = {}
 
@@ -250,7 +251,11 @@ def create_drawer():
                     recovery_detail_transfer.set_text(
                         f"Đang quét kênh {current}/{total}"
                         if phase == "scanning" and total
-                        else "Đang chuẩn bị audio để add lại"
+                        else (
+                            "Đang đăng lại phụ đề còn thiếu"
+                            if phase == "captioning"
+                            else "Đang chuẩn bị audio để add lại"
+                        )
                     )
                 else:
                     recovery_detail_progress.set_value(0)
@@ -335,8 +340,9 @@ def create_drawer():
                                 ui.label(
                                     f"Lần quét cuối {time.strftime('%H:%M:%S', time.localtime(finished_at))} · "
                                     f"đã gửi lại {status.get('repaired', 0)}, "
+                                    f"phụ đề {status.get('captions_repaired', 0)}, "
                                     f"hoãn {deferred_visibility} chưa công khai, "
-                                    f"lỗi {status.get('failed', 0)}"
+                                    f"lỗi {int(status.get('failed', 0) or 0) + int(status.get('captions_failed', 0) or 0)}"
                                 ).classes("text-[10px] text-emerald-800")
                             else:
                                 ui.label("Đang chờ vòng quét đầu tiên").classes(
@@ -345,6 +351,17 @@ def create_drawer():
                             ui.label("Nhấp để xem chi tiết").classes(
                                 "text-[10px] text-emerald-700 underline"
                             )
+
+                    quota_message = str(status.get("caption_quota_message") or "")
+                    if quota_message:
+                        with ui.card().classes(
+                            "w-full p-2 bg-orange-50 border border-orange-300 shadow-none"
+                        ):
+                            with ui.row().classes("items-start gap-2 no-wrap"):
+                                ui.icon("data_usage").classes("text-orange-700")
+                                ui.label(quota_message).classes(
+                                    "text-xs font-medium text-orange-900"
+                                )
 
                 refresh_recovery_details(status)
 
@@ -358,12 +375,30 @@ def create_drawer():
                 elif recovery_activity_state["was_active"] and not active:
                     repaired = int(status.get("repaired") or 0)
                     failed = int(status.get("failed") or 0)
-                    if repaired or failed:
+                    captions_repaired = int(status.get("captions_repaired") or 0)
+                    captions_failed = int(status.get("captions_failed") or 0)
+                    if repaired or failed or captions_repaired or captions_failed:
                         ui.notify(
                             str(status.get("message") or "Đã hoàn tất tự động khôi phục audio"),
-                            type="positive" if failed == 0 else "warning",
+                            type=(
+                                "positive"
+                                if failed + captions_failed == 0
+                                else "warning"
+                            ),
                             timeout=5000,
                         )
+                quota_message = str(status.get("caption_quota_message") or "")
+                if (
+                    quota_message
+                    and recovery_activity_state["quota_signature"] != quota_message
+                ):
+                    ui.notify(
+                        quota_message,
+                        type="warning",
+                        timeout=0,
+                        close_button="Đóng",
+                    )
+                    recovery_activity_state["quota_signature"] = quota_message
                 recovery_activity_state["was_active"] = active
 
             refresh_recovery_activity()

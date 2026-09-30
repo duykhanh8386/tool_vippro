@@ -26,8 +26,22 @@ from src.module.audio_module import update_audio_module
 from src.module.list_videos_module import list_videos_module
 from src.module.model import Video
 from src.state_manager import state_manager
+from src.subtitle_generation import (
+    DEFAULT_SUBTITLE_MODEL,
+    persist_video_source_srt,
+    render_source_srt,
+)
 from src.utils import get_channels_info, multiply_audio, normalize_path, validate_path_text
-from web.components.common import select_directory
+from src.youtube_caption_api import (
+    CaptionAuthenticationError,
+    CaptionQuotaExceededError,
+    authorize_caption_channel,
+    get_caption_quota_status,
+    has_caption_oauth,
+    prepare_source_caption,
+    publish_translated_caption,
+)
+from web.components.common import select_directory, select_file
 from web.theme import app_card, page_header, section_header
 
 
@@ -488,6 +502,8 @@ def _audio_workflow_signature(
     extra_minutes: float,
     selective_repair: bool = False,
     repair_track_ids: Iterable[str] = (),
+    subtitles_enabled: bool = False,
+    subtitle_languages: Iterable[str] = (),
 ) -> dict:
     """Describe inputs which require a fresh delete-before-add run."""
     return {
@@ -498,6 +514,8 @@ def _audio_workflow_signature(
         "extra_minutes": float(extra_minutes),
         "selective_repair": bool(selective_repair),
         "repair_track_ids": list(repair_track_ids),
+        "subtitles_enabled": bool(subtitles_enabled),
+        "subtitle_languages": list(subtitle_languages) if subtitles_enabled else [],
     }
 
 
@@ -584,6 +602,9 @@ def create_add_audio_page():
     auto_match_info = {}
     video_processing_status = {}
     video_processing_errors = {}
+    video_caption_status = {}
+    video_caption_errors = {}
+    video_caption_sources = {}
     video_cleanup_status = {}
     delete_requested = {}
     video_workflow_signatures = {}
@@ -592,6 +613,11 @@ def create_add_audio_page():
     performance_settings = {
         "max_concurrency": DEFAULT_AUDIO_UPLOAD_CONCURRENCY,
         "mode": _AUDIO_UPLOAD_CONCURRENCY_MODE,
+    }
+    subtitle_settings = {
+        "enabled": False,
+        "oauth_client_json": "",
+        "model": DEFAULT_SUBTITLE_MODEL,
     }
     batch_scan_state = {
         "music_folder": "",
@@ -640,6 +666,9 @@ def create_add_audio_page():
         "failed_video_scan_button": None,
         "scan_scope_toggle": None,
         "recent_limit_input": None,
+        "subtitle_switch": None,
+        "oauth_client_input": None,
+        "caption_oauth_status": None,
     }
 
     def configuration_change_blocked() -> bool:
@@ -680,6 +709,9 @@ def create_add_audio_page():
                 "auto_match_info": auto_match_info,
                 "video_processing_status": video_processing_status,
                 "video_processing_errors": video_processing_errors,
+                "video_caption_status": video_caption_status,
+                "video_caption_errors": video_caption_errors,
+                "video_caption_sources": video_caption_sources,
                 "video_cleanup_status": video_cleanup_status,
                 "delete_requested": delete_requested,
                 "video_workflow_signatures": video_workflow_signatures,
@@ -688,6 +720,7 @@ def create_add_audio_page():
                 "repeat_settings": repeat_settings,
                 "selected_channel": selected_channel["id"],
                 "performance_settings": performance_settings,
+                "subtitle_settings": subtitle_settings,
                 "batch_scan_state": batch_scan_state,
                 "video_source_state": video_source_state,
             }
@@ -721,6 +754,18 @@ def create_add_audio_page():
                     needs_checkpoint_save = True
             if "video_processing_errors" in state:
                 video_processing_errors.update(state["video_processing_errors"])
+            restored_caption_statuses = _restore_language_statuses(
+                state.get("video_caption_status"),
+                reset_processing=not _ADD_AUDIO_RUN_GUARD.locked(),
+            )
+            video_caption_status.clear()
+            video_caption_status.update(restored_caption_statuses)
+            if restored_caption_statuses != (state.get("video_caption_status") or {}):
+                needs_checkpoint_save = True
+            video_caption_errors.clear()
+            video_caption_errors.update(state.get("video_caption_errors") or {})
+            video_caption_sources.clear()
+            video_caption_sources.update(state.get("video_caption_sources") or {})
             restored_cleanup = _restore_cleanup_statuses(
                 state.get("video_cleanup_status"),
                 reset_processing=not _ADD_AUDIO_RUN_GUARD.locked(),
@@ -753,6 +798,17 @@ def create_add_audio_page():
             performance_settings.update(restored_performance)
             if performance_changed:
                 needs_checkpoint_save = True
+            saved_subtitles = state.get("subtitle_settings") or {}
+            if isinstance(saved_subtitles, dict):
+                subtitle_settings["enabled"] = bool(
+                    saved_subtitles.get("enabled", False)
+                )
+                subtitle_settings["oauth_client_json"] = str(
+                    saved_subtitles.get("oauth_client_json") or ""
+                )
+                subtitle_settings["model"] = str(
+                    saved_subtitles.get("model") or DEFAULT_SUBTITLE_MODEL
+                )
             if "batch_scan_state" in state:
                 batch_scan_state.update(state["batch_scan_state"])
             if "video_source_state" in state:
@@ -804,6 +860,13 @@ def create_add_audio_page():
                         ui_refs["recent_limit_input"].value = video_source_state[
                             "recent_limit"
                         ]
+                    if ui_refs["subtitle_switch"]:
+                        ui_refs["subtitle_switch"].value = subtitle_settings["enabled"]
+                    if ui_refs["oauth_client_input"]:
+                        ui_refs["oauth_client_input"].value = subtitle_settings[
+                            "oauth_client_json"
+                        ]
+                    refresh_caption_oauth_status()
                     refresh_video_source_controls()
                     refresh_right_panel()
                     refresh_scan_preview()
@@ -836,6 +899,7 @@ def create_add_audio_page():
             replace_active_video_list([])
 
         refresh_video_source_controls()
+        refresh_caption_oauth_status()
         save_right_panel_state()
         return True
     def create_language_input_and_chips():
@@ -886,6 +950,134 @@ def create_add_audio_page():
 
         ui_refs["refresh_language_chips"] = refresh_language_chips
         return refresh_language_chips
+
+    def refresh_caption_oauth_status() -> None:
+        container = ui_refs.get("caption_oauth_status")
+        if not container:
+            return
+        container.clear()
+        channel_id = selected_channel.get("id")
+        with container:
+            if not channel_id:
+                ui.label("Chọn kênh để kiểm tra quyền đăng phụ đề.").classes(
+                    "text-xs text-gray-500"
+                )
+            elif has_caption_oauth(channel_id):
+                ui.label("Kênh đã được cấp quyền đăng phụ đề.").classes(
+                    "text-xs font-medium text-emerald-700"
+                )
+            else:
+                ui.label("Kênh chưa được cấp quyền đăng phụ đề.").classes(
+                    "text-xs font-medium text-orange-600"
+                )
+            quota = get_caption_quota_status()
+            if quota.get("blocked"):
+                ui.label(str(quota.get("message") or "Đã hết quota phụ đề.")).classes(
+                    "text-xs font-medium text-red-700"
+                )
+
+    def create_subtitle_settings() -> None:
+        def update_enabled(event) -> None:
+            if configuration_change_blocked():
+                event.sender.value = subtitle_settings["enabled"]
+                return
+            subtitle_settings["enabled"] = bool(event.value)
+            save_right_panel_state()
+
+        def update_client_path(_event=None) -> None:
+            if configuration_change_blocked():
+                ui_refs["oauth_client_input"].value = subtitle_settings[
+                    "oauth_client_json"
+                ]
+                return
+            subtitle_settings["oauth_client_json"] = normalize_path(
+                str(ui_refs["oauth_client_input"].value or "")
+            )
+            save_right_panel_state()
+
+        def pick_client_json() -> None:
+            if configuration_change_blocked():
+                return
+            path = select_file(
+                initial_dir=(
+                    str(Path(subtitle_settings["oauth_client_json"]).parent)
+                    if subtitle_settings["oauth_client_json"]
+                    else None
+                ),
+                title="Chọn OAuth Client JSON của Google",
+                filetypes=(("JSON", "*.json"), ("Tất cả", "*.*")),
+            )
+            if path:
+                subtitle_settings["oauth_client_json"] = normalize_path(path)
+                ui_refs["oauth_client_input"].value = subtitle_settings[
+                    "oauth_client_json"
+                ]
+                save_right_panel_state()
+
+        async def connect_caption_oauth() -> None:
+            if configuration_change_blocked():
+                return
+            channel_id = selected_channel.get("id")
+            client_path = str(subtitle_settings["oauth_client_json"] or "").strip()
+            if not channel_id:
+                ui.notify("Hãy chọn kênh trước khi kết nối phụ đề.", type="warning")
+                return
+            if not client_path:
+                ui.notify("Hãy chọn OAuth Client JSON của Google.", type="warning")
+                return
+            ui.notify(
+                "Trình duyệt đang mở. Hãy đăng nhập đúng tài khoản sở hữu kênh.",
+                type="info",
+                timeout=5000,
+            )
+            try:
+                await asyncio.to_thread(
+                    authorize_caption_channel,
+                    channel_id,
+                    client_path,
+                )
+            except Exception as exc:
+                logger.exception("Could not authorize YouTube captions")
+                ui.notify(f"Kết nối phụ đề thất bại: {exc}", type="negative")
+            else:
+                ui.notify("Đã kết nối quyền đăng phụ đề cho kênh.", type="positive")
+            refresh_caption_oauth_status()
+
+        with app_card(classes="audio-add-section"):
+            with ui.row().classes("w-full items-center justify-between gap-3"):
+                with ui.column().classes("gap-0 flex-1"):
+                    ui.label("Tạo phụ đề tự động").classes("app-section-title")
+                    ui.label(
+                        "Nhận dạng lời từ file nhạc, tạo SRT khớp thời gian và đăng đủ các ngôn ngữ ở trên."
+                    ).classes("app-section-copy")
+                subtitle_switch = ui.switch(
+                    "Bật phụ đề",
+                    value=subtitle_settings["enabled"],
+                    on_change=update_enabled,
+                )
+                ui_refs["subtitle_switch"] = subtitle_switch
+            with ui.row().classes("w-full items-end gap-2"):
+                oauth_input = ui.input(
+                    "OAuth Client JSON",
+                    value=subtitle_settings["oauth_client_json"],
+                ).props("outlined clearable").classes("flex-1")
+                oauth_input.on("change", update_client_path)
+                ui_refs["oauth_client_input"] = oauth_input
+                ui.button("Chọn file", icon="folder_open", on_click=pick_client_json).props(
+                    "outline"
+                )
+                ui.button(
+                    "Kết nối kênh",
+                    icon="link",
+                    on_click=connect_caption_oauth,
+                ).classes("app-button-primary")
+            status_container = ui.column().classes("w-full gap-1")
+            ui_refs["caption_oauth_status"] = status_container
+            refresh_caption_oauth_status()
+            ui.label(
+                "Lần đầu model nhận dạng sẽ được tải về. Khi quota YouTube hết, audio vẫn chạy; phụ đề còn thiếu được Auto Registry giữ lại để thử tiếp."
+            ).classes("text-[11px] text-gray-500")
+
     def create_repeat_settings():
         """Create repeat settings interface"""
         with app_card(classes="audio-add-section"):
@@ -989,6 +1181,9 @@ def create_add_audio_page():
             )
         video_processing_status.clear()
         video_processing_errors.clear()
+        video_caption_status.clear()
+        video_caption_errors.clear()
+        video_caption_sources.clear()
         video_cleanup_status.clear()
         delete_requested.clear()
         video_workflow_signatures.clear()
@@ -1575,6 +1770,8 @@ def create_add_audio_page():
             for vid in video_ids_state["ids"]:
                 current_path_value = id_to_path.get(vid, "")
                 video_status = video_processing_status.get(vid, {})
+                caption_status = video_caption_status.get(vid, {})
+                caption_errors = video_caption_errors.get(vid, {})
                 if video_source_state.get("mode") == "failed":
                     selected_repairs = _select_terminal_repair_actions(
                         video_source_state.get("failed_targets"),
@@ -1588,6 +1785,8 @@ def create_add_audio_page():
                 else:
                     active_languages = list(selected_languages["languages"])
                 active_language_set = set(active_languages)
+                active_caption_languages = list(selected_languages["languages"])
+                active_caption_language_set = set(active_caption_languages)
                 cleanup_status = video_cleanup_status.get(vid, "pending")
                 video_errors = {
                     language: message
@@ -1676,6 +1875,9 @@ def create_add_audio_page():
                             if id_to_path.get(video_id, "") != new_path:
                                 video_processing_status.pop(video_id, None)
                                 video_processing_errors.pop(video_id, None)
+                                video_caption_status.pop(video_id, None)
+                                video_caption_errors.pop(video_id, None)
+                                video_caption_sources.pop(video_id, None)
                                 video_cleanup_status.pop(video_id, None)
                                 delete_requested.pop(video_id, None)
                                 video_workflow_signatures.pop(video_id, None)
@@ -1727,6 +1929,9 @@ def create_add_audio_page():
                             auto_match_info.pop(video_id, None)
                             video_processing_status.pop(video_id, None)
                             video_processing_errors.pop(video_id, None)
+                            video_caption_status.pop(video_id, None)
+                            video_caption_errors.pop(video_id, None)
+                            video_caption_sources.pop(video_id, None)
                             video_cleanup_status.pop(video_id, None)
                             delete_requested.pop(video_id, None)
                             video_workflow_signatures.pop(video_id, None)
@@ -1762,6 +1967,56 @@ def create_add_audio_page():
                     with ui.column().classes("w-1/12 flex justify-center"):
                         ui.button(icon="delete", on_click=make_delete(vid)).props("flat round dense")
 
+                if subtitle_settings["enabled"] or caption_status:
+                    caption_complete = sum(
+                        1
+                        for language in active_caption_languages
+                        if caption_status.get(language)
+                        in ("successful", "already_added")
+                    )
+                    with ui.row().classes(
+                        "w-full items-center gap-2 bg-blue-50 border-b border-blue-100 px-4 py-2"
+                    ):
+                        ui.icon("subtitles").classes("text-blue-700")
+                        ui.label(
+                            f"Phụ đề: {caption_complete}/{len(active_caption_languages)} ngôn ngữ"
+                        ).classes("text-xs font-medium text-blue-800")
+                        if any(
+                            caption_status.get(language) == "processing"
+                            for language in active_caption_languages
+                        ):
+                            ui.label("Đang xử lý").classes("text-xs text-blue-600")
+                        elif (
+                            caption_complete == len(active_caption_languages)
+                            and active_caption_languages
+                        ):
+                            ui.label("Hoàn tất").classes("text-xs text-emerald-700")
+                        elif caption_status:
+                            ui.label("Còn chờ Auto Registry").classes(
+                                "text-xs text-orange-600"
+                            )
+
+                active_caption_errors = {
+                    language: message
+                    for language, message in caption_errors.items()
+                    if language in active_caption_language_set
+                }
+                if active_caption_errors:
+                    with ui.card().classes(
+                        "w-full bg-orange-50 border border-orange-300 px-4 py-2 mt-1"
+                    ):
+                        with ui.row().classes("items-center gap-2"):
+                            ui.icon("subtitles_off").classes("text-orange-700")
+                            ui.label(f"Phụ đề video {vid} còn chờ xử lý").classes(
+                                "font-semibold text-orange-800"
+                            )
+                        for error_lang, error_message in active_caption_errors.items():
+                            ui.label(
+                                f"Ngôn ngữ {error_lang}: {error_message}"
+                            ).classes(
+                                "text-sm text-orange-800 whitespace-normal break-words"
+                            )
+
                 if video_errors:
                     with ui.card().classes("w-full bg-red-50 border border-red-300 px-4 py-2 mt-1"):
                         with ui.row().classes("items-center gap-2"):
@@ -1795,6 +2050,14 @@ def create_add_audio_page():
             ui.notify(
                 f"Mã ngôn ngữ không hợp lệ: {', '.join(invalid_languages)}",
                 type="negative",
+            )
+            return None
+        subtitles_enabled = bool(subtitle_settings.get("enabled"))
+        if subtitles_enabled and not has_caption_oauth(selected_channel["id"]):
+            ui.notify(
+                "Kênh chưa được cấp quyền phụ đề. Hãy chọn OAuth Client JSON "
+                "và bấm Kết nối kênh.",
+                type="warning",
             )
             return None
         selective_repair = video_source_state.get("mode") == "failed"
@@ -1879,6 +2142,7 @@ def create_add_audio_page():
             video_id: 0 for video_id in job_video_ids
         }
         overall_errors = []
+        quota_notice = {"shown": False}
         max_concurrency = _clamp_upload_concurrency(
             performance_settings.get("max_concurrency")
         )
@@ -1956,12 +2220,236 @@ def create_add_audio_page():
             finally:
                 active_uploads.pop(progress_key, None)
 
+        async def run_caption_workflow(
+            *,
+            vid: str,
+            audio_path: Path,
+            languages: list[str],
+        ) -> dict:
+            """Generate one source SRT and publish/retry the requested languages."""
+            if not subtitles_enabled:
+                return {"enabled": False}
+
+            statuses = video_caption_status.setdefault(vid, {})
+            errors = video_caption_errors.setdefault(vid, {})
+            missing = [
+                language
+                for language in languages
+                if statuses.get(language) not in ("successful", "already_added")
+            ]
+            source = video_caption_sources.get(vid) or {}
+            source_path = Path(str(source.get("source_srt_path") or ""))
+            source_language = str(source.get("source_language") or "").strip()
+            source_track_id = str(source.get("source_track_id") or "").strip()
+
+            if missing and (not source_path.is_file() or not source_language):
+                try:
+                    best_effort_ui(
+                        "render subtitle transcription state",
+                        lambda: status_label.set_text(
+                            f"Đang nhận dạng lời và tạo phụ đề cho video {vid}..."
+                        ),
+                    )
+                    video_info = await asyncio.to_thread(
+                        update_audio_module._get_video_info,
+                        video_id=vid,
+                        channel_id=channel_id,
+                    )
+                    duration_seconds = (
+                        video_info.duration_ms / 1000.0
+                        if video_info.duration_ms > 0
+                        else None
+                    )
+                    if not duration_seconds:
+                        raise RuntimeError("YouTube không trả thời lượng video.")
+                    source_language, srt_text = await asyncio.to_thread(
+                        render_source_srt,
+                        audio_path,
+                        target_duration=duration_seconds,
+                        model_name=subtitle_settings["model"],
+                    )
+                    source_path = await asyncio.to_thread(
+                        persist_video_source_srt,
+                        vid,
+                        source_language,
+                        srt_text,
+                    )
+                    source = {
+                        "source_srt_path": str(source_path),
+                        "source_language": source_language,
+                        "source_track_id": "",
+                    }
+                    video_caption_sources[vid] = source
+                    save_right_panel_state()
+                except Exception as exc:
+                    message = str(exc)
+                    for language in missing:
+                        statuses[language] = "unsuccessful"
+                        errors[language] = message
+                    overall_errors.append(f"{vid}-phụ đề: {message}")
+                    save_right_panel_state()
+                    return {
+                        "enabled": False,
+                        "source_srt_path": "",
+                        "source_language": "",
+                        "languages": languages,
+                        "completed_languages": [],
+                    }
+
+            completed_languages = [
+                language
+                for language in languages
+                if statuses.get(language) in ("successful", "already_added")
+            ]
+            if not missing:
+                return {
+                    "enabled": True,
+                    "source_srt_path": str(source_path),
+                    "source_language": source_language,
+                    "source_track_id": source_track_id,
+                    "languages": languages,
+                    "completed_languages": completed_languages,
+                }
+
+            quota = get_caption_quota_status()
+            if quota.get("blocked"):
+                message = str(quota.get("message") or "Đã hết quota phụ đề.")
+                if not quota_notice["shown"]:
+                    quota_notice.update(shown=True, message=message)
+                    best_effort_ui(
+                        "notify caption quota",
+                        lambda: ui.notify(
+                            message,
+                            type="warning",
+                            timeout=0,
+                            close_button="Đóng",
+                        ),
+                    )
+                for language in missing:
+                    statuses[language] = "pending"
+                    errors[language] = message
+                save_right_panel_state()
+                return {
+                    "enabled": True,
+                    "source_srt_path": str(source_path),
+                    "source_language": source_language,
+                    "source_track_id": source_track_id,
+                    "languages": languages,
+                    "completed_languages": completed_languages,
+                }
+
+            try:
+                best_effort_ui(
+                    "render source caption upload state",
+                    lambda: status_label.set_text(
+                        f"Đang chuẩn bị phụ đề nguồn cho video {vid}..."
+                    ),
+                )
+                source_track_id, tracks, _ = await asyncio.to_thread(
+                    prepare_source_caption,
+                    channel_id=channel_id,
+                    video_id=vid,
+                    source_language=source_language,
+                    source_srt_path=source_path,
+                    replace_existing=False,
+                )
+                source["source_track_id"] = source_track_id
+                video_caption_sources[vid] = source
+                for language_index, language in enumerate(missing, 1):
+                    statuses[language] = "processing"
+                    errors.pop(language, None)
+                    save_right_panel_state()
+                    best_effort_ui(
+                        "render caption language state",
+                        lambda language=language, language_index=language_index: status_label.set_text(
+                            f"Đang đăng phụ đề {language_index}/{len(missing)}: {language}"
+                        ),
+                    )
+                    try:
+                        status = await asyncio.to_thread(
+                            publish_translated_caption,
+                            channel_id=channel_id,
+                            video_id=vid,
+                            source_track_id=source_track_id,
+                            source_language=source_language,
+                            source_srt_path=source_path,
+                            target_language=language,
+                            existing_tracks=tracks,
+                            replace_existing=False,
+                        )
+                        statuses[language] = status
+                        completed_languages.append(language)
+                    except CaptionQuotaExceededError as exc:
+                        message = str(exc)
+                        statuses[language] = "pending"
+                        errors[language] = message
+                        for remaining in missing[language_index:]:
+                            statuses[remaining] = "pending"
+                            errors[remaining] = message
+                        if not quota_notice["shown"]:
+                            quota_notice.update(shown=True, message=message)
+                            best_effort_ui(
+                                "notify caption quota",
+                                lambda: ui.notify(
+                                    message,
+                                    type="warning",
+                                    timeout=0,
+                                    close_button="Đóng",
+                                ),
+                            )
+                        break
+                    except Exception as exc:
+                        statuses[language] = "unsuccessful"
+                        errors[language] = str(exc)
+                        overall_errors.append(f"{vid}-phụ đề-{language}: {exc}")
+                        if isinstance(exc, CaptionAuthenticationError):
+                            break
+                    finally:
+                        save_right_panel_state()
+                        best_effort_ui(
+                            "render caption checkpoint",
+                            lambda: refresh_right_panel(force=False),
+                        )
+            except CaptionQuotaExceededError as exc:
+                message = str(exc)
+                for language in missing:
+                    statuses[language] = "pending"
+                    errors[language] = message
+                if not quota_notice["shown"]:
+                    quota_notice.update(shown=True, message=message)
+                    best_effort_ui(
+                        "notify caption quota",
+                        lambda: ui.notify(
+                            message,
+                            type="warning",
+                            timeout=0,
+                            close_button="Đóng",
+                        ),
+                    )
+            except Exception as exc:
+                message = str(exc)
+                for language in missing:
+                    if statuses.get(language) not in ("successful", "already_added"):
+                        statuses[language] = "unsuccessful"
+                        errors[language] = message
+                overall_errors.append(f"{vid}-phụ đề: {message}")
+            save_right_panel_state()
+            return {
+                "enabled": True,
+                "source_srt_path": str(source_path),
+                "source_language": source_language,
+                "source_track_id": source_track_id,
+                "languages": languages,
+                "completed_languages": list(dict.fromkeys(completed_languages)),
+            }
+
         async def process_video(item: tuple[int, str]) -> None:
             nonlocal completed_tasks
             video_index, vid = item
             temp_audio_path: Path | None = None
             try:
                 planned_actions = repair_actions_by_video[vid]
+                file_path = Path((id_to_path.get(vid) or "").strip())
                 languages_for_video = [
                     action["language"] for action in planned_actions
                 ]
@@ -2009,10 +2497,15 @@ def create_add_audio_page():
                     extra_minutes=extra_minutes,
                     selective_repair=selective_repair,
                     repair_track_ids=failed_track_ids,
+                    subtitles_enabled=subtitles_enabled,
+                    subtitle_languages=languages_to_process,
                 )
                 if video_workflow_signatures.get(vid) != workflow_signature:
                     video_processing_status.pop(vid, None)
                     video_processing_errors.pop(vid, None)
+                    video_caption_status.pop(vid, None)
+                    video_caption_errors.pop(vid, None)
+                    video_caption_sources.pop(vid, None)
                     video_cleanup_status.pop(vid, None)
                     delete_requested.pop(vid, None)
                     video_workflow_signatures[vid] = workflow_signature
@@ -2125,6 +2618,11 @@ def create_add_audio_page():
                         lambda: setattr(progress_bar, "value", completed_tasks / total_tasks),
                     )
                 if not missing_languages:
+                    caption_config = await run_caption_workflow(
+                        vid=vid,
+                        audio_path=file_path,
+                        languages=languages_to_process,
+                    )
                     register_audio_recovery(
                         channel_id=channel_id,
                         video_id=vid,
@@ -2133,6 +2631,7 @@ def create_add_audio_page():
                         repeat_times=repeat_times,
                         extra_minutes=extra_minutes,
                         merge_languages=selective_repair,
+                        caption_config=caption_config,
                     )
                     best_effort_ui(
                         "render already-complete video",
@@ -2148,7 +2647,6 @@ def create_add_audio_page():
                     )
                     return
 
-                file_path = Path((id_to_path.get(vid) or "").strip())
                 best_effort_ui(
                     "render current audio video",
                     lambda: (
@@ -2230,6 +2728,11 @@ def create_add_audio_page():
                     in ("successful", "already_added")
                     for language in languages_for_video
                 ):
+                    caption_config = await run_caption_workflow(
+                        vid=vid,
+                        audio_path=file_path,
+                        languages=languages_to_process,
+                    )
                     register_audio_recovery(
                         channel_id=channel_id,
                         video_id=vid,
@@ -2238,6 +2741,7 @@ def create_add_audio_page():
                         repeat_times=repeat_times,
                         extra_minutes=extra_minutes,
                         merge_languages=selective_repair,
+                        caption_config=caption_config,
                     )
                 best_effort_ui(
                     "clear sequential upload state",
@@ -2306,7 +2810,17 @@ def create_add_audio_page():
             if total_languages > 0 and successful_count == total_languages:
                 successful_videos += 1
         success_percentage = successful_videos / total_videos * 100 if total_videos > 0 else 0
-        if overall_errors:
+        if quota_notice.get("shown"):
+            best_effort_ui(
+                "notify deferred caption quota",
+                lambda: ui.notify(
+                    "Audio đã xử lý xong. Phụ đề còn thiếu đã được lưu vào "
+                    "Auto Registry và sẽ tự thử lại sau khi quota được đặt lại.",
+                    type="warning",
+                    timeout=10000,
+                ),
+            )
+        elif overall_errors:
             best_effort_ui(
                 "notify audio errors",
                 lambda: ui.notify(
@@ -2342,6 +2856,8 @@ def create_add_audio_page():
         ui_refs["refresh_channel_display"] = refresh_channel_display
     with page:
         refresh_language_chips = create_language_input_and_chips()
+    with page:
+        create_subtitle_settings()
     with page:
         create_repeat_settings()
     with page:

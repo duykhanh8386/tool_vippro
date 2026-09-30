@@ -1,7 +1,12 @@
 import os
 from pathlib import Path
 
-from PyInstaller.utils.hooks import collect_data_files, copy_metadata
+from PyInstaller.utils.hooks import (
+    collect_data_files,
+    collect_dynamic_libs,
+    collect_submodules,
+    copy_metadata,
+)
 
 
 project_root = Path(SPECPATH).resolve()
@@ -47,6 +52,7 @@ datas = [
     *collect_data_files("nicegui"),
     *collect_data_files("certifi"),
     *copy_metadata("nicegui"),
+    *copy_metadata("faster-whisper"),
 ]
 
 hiddenimports = [
@@ -61,12 +67,18 @@ hiddenimports = [
     "uvicorn.protocols.websockets.websockets_impl",
     "uvicorn.protocols.websockets.websockets_sansio_impl",
     "uvicorn.protocols.websockets.wsproto_impl",
+    *collect_submodules("faster_whisper"),
 ]
 
 a = Analysis(
     [str(project_root / "app.py")],
     pathex=[str(project_root)],
-    binaries=collect_media_binaries() + collect_chromedriver(),
+    binaries=(
+        collect_media_binaries()
+        + collect_chromedriver()
+        + collect_dynamic_libs("ctranslate2")
+        + collect_dynamic_libs("av")
+    ),
     datas=datas,
     hiddenimports=hiddenimports,
     hookspath=[],

@@ -23,6 +23,13 @@ from src.module.audio_module import update_audio_module
 from src.module.list_videos_module import list_videos_module
 from src.state_manager import state_manager
 from src.utils import multiply_audio, normalize_path
+from src.youtube_caption_api import (
+    CaptionAuthenticationError,
+    CaptionQuotaExceededError,
+    get_caption_quota_status,
+    prepare_source_caption,
+    publish_translated_caption,
+)
 
 
 RECOVERY_STATE_NAME = "audio_recovery"
@@ -65,6 +72,10 @@ _RUNTIME_STATUS = {
     "repair_total": 0,
     "repaired": 0,
     "failed": 0,
+    "captions_repaired": 0,
+    "captions_failed": 0,
+    "captions_deferred_quota": 0,
+    "caption_quota_message": "",
     "deferred_non_public": 0,
     "deferred_visibility_unknown": 0,
     "_upload_progress": None,
@@ -256,6 +267,7 @@ def register_audio_recovery(
     extra_minutes: float,
     registered_at: float | None = None,
     merge_languages: bool = False,
+    caption_config: dict | None = None,
 ) -> bool:
     """Persist one successfully matched/uploaded video for later recovery."""
     clean_channel = str(channel_id or "").strip()
@@ -302,6 +314,47 @@ def register_audio_recovery(
                 languages_changed and not merge_languages
             ):
                 attempts = {}
+        stored_caption = (
+            dict(previous.get("caption") or {})
+            if caption_config is None and isinstance(previous, dict)
+            else dict(caption_config or {})
+        )
+        if stored_caption:
+            caption_languages = list(
+                dict.fromkeys(
+                    str(language or "").strip()
+                    for language in stored_caption.get("languages") or []
+                    if str(language or "").strip()
+                )
+            )
+            completed_caption_languages = list(
+                dict.fromkeys(
+                    str(language or "").strip()
+                    for language in stored_caption.get("completed_languages") or []
+                    if str(language or "").strip()
+                    and str(language or "").strip().casefold()
+                    in {item.casefold() for item in caption_languages}
+                )
+            )
+            stored_caption = {
+                "enabled": bool(stored_caption.get("enabled")),
+                "source_srt_path": str(
+                    stored_caption.get("source_srt_path") or ""
+                ).strip(),
+                "source_language": str(
+                    stored_caption.get("source_language") or ""
+                ).strip(),
+                "source_track_id": str(
+                    stored_caption.get("source_track_id") or ""
+                ).strip(),
+                "languages": caption_languages,
+                "completed_languages": completed_caption_languages,
+                "attempts": (
+                    dict(stored_caption.get("attempts") or {})
+                    if isinstance(stored_caption.get("attempts"), dict)
+                    else {}
+                ),
+            }
         videos[clean_video] = {
             "audio_path": clean_path,
             "languages": clean_languages,
@@ -311,6 +364,7 @@ def register_audio_recovery(
                 time.time() if registered_at is None else float(registered_at)
             ),
             "attempts": attempts if isinstance(attempts, dict) else {},
+            "caption": stored_caption,
         }
         saved = state_manager.save_state(RECOVERY_STATE_NAME, state)
     if saved:
@@ -776,6 +830,216 @@ def _record_recovery_attempt(
         state_manager.save_state(RECOVERY_STATE_NAME, state)
 
 
+def _caption_pending_languages(entry: dict) -> list[str]:
+    caption = entry.get("caption") or {}
+    if not isinstance(caption, dict) or not caption.get("enabled"):
+        return []
+    completed = {
+        str(language or "").strip().casefold()
+        for language in caption.get("completed_languages") or []
+        if str(language or "").strip()
+    }
+    return [
+        str(language).strip()
+        for language in caption.get("languages") or []
+        if str(language or "").strip()
+        and str(language).strip().casefold() not in completed
+    ]
+
+
+def _record_caption_recovery_result(
+    channel_id: str,
+    video_id: str,
+    language: str,
+    *,
+    succeeded: bool,
+    message: str,
+    attempted_at: float,
+    source_track_id: str | None = None,
+) -> None:
+    with _STATE_LOCK:
+        state = _load_state()
+        entry = (
+            state.get("entries", {})
+            .get(channel_id, {})
+            .get(video_id)
+        )
+        if not isinstance(entry, dict):
+            return
+        caption = entry.get("caption") or {}
+        if not isinstance(caption, dict) or not caption.get("enabled"):
+            return
+        if source_track_id:
+            caption["source_track_id"] = str(source_track_id)
+        attempts = caption.setdefault("attempts", {})
+        attempts[str(language).casefold()] = {
+            "attempted_at": attempted_at,
+            "succeeded": bool(succeeded),
+            "message": str(message),
+        }
+        if succeeded:
+            completed = list(caption.get("completed_languages") or [])
+            completed_keys = {
+                str(item or "").strip().casefold() for item in completed
+            }
+            if str(language).strip().casefold() not in completed_keys:
+                completed.append(str(language).strip())
+            caption["completed_languages"] = completed
+            caption["last_recovered_at"] = attempted_at
+        entry["caption"] = caption
+        state_manager.save_state(RECOVERY_STATE_NAME, state)
+
+
+def _caption_cooldown_elapsed(
+    entry: dict,
+    language: str,
+    now: float,
+    cooldown: float,
+) -> bool:
+    caption = entry.get("caption") or {}
+    attempt = (caption.get("attempts") or {}).get(language.casefold()) or {}
+    try:
+        attempted_at = float(attempt.get("attempted_at") or 0)
+    except (TypeError, ValueError):
+        attempted_at = 0
+    return now - attempted_at >= cooldown
+
+
+async def _recover_registered_captions(
+    *,
+    channel_id: str,
+    entries: dict[str, dict],
+    cycle_time: float,
+    cooldown: float,
+) -> dict:
+    """Retry pending caption languages for public videos in one channel."""
+    repaired = 0
+    failed = 0
+    deferred_quota = 0
+    quota_message = ""
+    guard = get_audio_mutation_guard(channel_id)
+
+    for video_id, entry in entries.items():
+        pending = [
+            language
+            for language in _caption_pending_languages(entry)
+            if _caption_cooldown_elapsed(entry, language, cycle_time, cooldown)
+        ]
+        if not pending:
+            continue
+        quota = get_caption_quota_status(now=cycle_time)
+        if quota["blocked"]:
+            deferred_quota += len(pending)
+            quota_message = quota["message"]
+            break
+        caption = entry.get("caption") or {}
+        source_path = Path(str(caption.get("source_srt_path") or ""))
+        source_language = str(caption.get("source_language") or "").strip()
+        if not source_path.is_file() or not source_language:
+            message = "Không còn file phụ đề nguồn hoặc thiếu ngôn ngữ nguồn."
+            for language in pending:
+                failed += 1
+                _record_caption_recovery_result(
+                    channel_id,
+                    video_id,
+                    language,
+                    succeeded=False,
+                    message=message,
+                    attempted_at=cycle_time,
+                )
+            continue
+        if not guard.acquire(blocking=False):
+            continue
+        try:
+            _update_runtime_status(
+                phase="captioning",
+                message="Đang tự động đăng lại phụ đề còn thiếu",
+                channel_id=channel_id,
+                video_id=video_id,
+                language="",
+            )
+            source_track_id, tracks, _ = await asyncio.to_thread(
+                prepare_source_caption,
+                channel_id=channel_id,
+                video_id=video_id,
+                source_language=source_language,
+                source_srt_path=source_path,
+                replace_existing=False,
+            )
+            for language in pending:
+                try:
+                    _update_runtime_status(language=language)
+                    status = await asyncio.to_thread(
+                        publish_translated_caption,
+                        channel_id=channel_id,
+                        video_id=video_id,
+                        source_track_id=source_track_id,
+                        source_language=source_language,
+                        source_srt_path=source_path,
+                        target_language=language,
+                        existing_tracks=tracks,
+                        replace_existing=False,
+                    )
+                    repaired += 1
+                    _record_caption_recovery_result(
+                        channel_id,
+                        video_id,
+                        language,
+                        succeeded=True,
+                        message=status,
+                        attempted_at=cycle_time,
+                        source_track_id=source_track_id,
+                    )
+                except CaptionQuotaExceededError as exc:
+                    quota_message = str(exc)
+                    deferred_quota += len(pending) - pending.index(language)
+                    break
+                except Exception as exc:
+                    failed += 1
+                    _record_caption_recovery_result(
+                        channel_id,
+                        video_id,
+                        language,
+                        succeeded=False,
+                        message=str(exc),
+                        attempted_at=cycle_time,
+                        source_track_id=source_track_id,
+                    )
+                    if isinstance(exc, CaptionAuthenticationError):
+                        break
+        except CaptionQuotaExceededError as exc:
+            quota_message = str(exc)
+            deferred_quota += len(pending)
+        except Exception as exc:
+            logger.error(
+                "Caption auto-recovery preparation failed: channel={} video={} error={}",
+                channel_id,
+                video_id,
+                exc,
+            )
+            for language in pending:
+                failed += 1
+                _record_caption_recovery_result(
+                    channel_id,
+                    video_id,
+                    language,
+                    succeeded=False,
+                    message=str(exc),
+                    attempted_at=cycle_time,
+                )
+        finally:
+            guard.release()
+        if quota_message:
+            break
+
+    return {
+        "repaired": repaired,
+        "failed": failed,
+        "deferred_quota": deferred_quota,
+        "quota_message": quota_message,
+    }
+
+
 def _cooldown_elapsed(entry: dict, language: str, now: float, cooldown: float) -> bool:
     attempt = (entry.get("attempts") or {}).get(language.casefold()) or {}
     try:
@@ -808,13 +1072,17 @@ def _registered_language_count(video_entries: dict[str, dict]) -> int:
 
 
 async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
-    """Scan the persistent registry once and selectively repair lost tracks."""
+    """Scan the persistent registry once and repair audio/caption tracks."""
     cycle_time = float(now if now is not None else time.time())
     with _RUNTIME_STATUS_LOCK:
         cycle_id = int(_RUNTIME_STATUS.get("cycle_id") or 0) + 1
     final_message = "Đã hoàn tất vòng quét tự động"
     repaired = 0
     failed = 0
+    captions_repaired = 0
+    captions_failed = 0
+    captions_deferred_quota = 0
+    caption_quota_message = ""
     unreadable: list[str] = []
     deferred_busy = 0
     deferred_initial_grace = 0
@@ -837,6 +1105,10 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
         repair_total=0,
         repaired=0,
         failed=0,
+        captions_repaired=0,
+        captions_failed=0,
+        captions_deferred_quota=0,
+        caption_quota_message="",
         deferred_non_public=0,
         deferred_visibility_unknown=0,
         _upload_progress=None,
@@ -981,6 +1253,30 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
                 for video_id in public_video_ids
             }
             video_ids = public_video_ids
+
+            # Captions have their own official API/OAuth flow and must remain
+            # retryable even when every audio track is already healthy.  The
+            # entries reaching this point have been confirmed PUBLIC above.
+            caption_result = await _recover_registered_captions(
+                channel_id=channel_id,
+                entries=eligible_entries,
+                cycle_time=cycle_time,
+                cooldown=cooldown,
+            )
+            captions_repaired += int(caption_result.get("repaired") or 0)
+            captions_failed += int(caption_result.get("failed") or 0)
+            captions_deferred_quota += int(
+                caption_result.get("deferred_quota") or 0
+            )
+            if caption_result.get("quota_message"):
+                caption_quota_message = str(caption_result["quota_message"])
+            _update_runtime_status(
+                captions_repaired=captions_repaired,
+                captions_failed=captions_failed,
+                captions_deferred_quota=captions_deferred_quota,
+                caption_quota_message=caption_quota_message,
+            )
+
             batch_size = update_audio_module._TRANSLATION_BATCH_SIZE
             channel_actions: list[dict] = []
             for start in range(0, len(video_ids), batch_size):
@@ -1242,6 +1538,10 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
         result = {
             "repaired": repaired,
             "failed": failed,
+            "captions_repaired": captions_repaired,
+            "captions_failed": captions_failed,
+            "captions_deferred_quota": captions_deferred_quota,
+            "caption_quota_message": caption_quota_message,
             "unreadable": list(dict.fromkeys(unreadable)),
             "reauth_required": sorted(get_channel_refresh_alerts()),
             "deferred_busy": deferred_busy,
@@ -1256,16 +1556,21 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
             latest["last_cycle_result"] = result
             state_manager.save_state(RECOVERY_STATE_NAME, latest)
         logger.info(
-            "Audio auto-recovery scan finished: repaired={} failed={} unreadable={}.",
+            "Audio/caption auto-recovery scan finished: audio_repaired={} "
+            "audio_failed={} captions_repaired={} captions_failed={} unreadable={}.",
             repaired,
             failed,
+            captions_repaired,
+            captions_failed,
             len(result["unreadable"]),
         )
         final_message = (
-            f"Quét xong: đã gửi lại {repaired}, hoãn "
+            f"Quét xong: audio {repaired}, phụ đề {captions_repaired}, hoãn "
             f"{deferred_non_public + deferred_visibility_unknown} video chưa "
-            f"công khai, lỗi {failed}"
+            f"công khai, lỗi {failed + captions_failed}"
         )
+        if caption_quota_message:
+            final_message = caption_quota_message
         return result
     except asyncio.CancelledError:
         final_message = "Đã dừng tự động quét audio"
@@ -1291,6 +1596,10 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
                     repair_total=0,
                     repaired=repaired,
                     failed=failed,
+                    captions_repaired=captions_repaired,
+                    captions_failed=captions_failed,
+                    captions_deferred_quota=captions_deferred_quota,
+                    caption_quota_message=caption_quota_message,
                     deferred_non_public=deferred_non_public,
                     deferred_visibility_unknown=deferred_visibility_unknown,
                     _upload_progress=None,
