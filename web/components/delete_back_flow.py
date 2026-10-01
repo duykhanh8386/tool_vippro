@@ -47,8 +47,14 @@ COPYRIGHT_POLL_INTERVAL_SECONDS = 5
 
 _FLOW_RUN_GUARD = threading.Lock()
 _DELETE_LOG_LOCK = threading.Lock()
+_STATE_CHECKPOINT_LOCK = threading.RLock()
 _OUTPUT_NAME_LOCK = threading.Lock()
 _RESERVED_OUTPUT_PATHS: set[str] = set()
+REMOTE_UPLOAD_CHECKPOINT_FIELDS = (
+    "video_id",
+    "frontend_upload_id",
+    "scotty_resource_id",
+)
 PERSIST_FIELDS = (
     "music",
     "music_path",
@@ -211,6 +217,62 @@ def _replace_status_snapshot(target: dict, source: dict) -> None:
     """Keep the saved-state source in sync with the latest checkpoint."""
     target.clear()
     target.update(source)
+
+
+def _status_source_path(status: dict) -> str:
+    """Return a comparable source path without requiring the file to exist."""
+    value = normalize_path(str(status.get("source_path") or ""))
+    if not value:
+        return ""
+    return str(Path(value).resolve(strict=False)).casefold()
+
+
+def _saved_status_for_source(statuses: dict, name: str, source_path: str) -> dict:
+    """Return a checkpoint only when it belongs to this exact input file."""
+    saved = (statuses or {}).get(name, {})
+    if not isinstance(saved, dict):
+        return {}
+    saved_path = _status_source_path(saved)
+    current_path = _status_source_path({"source_path": source_path})
+    if saved_path and current_path and saved_path != current_path:
+        return {}
+    return saved
+
+
+def _merge_remote_upload_checkpoints(
+    current_statuses: dict,
+    persisted_statuses: dict,
+) -> dict:
+    """Keep durable YouTube IDs when an older page saves a stale snapshot.
+
+    NiceGUI can briefly keep the old page alive while a refreshed page is
+    created.  Both pages used to replace the complete ``statuses`` object, so a
+    stale item whose IDs were still empty could erase IDs checkpointed by the
+    background upload.  Remote upload IDs are immutable for one source file;
+    preserve their latest non-empty values while normal status fields continue
+    to be saved normally.
+    """
+    merged = {
+        name: dict(entry)
+        for name, entry in (persisted_statuses or {}).items()
+        if isinstance(entry, dict)
+    }
+    for name, current in (current_statuses or {}).items():
+        entry = dict(current) if isinstance(current, dict) else {}
+        persisted = merged.get(name, {})
+        current_path = _status_source_path(entry)
+        persisted_path = _status_source_path(persisted)
+        same_source = (
+            not current_path
+            or not persisted_path
+            or current_path == persisted_path
+        )
+        if same_source:
+            for field in REMOTE_UPLOAD_CHECKPOINT_FIELDS:
+                if not entry.get(field) and persisted.get(field):
+                    entry[field] = persisted[field]
+        merged[name] = entry
+    return merged
 
 
 def _replace_video_items_unless_processing(
@@ -391,28 +453,53 @@ def create_delete_back_flow_page():
     if page_client is not None:
         page_client.on_disconnect(mark_client_unavailable)
 
-    def save_state() -> bool:
+    def save_state(*, clear_statuses: bool = False) -> bool:
         if suppress_autosave["value"]:
             return False
         statuses = {}
         for it in videos_state["items"]:
-            entry = {"steps": dict(it["steps"])}
+            entry = {
+                "steps": dict(it["steps"]),
+                "source_path": normalize_path(str(it.get("path") or "")),
+            }
             for field in PERSIST_FIELDS:
                 entry[field] = it.get(field, "")
             statuses[it["name"]] = entry
         try:
-            _replace_status_snapshot(saved_status_map, statuses)
-            return state_manager.save_state(
-                STATE_KEY,
-                {
-                    "video_folder": paths_state["video_folder"],
-                    "music_folder": paths_state["music_folder"],
-                    "output_folder": paths_state["output_folder"],
-                    "random_music": options_state["random_music"],
-                    "selected_channel": selected_channel["id"],
-                    "statuses": statuses,
-                },
-            )
+            # The lock makes load+merge+save atomic across all browser page
+            # instances in this process.  Without it, a refreshed/stale page
+            # can win the final write and replace newly checkpointed IDs with
+            # empty strings.
+            with _STATE_CHECKPOINT_LOCK:
+                if not clear_statuses:
+                    latest_state = state_manager.load_state(STATE_KEY) or {}
+                    statuses = _merge_remote_upload_checkpoints(
+                        statuses,
+                        latest_state.get("statuses") or {},
+                    )
+
+                    # Keep the live item objects consistent with any durable
+                    # checkpoint recovered from a newer page instance.
+                    for it in videos_state["items"]:
+                        saved = statuses.get(it["name"], {})
+                        for field in REMOTE_UPLOAD_CHECKPOINT_FIELDS:
+                            if saved.get(field) and not it.get(field):
+                                it[field] = saved[field]
+
+                saved_ok = state_manager.save_state(
+                    STATE_KEY,
+                    {
+                        "video_folder": paths_state["video_folder"],
+                        "music_folder": paths_state["music_folder"],
+                        "output_folder": paths_state["output_folder"],
+                        "random_music": options_state["random_music"],
+                        "selected_channel": selected_channel["id"],
+                        "statuses": statuses,
+                    },
+                )
+                if saved_ok:
+                    _replace_status_snapshot(saved_status_map, statuses)
+                return saved_ok
         except Exception as e:
             logger.error(f"Failed to save delete_back_flow state: {e}")
             return False
@@ -454,7 +541,11 @@ def create_delete_back_flow_page():
             reset_processing = not _FLOW_RUN_GUARD.locked()
             if folder and Path(folder).is_dir():
                 for p in list_media_files(folder, VIDEO_EXTENSIONS):
-                    saved = saved_status_map.get(p.name, {})
+                    saved = _saved_status_for_source(
+                        saved_status_map,
+                        p.name,
+                        str(p),
+                    )
                     try:
                         size = p.stat().st_size
                     except OSError:
@@ -553,7 +644,11 @@ def create_delete_back_flow_page():
         _replace_status_snapshot(saved_status_map, statuses)
         changed = False
         for item in videos_state["items"]:
-            saved = statuses.get(item["name"])
+            saved = _saved_status_for_source(
+                statuses,
+                item["name"],
+                item["path"],
+            )
             if not saved:
                 continue
             restored_steps = _restore_steps(
@@ -1186,7 +1281,7 @@ def create_delete_back_flow_page():
             refresh_video_list()
         finally:
             suppress_autosave["value"] = False
-        save_state()
+        save_state(clear_statuses=True)
         safe_notify("Đã xóa tất cả input và trạng thái", type="info")
 
     def build_folder_selector(key: str, label: str, placeholder: str, icon: str):
