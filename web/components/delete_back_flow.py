@@ -35,7 +35,7 @@ from web.components.drawer import nav_state
 from web.theme import app_card, page_header, section_header, workflow_steps
 
 STATE_KEY = "delete_back_flow"
-ORIGINAL_AUDIO_RENDER_MODE = "original_music_v1"
+ORIGINAL_AUDIO_RENDER_MODE = "original_music_named_v2"
 _DELETE_LOG_FILENAME = "deleted_back_videos.csv"
 MAX_ACTIVE_VIDEOS = 5
 MAX_FFMPEG_JOBS = 5
@@ -47,6 +47,8 @@ COPYRIGHT_POLL_INTERVAL_SECONDS = 5
 
 _FLOW_RUN_GUARD = threading.Lock()
 _DELETE_LOG_LOCK = threading.Lock()
+_OUTPUT_NAME_LOCK = threading.Lock()
+_RESERVED_OUTPUT_PATHS: set[str] = set()
 PERSIST_FIELDS = (
     "music",
     "music_path",
@@ -143,12 +145,40 @@ def _restore_delete_back_steps(saved: dict, *, reset_processing: bool) -> dict:
     return steps
 
 
+def _reserve_music_output_path(
+    output_folder: str,
+    music: Path,
+    index: int,
+) -> Path:
+    """Reserve a collision-free MP4 name derived from the input song."""
+    folder = Path(output_folder)
+    stem = music.stem.strip() or f"output_{index}"
+    with _OUTPUT_NAME_LOCK:
+        suffix = 1
+        while True:
+            filename = f"{stem}.mp4" if suffix == 1 else f"{stem} ({suffix}).mp4"
+            candidate = folder / filename
+            reservation_key = str(candidate.resolve(strict=False)).casefold()
+            if not candidate.exists() and reservation_key not in _RESERVED_OUTPUT_PATHS:
+                _RESERVED_OUTPUT_PATHS.add(reservation_key)
+                return candidate
+            suffix += 1
+
+
+def _release_music_output_path(path: Path) -> None:
+    with _OUTPUT_NAME_LOCK:
+        _RESERVED_OUTPUT_PATHS.discard(
+            str(path.resolve(strict=False)).casefold()
+        )
+
+
 async def _render_delete_back_output(
     item: dict, output_folder: str, music: Path, index: int, overlay_png: str | None
 ) -> None:
     """Mux the original, uninterrupted music; never create a 3s/7s track."""
     music_path = str(music)
-    video_out = str(Path(output_folder) / f"output_{index}_processed.mp4")
+    video_out_path = _reserve_music_output_path(output_folder, music, index)
+    video_out = str(video_out_path)
     item.update(
         music=music.name,
         music_path=music_path,
@@ -160,18 +190,21 @@ async def _render_delete_back_output(
         # The source MP3 is user data, not a temporary output to clean up.
         run_context.register_cleanup_path(video_out)
 
-    duration = await asyncio.to_thread(get_video_duration, music_path)
-    await asyncio.to_thread(
-        mux_audio_into_video,
-        video_file=item["path"],
-        audio_file=music_path,
-        video_out=video_out,
-        duration=duration,
-        overlay_png=overlay_png or None,
-    )
-    item["render_audio_mode"] = ORIGINAL_AUDIO_RENDER_MODE
-    if run_context is not None:
-        run_context.keep_path(video_out)
+    try:
+        duration = await asyncio.to_thread(get_video_duration, music_path)
+        await asyncio.to_thread(
+            mux_audio_into_video,
+            video_file=item["path"],
+            audio_file=music_path,
+            video_out=video_out,
+            duration=duration,
+            overlay_png=overlay_png or None,
+        )
+        item["render_audio_mode"] = ORIGINAL_AUDIO_RENDER_MODE
+        if run_context is not None:
+            run_context.keep_path(video_out)
+    finally:
+        _release_music_output_path(video_out_path)
 
 
 def _replace_status_snapshot(target: dict, source: dict) -> None:

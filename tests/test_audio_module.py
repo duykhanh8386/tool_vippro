@@ -217,6 +217,65 @@ class AudioUploadTests(unittest.TestCase):
         self.assertEqual(raised.exception.status_code, 409)
         upload.assert_not_called()
 
+    def test_processing_95_percent_is_not_treated_as_existing_success(self):
+        module = UpdateAudioModule()
+        payload = {
+            "videoTranslations": [
+                {
+                    "videoId": "video",
+                    "translations": [
+                        {
+                            "languageCode": "it",
+                            "audioTranslation": {
+                                "audioTrackId": "processing-it",
+                                "statusLabel": "Đang xử lý... 95%",
+                            },
+                        }
+                    ],
+                }
+            ],
+            "audioTracks": [],
+        }
+
+        self.assertEqual(
+            module._audio_language_state_from_payload(payload, "video", "it"),
+            "inflight",
+        )
+        with (
+            patch.object(
+                module,
+                "_get_video_translation_payload",
+                return_value=payload,
+            ),
+            patch("src.module.audio_module.wait_interruptibly"),
+        ):
+            self.assertFalse(module._has_audio_track("video", "channel", "it"))
+
+    def test_published_track_is_still_a_verified_409_success(self):
+        module = UpdateAudioModule()
+        payload = {
+            "videoTranslations": [
+                {
+                    "videoId": "video",
+                    "translations": [
+                        {
+                            "languageCode": "fr",
+                            "audioTranslation": {
+                                "audioTrackId": "published-fr",
+                                "publishStatus": "PUBLISHED",
+                            },
+                        }
+                    ],
+                }
+            ],
+            "audioTracks": [],
+        }
+
+        self.assertEqual(
+            module._audio_language_state_from_payload(payload, "video", "fr"),
+            "healthy",
+        )
+
     def test_extracts_language_from_translation_response(self):
         module = UpdateAudioModule()
         self.assertEqual(
