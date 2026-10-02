@@ -9,8 +9,12 @@ from unittest.mock import Mock, patch
 from src.state_manager import StateManager
 from web.components.delete_video_controller import DeleteVideoController
 from web.components.delete_back_flow import (
+    COPYRIGHT_CHECK_COMPLETED,
+    COPYRIGHT_CHECK_NOT_STARTED,
+    COPYRIGHT_CHECK_STARTED,
     ORIGINAL_AUDIO_RENDER_MODE,
     PERSIST_FIELDS,
+    _copyright_check_allows_delete,
     _repair_missing_upload_input,
     _replace_video_items_unless_processing,
     _require_checkpoint,
@@ -21,6 +25,17 @@ from web.components.delete_back_flow import (
 
 
 class DeleteBackFlowRecoveryTests(unittest.TestCase):
+    def test_delete_is_allowed_as_soon_as_copyright_check_starts(self):
+        self.assertTrue(_copyright_check_allows_delete(COPYRIGHT_CHECK_STARTED))
+        self.assertTrue(_copyright_check_allows_delete(COPYRIGHT_CHECK_COMPLETED))
+
+    def test_delete_waits_while_check_has_not_started_or_video_is_missing(self):
+        self.assertFalse(
+            _copyright_check_allows_delete(COPYRIGHT_CHECK_NOT_STARTED)
+        )
+        self.assertFalse(_copyright_check_allows_delete(""))
+        self.assertFalse(_copyright_check_allows_delete(None))
+
     def test_interrupted_step_is_retryable_without_losing_completed_steps(self):
         recovered = _restore_steps(
             {

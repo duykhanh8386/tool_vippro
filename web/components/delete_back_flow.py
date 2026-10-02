@@ -44,6 +44,13 @@ MAX_WAIT_JOBS = 5
 MAX_DELETE_JOBS = 5
 COPYRIGHT_WAIT_TIMEOUT_SECONDS = 1800
 COPYRIGHT_POLL_INTERVAL_SECONDS = 5
+COPYRIGHT_CHECK_STARTED = "UPLOAD_CHECKS_DATA_COPYRIGHT_STATUS_STARTED"
+COPYRIGHT_CHECK_NOT_STARTED = "UPLOAD_CHECKS_DATA_COPYRIGHT_STATUS_NOT_STARTED"
+COPYRIGHT_CHECK_COMPLETED = "UPLOAD_CHECKS_DATA_COPYRIGHT_STATUS_COMPLETED"
+COPYRIGHT_DELETE_READY_STATUSES = {
+    COPYRIGHT_CHECK_STARTED,
+    COPYRIGHT_CHECK_COMPLETED,
+}
 
 _FLOW_RUN_GUARD = threading.Lock()
 _DELETE_LOG_LOCK = threading.Lock()
@@ -104,6 +111,11 @@ def _new_steps() -> dict:
         "wait": "pending",
         "delete_back": "pending",
     }
+
+
+def _copyright_check_allows_delete(status: object) -> bool:
+    """Delete as soon as YouTube has actually started its copyright check."""
+    return str(status or "").strip() in COPYRIGHT_DELETE_READY_STATUSES
 
 
 def _restore_steps(saved_steps: dict | None, *, reset_processing: bool) -> dict:
@@ -735,7 +747,11 @@ def create_delete_back_flow_page():
                 list_videos_module.get_copyright_statuses, channel_id, {video_id}
             )
             st = (statuses or {}).get(video_id)
-            if st == "UPLOAD_CHECKS_DATA_COPYRIGHT_STATUS_COMPLETED":
+            if _copyright_check_allows_delete(st):
+                push_log(
+                    f"{item['name']} - YouTube đã bắt đầu kiểm tra; chuyển sang xóa ngay",
+                    "success",
+                )
                 return
 
             elapsed = int(asyncio.get_running_loop().time() - started_at)
@@ -763,7 +779,7 @@ def create_delete_back_flow_page():
                     run_context.checkpoint()
                 await asyncio.sleep(0.1)
         raise TimeoutError(
-            "YouTube chưa hoàn tất kiểm tra bản quyền sau "
+            "YouTube chưa bắt đầu kiểm tra bản quyền sau "
             f"{COPYRIGHT_WAIT_TIMEOUT_SECONDS} giây; trạng thái cuối: "
             f"{previous_status or 'không tìm thấy video'}"
         )
@@ -812,7 +828,7 @@ def create_delete_back_flow_page():
     STEP_SEQUENCE = [
         ("merge", "Ghép nhạc", step_merge),
         ("upload", "Upload", step_upload),
-        ("wait", "Chờ kiểm tra bản quyền", step_wait_processed),
+        ("wait", "Chờ bắt đầu kiểm tra bản quyền", step_wait_processed),
         ("delete_back", "Xóa - Back", step_delete_back),
     ]
 
@@ -1226,7 +1242,7 @@ def create_delete_back_flow_page():
             [
                 {"title": "Ghép nhạc", "description": "Giữ nguyên nhạc gốc", "state": "current"},
                 {"title": "Upload", "description": "Đăng video lên kênh", "state": "pending"},
-                {"title": "Chờ xử lý", "description": "Đợi trạng thái YouTube", "state": "pending"},
+                {"title": "Chờ xử lý", "description": "Đợi YouTube bắt đầu kiểm tra", "state": "pending"},
                 {"title": "Xóa - Back", "description": "Hoàn tất quy trình", "state": "pending"},
             ]
         )
