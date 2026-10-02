@@ -35,6 +35,8 @@ RECOVERY_STATE_NAME = "audio_recovery"
 DEFAULT_RECOVERY_INTERVAL_SECONDS = 15 * 60
 DEFAULT_RECOVERY_RETRY_COOLDOWN_SECONDS = 15 * 60
 DEFAULT_INITIAL_RECOVERY_GRACE_SECONDS = 15 * 60
+DEFAULT_STALE_PROCESSING_SECONDS = 6 * 60 * 60
+MIN_STALE_PROCESSING_SCANS = 2
 CAPTION_STATUS_CHECK_INTERVAL_SECONDS = 6 * 60 * 60
 CAPTION_REPAIR_VERIFY_SECONDS = 15 * 60
 REAUTH_ALERT_REASON = "encoded_reauth_proof_token_missing"
@@ -222,6 +224,7 @@ def _default_state() -> dict:
         "interval_seconds": DEFAULT_RECOVERY_INTERVAL_SECONDS,
         "retry_cooldown_seconds": DEFAULT_RECOVERY_RETRY_COOLDOWN_SECONDS,
         "initial_grace_seconds": DEFAULT_INITIAL_RECOVERY_GRACE_SECONDS,
+        "stale_processing_seconds": DEFAULT_STALE_PROCESSING_SECONDS,
         "entries": {},
         "channel_refresh_alerts": {},
         "last_cycle_at": None,
@@ -254,6 +257,7 @@ def _load_state() -> dict:
     state["interval_seconds"] = DEFAULT_RECOVERY_INTERVAL_SECONDS
     state["retry_cooldown_seconds"] = DEFAULT_RECOVERY_RETRY_COOLDOWN_SECONDS
     state["initial_grace_seconds"] = DEFAULT_INITIAL_RECOVERY_GRACE_SECONDS
+    state["stale_processing_seconds"] = DEFAULT_STALE_PROCESSING_SECONDS
     return state
 
 
@@ -287,6 +291,7 @@ def register_audio_recovery(
         channels = state.setdefault("entries", {})
         videos = channels.setdefault(clean_channel, {})
         previous = videos.get(clean_video)
+        same_audio_configuration = False
         attempts = previous.get("attempts", {}) if isinstance(previous, dict) else {}
         if isinstance(previous, dict):
             same_audio_configuration = (
@@ -330,6 +335,16 @@ def register_audio_recovery(
         ):
             updated_entry["caption_monitor"] = dict(
                 previous["caption_monitor"]
+            )
+        if (
+            same_audio_configuration
+            and isinstance(previous, dict)
+            and isinstance(previous.get("processing_observations"), dict)
+        ):
+            # Keep the first-seen timestamp across page reloads and tool
+            # restarts. A different source/configuration starts a fresh clock.
+            updated_entry["processing_observations"] = dict(
+                previous["processing_observations"]
             )
         videos[clean_video] = updated_entry
         saved = state_manager.save_state(RECOVERY_STATE_NAME, state)
@@ -640,6 +655,8 @@ def build_audio_recovery_plan(
     payload: dict,
     requested_entries: dict[str, dict],
     requested_order: list[str] | None = None,
+    *,
+    observation_sink: dict | None = None,
 ) -> tuple[list[dict], set[str]]:
     """Build language-level repairs from one Studio response.
 
@@ -697,17 +714,27 @@ def build_audio_recovery_plan(
     source_track_ids: dict[str, set[str]] = {}
     creator_track_ids: dict[str, set[str]] = {}
     observations: dict[str, dict[str, set[str]]] = {}
+    observation_track_ids: dict[
+        str, dict[str, dict[str, set[str]]]
+    ] = {}
 
     def observe(
         video_id: str,
         language: str,
         state: str,
+        track_id: str = "",
     ) -> None:
         clean_language = str(language or "").strip().casefold()
-        if clean_language:
-            observations.setdefault(video_id, {}).setdefault(
-                clean_language, set()
-            ).add(state)
+        if not clean_language:
+            return
+        observations.setdefault(video_id, {}).setdefault(
+            clean_language, set()
+        ).add(state)
+        clean_track_id = str(track_id or "").strip()
+        if clean_track_id:
+            observation_track_ids.setdefault(video_id, {}).setdefault(
+                clean_language, {}
+            ).setdefault(state, set()).add(clean_track_id)
 
     tracks = payload.get("audioTracks") or []
     if isinstance(tracks, list):
@@ -740,7 +767,7 @@ def build_audio_recovery_plan(
                 state = "inflight"
             else:
                 state = "healthy"
-            observe(video_id, language, state)
+            observe(video_id, language, state, track_id)
 
     # Published tracks are not always repeated in root audioTracks. Treat the
     # language row's audioTranslation as evidence too, otherwise a published
@@ -762,7 +789,28 @@ def build_audio_recovery_plan(
                 state = "inflight"
             else:
                 state = "healthy"
-            observe(video_id, language, state)
+            observe(video_id, language, state, track_id)
+
+    if observation_sink is not None:
+        observation_sink.clear()
+        for video_id, language_states in observations.items():
+            observation_sink[video_id] = {}
+            for language_key, states in language_states.items():
+                track_ids_by_state = observation_track_ids.get(
+                    video_id, {}
+                ).get(language_key, {})
+                observation_sink[video_id][language_key] = {
+                    "states": sorted(states),
+                    "inflight_track_ids": sorted(
+                        track_ids_by_state.get("inflight", set())
+                    ),
+                    "terminal_track_ids": sorted(
+                        track_ids_by_state.get("terminal", set())
+                    ),
+                    "healthy_track_ids": sorted(
+                        track_ids_by_state.get("healthy", set())
+                    ),
+                }
 
     terminal_by_video = {
         video_id: {
@@ -811,6 +859,145 @@ def build_audio_recovery_plan(
     return actions, unreadable_ids
 
 
+def _record_processing_observations(
+    *,
+    channel_id: str,
+    requested_entries: dict[str, dict],
+    observations: dict,
+    observed_at: float,
+    stale_after_seconds: float = DEFAULT_STALE_PROCESSING_SECONDS,
+) -> list[dict]:
+    """Persist in-flight track ages and return only provably stale repairs.
+
+    A language is eligible only when the same exact Audio Track ID remains in
+    PROCESSING across multiple scans for the full stale window. Healthy or
+    terminal evidence clears the timer, as does a changed/missing Track ID.
+    This makes the decision survive app restarts without treating one delayed
+    Studio response as a failure.
+    """
+    stale_actions: list[dict] = []
+    threshold = max(0.0, float(stale_after_seconds))
+    timestamp = float(observed_at)
+
+    with _STATE_LOCK:
+        state = _load_state()
+        channel_entries = state.get("entries", {}).get(channel_id, {})
+        if not isinstance(channel_entries, dict):
+            return []
+
+        changed = False
+        for video_id, requested_entry in requested_entries.items():
+            entry = channel_entries.get(video_id)
+            if not isinstance(entry, dict) or not isinstance(requested_entry, dict):
+                continue
+            registered_languages = {
+                str(language).strip().casefold(): str(language).strip()
+                for language in requested_entry.get("languages") or []
+                if str(language or "").strip()
+            }
+            raw_trackers = entry.get("processing_observations")
+            trackers = raw_trackers if isinstance(raw_trackers, dict) else {}
+            if raw_trackers is not trackers:
+                entry["processing_observations"] = trackers
+                changed = True
+
+            for obsolete_key in set(trackers) - set(registered_languages):
+                trackers.pop(obsolete_key, None)
+                changed = True
+
+            video_observations = observations.get(video_id) or {}
+            for language_key, display_language in registered_languages.items():
+                observed = video_observations.get(language_key) or {}
+                states = set(observed.get("states") or [])
+                track_ids = sorted(
+                    {
+                        str(track_id).strip()
+                        for track_id in observed.get("inflight_track_ids") or []
+                        if str(track_id or "").strip()
+                    }
+                )
+
+                # Any good copy protects the language. Explicit terminal
+                # failures are handled immediately by the normal repair plan.
+                if "healthy" in states or "terminal" in states:
+                    if language_key in trackers:
+                        trackers.pop(language_key, None)
+                        changed = True
+                    continue
+
+                # Missing/ambiguous response data is never proof of a stuck
+                # track. Reset the clock so a later row must prove staleness.
+                if "inflight" not in states or not track_ids:
+                    if language_key in trackers:
+                        trackers.pop(language_key, None)
+                        changed = True
+                    continue
+
+                previous = trackers.get(language_key)
+                if isinstance(previous, dict):
+                    previous_ids = sorted(
+                        str(track_id).strip()
+                        for track_id in previous.get("track_ids") or []
+                        if str(track_id or "").strip()
+                    )
+                else:
+                    previous_ids = []
+                if previous_ids == track_ids:
+                    try:
+                        first_seen_at = float(previous.get("first_seen_at"))
+                    except (TypeError, ValueError):
+                        first_seen_at = timestamp
+                    try:
+                        scan_count = int(previous.get("scan_count") or 0) + 1
+                    except (TypeError, ValueError):
+                        scan_count = 2
+                else:
+                    first_seen_at = timestamp
+                    scan_count = 1
+
+                current = {
+                    "language": display_language,
+                    "track_ids": track_ids,
+                    "first_seen_at": first_seen_at,
+                    "last_seen_at": timestamp,
+                    "scan_count": scan_count,
+                }
+                if previous != current:
+                    trackers[language_key] = current
+                    changed = True
+
+                if (
+                    scan_count >= MIN_STALE_PROCESSING_SCANS
+                    and timestamp - first_seen_at >= threshold
+                ):
+                    logger.warning(
+                        "Audio auto-recovery detected stale processing track: "
+                        "channel={} video={} language={} track_ids={} age_seconds={:.0f}",
+                        channel_id,
+                        video_id,
+                        display_language,
+                        ",".join(track_ids),
+                        timestamp - first_seen_at,
+                    )
+                    stale_actions.append(
+                        {
+                            "video_id": video_id,
+                            "language": display_language,
+                            "track_ids": track_ids,
+                            "reason": "stale_processing",
+                        }
+                    )
+
+            if not trackers and "processing_observations" in entry:
+                entry.pop("processing_observations", None)
+                changed = True
+
+        if changed:
+            state_manager.save_state(RECOVERY_STATE_NAME, state)
+
+    return stale_actions
+
+
 def _record_recovery_attempt(
     channel_id: str,
     video_id: str,
@@ -837,6 +1024,11 @@ def _record_recovery_attempt(
         }
         if succeeded:
             entry["last_recovered_at"] = attempted_at
+            processing = entry.get("processing_observations")
+            if isinstance(processing, dict):
+                processing.pop(language.casefold(), None)
+                if not processing:
+                    entry.pop("processing_observations", None)
         state_manager.save_state(RECOVERY_STATE_NAME, state)
 
 
@@ -1136,6 +1328,18 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
             )
         except (TypeError, ValueError):
             initial_grace = DEFAULT_INITIAL_RECOVERY_GRACE_SECONDS
+        try:
+            stale_processing_seconds = max(
+                0.0,
+                float(
+                    state.get(
+                        "stale_processing_seconds",
+                        DEFAULT_STALE_PROCESSING_SECONDS,
+                    )
+                ),
+            )
+        except (TypeError, ValueError):
+            stale_processing_seconds = DEFAULT_STALE_PROCESSING_SECONDS
         if not entries_by_channel:
             final_message = "Chưa có video được đăng ký tự động khôi phục"
             return {"skipped": "empty", "repaired": 0, "failed": 0}
@@ -1301,10 +1505,32 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
                     if channel_requires_refresh:
                         break
                     continue
+                processing_observations: dict = {}
+                chunk_entries = {
+                    video_id: eligible_entries[video_id] for video_id in chunk
+                }
                 actions, unreadable_chunk = build_audio_recovery_plan(
                     payload,
-                    {video_id: eligible_entries[video_id] for video_id in chunk},
+                    chunk_entries,
                     chunk,
+                    observation_sink=processing_observations,
+                )
+                stale_actions = _record_processing_observations(
+                    channel_id=channel_id,
+                    requested_entries=chunk_entries,
+                    observations=processing_observations,
+                    observed_at=cycle_time,
+                    stale_after_seconds=stale_processing_seconds,
+                )
+                planned_languages = {
+                    (action["video_id"], action["language"].casefold())
+                    for action in actions
+                }
+                actions.extend(
+                    action
+                    for action in stale_actions
+                    if (action["video_id"], action["language"].casefold())
+                    not in planned_languages
                 )
                 channel_actions.extend(actions)
                 unreadable.extend(sorted(unreadable_chunk))

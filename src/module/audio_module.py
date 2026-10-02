@@ -87,8 +87,8 @@ class UpdateAudioModule(IModule):
                     logger.info("Audio track already exists: video={} language={}", id_video, language)
                     return 409
                 raise AudioUpdateError(
-                    "YouTube báo xung đột (409) nhưng không tìm thấy audio track tương ứng; "
-                    "không tự động coi là thành công.",
+                    "YouTube báo xung đột (409) nhưng audio track chưa READY/PUBLISHED "
+                    "(có thể đang xử lý hoặc đã lỗi); không coi là thành công.",
                     status_code=409,
                 )
             self._next_upload_http(
@@ -467,6 +467,21 @@ class UpdateAudioModule(IModule):
                 "STATEUPLOADING",
                 "STATUSINPROGRESS",
                 "STATEINPROGRESS",
+            )
+        ):
+            return True
+        # Human-readable Studio labels append a percentage, for example
+        # ``Đang xử lý... 95%``. READY/COMPLETED enum values were already
+        # excluded above, so matching these markers here is safe.
+        if any(
+            marker in normalized_value
+            for marker in (
+                "DANGXULY",
+                "PROCESSING",
+                "PENDING",
+                "TRANSCODING",
+                "UPLOADING",
+                "INPROGRESS",
             )
         ):
             return True
@@ -1173,15 +1188,102 @@ class UpdateAudioModule(IModule):
                             return nested
         return None
 
-    def _has_audio_track(self, id_video: str, channel_id: str, language: str) -> bool:
-        expected = language.casefold()
-        for attempt in range(3):
-            items = self._get_audio_translation_items(id_video, channel_id)
-            for item in items:
+    @classmethod
+    def _audio_language_state_from_payload(
+        cls,
+        payload: dict,
+        video_id: str,
+        language: str,
+    ) -> str:
+        """Return ``healthy``, ``inflight``, ``terminal``, or ``missing``.
+
+        A 409 response only proves that a language row already exists.  It may
+        be an orphan whose upload never finalized or a track stuck at 95%.
+        Callers must only treat READY/PUBLISHED tracks as already added.
+        """
+        expected = str(language or "").strip().casefold()
+        if not expected:
+            return "missing"
+
+        root_tracks: dict[str, dict] = {}
+        tracks = payload.get("audioTracks") or []
+        if isinstance(tracks, list):
+            for track in tracks:
+                if not isinstance(track, dict):
+                    continue
+                track_video_id = str(track.get("videoId") or "").strip()
+                if track_video_id and track_video_id != video_id:
+                    continue
+                track_id = str(track.get("audioTrackId") or "").strip()
+                if track_id:
+                    root_tracks[track_id] = track
+
+        groups = payload.get("videoTranslations") or []
+        if not isinstance(groups, list):
+            groups = []
+        matching_groups = [
+            group
+            for group in groups
+            if isinstance(group, dict)
+            and cls._translation_group_video_id(group) == video_id
+        ]
+        if not matching_groups and len(groups) == 1 and isinstance(groups[0], dict):
+            # Some Studio variants omit videoId for a single-video request.
+            matching_groups = [groups[0]]
+
+        states: set[str] = set()
+        for group in matching_groups:
+            translations = group.get("translations") or []
+            if not isinstance(translations, list):
+                continue
+            for item in translations:
+                if not isinstance(item, dict):
+                    continue
+                actual = cls._translation_language(item)
+                if not actual or actual.casefold() != expected:
+                    continue
                 audio = item.get("audioTranslation") or {}
-                actual = self._translation_language(item)
-                if audio.get("audioTrackId") and actual and actual.casefold() == expected:
-                    return True
+                if not isinstance(audio, dict):
+                    continue
+                track_id = str(audio.get("audioTrackId") or "").strip()
+                if not track_id:
+                    continue
+                root_track = root_tracks.get(track_id)
+                status_payload = root_track if root_track is not None else item
+                if cls._audio_payload_has_terminal_failure(
+                    status_payload,
+                    assume_audio=root_track is not None,
+                ):
+                    states.add("terminal")
+                elif cls._audio_payload_needs_attention(
+                    status_payload,
+                    assume_audio=root_track is not None,
+                ):
+                    states.add("inflight")
+                else:
+                    states.add("healthy")
+
+        # A good duplicate always wins. Never replace it because an older copy
+        # of the same language is still processing or failed.
+        if "healthy" in states:
+            return "healthy"
+        if "inflight" in states:
+            return "inflight"
+        if "terminal" in states:
+            return "terminal"
+        return "missing"
+
+    def _has_audio_track(self, id_video: str, channel_id: str, language: str) -> bool:
+        """Return true only when the existing language is READY/PUBLISHED."""
+        for attempt in range(3):
+            payload = self._get_video_translation_payload([id_video], channel_id)
+            state = self._audio_language_state_from_payload(
+                payload,
+                id_video,
+                language,
+            )
+            if state == "healthy":
+                return True
             if attempt < 2:
                 wait_interruptibly(2 * (attempt + 1))
         return False

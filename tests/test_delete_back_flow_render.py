@@ -20,7 +20,7 @@ class DeleteBackFlowRenderTests(unittest.IsolatedAsyncioTestCase):
         item = {"path": "video.mp4"}
         music = Path("music") / "bài nhạc gốc.mp3"
         output_folder = str(Path("output"))
-        video_out = str(Path(output_folder) / "output_2_processed.mp4")
+        video_out = str(Path(output_folder) / "bài nhạc gốc.mp4")
         run_context = Mock()
         with patch(
             "web.components.delete_back_flow.get_video_duration", return_value=125.5
@@ -67,10 +67,44 @@ class DeleteBackFlowRenderTests(unittest.IsolatedAsyncioTestCase):
                         )
 
                 run_context.register_cleanup_path.assert_called_once_with(
-                    str(Path("output") / "output_1_processed.mp4")
+                    str(Path("output") / "music.mp4")
                 )
                 run_context.keep_path.assert_not_called()
                 self.assertNotIn("render_audio_mode", item)
+
+    async def test_existing_song_output_gets_numbered_without_overwrite(self):
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            directory = Path(temporary_dir)
+            music = directory / "Baladas Románticas.m4a"
+            existing = directory / "Baladas Románticas.mp4"
+            existing.write_bytes(b"keep-existing")
+            item = {"path": "video.mp4"}
+
+            with (
+                patch(
+                    "web.components.delete_back_flow.get_video_duration",
+                    return_value=60,
+                ),
+                patch(
+                    "web.components.delete_back_flow.mux_audio_into_video"
+                ) as mux,
+                patch(
+                    "web.components.delete_back_flow.current_run_context",
+                    return_value=None,
+                ),
+            ):
+                await _render_delete_back_output(
+                    item,
+                    str(directory),
+                    music,
+                    1,
+                    "",
+                )
+
+            expected = directory / "Baladas Románticas (2).mp4"
+            self.assertEqual(item["output_path"], str(expected))
+            self.assertEqual(existing.read_bytes(), b"keep-existing")
+            self.assertEqual(mux.call_args.kwargs["video_out"], str(expected))
 
     @unittest.skipUnless(
         shutil.which("ffmpeg") and shutil.which("ffprobe"), "FFmpeg integration test"

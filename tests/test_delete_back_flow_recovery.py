@@ -15,11 +15,13 @@ from web.components.delete_back_flow import (
     ORIGINAL_AUDIO_RENDER_MODE,
     PERSIST_FIELDS,
     _copyright_check_allows_delete,
+    _merge_remote_upload_checkpoints,
     _repair_missing_upload_input,
     _replace_video_items_unless_processing,
     _require_checkpoint,
     _restore_delete_back_steps,
     _restore_steps,
+    _saved_status_for_source,
     _upload_resume_point,
 )
 
@@ -35,6 +37,82 @@ class DeleteBackFlowRecoveryTests(unittest.TestCase):
         )
         self.assertFalse(_copyright_check_allows_delete(""))
         self.assertFalse(_copyright_check_allows_delete(None))
+
+    def test_stale_page_cannot_erase_checkpointed_youtube_ids(self):
+        persisted = {
+            "video.mp4": {
+                "source_path": "D:/videos/video.mp4",
+                "video_id": "youtube-id",
+                "frontend_upload_id": "frontend-id",
+                "scotty_resource_id": "scotty-id",
+                "steps": {"upload": "processing"},
+            }
+        }
+        stale_page = {
+            "video.mp4": {
+                "source_path": "D:/videos/video.mp4",
+                "video_id": "",
+                "frontend_upload_id": "",
+                "scotty_resource_id": "",
+                "steps": {"upload": "stopped"},
+            }
+        }
+
+        merged = _merge_remote_upload_checkpoints(stale_page, persisted)
+
+        self.assertEqual(merged["video.mp4"]["video_id"], "youtube-id")
+        self.assertEqual(
+            merged["video.mp4"]["frontend_upload_id"], "frontend-id"
+        )
+        self.assertEqual(merged["video.mp4"]["scotty_resource_id"], "scotty-id")
+        self.assertEqual(merged["video.mp4"]["steps"]["upload"], "stopped")
+
+    def test_checkpoint_is_not_reused_for_same_name_from_another_folder(self):
+        persisted = {
+            "video.mp4": {
+                "source_path": "D:/old/video.mp4",
+                "video_id": "old-youtube-id",
+            }
+        }
+        current = {
+            "video.mp4": {
+                "source_path": "D:/new/video.mp4",
+                "video_id": "",
+            }
+        }
+
+        merged = _merge_remote_upload_checkpoints(current, persisted)
+
+        self.assertEqual(merged["video.mp4"]["video_id"], "")
+
+    def test_reload_ignores_same_filename_checkpoint_from_another_folder(self):
+        statuses = {
+            "video.mp4": {
+                "source_path": "D:/old/video.mp4",
+                "video_id": "old-youtube-id",
+            }
+        }
+
+        saved = _saved_status_for_source(
+            statuses,
+            "video.mp4",
+            "D:/new/video.mp4",
+        )
+
+        self.assertEqual(saved, {})
+
+    def test_legacy_checkpoint_without_source_path_is_preserved(self):
+        persisted = {"video.mp4": {"video_id": "legacy-youtube-id"}}
+        current = {
+            "video.mp4": {
+                "source_path": "D:/videos/video.mp4",
+                "video_id": "",
+            }
+        }
+
+        merged = _merge_remote_upload_checkpoints(current, persisted)
+
+        self.assertEqual(merged["video.mp4"]["video_id"], "legacy-youtube-id")
 
     def test_interrupted_step_is_retryable_without_losing_completed_steps(self):
         recovered = _restore_steps(
