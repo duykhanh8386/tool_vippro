@@ -53,6 +53,8 @@ COPYRIGHT_DELETE_READY_STATUSES = {
 }
 
 _FLOW_RUN_GUARD = threading.Lock()
+_ACTIVE_FLOW_RUN = {"parent": None, "children": {}, "task": None}
+_FLOW_STOP_REQUESTED = {"value": False}
 _DELETE_LOG_LOCK = threading.Lock()
 _STATE_CHECKPOINT_LOCK = threading.RLock()
 _OUTPUT_NAME_LOCK = threading.Lock()
@@ -231,6 +233,18 @@ def _replace_status_snapshot(target: dict, source: dict) -> None:
     target.update(source)
 
 
+def _run_finalizers(steps: list[tuple[str, object]]) -> list[Exception]:
+    """Run every cleanup step so a UI failure cannot leave the flow locked."""
+    errors = []
+    for name, callback in steps:
+        try:
+            callback()
+        except Exception as exc:
+            errors.append(exc)
+            logger.exception("Delete-Back finalizer '{}' failed: {}", name, exc)
+    return errors
+
+
 def _status_source_path(status: dict) -> str:
     """Return a comparable source path without requiring the file to exist."""
     value = normalize_path(str(status.get("source_path") or ""))
@@ -385,9 +399,9 @@ def create_delete_back_flow_page():
     videos_state = {"items": []}
     saved_status_map = {}
     suppress_autosave = {"value": False}
-    stop_requested = {"value": False}
+    stop_requested = _FLOW_STOP_REQUESTED
     processing = {"value": False}
-    active_run = {"parent": None, "children": {}}
+    active_run = _ACTIVE_FLOW_RUN
 
     ui_refs = {
         "refresh_channel_display": None,
@@ -1194,6 +1208,8 @@ def create_delete_back_flow_page():
             )
             return
 
+        active_run["task"] = asyncio.current_task()
+
         stop_requested["value"] = False
         stopped = False
         total_items = len(pending_items)
@@ -1222,15 +1238,26 @@ def create_delete_back_flow_page():
             save_state()
             logger.exception("Delete-Back batch failed: {}", exc)
         finally:
-            # Persist before any UI cleanup. This is the last durable recovery
-            # point when the application is closed normally.
-            save_state()
+            # Persist and release backend ownership even if the old page was
+            # closed and one of its UI elements can no longer be updated.
+            finalizers = [("persist final state", save_state)]
             if run_context is not None:
-                run_context.cleanup()
-            active_run["parent"] = None
-            active_run["children"].clear()
-            _FLOW_RUN_GUARD.release()
-            set_processing_ui(False)
+                finalizers.append(("cleanup parent run context", run_context.cleanup))
+            finalizers.extend(
+                [
+                    (
+                        "clear active run references",
+                        lambda: (
+                            active_run.__setitem__("parent", None),
+                            active_run["children"].clear(),
+                            active_run.__setitem__("task", None),
+                        ),
+                    ),
+                    ("release flow guard", _FLOW_RUN_GUARD.release),
+                    ("reset processing UI", lambda: set_processing_ui(False)),
+                ]
+            )
+            _run_finalizers(finalizers)
 
         done_count = sum(
             1
@@ -1273,6 +1300,24 @@ def create_delete_back_flow_page():
                 *(asyncio.to_thread(context.request_stop) for context in contexts),
                 return_exceptions=True,
             )
+
+        task = active_run.get("task")
+        if task is not None and task is not asyncio.current_task() and not task.done():
+            await asyncio.gather(asyncio.shield(task), return_exceptions=True)
+        if (
+            _FLOW_RUN_GUARD.locked()
+            and active_run.get("parent") is None
+            and not active_run["children"]
+            and not active_run.get("task")
+        ):
+            try:
+                _FLOW_RUN_GUARD.release()
+            except RuntimeError:
+                pass
+        safe_notify(
+            "Đã dừng tác vụ và nhả khóa. Dữ liệu trên UI được giữ nguyên.",
+            type="positive",
+        )
 
     def clear_all_inputs():
         if configuration_change_blocked():
@@ -1504,12 +1549,18 @@ def create_delete_back_flow_page():
                 .classes("app-button-primary flex-1")
             )
             ui_refs["stop_btn"] = (
-                ui.button("Dừng", icon="stop", on_click=handle_stop)
+                ui.button(
+                    "Dừng tác vụ đang chạy", icon="stop", on_click=handle_stop
+                )
                 .classes("app-button-secondary flex-1")
             )
             ui_refs["stop_btn"].set_visibility(False)
             ui_refs["clear_btn"] = (
-                ui.button("Xóa tất cả", icon="delete_sweep", on_click=clear_all_inputs)
+                ui.button(
+                    "Xóa tất cả",
+                    icon="delete_sweep",
+                    on_click=clear_all_inputs,
+                )
                 .classes("app-button-secondary flex-1")
             )
 

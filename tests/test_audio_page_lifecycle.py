@@ -1,5 +1,6 @@
 import asyncio
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,6 +15,7 @@ from web.components.audio import (
     _audio_workflow_signature,
     _ADD_AUDIO_RUN_GUARD,
     _best_effort_ui as audio_best_effort_ui,
+    _clear_audio_ui_workflow_data,
     _clamp_upload_concurrency,
     _cleanup_temp_audio_file,
     _fetch_channel_videos,
@@ -29,9 +31,11 @@ from web.components.audio import (
     _run_client_independent,
     _run_in_target_slot,
     _run_sequentially_isolated,
+    _own_audio_run_lock,
     _remember_audio_path_history,
     _select_videos_by_ids,
     _select_terminal_repair_actions,
+    _stop_active_audio_runs,
     _upload_progress_summary,
     _video_from_snapshot,
     _video_snapshot,
@@ -40,6 +44,7 @@ from src.audio_recovery import get_audio_mutation_guard
 from src.module.model import Video
 from src.module.list_videos_module import ListVideosModule
 from src.utils import multiply_audio
+from src.task_runtime import check_stopped
 from web.components.remove_audio import (
     DEFAULT_REMOVE_AUDIO_CONCURRENCY,
     MAX_REMOVE_AUDIO_CONCURRENCY,
@@ -55,6 +60,28 @@ from web.components.remove_audio import (
 class AudioPageLifecycleTests(unittest.IsolatedAsyncioTestCase):
     def test_manual_run_state_is_separate_from_automatic_recovery_guard(self):
         self.assertIsNot(_ADD_AUDIO_RUN_GUARD, get_audio_mutation_guard("channel"))
+
+    def test_clear_page_data_preserves_the_separate_recovery_registry(self):
+        video_ids_state = {"ids": ["video-a"]}
+        page_maps = [
+            {"video-a": "audio.mp3"},
+            {"video-a": {"en": "processing"}},
+            {"video-a": {"en": "failed"}},
+        ]
+        recovery_registry = {
+            "channel-a": {
+                "video-a": {
+                    "audio_path": "audio.mp3",
+                    "languages": ["en"],
+                }
+            }
+        }
+
+        _clear_audio_ui_workflow_data(video_ids_state, *page_maps)
+
+        self.assertEqual(video_ids_state["ids"], [])
+        self.assertTrue(all(mapping == {} for mapping in page_maps))
+        self.assertIn("video-a", recovery_registry["channel-a"])
 
     def test_combined_workflow_concurrency_is_limited_to_three_through_five(self):
         self.assertEqual(_clamp_upload_concurrency(None), DEFAULT_AUDIO_UPLOAD_CONCURRENCY)
@@ -429,6 +456,58 @@ class AudioPageLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
         release.set()
         await asyncio.wait_for(finished.wait(), timeout=1)
+
+    async def test_stop_releases_owned_worker_lock_and_allows_next_run(self):
+        worker_lock = threading.Lock()
+        first_started = asyncio.Event()
+        ui_checkpoint = {"video-a": {"en": "processing"}}
+
+        async def first_job():
+            self.assertTrue(_ADD_AUDIO_RUN_GUARD.acquire(blocking=False))
+            _own_audio_run_lock(_ADD_AUDIO_RUN_GUARD)
+            self.assertTrue(worker_lock.acquire(blocking=False))
+            _own_audio_run_lock(worker_lock)
+            first_started.set()
+            while True:
+                await asyncio.sleep(0.01)
+                check_stopped()
+
+        first_client_task = asyncio.create_task(
+            _run_client_independent(first_job())
+        )
+        await asyncio.wait_for(first_started.wait(), timeout=1)
+
+        self.assertEqual(await _stop_active_audio_runs(), 1)
+        await asyncio.wait_for(first_client_task, timeout=1)
+        self.assertFalse(_ADD_AUDIO_RUN_GUARD.locked())
+        self.assertFalse(worker_lock.locked())
+        self.assertEqual(ui_checkpoint, {"video-a": {"en": "processing"}})
+
+        second_finished = asyncio.Event()
+
+        async def second_job():
+            self.assertTrue(_ADD_AUDIO_RUN_GUARD.acquire(blocking=False))
+            _own_audio_run_lock(_ADD_AUDIO_RUN_GUARD)
+            self.assertTrue(worker_lock.acquire(blocking=False))
+            _own_audio_run_lock(worker_lock)
+            second_finished.set()
+
+        await asyncio.wait_for(
+            _run_client_independent(second_job()),
+            timeout=1,
+        )
+        self.assertTrue(second_finished.is_set())
+        self.assertFalse(_ADD_AUDIO_RUN_GUARD.locked())
+        self.assertFalse(worker_lock.locked())
+
+    async def test_stop_manual_worker_does_not_release_auto_registry_guard(self):
+        registry_guard = get_audio_mutation_guard("registry-owned-channel")
+        self.assertTrue(registry_guard.acquire(blocking=False))
+        try:
+            self.assertEqual(await _stop_active_audio_runs(), 0)
+            self.assertTrue(registry_guard.locked())
+        finally:
+            registry_guard.release()
 
     async def test_detached_audio_job_enters_the_page_target_slot(self):
         events = []

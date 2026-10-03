@@ -88,6 +88,7 @@ class DeleteVideoController:
         self._run_context = None
         self._channel_name_map = {}
         self._channel_avatar_map = {}
+        self._history_hidden_from_queue = False
         self.output_dir = _load_output_dir()
         self._restore_run_state()
 
@@ -105,6 +106,7 @@ class DeleteVideoController:
                     "max_workers": self.max_workers,
                     "all_videos": self.all_videos,
                     "status_text": self.status_text,
+                    "history_hidden_from_queue": self._history_hidden_from_queue,
                 },
             )
         except Exception as exc:
@@ -117,6 +119,9 @@ class DeleteVideoController:
             state = state_manager.load_state(_RUN_STATE_KEY) or {}
             self.selected_channel_ids = list(state.get("selected_channel_ids") or [])
             self.max_workers = max(1, int(state.get("max_workers") or 5))
+            self._history_hidden_from_queue = bool(
+                state.get("history_hidden_from_queue", False)
+            )
             restored = state.get("all_videos") or []
             self.all_videos = [dict(video) for video in restored if isinstance(video, dict)]
 
@@ -130,7 +135,7 @@ class DeleteVideoController:
                 if video.get("row_status") == "deleting":
                     video["row_status"] = "ready"
                     recovered = True
-            if self._restore_deleted_history():
+            if not self._history_hidden_from_queue and self._restore_deleted_history():
                 recovered = True
             if self.all_videos:
                 self.status_text = (
@@ -198,7 +203,8 @@ class DeleteVideoController:
         state_manager.save_state(
             _SETTINGS_KEY, {"output_dir": str(self.output_dir)}
         )
-        self._restore_deleted_history()
+        if not self._history_hidden_from_queue:
+            self._restore_deleted_history()
         self._bump()
 
     def refresh_channel_maps(self):
@@ -253,6 +259,21 @@ class DeleteVideoController:
         except (TaskStopped, asyncio.CancelledError):
             pass
 
+    def clear_ui_state(self) -> bool:
+        """Clear the UI queue/checkpoint only when no worker is running."""
+        if self.is_running():
+            return False
+        self.all_videos.clear()
+        self.selected_channel_ids.clear()
+        self.polling = False
+        self.next_poll_at = 0.0
+        self.status_text = "Đã dừng tác vụ và xóa dữ liệu trên UI."
+        # Keep the CSV history on disk without importing it back into the UI
+        # after the next application restart.
+        self._history_hidden_from_queue = True
+        self._bump()
+        return True
+
     async def _run_loop(self, run_context):
         try:
             with bind_run_context(run_context):
@@ -298,6 +319,8 @@ class DeleteVideoController:
             run_context.cleanup()
             if self._run_context is run_context:
                 self._run_context = None
+            if self._task is asyncio.current_task():
+                self._task = None
             self._bump()
 
     def _video_dict(self, v, channel_id: str) -> dict:

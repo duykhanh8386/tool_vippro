@@ -512,6 +512,69 @@ class DeleteVideoHistoryTests(unittest.IsolatedAsyncioTestCase):
                 release_run.set()
                 await controller._task
 
+    async def test_stop_and_clear_ui_are_separate_and_preserve_csv_history(self):
+        class MemoryStateManager:
+            def __init__(self, output_dir):
+                self.states = {
+                    "delete_video_settings": {"output_dir": str(output_dir)}
+                }
+
+            def save_state(self, key, value):
+                self.states[key] = copy.deepcopy(value)
+                return True
+
+            def load_state(self, key):
+                return copy.deepcopy(self.states.get(key))
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir)
+            log_file = output_dir / "deleted_videos.csv"
+            log_file.write_text(
+                "video_id,channel_id,channel_name,deleted_at,video_url\n"
+                "saved-id,channel-id,Channel,2026-09-01 12:00:00,"
+                "https://www.youtube.com/watch?v=saved-id\n",
+                encoding="utf-8",
+            )
+            memory_state = MemoryStateManager(output_dir)
+            stopped = asyncio.Event()
+            fake_context = Mock()
+            fake_context.request_stop.side_effect = stopped.set
+
+            async def held_run(_context):
+                await stopped.wait()
+
+            with patch(
+                "web.components.delete_video_controller.state_manager",
+                memory_state,
+            ), patch(
+                "web.components.delete_video_controller.create_run_context",
+                return_value=fake_context,
+            ):
+                controller = DeleteVideoController()
+                with patch.object(controller, "refresh_channel_maps"), patch.object(
+                    controller, "_run_loop", side_effect=held_run
+                ):
+                    controller.start(["channel-id"])
+                    self.assertFalse(controller.clear_ui_state())
+                    self.assertTrue(controller.all_videos)
+                    await controller.stop()
+                    self.assertTrue(controller.all_videos)
+                    self.assertTrue(controller.clear_ui_state())
+
+                self.assertFalse(controller.is_running())
+                self.assertEqual(controller.all_videos, [])
+                self.assertEqual(controller.selected_channel_ids, [])
+                self.assertTrue(log_file.is_file())
+                self.assertIn("saved-id", log_file.read_text(encoding="utf-8"))
+                self.assertTrue(
+                    memory_state.states["delete_video_run"][
+                        "history_hidden_from_queue"
+                    ]
+                )
+
+                restored = DeleteVideoController()
+                self.assertEqual(restored.all_videos, [])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -5,7 +5,6 @@ from typing import Awaitable, Callable, Iterable, TypeVar
 from loguru import logger
 from nicegui import context, ui
 from src.audio_recovery import (
-    clear_audio_recovery_registry,
     get_audio_mutation_guard,
     register_audio_recovery,
     register_caption_monitor,
@@ -32,6 +31,15 @@ from src.subtitle_generation import (
     persist_video_source_srt,
     render_source_srt,
 )
+from src.task_runtime import (
+    TaskRunContext,
+    TaskStopped,
+    activate_run_context,
+    check_stopped,
+    create_run_context,
+    current_run_context,
+    reset_run_context,
+)
 from src.utils import get_channels_info, multiply_audio, normalize_path, validate_path_text
 from src.youtube_caption_api import (
     CaptionAuthenticationError,
@@ -52,6 +60,8 @@ _T = TypeVar("_T")
 # checkpoints look like a live job in another browser tab.
 _ADD_AUDIO_RUN_GUARD = threading.Lock()
 _ADD_AUDIO_BACKGROUND_TASKS: set[asyncio.Task] = set()
+_ACTIVE_AUDIO_RUNS: dict[str, "_AudioRunControl"] = {}
+_ACTIVE_AUDIO_RUNS_LOCK = threading.RLock()
 DEFAULT_AUDIO_UPLOAD_CONCURRENCY = 3
 MIN_AUDIO_UPLOAD_CONCURRENCY = 3
 MAX_AUDIO_UPLOAD_CONCURRENCY = 5
@@ -65,6 +75,147 @@ VIDEO_SCAN_SCOPE_LABELS = {
     "draft": "video bản nháp",
     "recent": "video đăng gần nhất",
 }
+
+
+class _AudioRunControl:
+    """Own the resources and locks of exactly one manual audio run."""
+
+    def __init__(self) -> None:
+        self.context: TaskRunContext = create_run_context("audio_delete_and_add")
+        self.task: asyncio.Task | None = None
+        self._locks: list[object] = []
+        self._lock = threading.RLock()
+
+    def own_lock(self, lock: object) -> None:
+        with self._lock:
+            if lock not in self._locks:
+                self._locks.append(lock)
+
+    def release_lock(self, lock: object) -> None:
+        with self._lock:
+            if lock not in self._locks:
+                return
+            self._locks.remove(lock)
+        try:
+            lock.release()
+        except RuntimeError:
+            logger.warning("Audio run lock was already released")
+
+    def release_all_locks(self) -> None:
+        with self._lock:
+            locks = list(reversed(self._locks))
+            self._locks.clear()
+        for lock in locks:
+            try:
+                lock.release()
+            except RuntimeError:
+                logger.warning("Audio run lock was already released")
+
+    def request_stop(self) -> None:
+        self.context.request_stop()
+
+
+def _current_audio_run_control() -> _AudioRunControl | None:
+    run_context = current_run_context()
+    if run_context is None:
+        return None
+    with _ACTIVE_AUDIO_RUNS_LOCK:
+        return _ACTIVE_AUDIO_RUNS.get(run_context.run_id)
+
+
+def _own_audio_run_lock(lock: object) -> None:
+    control = _current_audio_run_control()
+    if control is not None:
+        control.own_lock(lock)
+
+
+def _release_audio_run_lock(lock: object) -> None:
+    control = _current_audio_run_control()
+    if control is not None:
+        control.release_lock(lock)
+        return
+    try:
+        lock.release()
+    except RuntimeError:
+        logger.warning("Audio run lock was already released")
+
+
+async def _run_controlled_audio_job(job: Awaitable[None]) -> None:
+    """Run an audio-page job with independently stoppable owned resources."""
+    control = _AudioRunControl()
+    control.task = asyncio.current_task()
+    with _ACTIVE_AUDIO_RUNS_LOCK:
+        _ACTIVE_AUDIO_RUNS[control.context.run_id] = control
+    token = activate_run_context(control.context)
+    try:
+        check_stopped()
+        await job
+    except TaskStopped:
+        logger.info("Audio page run {} was stopped", control.context.run_id)
+    finally:
+        # This outer cleanup also covers validation/UI exceptions which occur
+        # outside the workflow's own try/finally block.
+        control.context.cleanup()
+        control.release_all_locks()
+        reset_run_context(token)
+        with _ACTIVE_AUDIO_RUNS_LOCK:
+            _ACTIVE_AUDIO_RUNS.pop(control.context.run_id, None)
+
+
+def _request_active_audio_runs_stop() -> list[_AudioRunControl]:
+    """Signal only audio-page runs; automatic recovery is never included."""
+    with _ACTIVE_AUDIO_RUNS_LOCK:
+        controls = list(_ACTIVE_AUDIO_RUNS.values())
+    for control in controls:
+        control.request_stop()
+    return controls
+
+
+async def _stop_active_audio_runs() -> int:
+    """Stop audio-page workers and wait until every owned lock is released."""
+    controls = _request_active_audio_runs_stop()
+    current_task = asyncio.current_task()
+    tasks = [
+        control.task
+        for control in controls
+        if control.task is not None and control.task is not current_task
+    ]
+    if tasks:
+        await asyncio.gather(
+            *(asyncio.shield(task) for task in tasks),
+            return_exceptions=True,
+        )
+
+    # Recover a stale manual-only guard left by an older interrupted build.
+    # Never touch per-channel mutation guards because Auto Registry can own one.
+    with _ACTIVE_AUDIO_RUNS_LOCK:
+        has_active_runs = bool(_ACTIVE_AUDIO_RUNS)
+    if (
+        not has_active_runs
+        and not _ADD_AUDIO_BACKGROUND_TASKS
+        and _ADD_AUDIO_RUN_GUARD.locked()
+    ):
+        try:
+            _ADD_AUDIO_RUN_GUARD.release()
+            logger.warning("Released an orphaned manual add-audio guard")
+        except RuntimeError:
+            pass
+    return len(controls)
+
+
+def _clear_audio_ui_workflow_data(
+    video_ids_state: dict,
+    *page_state_mappings: dict,
+) -> None:
+    """Clear only the current page and its persisted workflow checkpoint.
+
+    The automatic recovery registry is deliberately not accepted by this
+    helper. Resetting the form must never unregister videos from background
+    recovery for this or any other channel.
+    """
+    video_ids_state["ids"] = []
+    for mapping in page_state_mappings:
+        mapping.clear()
 
 
 def _best_effort_ui(
@@ -92,8 +243,11 @@ async def _run_sequentially_isolated(
 ) -> list[tuple[_T, Exception]]:
     failures: list[tuple[_T, Exception]] = []
     for item in items:
+        check_stopped()
         try:
             await process_item(item)
+        except TaskStopped:
+            raise
         except Exception as exc:
             failures.append((item, exc))
             on_error(item, exc)
@@ -124,11 +278,18 @@ async def _run_concurrently_isolated(
     async def worker() -> None:
         while not fatal_errors:
             try:
+                check_stopped()
+            except TaskStopped as exc:
+                fatal_errors.append(exc)
+                return
+            try:
                 item = queue.get_nowait()
             except asyncio.QueueEmpty:
                 return
             try:
                 await process_item(item)
+            except TaskStopped as exc:
+                fatal_errors.append(exc)
             except Exception as exc:
                 failures.append((item, exc))
                 on_error(item, exc)
@@ -158,7 +319,7 @@ def _consume_background_audio_task(task: asyncio.Task) -> None:
 
 async def _run_client_independent(job: Awaitable[None]) -> None:
     """Let backend processing survive a browser/NiceGUI client cancellation."""
-    task = asyncio.create_task(job)
+    task = asyncio.create_task(_run_controlled_audio_job(job))
     _ADD_AUDIO_BACKGROUND_TASKS.add(task)
     task.add_done_callback(_consume_background_audio_task)
     try:
@@ -642,7 +803,7 @@ def create_add_audio_page():
     right_panel_container = None
     scan_preview_container = None
     video_source_status_container = None
-    scan_runtime = {"running": False}
+    scan_runtime = {"running": False, "task": None}
     right_panel_refresh = {"last": 0.0}
     suppress_autosave = {"value": False}
     ui_refs = {
@@ -1480,7 +1641,7 @@ def create_add_audio_page():
             )
         return selected
 
-    async def handle_failed_video_scan():
+    async def _execute_failed_video_scan():
         if configuration_change_blocked():
             return
         if scan_runtime["running"]:
@@ -1494,6 +1655,7 @@ def create_add_audio_page():
             return
 
         scan_runtime["running"] = True
+        scan_runtime["task"] = asyncio.current_task()
         set_scan_controls_busy(True, loading_key="failed_video_scan_button")
         try:
             channel_id = selected_channel["id"]
@@ -1515,6 +1677,7 @@ def create_add_audio_page():
                 scope=scan_scope,
                 recent_limit=recent_limit,
             )
+            check_stopped()
             unreadable_ids: list[str] = []
             failed_targets = await asyncio.to_thread(
                 update_audio_module.get_terminal_audio_repair_targets,
@@ -1522,6 +1685,7 @@ def create_add_audio_page():
                 channel_id,
                 unreadable_ids,
             )
+            check_stopped()
             failed_ids = set(failed_targets)
             failed_videos = [video for video in videos if video.id in failed_ids]
 
@@ -1573,6 +1737,8 @@ def create_add_audio_page():
                     "Không xử lý được / Không đủ điều kiện / Đã xoá.",
                     type="warning",
                 )
+        except TaskStopped:
+            raise
         except Exception as exc:
             logger.exception("Failed to scan videos with audio processing errors")
             if _is_youtube_auth_error(exc):
@@ -1582,7 +1748,11 @@ def create_add_audio_page():
             ui.notify(message, type="negative")
         finally:
             scan_runtime["running"] = False
+            scan_runtime["task"] = None
             set_scan_controls_busy(False, loading_key="failed_video_scan_button")
+
+    async def handle_failed_video_scan():
+        await _run_controlled_audio_job(_execute_failed_video_scan())
 
     async def run_folder_scan(*, mode: str):
         if configuration_change_blocked():
@@ -1600,6 +1770,7 @@ def create_add_audio_page():
             return
 
         scan_runtime["running"] = True
+        scan_runtime["task"] = asyncio.current_task()
         active_button_key = {
             "duration": "scan_button",
             "title": "title_button",
@@ -1611,6 +1782,7 @@ def create_add_audio_page():
             videos = await asyncio.to_thread(
                 source_videos_for_matching, selected_channel["id"]
             )
+            check_stopped()
             matcher = {
                 "duration": match_audio_files,
                 "title": match_audio_files_by_title,
@@ -1629,6 +1801,7 @@ def create_add_audio_page():
                 folder,
                 **matcher_kwargs,
             )
+            check_stopped()
             matched_count = apply_batch_match(result, mode=mode)
             if matched_count:
                 action = {
@@ -1647,6 +1820,8 @@ def create_add_audio_page():
                     "sequential": "Thư mục không có file âm thanh để ghép lần lượt.",
                 }[mode]
                 ui.notify(message, type="warning")
+        except TaskStopped:
+            raise
         except Exception as exc:
             logger.exception("Automatic audio scan failed")
             if _is_youtube_auth_error(exc):
@@ -1656,16 +1831,17 @@ def create_add_audio_page():
             ui.notify(message, type="negative")
         finally:
             scan_runtime["running"] = False
+            scan_runtime["task"] = None
             set_scan_controls_busy(False, loading_key=active_button_key)
 
     async def handle_auto_scan():
-        await run_folder_scan(mode="duration")
+        await _run_controlled_audio_job(run_folder_scan(mode="duration"))
 
     async def handle_title_scan():
-        await run_folder_scan(mode="title")
+        await _run_controlled_audio_job(run_folder_scan(mode="title"))
 
     async def handle_sequential_scan():
-        await run_folder_scan(mode="sequential")
+        await _run_controlled_audio_job(run_folder_scan(mode="sequential"))
 
     def open_rename_dialog():
         if configuration_change_blocked():
@@ -2110,22 +2286,24 @@ def create_add_audio_page():
         if not _ADD_AUDIO_RUN_GUARD.acquire(blocking=False):
             ui.notify("Quy trình xóa và thêm audio đang chạy ở một trang khác.", type="warning")
             return None
+        _own_audio_run_lock(_ADD_AUDIO_RUN_GUARD)
         channel_mutation_guard = get_audio_mutation_guard(selected_channel["id"])
         if not channel_mutation_guard.acquire(blocking=False):
-            _ADD_AUDIO_RUN_GUARD.release()
+            _release_audio_run_lock(_ADD_AUDIO_RUN_GUARD)
             ui.notify(
                 "Tự động khôi phục audio đang cập nhật một track. "
                 "Vui lòng thử lại sau ít giây.",
                 type="warning",
             )
             return None
+        _own_audio_run_lock(channel_mutation_guard)
         channel_id = selected_channel["id"]
         repeat_times = repeat_settings["times"]
         extra_minutes = repeat_settings["extra_minutes"]
         video_processing_errors.clear()
         if save_right_panel_state() is False:
-            channel_mutation_guard.release()
-            _ADD_AUDIO_RUN_GUARD.release()
+            _release_audio_run_lock(channel_mutation_guard)
+            _release_audio_run_lock(_ADD_AUDIO_RUN_GUARD)
             ui.notify("Không thể lưu phiên xử lý. Vui lòng thử lại.", type="negative")
             return None
         with ui.dialog() as progress_dialog:
@@ -2166,6 +2344,7 @@ def create_add_audio_page():
         upload_progress_timer = ui.timer(0.5, refresh_upload_progress)
 
         async def run_upload(vid: str, lang: str, temp_audio_path: Path):
+            check_stopped()
             progress_key = f"{vid}:{lang}"
             upload_progress = {
                 "sent": 0,
@@ -2211,12 +2390,15 @@ def create_add_audio_page():
                     update_one_language,
                     on_retry=log_retry,
                 )
+                check_stopped()
                 if status_code == 200:
                     video_processing_status[vid][lang] = "successful"
                 else:
                     video_processing_status[vid][lang] = "already_added"
                 if save_right_panel_state() is False:
                     raise RuntimeError("Không thể lưu checkpoint sau khi thêm audio")
+            except TaskStopped:
+                raise
             except Exception as exc:
                 video_processing_status.setdefault(vid, {})[lang] = "unsuccessful"
                 overall_errors.append(f"{vid}-{lang}: {exc}")
@@ -2234,6 +2416,7 @@ def create_add_audio_page():
             languages: list[str],
         ) -> dict:
             """Generate one source SRT and publish/retry the requested languages."""
+            check_stopped()
             if not subtitles_enabled:
                 return {"enabled": False}
 
@@ -2274,6 +2457,7 @@ def create_add_audio_page():
                         video_id=vid,
                         channel_id=channel_id,
                     )
+                    check_stopped()
                     duration_seconds = (
                         video_info.duration_ms / 1000.0
                         if video_info.duration_ms > 0
@@ -2287,12 +2471,14 @@ def create_add_audio_page():
                         target_duration=duration_seconds,
                         model_name=subtitle_settings["model"],
                     )
+                    check_stopped()
                     source_path = await asyncio.to_thread(
                         persist_video_source_srt,
                         vid,
                         source_language,
                         srt_text,
                     )
+                    check_stopped()
                     source = {
                         "source_srt_path": str(source_path),
                         "source_language": source_language,
@@ -2300,6 +2486,8 @@ def create_add_audio_page():
                     }
                     video_caption_sources[vid] = source
                     save_right_panel_state()
+                except TaskStopped:
+                    raise
                 except Exception as exc:
                     message = str(exc)
                     for language in languages:
@@ -2362,9 +2550,11 @@ def create_add_audio_page():
                     source_srt_path=source_path,
                     replace_existing=False,
                 )
+                check_stopped()
                 source["source_track_id"] = source_track_id
                 video_caption_sources[vid] = source
                 for language_index, language in enumerate(languages, 1):
+                    check_stopped()
                     statuses[language] = "processing"
                     errors.pop(language, None)
                     save_right_panel_state()
@@ -2386,6 +2576,7 @@ def create_add_audio_page():
                             existing_tracks=tracks,
                             replace_existing=False,
                         )
+                        check_stopped()
                         statuses[language] = status
                         completed_languages.append(language)
                     except CaptionQuotaExceededError as exc:
@@ -2407,6 +2598,8 @@ def create_add_audio_page():
                                 ),
                             )
                         break
+                    except TaskStopped:
+                        raise
                     except Exception as exc:
                         statuses[language] = "unsuccessful"
                         errors[language] = str(exc)
@@ -2435,6 +2628,8 @@ def create_add_audio_page():
                             close_button="Đóng",
                         ),
                     )
+            except TaskStopped:
+                raise
             except Exception as exc:
                 message = str(exc)
                 for language in missing:
@@ -2476,6 +2671,7 @@ def create_add_audio_page():
 
         async def process_video(item: tuple[int, str]) -> None:
             nonlocal completed_tasks
+            check_stopped()
             video_index, vid = item
             temp_audio_path: Path | None = None
             try:
@@ -2496,6 +2692,7 @@ def create_add_audio_page():
                         channel_id,
                         unreadable_now,
                     )
+                    check_stopped()
                     if unreadable_now:
                         raise RuntimeError(
                             "YouTube không trả trạng thái audio mới nhất; đã dừng để tránh add nhầm."
@@ -2592,6 +2789,7 @@ def create_add_audio_page():
                             delete_old_audio,
                             on_retry=log_delete_retry,
                         )
+                        check_stopped()
                         video_cleanup_status[vid] = "successful"
                         delete_requested.pop(vid, None)
                         if save_right_panel_state() is False:
@@ -2600,6 +2798,8 @@ def create_add_audio_page():
                             raise RuntimeError(
                                 "Không thể lưu checkpoint sau khi xóa audio cũ"
                             )
+                    except TaskStopped:
+                        raise
                     except Exception as exc:
                         video_cleanup_status[vid] = "unsuccessful"
                         delete_requested[vid] = True
@@ -2690,6 +2890,7 @@ def create_add_audio_page():
                     video_id=vid,
                     channel_id=channel_id,
                 )
+                check_stopped()
                 video_duration_seconds = (
                     video_info.duration_ms / 1000.0
                     if video_info.duration_ms > 0
@@ -2714,6 +2915,7 @@ def create_add_audio_page():
                     extra_minutes=extra_minutes,
                     video_duration_seconds=video_duration_seconds,
                 )
+                check_stopped()
                 best_effort_ui(
                     "render concurrent upload state",
                     lambda: concurrent_label.set_text(
@@ -2721,6 +2923,7 @@ def create_add_audio_page():
                     ),
                 )
                 for language_index, lang in enumerate(missing_languages, 1):
+                    check_stopped()
                     best_effort_ui(
                         "render language upload state",
                         lambda language_index=language_index, lang=lang: status_label.set_text(
@@ -2807,6 +3010,9 @@ def create_add_audio_page():
                 max_concurrency=max_concurrency,
                 stop_on_error=_is_youtube_auth_error,
             )
+        except TaskStopped:
+            logger.info("Manual delete/add audio workflow received a stop request")
+            return None
         except Exception as main_exc:
             logger.error("Main processing error: {}", main_exc)
             overall_errors.append(f"Main process: {main_exc}")
@@ -2818,8 +3024,8 @@ def create_add_audio_page():
             save_right_panel_state()
             best_effort_ui("close progress dialog", progress_dialog.close)
             best_effort_ui("render final audio state", refresh_right_panel)
-            channel_mutation_guard.release()
-            _ADD_AUDIO_RUN_GUARD.release()
+            _release_audio_run_lock(channel_mutation_guard)
+            _release_audio_run_lock(_ADD_AUDIO_RUN_GUARD)
         total_videos = len(job_video_ids)
         successful_videos = 0
         for vid in job_video_ids:
@@ -3227,7 +3433,7 @@ def create_add_audio_page():
         state_sync_timer["value"] = ui.timer(0.5, sync_persisted_running_state)
 
         def clear_all_inputs():
-            """Clear all inputs and reset form state"""
+            """Clear this page and its checkpoint without touching Auto Registry."""
             if configuration_change_blocked():
                 return
             try:
@@ -3252,17 +3458,22 @@ def create_add_audio_page():
                     ui_refs["scan_scope_toggle"].value = "all"
                 if ui_refs["recent_limit_input"]:
                     ui_refs["recent_limit_input"].value = DEFAULT_RECENT_VIDEO_LIMIT
-                video_ids_state["ids"] = []
-                id_to_path.clear()
-                video_titles.clear()
-                auto_match_info.clear()
-                video_processing_status.clear()
-                video_processing_errors.clear()
-                video_cleanup_status.clear()
-                delete_requested.clear()
-                video_workflow_signatures.clear()
-                audio_path_history.clear()
-                clear_audio_recovery_registry()
+                _clear_audio_ui_workflow_data(
+                    video_ids_state,
+                    id_to_path,
+                    video_titles,
+                    auto_match_info,
+                    video_processing_status,
+                    video_processing_errors,
+                    video_caption_status,
+                    video_caption_errors,
+                    video_caption_sources,
+                    video_caption_signatures,
+                    video_cleanup_status,
+                    delete_requested,
+                    video_workflow_signatures,
+                    audio_path_history,
+                )
                 selected_channel["id"] = None
                 selected_languages["languages"] = []
                 repeat_settings["times"] = 2
@@ -3295,10 +3506,41 @@ def create_add_audio_page():
                     ui_refs["refresh_language_chips"]()
                 if ui_refs["refresh_channel_display"]:
                     ui_refs["refresh_channel_display"]()
-                ui.notify("Đã xóa tất cả input và trạng thái", type="info")
             finally:
                 suppress_autosave["value"] = False
             save_right_panel_state()
+            ui.notify(
+                "Đã xóa dữ liệu trên UI; Auto Registry vẫn được giữ nguyên.",
+                type="info",
+            )
+
+        async def stop_running_task():
+            """Stop owned workers while preserving every UI/checkpoint value."""
+            scan_task = scan_runtime.get("task")
+            scan_was_running = bool(
+                scan_task is not None
+                and scan_task is not asyncio.current_task()
+                and not scan_task.done()
+            )
+
+            with _ACTIVE_AUDIO_RUNS_LOCK:
+                has_audio_worker = bool(_ACTIVE_AUDIO_RUNS)
+            if has_audio_worker or scan_was_running or _ADD_AUDIO_RUN_GUARD.locked():
+                ui.notify(
+                    "Đang dừng tác vụ an toàn và chờ worker nhả khóa...",
+                    type="info",
+                    timeout=5000,
+                )
+
+            stopped_workers = await _stop_active_audio_runs()
+            if stopped_workers or scan_was_running:
+                message = (
+                    "Đã dừng tác vụ và nhả khóa. UI được giữ nguyên để kiểm tra hoặc chạy tiếp; "
+                    "Auto Registry vẫn hoạt động."
+                )
+            else:
+                message = "Không có tác vụ nào đang chạy. UI và Auto Registry được giữ nguyên."
+            ui.notify(message, type="positive" if stopped_workers or scan_was_running else "info")
 
         with ui.row().classes("w-full gap-2 mt-3"):
             ui.button(
@@ -3306,4 +3548,13 @@ def create_add_audio_page():
                 icon="play_arrow",
                 on_click=handle_add_audio,
             ).classes("app-button-primary flex-1")
-            ui.button("Xóa dữ liệu", icon="delete_sweep", on_click=clear_all_inputs).classes("audio-add-destructive flex-1")
+            ui.button(
+                "Dừng tác vụ đang chạy",
+                icon="stop_circle",
+                on_click=stop_running_task,
+            ).classes("audio-add-destructive flex-1")
+            ui.button(
+                "Xóa dữ liệu",
+                icon="delete_sweep",
+                on_click=clear_all_inputs,
+            ).classes("app-button-secondary flex-1")

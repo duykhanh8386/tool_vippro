@@ -40,7 +40,7 @@ YOUTUBE_STATUS_MAX_CONSECUTIVE_TRANSIENT_ERRORS = 3
 # NiceGUI can open the same page in multiple browser tabs.  Keep one flow run
 # per application instance so two tabs cannot overwrite output_0/output_1...
 _FLOW_RUN_GUARD = threading.Lock()
-_ACTIVE_FLOW_RUN = {"parent": None, "children": {}}
+_ACTIVE_FLOW_RUN = {"parent": None, "children": {}, "task": None}
 _FLOW_STOP_REQUESTED = {"value": False}
 
 
@@ -1328,6 +1328,24 @@ def create_add_audio_flow_page():
                 return_exceptions=True,
             )
 
+        task = active_run.get("task")
+        if task is not None and task is not asyncio.current_task() and not task.done():
+            await asyncio.gather(asyncio.shield(task), return_exceptions=True)
+        if (
+            _FLOW_RUN_GUARD.locked()
+            and active_run.get("parent") is None
+            and not active_run["children"]
+            and not active_run.get("task")
+        ):
+            try:
+                _FLOW_RUN_GUARD.release()
+            except RuntimeError:
+                pass
+        safe_notify(
+            "Đã dừng tác vụ và nhả khóa. Dữ liệu trên UI được giữ nguyên; Auto Registry vẫn hoạt động.",
+            type="positive",
+        )
+
     async def handle_process():
         if processing["value"]:
             safe_notify("Đang xử lý, vui lòng đợi hoàn tất", type="warning")
@@ -1401,6 +1419,8 @@ def create_add_audio_flow_page():
             )
             return
 
+        active_run["task"] = asyncio.current_task()
+
         total = len(pending_items)
         errors = []
         stop_requested["value"] = False
@@ -1440,6 +1460,7 @@ def create_add_audio_flow_page():
                         lambda: (
                             active_run.__setitem__("parent", None),
                             active_run["children"].clear(),
+                            active_run.__setitem__("task", None),
                         ),
                     ),
                     ("release flow guard", _FLOW_RUN_GUARD.release),
@@ -1683,9 +1704,15 @@ def create_add_audio_flow_page():
 
         with ui.row().classes("w-full gap-2 mt-3"):
             ui_refs["process_btn"] = ui.button("Xử lý", icon="play_arrow", on_click=handle_process).classes("app-button-primary flex-1")
-            ui_refs["stop_btn"] = ui.button("Dừng", icon="stop", on_click=handle_stop).classes("app-button-secondary flex-1")
+            ui_refs["stop_btn"] = ui.button(
+                "Dừng tác vụ đang chạy", icon="stop", on_click=handle_stop
+            ).classes("app-button-secondary flex-1")
             ui_refs["stop_btn"].set_visibility(False)
-            ui_refs["clear_btn"] = ui.button("Xóa dữ liệu", icon="delete_sweep", on_click=clear_all_inputs).classes("app-button-secondary flex-1")
+            ui_refs["clear_btn"] = ui.button(
+                "Xóa dữ liệu",
+                icon="delete_sweep",
+                on_click=clear_all_inputs,
+            ).classes("app-button-secondary flex-1")
 
         progress_panel = ui.card().classes("app-progress-panel w-full mt-2 gap-1 p-3")
         with progress_panel:

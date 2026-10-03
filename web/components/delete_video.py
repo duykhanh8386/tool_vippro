@@ -45,6 +45,7 @@ def create_delete_video_page():
     ui_refs = {
         "scan_btn": None,
         "stop_btn": None,
+        "clear_btn": None,
         "status_label": None,
         "progress_bar": None,
         "summary_label": None,
@@ -216,10 +217,13 @@ def create_delete_video_page():
         running = delete_controller.is_running()
         scan_btn = ui_refs["scan_btn"]
         stop_btn = ui_refs["stop_btn"]
+        clear_btn = ui_refs["clear_btn"]
         if scan_btn:
             scan_btn.set_enabled(not running)
         if stop_btn:
             stop_btn.set_enabled(running)
+        if clear_btn:
+            clear_btn.set_enabled(not running)
         if running:
             nav_state.lock("/reup/delete-video", NAV_LOCK_MSG)
         else:
@@ -275,8 +279,31 @@ def create_delete_video_page():
             await delete_controller.stop()
             last_version["v"] = -1
             _sync_tick()
+            ui.notify(
+                "Đã dừng tác vụ và nhả khóa. Danh sách trên UI được giữ nguyên.",
+                type="positive",
+            )
         except Exception as exc:
             ui.notify(f"Lỗi khi dừng: {exc}", type="negative")
+
+    def handle_clear_ui():
+        try:
+            if not delete_controller.clear_ui_state():
+                ui.notify(
+                    "Tác vụ đang chạy. Hãy bấm Dừng tác vụ trước khi xóa dữ liệu.",
+                    type="warning",
+                )
+                return
+            selected_channels["ids"].clear()
+            refresh_channel_display()
+            last_version["v"] = -1
+            _sync_tick()
+            ui.notify(
+                "Đã xóa dữ liệu trên UI; file lịch sử xóa vẫn được giữ nguyên.",
+                type="info",
+            )
+        except Exception as exc:
+            ui.notify(f"Lỗi khi xóa dữ liệu UI: {exc}", type="negative")
 
     def handle_pick_folder():
         chosen = select_directory(
@@ -315,7 +342,7 @@ def create_delete_video_page():
             pass
 
         # Channel selection widget
-        create_channel_selection(
+        selected_channels, refresh_channel_display = create_channel_selection(
             channels,
             on_channel_select,
             multi_select=True,
@@ -353,10 +380,21 @@ def create_delete_video_page():
                 )
                 ui_refs["scan_btn"] = scan_btn
                 stop_btn = (
-                    ui.button("Dừng", icon="stop", on_click=handle_stop)
+                    ui.button(
+                        "Dừng tác vụ đang chạy", icon="stop", on_click=handle_stop
+                    )
                     .classes("app-button-secondary")
                 )
                 ui_refs["stop_btn"] = stop_btn
+                clear_btn = (
+                    ui.button(
+                        "Xóa dữ liệu",
+                        icon="delete_sweep",
+                        on_click=handle_clear_ui,
+                    )
+                    .classes("app-button-secondary")
+                )
+                ui_refs["clear_btn"] = clear_btn
             ui.separator().classes("my-2 opacity-40")
             ui_refs["status_label"] = ui.label(delete_controller.status_text).classes(
                 "text-sm text-gray-600 italic"
