@@ -10,6 +10,8 @@ from src.audio_recovery import (
     DEFAULT_RECOVERY_INTERVAL_SECONDS,
     DEFAULT_RECOVERY_RETRY_COOLDOWN_SECONDS,
     DEFAULT_STALE_PROCESSING_SECONDS,
+    RECOVERY_SCAN_MODE_ALL,
+    RECOVERY_SCAN_MODE_SELECTED,
     _get_registered_video_public_statuses,
     _monitor_failed_caption_tracks,
     _monitor_loop,
@@ -18,6 +20,7 @@ from src.audio_recovery import (
     build_audio_recovery_plan,
     clear_audio_recovery_registry,
     get_audio_recovery_runtime_status,
+    get_audio_recovery_scan_preferences,
     get_channel_refresh_alerts,
     get_audio_mutation_guard,
     import_add_audio_flow_recovery_state,
@@ -25,6 +28,7 @@ from src.audio_recovery import (
     register_audio_recovery,
     register_caption_monitor,
     run_audio_recovery_cycle,
+    set_audio_recovery_scan_preferences,
 )
 
 
@@ -296,6 +300,45 @@ class AudioRecoveryPlanTests(unittest.TestCase):
 
 
 class AudioRecoveryRegistryTests(unittest.TestCase):
+    def test_scan_scope_defaults_to_all_for_existing_installations(self):
+        with patch("src.audio_recovery.state_manager.load_state", return_value=None):
+            preferences = get_audio_recovery_scan_preferences()
+
+        self.assertEqual(preferences["scan_mode"], RECOVERY_SCAN_MODE_ALL)
+        self.assertEqual(preferences["selected_channel_ids"], [])
+
+    def test_selected_scan_scope_is_persisted_without_changing_registry(self):
+        stored = {
+            "enabled": True,
+            "entries": {"channel-a": {"video": {"languages": ["en"]}}},
+        }
+
+        def load(_name):
+            return stored.copy()
+
+        def save(_name, state):
+            stored.clear()
+            stored.update(state)
+            return True
+
+        with (
+            patch("src.audio_recovery.state_manager.load_state", side_effect=load),
+            patch("src.audio_recovery.state_manager.save_state", side_effect=save),
+        ):
+            saved = set_audio_recovery_scan_preferences(
+                scan_mode=RECOVERY_SCAN_MODE_SELECTED,
+                selected_channel_ids=["channel-b", "channel-a", "channel-b", ""],
+            )
+            preferences = get_audio_recovery_scan_preferences()
+
+        self.assertTrue(saved)
+        self.assertEqual(preferences["scan_mode"], RECOVERY_SCAN_MODE_SELECTED)
+        self.assertEqual(
+            preferences["selected_channel_ids"],
+            ["channel-b", "channel-a"],
+        )
+        self.assertIn("channel-a", stored["entries"])
+
     def test_imports_completed_legacy_add_audio_flow_items(self):
         flow_state = {
             "selected_channel": "channel",
@@ -578,6 +621,153 @@ class AudioRecoveryCycleTests(unittest.IsolatedAsyncioTestCase):
         )
         self.visibility_patch.start()
         self.addCleanup(self.visibility_patch.stop)
+
+    async def test_selected_scope_scans_only_selected_registry_channels(self):
+        state = {
+            "enabled": True,
+            "scan_mode": RECOVERY_SCAN_MODE_SELECTED,
+            "selected_channel_ids": ["channel-a"],
+            "retry_cooldown_seconds": 0,
+            "initial_grace_seconds": 0,
+            "entries": {
+                "channel-a": {
+                    "video-a": {"audio_path": "unused-a.mp3", "languages": ["en"]}
+                },
+                "channel-b": {
+                    "video-b": {"audio_path": "unused-b.mp3", "languages": ["en"]}
+                },
+            },
+            "channel_refresh_alerts": {},
+        }
+        scanned_channels = []
+
+        def fetch(video_ids, channel_id):
+            scanned_channels.append(channel_id)
+            return {
+                "videoTranslations": [
+                    {"videoId": video_id} for video_id in video_ids
+                ],
+                "audioTracks": [
+                    {
+                        "videoId": video_id,
+                        "audioTrackId": f"healthy-{video_id}",
+                        "language": "en",
+                        "source": "AUDIO_TRACK_SOURCE_CREATOR",
+                        "audioContentTypeString": "dubbed",
+                        "status": "AUDIO_TRACK_STATUS_READY",
+                    }
+                    for video_id in video_ids
+                ],
+            }
+
+        with (
+            patch("src.audio_recovery.get_audio_recovery_state", return_value=state),
+            patch("src.audio_recovery._load_state", return_value=state),
+            patch("src.audio_recovery.state_manager.save_state", return_value=True),
+            patch.object(
+                __import__(
+                    "src.audio_recovery", fromlist=["update_audio_module"]
+                ).update_audio_module,
+                "_get_video_translation_payload",
+                side_effect=fetch,
+            ),
+        ):
+            result = await run_audio_recovery_cycle(now=2000)
+
+        self.assertEqual(scanned_channels, ["channel-a"])
+        self.assertEqual(result["scan_mode"], RECOVERY_SCAN_MODE_SELECTED)
+        self.assertEqual(result["scope_skipped_channel_ids"], ["channel-b"])
+
+    async def test_deselecting_channel_finishes_current_track_then_stops_scheduling(self):
+        with tempfile.TemporaryDirectory() as folder:
+            source = Path(folder) / "source.mp3"
+            source.write_bytes(b"source")
+            state = {
+                "enabled": True,
+                "scan_mode": RECOVERY_SCAN_MODE_SELECTED,
+                "selected_channel_ids": ["channel"],
+                "retry_cooldown_seconds": 0,
+                "initial_grace_seconds": 0,
+                "entries": {
+                    "channel": {
+                        "video": {
+                            "audio_path": str(source),
+                            "languages": ["en", "es"],
+                            "repeat_times": 1,
+                            "extra_minutes": 0,
+                            "attempts": {},
+                        }
+                    }
+                },
+                "channel_refresh_alerts": {},
+            }
+            payload = {
+                "videoTranslations": [
+                    {
+                        "videoId": "video",
+                        "translations": [
+                            {
+                                "languageCode": language,
+                                "audioTranslation": {
+                                    "status": "AUDIO_TRACK_STATUS_FAILED"
+                                },
+                            }
+                            for language in ("en", "es")
+                        ],
+                    }
+                ],
+                "audioTracks": [],
+            }
+
+            def render_audio(*, output_file, **_kwargs):
+                Path(output_file).write_bytes(b"rendered")
+
+            def add_track(**kwargs):
+                state["selected_channel_ids"] = []
+                return 200
+
+            async def run_retry(operation, **_kwargs):
+                return operation()
+
+            added = Mock(side_effect=add_track)
+            with (
+                patch("src.audio_recovery.get_audio_recovery_state", return_value=state),
+                patch("src.audio_recovery._load_state", return_value=state),
+                patch("src.audio_recovery.state_manager.save_state", return_value=True),
+                patch("src.audio_recovery._record_recovery_attempt"),
+                patch.object(
+                    __import__(
+                        "src.audio_recovery", fromlist=["update_audio_module"]
+                    ).update_audio_module,
+                    "_get_video_translation_payload",
+                    return_value=payload,
+                ),
+                patch.object(
+                    __import__(
+                        "src.audio_recovery", fromlist=["update_audio_module"]
+                    ).update_audio_module,
+                    "_get_video_info",
+                    return_value=SimpleNamespace(duration_ms=60_000),
+                ),
+                patch.object(
+                    __import__(
+                        "src.audio_recovery", fromlist=["update_audio_module"]
+                    ).update_audio_module,
+                    "add",
+                    added,
+                ),
+                patch("src.audio_recovery.multiply_audio", side_effect=render_audio),
+                patch(
+                    "src.audio_recovery.call_audio_update_with_retry",
+                    new=AsyncMock(side_effect=run_retry),
+                ),
+            ):
+                result = await run_audio_recovery_cycle(now=2000)
+
+        self.assertEqual(result["repaired"], 1)
+        self.assertEqual(added.call_count, 1)
+        self.assertEqual(added.call_args.kwargs["language"], "en")
+        self.assertEqual(result["scope_skipped_channel_ids"], ["channel"])
 
     async def test_cycle_replaces_only_same_track_stuck_past_timeout(self):
         with tempfile.TemporaryDirectory() as folder:

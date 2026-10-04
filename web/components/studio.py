@@ -6,8 +6,13 @@ from loguru import logger
 from nicegui import context, ui
 
 from src.audio_recovery import (
+    RECOVERY_SCAN_MODE_ALL,
+    RECOVERY_SCAN_MODE_SELECTED,
     acknowledge_channel_refresh,
+    get_audio_recovery_scan_preferences,
+    get_audio_recovery_state,
     run_audio_recovery_cycle,
+    set_audio_recovery_scan_preferences,
 )
 from src.channel_scanner import (
     AUTHENTICATION_TIMEOUT_SECONDS,
@@ -41,6 +46,11 @@ def create_studio_content():
         "deadline": None,
         "cancel_requested": False,
         "authenticated": False,
+    }
+    recovery_scope_refs = {
+        "toggle": None,
+        "summary": None,
+        "selection_actions": None,
     }
 
     def client_is_alive() -> bool:
@@ -322,6 +332,116 @@ def create_studio_content():
                     ).classes("app-button-danger")
         dialog.open()
 
+    def recovery_scope_snapshot() -> dict:
+        try:
+            return get_audio_recovery_scan_preferences()
+        except Exception as exc:
+            logger.error("Could not read Auto Registry channel scope: {}", exc)
+            return {
+                "scan_mode": RECOVERY_SCAN_MODE_ALL,
+                "selected_channel_ids": [],
+            }
+
+    def update_recovery_scope_summary(channels=None) -> None:
+        summary = recovery_scope_refs.get("summary")
+        if summary is None:
+            return
+        channels = list(channels if channels is not None else (get_channels_info() or []))
+        preferences = recovery_scope_snapshot()
+        mode = preferences["scan_mode"]
+        selected = set(preferences["selected_channel_ids"])
+        try:
+            registry_channel_ids = set(
+                (get_audio_recovery_state().get("entries") or {}).keys()
+            )
+        except Exception:
+            registry_channel_ids = set()
+
+        if mode == RECOVERY_SCAN_MODE_ALL:
+            summary.set_text(
+                "Mặc định: quét video công khai của toàn bộ "
+                f"{len(registry_channel_ids)} kênh đang có trong Auto Registry."
+            )
+        else:
+            visible_ids = {channel.id for channel in channels}
+            visible_selected = len(selected & visible_ids)
+            summary.set_text(
+                f"Đã chọn {visible_selected}/{len(channels)} kênh trong danh sách. "
+                "Kênh bỏ chọn vẫn được giữ nguyên Registry và lịch sử."
+            )
+
+        actions = recovery_scope_refs.get("selection_actions")
+        if actions is not None:
+            actions.set_visibility(mode == RECOVERY_SCAN_MODE_SELECTED)
+
+    def on_recovery_scope_change(event) -> None:
+        requested_mode = str(event.value or "").strip()
+        previous = recovery_scope_snapshot()
+        if requested_mode not in {
+            RECOVERY_SCAN_MODE_ALL,
+            RECOVERY_SCAN_MODE_SELECTED,
+        }:
+            requested_mode = RECOVERY_SCAN_MODE_ALL
+        if not set_audio_recovery_scan_preferences(scan_mode=requested_mode):
+            toggle = recovery_scope_refs.get("toggle")
+            if toggle is not None:
+                toggle.value = previous["scan_mode"]
+            ui.notify("Không thể lưu chế độ quét Auto Registry.", type="negative")
+            return
+        refresh_channel_list()
+        if requested_mode == RECOVERY_SCAN_MODE_ALL:
+            ui.notify(
+                "Auto Registry sẽ quét tất cả kênh trong lịch sử.",
+                type="positive",
+            )
+        else:
+            ui.notify(
+                "Auto Registry chỉ quét các kênh được chọn trong danh sách.",
+                type="positive",
+            )
+
+    def create_recovery_channel_toggle_handler(channel_id: str):
+        def handler(event) -> None:
+            preferences = recovery_scope_snapshot()
+            if preferences["scan_mode"] != RECOVERY_SCAN_MODE_SELECTED:
+                return
+            selected = set(preferences["selected_channel_ids"])
+            if bool(event.value):
+                selected.add(channel_id)
+            else:
+                selected.discard(channel_id)
+            if not set_audio_recovery_scan_preferences(
+                scan_mode=RECOVERY_SCAN_MODE_SELECTED,
+                selected_channel_ids=sorted(selected),
+            ):
+                ui.notify("Không thể lưu danh sách kênh tự động quét.", type="negative")
+                refresh_channel_list()
+                return
+            update_recovery_scope_summary()
+
+        return handler
+
+    def select_all_recovery_channels() -> None:
+        channel_ids = [channel.id for channel in (get_channels_info() or [])]
+        if set_audio_recovery_scan_preferences(
+            scan_mode=RECOVERY_SCAN_MODE_SELECTED,
+            selected_channel_ids=channel_ids,
+        ):
+            refresh_channel_list()
+            ui.notify(f"Đã chọn {len(channel_ids)} kênh để tự động quét.", type="positive")
+        else:
+            ui.notify("Không thể lưu danh sách kênh tự động quét.", type="negative")
+
+    def deselect_all_recovery_channels() -> None:
+        if set_audio_recovery_scan_preferences(
+            scan_mode=RECOVERY_SCAN_MODE_SELECTED,
+            selected_channel_ids=[],
+        ):
+            refresh_channel_list()
+            ui.notify("Đã bỏ chọn tất cả kênh; Registry và lịch sử vẫn được giữ.", type="info")
+        else:
+            ui.notify("Không thể lưu danh sách kênh tự động quét.", type="negative")
+
     def format_expiry(license_info) -> str:
         raw_expiry = license_info.get("expires_at") if license_info else None
         if not raw_expiry:
@@ -435,6 +555,48 @@ def create_studio_content():
             ).classes("app-button-primary")
 
         with app_card():
+            initial_recovery_scope = recovery_scope_snapshot()
+            with section_header(
+                "Phạm vi Auto Registry",
+                "Chọn quét toàn bộ kênh trong lịch sử hoặc chỉ các kênh đánh dấu bên dưới.",
+            ):
+                pass
+            with ui.row().classes("w-full items-center gap-3 flex-wrap"):
+                recovery_scope_toggle = ui.toggle(
+                    {
+                        RECOVERY_SCAN_MODE_ALL: "Tất cả các kênh",
+                        RECOVERY_SCAN_MODE_SELECTED: "Danh sách kênh",
+                    },
+                    value=initial_recovery_scope["scan_mode"],
+                    on_change=on_recovery_scope_change,
+                ).props("no-caps")
+                recovery_scope_refs["toggle"] = recovery_scope_toggle
+                with ui.row().classes(
+                    "items-center gap-1"
+                ) as recovery_selection_actions:
+                    ui.button(
+                        "Chọn tất cả",
+                        icon="done_all",
+                        on_click=select_all_recovery_channels,
+                    ).props("flat dense no-caps").classes("text-emerald-700")
+                    ui.button(
+                        "Bỏ chọn tất cả",
+                        icon="remove_done",
+                        on_click=deselect_all_recovery_channels,
+                    ).props("flat dense no-caps").classes("text-gray-600")
+                recovery_scope_refs["selection_actions"] = (
+                    recovery_selection_actions
+                )
+                recovery_selection_actions.set_visibility(
+                    initial_recovery_scope["scan_mode"]
+                    == RECOVERY_SCAN_MODE_SELECTED
+                )
+            recovery_scope_summary = ui.label("").classes(
+                "text-xs text-gray-500 mb-2"
+            )
+            recovery_scope_refs["summary"] = recovery_scope_summary
+
+            ui.separator().classes("my-2")
             with section_header(
                 "Kênh YouTube",
                 "Danh sách kênh được lưu riêng cho phiên bản ứng dụng này.",
@@ -479,10 +641,17 @@ def create_studio_content():
                 )
 
     def refresh_channel_list():
-        channels = get_channels_info()
+        channels = get_channels_info() or []
+        preferences = recovery_scope_snapshot()
+        recovery_scan_mode = preferences["scan_mode"]
+        recovery_selected_ids = set(preferences["selected_channel_ids"])
         channels_container.clear()
         channel_count_label.set_text(f"{len(channels)} kênh")
         more_actions_button.set_visibility(bool(channels))
+        toggle = recovery_scope_refs.get("toggle")
+        if toggle is not None and toggle.value != recovery_scan_mode:
+            toggle.value = recovery_scan_mode
+        update_recovery_scope_summary(channels)
 
         with channels_container:
             if not channels:
@@ -496,9 +665,10 @@ def create_studio_content():
                 return
 
             with app_table(
-                "minmax(240px, 1.5fr) minmax(220px, 1fr) 140px 44px"
+                "52px minmax(240px, 1.5fr) minmax(220px, 1fr) 140px 44px"
             ):
                 with ui.element("div").classes("app-table-header"):
+                    ui.label("Quét")
                     ui.label("Kênh")
                     ui.label("Channel ID")
                     ui.label("Trạng thái")
@@ -508,6 +678,20 @@ def create_studio_content():
                     avatar = channel_data.img_src
                     channel_id = channel_data.id
                     with ui.element("div").classes("app-table-row"):
+                        recovery_checkbox = ui.checkbox(
+                            value=(
+                                recovery_scan_mode == RECOVERY_SCAN_MODE_ALL
+                                or channel_id in recovery_selected_ids
+                            ),
+                            on_change=create_recovery_channel_toggle_handler(
+                                channel_id
+                            ),
+                        ).props("dense")
+                        if recovery_scan_mode == RECOVERY_SCAN_MODE_ALL:
+                            recovery_checkbox.props("disable")
+                            recovery_checkbox.tooltip(
+                                "Chế độ Tất cả các kênh đang bật"
+                            )
                         with ui.row().classes("items-center gap-3 min-w-0"):
                             if avatar:
                                 ui.image(avatar).classes(

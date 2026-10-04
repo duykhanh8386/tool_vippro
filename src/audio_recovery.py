@@ -14,7 +14,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 
 from loguru import logger
 
@@ -32,6 +32,12 @@ from src.youtube_caption_api import (
 
 
 RECOVERY_STATE_NAME = "audio_recovery"
+RECOVERY_SCAN_MODE_ALL = "all"
+RECOVERY_SCAN_MODE_SELECTED = "selected"
+RECOVERY_SCAN_MODES = {
+    RECOVERY_SCAN_MODE_ALL,
+    RECOVERY_SCAN_MODE_SELECTED,
+}
 DEFAULT_RECOVERY_INTERVAL_SECONDS = 15 * 60
 DEFAULT_RECOVERY_RETRY_COOLDOWN_SECONDS = 15 * 60
 DEFAULT_INITIAL_RECOVERY_GRACE_SECONDS = 15 * 60
@@ -80,6 +86,8 @@ _RUNTIME_STATUS = {
     "caption_quota_message": "",
     "deferred_non_public": 0,
     "deferred_visibility_unknown": 0,
+    "scan_mode": RECOVERY_SCAN_MODE_ALL,
+    "selected_channel_ids": [],
     "_upload_progress": None,
 }
 
@@ -221,6 +229,10 @@ def _get_registered_video_public_statuses(
 def _default_state() -> dict:
     return {
         "enabled": True,
+        # Existing installations intentionally migrate to the product default:
+        # every channel which already has entries in the persistent registry.
+        "scan_mode": RECOVERY_SCAN_MODE_ALL,
+        "selected_channel_ids": [],
         "interval_seconds": DEFAULT_RECOVERY_INTERVAL_SECONDS,
         "retry_cooldown_seconds": DEFAULT_RECOVERY_RETRY_COOLDOWN_SECONDS,
         "initial_grace_seconds": DEFAULT_INITIAL_RECOVERY_GRACE_SECONDS,
@@ -239,6 +251,10 @@ def _load_state() -> dict:
         state.update(raw)
     if not isinstance(state.get("entries"), dict):
         state["entries"] = {}
+    state["scan_mode"] = _normalize_recovery_scan_mode(state.get("scan_mode"))
+    state["selected_channel_ids"] = _normalize_channel_ids(
+        state.get("selected_channel_ids")
+    )
     if not isinstance(state.get("channel_refresh_alerts"), dict):
         state["channel_refresh_alerts"] = {}
     else:
@@ -259,6 +275,47 @@ def _load_state() -> dict:
     state["initial_grace_seconds"] = DEFAULT_INITIAL_RECOVERY_GRACE_SECONDS
     state["stale_processing_seconds"] = DEFAULT_STALE_PROCESSING_SECONDS
     return state
+
+
+def _normalize_recovery_scan_mode(value: object) -> str:
+    mode = str(value or "").strip().casefold()
+    if mode not in RECOVERY_SCAN_MODES:
+        return RECOVERY_SCAN_MODE_ALL
+    return mode
+
+
+def _normalize_channel_ids(channel_ids: object) -> list[str]:
+    if isinstance(channel_ids, str):
+        values = [channel_ids]
+    elif isinstance(channel_ids, Iterable):
+        values = channel_ids
+    else:
+        values = []
+    return list(
+        dict.fromkeys(
+            clean_id
+            for channel_id in values
+            if (clean_id := str(channel_id or "").strip())
+        )
+    )
+
+
+def _scan_preferences_from_state(state: dict) -> dict:
+    return {
+        "scan_mode": _normalize_recovery_scan_mode(state.get("scan_mode")),
+        "selected_channel_ids": _normalize_channel_ids(
+            state.get("selected_channel_ids")
+        ),
+    }
+
+
+def _channel_is_in_recovery_scope(state: dict, channel_id: str) -> bool:
+    preferences = _scan_preferences_from_state(state)
+    if preferences["scan_mode"] == RECOVERY_SCAN_MODE_ALL:
+        return True
+    return str(channel_id or "").strip() in set(
+        preferences["selected_channel_ids"]
+    )
 
 
 def register_audio_recovery(
@@ -494,6 +551,42 @@ def get_audio_recovery_state() -> dict:
     """Expose a snapshot for diagnostics and tests."""
     with _STATE_LOCK:
         return _load_state()
+
+
+def get_audio_recovery_scan_preferences() -> dict:
+    """Return the persisted channel scope used by automatic recovery."""
+    with _STATE_LOCK:
+        return _scan_preferences_from_state(_load_state())
+
+
+def set_audio_recovery_scan_preferences(
+    *,
+    scan_mode: str,
+    selected_channel_ids: Iterable[str] | None = None,
+) -> bool:
+    """Persist the scan mode without changing registry entries or history.
+
+    ``selected_channel_ids`` is deliberately preserved when switching to the
+    all-channels mode, allowing the previous custom list to be restored later.
+    """
+    clean_mode = _normalize_recovery_scan_mode(scan_mode)
+    with _STATE_LOCK:
+        state = _load_state()
+        state["scan_mode"] = clean_mode
+        if selected_channel_ids is not None:
+            state["selected_channel_ids"] = _normalize_channel_ids(
+                selected_channel_ids
+            )
+        return state_manager.save_state(RECOVERY_STATE_NAME, state)
+
+
+def is_audio_recovery_channel_enabled(channel_id: str) -> bool:
+    """Check the latest scope so a deselection takes effect between tracks."""
+    clean_channel_id = str(channel_id or "").strip()
+    if not clean_channel_id:
+        return False
+    with _STATE_LOCK:
+        return _channel_is_in_recovery_scope(_load_state(), clean_channel_id)
 
 
 def get_channel_refresh_alerts() -> dict[str, dict]:
@@ -1069,14 +1162,18 @@ async def _monitor_failed_caption_tracks(
     channel_id: str,
     entries: dict[str, dict],
     cycle_time: float,
+    continue_allowed: Callable[[], bool] | None = None,
 ) -> dict:
     """Verify recently submitted tracks and re-upload only explicit failures."""
     repaired = 0
     failed = 0
     quota_message = ""
     guard = get_audio_mutation_guard(channel_id)
+    can_continue = continue_allowed or (lambda: True)
 
     for video_id, entry in entries.items():
+        if not can_continue():
+            break
         monitor = entry.get("caption_monitor") or {}
         if not isinstance(monitor, dict):
             continue
@@ -1154,6 +1251,8 @@ async def _monitor_failed_caption_tracks(
                     (source_track.get("snippet") or {}).get("status") or ""
                 ).casefold()
                 if source_status == "failed":
+                    if not can_continue():
+                        break
                     await asyncio.to_thread(
                         client.upsert_track,
                         video_id=video_id,
@@ -1166,6 +1265,8 @@ async def _monitor_failed_caption_tracks(
                     source_status = "syncing"
 
                 for language in failed_languages:
+                    if not can_continue():
+                        break
                     if language.casefold() == source_language.casefold():
                         continue
                     # YouTube cannot reliably translate from a source track
@@ -1278,6 +1379,7 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
     deferred_initial_grace = 0
     deferred_non_public = 0
     deferred_visibility_unknown = 0
+    scope_skipped_channel_ids: set[str] = set()
     cancelled_by_clear = False
     owned_mutation_guard: threading.Lock | None = None
     _update_runtime_status(
@@ -1300,6 +1402,8 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
         caption_quota_message="",
         deferred_non_public=0,
         deferred_visibility_unknown=0,
+        scan_mode=RECOVERY_SCAN_MODE_ALL,
+        selected_channel_ids=[],
         _upload_progress=None,
     )
     with _STATE_LOCK:
@@ -1309,7 +1413,24 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
         if not state.get("enabled", True):
             final_message = "Tự động khôi phục audio đang tắt"
             return {"skipped": "disabled", "repaired": 0, "failed": 0}
-        entries_by_channel = state.get("entries") or {}
+        all_entries_by_channel = state.get("entries") or {}
+        scan_preferences = _scan_preferences_from_state(state)
+        selected_channel_ids = set(scan_preferences["selected_channel_ids"])
+        if scan_preferences["scan_mode"] == RECOVERY_SCAN_MODE_SELECTED:
+            entries_by_channel = {
+                channel_id: video_entries
+                for channel_id, video_entries in all_entries_by_channel.items()
+                if channel_id in selected_channel_ids
+            }
+            scope_skipped_channel_ids.update(
+                set(all_entries_by_channel) - set(entries_by_channel)
+            )
+        else:
+            entries_by_channel = dict(all_entries_by_channel)
+        _update_runtime_status(
+            scan_mode=scan_preferences["scan_mode"],
+            selected_channel_ids=sorted(selected_channel_ids),
+        )
         refresh_alerts = state.get("channel_refresh_alerts") or {}
         try:
             cooldown = max(0.0, float(state.get("retry_cooldown_seconds") or 0))
@@ -1340,9 +1461,18 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
             )
         except (TypeError, ValueError):
             stale_processing_seconds = DEFAULT_STALE_PROCESSING_SECONDS
-        if not entries_by_channel:
+        if not all_entries_by_channel:
             final_message = "Chưa có video được đăng ký tự động khôi phục"
             return {"skipped": "empty", "repaired": 0, "failed": 0}
+        if not entries_by_channel:
+            final_message = "Danh sách kênh tự động quét chưa có kênh phù hợp"
+            return {
+                "skipped": "no_selected_channels",
+                "repaired": 0,
+                "failed": 0,
+                "scan_mode": scan_preferences["scan_mode"],
+                "scope_skipped_channel_ids": sorted(scope_skipped_channel_ids),
+            }
 
         channel_total = len(entries_by_channel)
         _update_runtime_status(
@@ -1368,6 +1498,13 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
             if _recovery_was_cleared(cycle_generation):
                 cancelled_by_clear = True
                 break
+            if not is_audio_recovery_channel_enabled(channel_id):
+                scope_skipped_channel_ids.add(channel_id)
+                logger.info(
+                    "Audio auto-recovery skipped deselected channel={}",
+                    channel_id,
+                )
+                continue
             if not isinstance(video_entries, dict):
                 continue
             if channel_id in refresh_alerts:
@@ -1449,6 +1586,10 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
             if not public_video_ids:
                 continue
 
+            if not is_audio_recovery_channel_enabled(channel_id):
+                scope_skipped_channel_ids.add(channel_id)
+                continue
+
             eligible_entries = {
                 video_id: eligible_entries[video_id]
                 for video_id in public_video_ids
@@ -1465,6 +1606,9 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
                     channel_id=channel_id,
                     entries=eligible_entries,
                     cycle_time=cycle_time,
+                    continue_allowed=lambda channel_id=channel_id: (
+                        is_audio_recovery_channel_enabled(channel_id)
+                    ),
                 )
                 captions_repaired += int(caption_result.get("repaired") or 0)
                 captions_failed += int(caption_result.get("failed") or 0)
@@ -1482,6 +1626,9 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
             for start in range(0, len(video_ids), batch_size):
                 if _recovery_was_cleared(cycle_generation):
                     cancelled_by_clear = True
+                    break
+                if not is_audio_recovery_channel_enabled(channel_id):
+                    scope_skipped_channel_ids.add(channel_id)
                     break
                 chunk = video_ids[start : start + batch_size]
                 try:
@@ -1549,6 +1696,9 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
             for video_id, actions in actions_by_video.items():
                 if _recovery_was_cleared(cycle_generation):
                     cancelled_by_clear = True
+                    break
+                if not is_audio_recovery_channel_enabled(channel_id):
+                    scope_skipped_channel_ids.add(channel_id)
                     break
                 entry = eligible_entries.get(video_id) or {}
                 channel_mutation_guard = get_audio_mutation_guard(channel_id)
@@ -1618,6 +1768,14 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
                     for action_index, action in enumerate(actions):
                         if _recovery_was_cleared(cycle_generation):
                             cancelled_by_clear = True
+                            break
+                        if not is_audio_recovery_channel_enabled(channel_id):
+                            scope_skipped_channel_ids.add(channel_id)
+                            logger.info(
+                                "Audio auto-recovery stopped scheduling new tracks "
+                                "for deselected channel={}",
+                                channel_id,
+                            )
                             break
                         language = action["language"]
                         if not channel_mutation_guard.acquire(blocking=False):
@@ -1770,6 +1928,8 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
             "deferred_non_public": deferred_non_public,
             "deferred_visibility_unknown": deferred_visibility_unknown,
             "cancelled_by_clear": cancelled_by_clear,
+            "scan_mode": scan_preferences["scan_mode"],
+            "scope_skipped_channel_ids": sorted(scope_skipped_channel_ids),
         }
         with _STATE_LOCK:
             latest = _load_state()
