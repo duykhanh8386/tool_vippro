@@ -130,9 +130,12 @@ class FakeChannelFetcher(ChannelFetcher):
                 raise outcome
             result = outcome
         else:
-            result = {"id": channel_id, "name": channel_id}
+            result = {"id": channel_id, "name": self.channel_names[channel_id]}
         self.persisted.append(channel_id)
         return result
+
+    def _read_current_channel_name_once(self):
+        return self.channel_names[self.channel_ids[self.position]]
 
     def _open_channel_switcher_once(self):
         self.menu_calls += 1
@@ -320,7 +323,7 @@ class ChannelScannerHardeningTests(unittest.TestCase):
         self.assertEqual(fetcher.filtered_switches, [])
         self.assertEqual(report.missing_channel_ids, ["B"])
 
-    def test_add_new_falls_back_to_name_when_menu_has_no_channel_ids(self):
+    def test_add_new_does_not_depend_on_ids_from_the_account_menu(self):
         fetcher = FakeChannelFetcher(
             ["A", "B", "C"],
             menu_ids_available=False,
@@ -337,7 +340,8 @@ class ChannelScannerHardeningTests(unittest.TestCase):
             )
 
         self.assertEqual(fetcher.info_calls, ["B"])
-        self.assertEqual(fetcher.filtered_switches, ["B"])
+        self.assertEqual(fetcher.filtered_switches, [])
+        self.assertEqual(fetcher.switch_calls, 2)
         self.assertEqual([item["id"] for item in report.channels], ["B"])
 
     def test_add_new_skips_different_id_when_channel_name_already_exists(self):
@@ -360,11 +364,12 @@ class ChannelScannerHardeningTests(unittest.TestCase):
             )
 
         self.assertEqual(fetcher.info_calls, ["C"])
-        self.assertEqual(fetcher.filtered_switches, ["C"])
+        self.assertEqual(fetcher.filtered_switches, [])
+        self.assertEqual(fetcher.switch_calls, 2)
         self.assertEqual([item["id"] for item in report.channels], ["C"])
         self.assertEqual(report.skipped_channel_ids, ["A", "B"])
 
-    def test_add_new_scrolls_through_all_profile_pages_before_filtering(self):
+    def test_selected_reload_scrolls_through_all_profile_pages_before_filtering(self):
         class PagedMenuFetcher(FakeChannelFetcher):
             def __init__(self):
                 super().__init__(
@@ -400,15 +405,15 @@ class ChannelScannerHardeningTests(unittest.TestCase):
             report = fetcher.run(
                 "user@example.com",
                 "not-logged",
-                exclude_channel_ids={"A"},
-                exclude_channel_names={"Existing"},
+                include_channel_ids={"B"},
+                include_channel_names={"B": "Brand New"},
             )
 
         self.assertEqual(fetcher.info_calls, ["B"])
         self.assertEqual(fetcher.filtered_switches, ["B"])
         self.assertEqual([item["id"] for item in report.channels], ["B"])
 
-    def test_add_new_retries_when_open_menu_temporarily_has_no_profiles(self):
+    def test_selected_reload_retries_when_open_menu_temporarily_has_no_profiles(self):
         class TemporarilyEmptyMenuFetcher(FakeChannelFetcher):
             def _read_visible_channel_menu_entries_once(self):
                 if self.menu_calls == 1:
@@ -425,15 +430,15 @@ class ChannelScannerHardeningTests(unittest.TestCase):
             report = fetcher.run(
                 "user@example.com",
                 "not-logged",
-                exclude_channel_ids={"A"},
-                exclude_channel_names={"Existing"},
+                include_channel_ids={"B"},
+                include_channel_names={"B": "Brand New"},
             )
 
         self.assertGreaterEqual(fetcher.menu_calls, 2)
         self.assertEqual(fetcher.info_calls, ["B"])
         self.assertEqual([item["id"] for item in report.channels], ["B"])
 
-    def test_add_new_clicks_only_ids_not_already_stored(self):
+    def test_add_new_visits_all_profiles_but_processes_only_new_ids(self):
         fetcher = FakeChannelFetcher(["A", "B", "C"])
         driver = FakeDriver("A")
 
@@ -445,7 +450,8 @@ class ChannelScannerHardeningTests(unittest.TestCase):
             )
 
         self.assertEqual(fetcher.info_calls, ["B"])
-        self.assertEqual(fetcher.filtered_switches, ["B"])
+        self.assertEqual(fetcher.filtered_switches, [])
+        self.assertEqual(fetcher.switch_calls, 2)
         self.assertEqual(report.skipped_channel_ids, ["A", "C"])
         self.assertEqual(report.missing_channel_ids, [])
         self.assertEqual(driver.quit_calls, 1)
@@ -471,6 +477,29 @@ class ChannelScannerHardeningTests(unittest.TestCase):
         self.assertEqual(fetcher.switch_calls, 2)
         self.assertEqual([item["id"] for item in report.channels], ["A", "B", "C"])
         self.assertEqual(driver.quit_calls, 1)
+
+    def test_add_new_with_stored_data_still_starts_at_first_chooser_row(self):
+        fetcher = FakeChannelFetcher(
+            ["NEW", "OLD"],
+            initial_state="chooser",
+            channel_names={"NEW": "Brand New", "OLD": "Existing"},
+        )
+        driver = FakeDriver("NEW")
+
+        with patch("src.channel_scanner.create_driver", return_value=driver):
+            report = fetcher.run(
+                "user@example.com",
+                "not-logged",
+                exclude_channel_ids={"OLD"},
+                exclude_channel_names={"Existing"},
+            )
+
+        self.assertEqual(fetcher.initial_select_calls, 1)
+        self.assertEqual(fetcher.info_calls, ["NEW"])
+        self.assertEqual(fetcher.filtered_switches, [])
+        self.assertEqual(fetcher.switch_calls, 1)
+        self.assertEqual([item["id"] for item in report.channels], ["NEW"])
+        self.assertEqual(report.skipped_channel_ids, ["OLD"])
 
     def test_empty_selected_reload_does_not_click_or_scan_any_channel(self):
         fetcher = FakeChannelFetcher(["A", "B"])

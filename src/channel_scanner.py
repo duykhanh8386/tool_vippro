@@ -244,25 +244,23 @@ class ChannelFetcher:
         )
         if on_authenticated is not None:
             on_authenticated()
-        # When the local channel list is empty there is nothing to filter yet.
-        # Bootstrap with the proven sequential flow so the first chooser row is
-        # clicked immediately instead of requiring its ID/name to be readable
-        # before the click.  Some YouTube account menus populate those fields
-        # asynchronously, which previously made "Add channel" finish with zero
-        # results and close the popup almost as soon as it opened.
-        is_empty_add_new_bootstrap = (
-            exclude_channel_ids is not None
-            and not excluded
-            and not excluded_names
-        )
-        if is_empty_add_new_bootstrap:
+        # "Add channel" deliberately uses the original sequential traversal.
+        # Reading IDs/names directly from the account chooser is not reliable:
+        # YouTube can render the rows before their metadata is attached.  That
+        # made the filtered flow see zero targets and close Chrome immediately.
+        # Visit every profile instead, then compare its Studio ID/name after the
+        # profile has loaded. Existing channels are skipped before any upsert.
+        if exclude_channel_ids is not None:
             if initial_state == "chooser":
                 self._run_step_with_retry(
                     self._select_initial_channel_once,
                     step="select_initial_channel",
                 )
-            return self._scan_authenticated_channels()
-        if include_channel_ids is not None or exclude_channel_ids is not None:
+            return self._scan_add_new_channels_sequentially(
+                excluded_channel_ids=excluded,
+                excluded_channel_names=excluded_names,
+            )
+        if include_channel_ids is not None:
             return self._scan_filtered_channels(
                 include_channel_ids=(
                     included if include_channel_ids is not None else None
@@ -987,6 +985,116 @@ class ChannelFetcher:
                 channel_id=previous_channel_id,
             )
             channel_index += 1
+
+    def _scan_add_new_channels_sequentially(
+        self,
+        *,
+        excluded_channel_ids: set[str],
+        excluded_channel_names: set[str],
+    ) -> ChannelScanReport:
+        """Traverse every account profile and save only genuinely new channels."""
+        report = self.last_report
+        channel_index = 1
+
+        while True:
+            self._checkpoint()
+            current_channel_id = self._run_step_with_retry(
+                self._current_channel_id,
+                step="read_channel_state",
+                channel_index=channel_index,
+            )
+            if (
+                current_channel_id
+                and current_channel_id not in report.available_channel_ids
+            ):
+                report.available_channel_ids.append(current_channel_id)
+
+            is_existing = bool(
+                current_channel_id
+                and current_channel_id in excluded_channel_ids
+            )
+            if not is_existing and excluded_channel_names:
+                try:
+                    current_channel_name = self._run_step_with_retry(
+                        self._read_current_channel_name_once,
+                        step="read_channel_name",
+                        channel_index=channel_index,
+                        channel_id=current_channel_id,
+                        default_category=ChannelScanErrorCategory.CHANNEL_ERROR,
+                    )
+                except ChannelScanError as exc:
+                    if exc.category in {
+                        ChannelScanErrorCategory.AUTH_ERROR,
+                        ChannelScanErrorCategory.UNKNOWN_AUTH_STATE,
+                        ChannelScanErrorCategory.FATAL_ERROR,
+                    }:
+                        raise
+                    # The full channel reader has its own bounded retry and a
+                    # better diagnostic. Do not turn a missing display name
+                    # into a false "existing channel" match.
+                    current_channel_name = ""
+                is_existing = bool(
+                    self._normalize_channel_name(current_channel_name)
+                    in excluded_channel_names
+                )
+
+            if is_existing:
+                if (
+                    current_channel_id
+                    and current_channel_id not in report.skipped_channel_ids
+                ):
+                    report.skipped_channel_ids.append(current_channel_id)
+            else:
+                self._scan_current_channel(
+                    report,
+                    channel_index,
+                    expected_channel_id=current_channel_id,
+                )
+
+            self._checkpoint()
+            self._run_step_with_retry(
+                self._open_channel_switcher_once,
+                step="open_channel_switcher",
+                channel_index=channel_index,
+                channel_id=current_channel_id,
+            )
+            self._checkpoint()
+            has_next_channel = self._run_step_with_retry(
+                self._has_next_channel,
+                step="detect_next_channel",
+                channel_index=channel_index,
+                channel_id=current_channel_id,
+            )
+            if not has_next_channel:
+                report.completed = True
+                report.end_category = ChannelScanErrorCategory.SCAN_END
+                logger.info(
+                    "Add-new sequential scan end confirmed: visited={} new={} "
+                    "skipped={} failed={}",
+                    channel_index,
+                    len(report.channels),
+                    len(report.skipped_channel_ids),
+                    len(report.failures),
+                )
+                return report
+
+            self._run_step_with_retry(
+                lambda: self._switch_to_next_channel_once(current_channel_id),
+                step="switch_channel",
+                channel_index=channel_index + 1,
+                channel_id=current_channel_id,
+            )
+            channel_index += 1
+
+    def _read_current_channel_name_once(self) -> str:
+        image_xpath = (
+            "//img[@class='thumbnail image-thumbnail style-scope "
+            "ytcp-navigation-drawer']"
+        )
+        image = WebDriverWait(
+            self.driver, STUDIO_LOAD_TIMEOUT_SECONDS
+        ).until(EC.presence_of_element_located((By.XPATH, image_xpath)))
+        return " ".join(str(image.get_attribute("alt") or "").split())
 
     def _scan_current_channel(
         self,
