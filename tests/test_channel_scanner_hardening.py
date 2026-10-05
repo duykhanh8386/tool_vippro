@@ -79,6 +79,7 @@ class FakeChannelFetcher(ChannelFetcher):
         stop_during_channel=None,
         menu_ids_available=True,
         channel_names=None,
+        initial_state="channel",
     ):
         super().__init__()
         self.channel_ids = list(channel_ids)
@@ -92,6 +93,7 @@ class FakeChannelFetcher(ChannelFetcher):
         self.fatal_next_check_at = fatal_next_check_at
         self.stop_during_channel = stop_during_channel
         self.menu_ids_available = menu_ids_available
+        self.initial_state = initial_state
         self.channel_names = {
             channel_id: str((channel_names or {}).get(channel_id) or channel_id)
             for channel_id in self.channel_ids
@@ -100,6 +102,7 @@ class FakeChannelFetcher(ChannelFetcher):
         self.menu_calls = 0
         self.switch_calls = 0
         self.filtered_switches = []
+        self.initial_select_calls = 0
         self.retry_waits = []
         self.persisted = []
 
@@ -109,7 +112,10 @@ class FakeChannelFetcher(ChannelFetcher):
     def _wait_for_initial_state(self):
         if self.initial_error is not None:
             raise self.initial_error
-        return "channel"
+        return self.initial_state
+
+    def _select_initial_channel_once(self):
+        self.initial_select_calls += 1
 
     def _get_channel_info(self):
         channel_id = self.channel_ids[self.position]
@@ -442,6 +448,28 @@ class ChannelScannerHardeningTests(unittest.TestCase):
         self.assertEqual(fetcher.filtered_switches, ["B"])
         self.assertEqual(report.skipped_channel_ids, ["A", "C"])
         self.assertEqual(report.missing_channel_ids, [])
+        self.assertEqual(driver.quit_calls, 1)
+
+    def test_add_new_with_empty_local_list_bootstraps_from_first_chooser_row(self):
+        fetcher = FakeChannelFetcher(
+            ["A", "B", "C"],
+            initial_state="chooser",
+        )
+        driver = FakeDriver("A")
+
+        with patch("src.channel_scanner.create_driver", return_value=driver):
+            report = fetcher.run(
+                "user@example.com",
+                "not-logged",
+                exclude_channel_ids=set(),
+                exclude_channel_names=set(),
+            )
+
+        self.assertEqual(fetcher.initial_select_calls, 1)
+        self.assertEqual(fetcher.info_calls, ["A", "B", "C"])
+        self.assertEqual(fetcher.filtered_switches, [])
+        self.assertEqual(fetcher.switch_calls, 2)
+        self.assertEqual([item["id"] for item in report.channels], ["A", "B", "C"])
         self.assertEqual(driver.quit_calls, 1)
 
     def test_empty_selected_reload_does_not_click_or_scan_any_channel(self):

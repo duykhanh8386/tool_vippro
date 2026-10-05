@@ -244,6 +244,24 @@ class ChannelFetcher:
         )
         if on_authenticated is not None:
             on_authenticated()
+        # When the local channel list is empty there is nothing to filter yet.
+        # Bootstrap with the proven sequential flow so the first chooser row is
+        # clicked immediately instead of requiring its ID/name to be readable
+        # before the click.  Some YouTube account menus populate those fields
+        # asynchronously, which previously made "Add channel" finish with zero
+        # results and close the popup almost as soon as it opened.
+        is_empty_add_new_bootstrap = (
+            exclude_channel_ids is not None
+            and not excluded
+            and not excluded_names
+        )
+        if is_empty_add_new_bootstrap:
+            if initial_state == "chooser":
+                self._run_step_with_retry(
+                    self._select_initial_channel_once,
+                    step="select_initial_channel",
+                )
+            return self._scan_authenticated_channels()
         if include_channel_ids is not None or exclude_channel_ids is not None:
             return self._scan_filtered_channels(
                 include_channel_ids=(
