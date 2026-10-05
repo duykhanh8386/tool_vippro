@@ -3,9 +3,11 @@ import hashlib
 import json
 import re
 import time
+import unicodedata
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Callable, Iterable, TypeVar
+from typing import Callable, Iterable, Mapping, TypeVar
 
 import requests
 from loguru import logger
@@ -137,7 +139,12 @@ class ChannelFetcher:
     EMAIL_XPATH = "//input[@name='identifier' and @id='identifierId']"
     PASSWORD_XPATH = "//input[@type='password' and @name='Passwd']"
     NEXT_BUTTON_XPATH = "//span[(text()='Next') or (text()='Tiếp theo')]"
-    CHANNEL_SELECTION_XPATH = "//ytd-account-item-renderer[@class='style-scope ytd-account-item-section-renderer']"
+    CHANNEL_SELECTION_XPATH = (
+        "//ytd-account-item-renderer["
+        "contains(concat(' ', normalize-space(@class), ' '), "
+        "' ytd-account-item-section-renderer ')"
+        "]"
+    )
     NEXT_CHANNEL_SELECTION_XPATH = "//ytd-account-item-renderer[@class='style-scope ytd-account-item-section-renderer' and @enable-ring-for-active-account]/following-sibling::ytd-account-item-renderer[1]"
     AVATAR_BUTTON_XPATH = "//*[@id='avatar-btn'] | //ytcp-topbar-menu-button-renderer[contains(concat(' ', normalize-space(@class), ' '), ' ytcpAppHeaderAccountButton ')]"
     SWTICH_ACCOUNT_BUTTON_XPATH = "//ytd-compact-link-renderer[@class='style-scope yt-multi-page-menu-section-renderer' and @has-secondary]"
@@ -155,6 +162,8 @@ class ChannelFetcher:
         *,
         include_channel_ids: Iterable[str] | None = None,
         exclude_channel_ids: Iterable[str] | None = None,
+        include_channel_names: Mapping[str, str] | None = None,
+        exclude_channel_names: Iterable[str] | None = None,
     ):
         run_context = current_run_context()
         try:
@@ -164,6 +173,8 @@ class ChannelFetcher:
                 on_authenticated=on_authenticated,
                 include_channel_ids=include_channel_ids,
                 exclude_channel_ids=exclude_channel_ids,
+                include_channel_names=include_channel_names,
+                exclude_channel_names=exclude_channel_names,
             )
         except Exception as exc:
             if run_context is not None and run_context.stopped:
@@ -192,6 +203,8 @@ class ChannelFetcher:
         *,
         include_channel_ids: Iterable[str] | None = None,
         exclude_channel_ids: Iterable[str] | None = None,
+        include_channel_names: Mapping[str, str] | None = None,
+        exclude_channel_names: Iterable[str] | None = None,
     ):
         logger.info("*** Fetching channel info ***")
         if include_channel_ids is not None and exclude_channel_ids is not None:
@@ -200,6 +213,16 @@ class ChannelFetcher:
             )
         included = self._normalize_channel_ids(include_channel_ids)
         excluded = self._normalize_channel_ids(exclude_channel_ids)
+        included_names = {
+            str(channel_id).strip(): str(name or "").strip()
+            for channel_id, name in (include_channel_names or {}).items()
+            if str(channel_id).strip() and str(name or "").strip()
+        }
+        excluded_names = {
+            self._normalize_channel_name(name)
+            for name in (exclude_channel_names or ())
+            if self._normalize_channel_name(name)
+        }
         self.last_report = ChannelScanReport()
         self.driver = create_driver(enable_performance_log=True)
         self._run_step_with_retry(
@@ -226,6 +249,8 @@ class ChannelFetcher:
                 exclude_channel_ids=(
                     excluded if exclude_channel_ids is not None else None
                 ),
+                include_channel_names=included_names,
+                exclude_channel_names=excluded_names,
             )
         if initial_state == "chooser":
             self._run_step_with_retry(
@@ -241,6 +266,12 @@ class ChannelFetcher:
             for value in (values or ())
             if str(value).strip()
         }
+
+    @staticmethod
+    def _normalize_channel_name(value: str | None) -> str:
+        return " ".join(
+            unicodedata.normalize("NFKC", str(value or "")).split()
+        ).casefold()
 
     def _wait_for_initial_state(self) -> str:
         def detect_initial_state(driver):
@@ -288,12 +319,24 @@ class ChannelFetcher:
         *,
         include_channel_ids: set[str] | None,
         exclude_channel_ids: set[str] | None,
+        include_channel_names: Mapping[str, str],
+        exclude_channel_names: set[str],
     ) -> ChannelScanReport:
         """Scan only explicitly allowed account rows, never probing skipped rows."""
         report = self.last_report
         entries = self._run_step_with_retry(
             self._list_channel_menu_entries_once,
             step="read_channel_menu",
+        )
+        menu_name_counts = Counter(
+            entry.get("normalized_name")
+            for entry in entries
+            if entry.get("normalized_name")
+        )
+        report.unidentified_channel_count = sum(
+            1
+            for entry in entries
+            if not entry.get("channel_id") and not entry.get("normalized_name")
         )
         available_ids = list(
             dict.fromkeys(
@@ -302,19 +345,43 @@ class ChannelFetcher:
                 if entry.get("channel_id")
             )
         )
-        report.available_channel_ids = available_ids
-        report.unidentified_channel_count = sum(
-            1 for entry in entries if not entry.get("channel_id")
-        )
-        available_set = set(available_ids)
+        selected_targets: list[dict] = []
 
         if include_channel_ids is not None:
-            selected_ids = [
-                channel_id
-                for channel_id in available_ids
-                if channel_id in include_channel_ids
-            ]
-            report.missing_channel_ids = sorted(include_channel_ids - available_set)
+            selected_ids_by_name: dict[str, list[str]] = defaultdict(list)
+            for channel_id in include_channel_ids:
+                normalized_name = self._normalize_channel_name(
+                    include_channel_names.get(channel_id)
+                )
+                if normalized_name:
+                    selected_ids_by_name[normalized_name].append(channel_id)
+
+            matched_ids: set[str] = set()
+            for entry in entries:
+                menu_channel_id = entry.get("channel_id")
+                expected_channel_id = None
+                if menu_channel_id in include_channel_ids:
+                    expected_channel_id = menu_channel_id
+                if expected_channel_id is None:
+                    normalized_name = entry.get("normalized_name") or ""
+                    name_matches = selected_ids_by_name.get(normalized_name, [])
+                    if (
+                        normalized_name
+                        and menu_name_counts[normalized_name] == 1
+                        and len(name_matches) == 1
+                    ):
+                        expected_channel_id = name_matches[0]
+
+                if expected_channel_id and expected_channel_id not in matched_ids:
+                    target = dict(entry)
+                    target["expected_channel_id"] = expected_channel_id
+                    selected_targets.append(target)
+                    matched_ids.add(expected_channel_id)
+
+            report.available_channel_ids = list(
+                dict.fromkeys([*available_ids, *matched_ids])
+            )
+            report.missing_channel_ids = sorted(include_channel_ids - matched_ids)
             report.skipped_channel_ids = [
                 channel_id
                 for channel_id in available_ids
@@ -322,37 +389,100 @@ class ChannelFetcher:
             ]
         else:
             excluded = exclude_channel_ids or set()
-            selected_ids = [
-                channel_id for channel_id in available_ids if channel_id not in excluded
-            ]
+            report.available_channel_ids = available_ids
             report.skipped_channel_ids = [
                 channel_id for channel_id in available_ids if channel_id in excluded
             ]
+            for entry in entries:
+                menu_channel_id = entry.get("channel_id")
+                normalized_name = entry.get("normalized_name") or ""
+                if menu_channel_id:
+                    if menu_channel_id in excluded:
+                        continue
+                elif not normalized_name:
+                    continue
+                elif normalized_name in exclude_channel_names:
+                    continue
+                elif menu_name_counts[normalized_name] != 1:
+                    report.unidentified_channel_count += 1
+                    continue
+                target = dict(entry)
+                target["expected_channel_id"] = menu_channel_id
+                selected_targets.append(target)
 
         logger.info(
             "Filtered channel scan: available={} selected={} skipped={} missing={} unidentified={}",
-            len(available_ids),
-            len(selected_ids),
+            len(report.available_channel_ids),
+            len(selected_targets),
             len(report.skipped_channel_ids),
             len(report.missing_channel_ids),
             report.unidentified_channel_count,
         )
-        for channel_index, channel_id in enumerate(selected_ids, start=1):
+        for channel_index, target in enumerate(selected_targets, start=1):
             self._checkpoint()
+            expected_channel_id = target.get("expected_channel_id")
+            menu_channel_id = target.get("channel_id")
+            channel_name = str(target.get("channel_name") or "")
             current_channel_id = self._current_channel_id()
-            if current_channel_id != channel_id:
-                self._run_step_with_retry(
-                    lambda channel_id=channel_id: self._switch_to_channel_id_once(
-                        channel_id
+            target_is_current = bool(
+                (expected_channel_id and current_channel_id == expected_channel_id)
+                or (menu_channel_id and current_channel_id == menu_channel_id)
+                or (target.get("active") and current_channel_id)
+            )
+            if not target_is_current:
+                try:
+                    self._run_step_with_retry(
+                        lambda: self._switch_to_channel_match_once(
+                            channel_id=menu_channel_id,
+                            channel_name=channel_name,
+                            expected_channel_id=expected_channel_id,
+                        ),
+                        step="switch_channel",
+                        channel_index=channel_index,
+                        channel_id=expected_channel_id or menu_channel_id,
+                    )
+                except ChannelScanError as exc:
+                    if exc.category in {
+                        ChannelScanErrorCategory.AUTH_ERROR,
+                        ChannelScanErrorCategory.UNKNOWN_AUTH_STATE,
+                        ChannelScanErrorCategory.FATAL_ERROR,
+                    }:
+                        raise
+                    self._record_channel_failure(
+                        report,
+                        exc,
+                        channel_index,
+                        expected_channel_id or menu_channel_id,
+                    )
+                    continue
+
+            actual_channel_id = self._current_channel_id()
+            if expected_channel_id and actual_channel_id != expected_channel_id:
+                error = ChannelScanError(
+                    ChannelScanErrorCategory.CHANNEL_ERROR,
+                    step="verify_channel_identity",
+                    detail=(
+                        "Channel name matched but the Studio URL returned a different "
+                        "Channel ID; skipped to avoid updating the wrong channel"
                     ),
-                    step="switch_channel",
                     channel_index=channel_index,
-                    channel_id=channel_id,
+                    channel_id=expected_channel_id,
+                    retryable=False,
                 )
+                self._record_channel_failure(
+                    report, error, channel_index, expected_channel_id
+                )
+                continue
+            if exclude_channel_ids is not None and actual_channel_id in (
+                exclude_channel_ids or set()
+            ):
+                if actual_channel_id not in report.skipped_channel_ids:
+                    report.skipped_channel_ids.append(actual_channel_id)
+                continue
             self._scan_current_channel(
                 report,
                 channel_index,
-                expected_channel_id=channel_id,
+                expected_channel_id=actual_channel_id or expected_channel_id,
             )
 
         report.completed = True
@@ -363,13 +493,53 @@ class ChannelFetcher:
         self._open_channel_switcher_once()
         self._checkpoint()
         elements = self.driver.find_elements(By.XPATH, self.CHANNEL_SELECTION_XPATH)
-        return [
-            {
-                "channel_id": self._channel_id_from_account_item(element),
-                "element": element,
-            }
-            for element in elements
-        ]
+        entries = []
+        for element in elements:
+            channel_name = self._channel_name_from_account_item(element)
+            entries.append(
+                {
+                    "channel_id": self._channel_id_from_account_item(element),
+                    "channel_name": channel_name,
+                    "normalized_name": self._normalize_channel_name(channel_name),
+                    "active": self._account_item_is_active(element),
+                    "element": element,
+                }
+            )
+        return entries
+
+    def _channel_name_from_account_item(self, element) -> str:
+        for xpath in (
+            ".//*[@id='account-name']",
+            ".//*[contains(concat(' ', normalize-space(@class), ' '), ' account-name ')]",
+            ".//yt-formatted-string[@id='channel-title']",
+        ):
+            try:
+                for candidate in element.find_elements(By.XPATH, xpath):
+                    text = " ".join(str(getattr(candidate, "text", "") or "").split())
+                    if text:
+                        return text
+            except (StaleElementReferenceException, WebDriverException):
+                continue
+        try:
+            lines = [
+                " ".join(line.split())
+                for line in str(getattr(element, "text", "") or "").splitlines()
+                if " ".join(line.split())
+            ]
+            return lines[0] if lines else ""
+        except (StaleElementReferenceException, WebDriverException):
+            return ""
+
+    def _account_item_is_active(self, element) -> bool:
+        try:
+            return bool(
+                self.driver.execute_script(
+                    "return arguments[0].hasAttribute('enable-ring-for-active-account');",
+                    element,
+                )
+            )
+        except (StaleElementReferenceException, WebDriverException):
+            return False
 
     def _channel_id_from_account_item(self, element) -> str | None:
         """Read a switcher row ID without clicking the row."""
@@ -449,37 +619,70 @@ class ChannelFetcher:
                 return exact_match.group(0)
         return None
 
-    def _switch_to_channel_id_once(self, channel_id: str) -> None:
+    def _switch_to_channel_match_once(
+        self,
+        *,
+        channel_id: str | None,
+        channel_name: str,
+        expected_channel_id: str | None,
+    ) -> None:
         self._checkpoint()
-        if self._current_channel_id() == channel_id:
+        if expected_channel_id and self._current_channel_id() == expected_channel_id:
             return
         entries = self._list_channel_menu_entries_once()
-        target = next(
-            (
-                entry.get("element")
+        matching_entries = []
+        if channel_id:
+            matching_entries = [
+                entry for entry in entries if entry.get("channel_id") == channel_id
+            ]
+        if not matching_entries and channel_name:
+            normalized_name = self._normalize_channel_name(channel_name)
+            matching_entries = [
+                entry
                 for entry in entries
-                if entry.get("channel_id") == channel_id
-            ),
-            None,
+                if entry.get("normalized_name") == normalized_name
+            ]
+        target = (
+            matching_entries[0].get("element")
+            if len(matching_entries) == 1
+            else None
         )
         if target is None:
             raise ChannelScanError(
-                ChannelScanErrorCategory.TRANSIENT_UI_ERROR,
+                ChannelScanErrorCategory.CHANNEL_ERROR,
                 step="switch_channel",
-                detail="Selected channel disappeared from the account menu",
-                channel_id=channel_id,
+                detail=(
+                    "Selected channel was missing or its name was not unique in the "
+                    "account menu"
+                ),
+                channel_id=expected_channel_id or channel_id,
+                retryable=False,
             )
+        previous_channel_id = self._current_channel_id()
         target.click()
+
+        def channel_switch_finished(driver) -> bool:
+            current_url = str(getattr(driver, "current_url", ""))
+            if "channel-appeal" in current_url:
+                return True
+            actual_channel_id = self._extract_channel_id(current_url)
+            if expected_channel_id:
+                return actual_channel_id == expected_channel_id
+            return bool(
+                actual_channel_id and actual_channel_id != previous_channel_id
+            )
+
         WebDriverWait(self.driver, STUDIO_LOAD_TIMEOUT_SECONDS).until(
             lambda driver: self._checkpoint_and_get(
-                lambda: (
-                    "channel-appeal" in str(getattr(driver, "current_url", ""))
-                    or self._extract_channel_id(
-                        str(getattr(driver, "current_url", ""))
-                    )
-                    == channel_id
-                )
+                lambda: channel_switch_finished(driver)
             )
+        )
+
+    def _switch_to_channel_id_once(self, channel_id: str) -> None:
+        self._switch_to_channel_match_once(
+            channel_id=channel_id,
+            channel_name="",
+            expected_channel_id=channel_id,
         )
 
     def _scan_authenticated_channels(self) -> ChannelScanReport:

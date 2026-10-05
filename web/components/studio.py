@@ -55,6 +55,8 @@ def create_studio_content():
         "operation": "add_new",
         "include_channel_ids": set(),
         "exclude_channel_ids": set(),
+        "include_channel_names": {},
+        "exclude_channel_names": set(),
     }
     recovery_scope_refs = {
         "toggle": None,
@@ -121,6 +123,8 @@ def create_studio_content():
         operation: str,
         include_channel_ids: set[str],
         exclude_channel_ids: set[str],
+        include_channel_names: dict[str, str],
+        exclude_channel_names: set[str],
     ):
         run_context = create_run_context("studio_channel_scan")
         scan_state["run_context"] = run_context
@@ -140,6 +144,16 @@ def create_studio_content():
                     ),
                     exclude_channel_ids=(
                         exclude_channel_ids
+                        if operation == "add_new"
+                        else None
+                    ),
+                    include_channel_names=(
+                        include_channel_names
+                        if operation == "reload_selected"
+                        else None
+                    ),
+                    exclude_channel_names=(
+                        exclude_channel_names
                         if operation == "add_new"
                         else None
                     ),
@@ -254,28 +268,48 @@ def create_studio_content():
             if not selected_ids:
                 ui.notify("Chưa chọn kênh nào để load lại.", type="warning")
                 return
+            stored_names = {
+                str(channel.id).strip(): str(channel.name or "").strip()
+                for channel in (get_channels_info() or [])
+                if str(channel.id).strip()
+            }
             scan_state["operation"] = operation
             scan_state["include_channel_ids"] = selected_ids
             scan_state["exclude_channel_ids"] = set()
+            scan_state["include_channel_names"] = {
+                channel_id: stored_names[channel_id]
+                for channel_id in selected_ids
+                if stored_names.get(channel_id)
+            }
+            scan_state["exclude_channel_names"] = set()
             ui_refs["login_title"].set_text("Load lại kênh đã chọn")
             ui_refs["login_copy"].set_text(
                 f"Đăng nhập tài khoản chứa {len(selected_ids)} kênh đã chọn. "
-                "Tool chỉ click đúng Channel ID trùng khớp."
+                "Tool ưu tiên khớp Channel ID; nếu YouTube không hiện ID thì "
+                "sẽ khớp theo tên kênh."
             )
             ui_refs["login_submit"].set_text("Load lại")
         else:
+            stored_channels = list(get_channels_info() or [])
             existing_ids = {
                 str(channel.id).strip()
-                for channel in (get_channels_info() or [])
+                for channel in stored_channels
                 if str(channel.id).strip()
+            }
+            existing_names = {
+                str(channel.name or "").strip()
+                for channel in stored_channels
+                if str(channel.name or "").strip()
             }
             scan_state["operation"] = "add_new"
             scan_state["include_channel_ids"] = set()
             scan_state["exclude_channel_ids"] = existing_ids
+            scan_state["include_channel_names"] = {}
+            scan_state["exclude_channel_names"] = existing_names
             ui_refs["login_title"].set_text("Thêm kênh YouTube mới")
             ui_refs["login_copy"].set_text(
-                "Đăng nhập tài khoản YouTube. Tool chỉ click các Channel ID chưa có "
-                "trong danh sách hiện tại."
+                "Đăng nhập tài khoản YouTube. Tool đối chiếu ID hoặc tên và "
+                "chỉ click các kênh chưa có trong danh sách hiện tại."
             )
             ui_refs["login_submit"].set_text("Tìm kênh mới")
         login_dialog.open()
@@ -310,6 +344,8 @@ def create_studio_content():
                 operation=str(scan_state["operation"]),
                 include_channel_ids=set(scan_state["include_channel_ids"]),
                 exclude_channel_ids=set(scan_state["exclude_channel_ids"]),
+                include_channel_names=dict(scan_state["include_channel_names"]),
+                exclude_channel_names=set(scan_state["exclude_channel_names"]),
             )
         )
 

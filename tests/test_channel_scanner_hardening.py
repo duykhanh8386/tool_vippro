@@ -77,6 +77,8 @@ class FakeChannelFetcher(ChannelFetcher):
         fatal_switch_at=None,
         fatal_next_check_at=None,
         stop_during_channel=None,
+        menu_ids_available=True,
+        channel_names=None,
     ):
         super().__init__()
         self.channel_ids = list(channel_ids)
@@ -89,6 +91,11 @@ class FakeChannelFetcher(ChannelFetcher):
         self.fatal_switch_at = fatal_switch_at
         self.fatal_next_check_at = fatal_next_check_at
         self.stop_during_channel = stop_during_channel
+        self.menu_ids_available = menu_ids_available
+        self.channel_names = {
+            channel_id: str((channel_names or {}).get(channel_id) or channel_id)
+            for channel_id in self.channel_ids
+        }
         self.info_calls = []
         self.menu_calls = 0
         self.switch_calls = 0
@@ -142,14 +149,43 @@ class FakeChannelFetcher(ChannelFetcher):
 
     def _list_channel_menu_entries_once(self):
         return [
-            {"channel_id": channel_id, "element": object()}
-            for channel_id in self.channel_ids
+            {
+                "channel_id": channel_id if self.menu_ids_available else None,
+                "channel_name": self.channel_names[channel_id],
+                "normalized_name": self._normalize_channel_name(
+                    self.channel_names[channel_id]
+                ),
+                "active": index == self.position,
+                "element": object(),
+            }
+            for index, channel_id in enumerate(self.channel_ids)
         ]
 
+    def _switch_to_channel_match_once(
+        self,
+        *,
+        channel_id,
+        channel_name,
+        expected_channel_id,
+    ):
+        resolved_id = expected_channel_id or channel_id
+        if not resolved_id:
+            normalized_name = self._normalize_channel_name(channel_name)
+            resolved_id = next(
+                item_id
+                for item_id, item_name in self.channel_names.items()
+                if self._normalize_channel_name(item_name) == normalized_name
+            )
+        self.filtered_switches.append(resolved_id)
+        self.position = self.channel_ids.index(resolved_id)
+        self.driver.current_url = f"https://studio.youtube.com/channel/{resolved_id}"
+
     def _switch_to_channel_id_once(self, channel_id):
-        self.filtered_switches.append(channel_id)
-        self.position = self.channel_ids.index(channel_id)
-        self.driver.current_url = f"https://studio.youtube.com/channel/{channel_id}"
+        self._switch_to_channel_match_once(
+            channel_id=channel_id,
+            channel_name="",
+            expected_channel_id=channel_id,
+        )
 
     def _wait_interruptibly(self, seconds):
         self._checkpoint()
@@ -203,6 +239,93 @@ class ChannelScannerHardeningTests(unittest.TestCase):
         )
 
         self.assertEqual(channel_id, expected)
+
+    def test_selected_reload_falls_back_to_unique_channel_name(self):
+        fetcher = FakeChannelFetcher(
+            ["A", "B", "C"],
+            menu_ids_available=False,
+            channel_names={"A": "Alpha", "B": "Healing Peace", "C": "Charlie"},
+        )
+        driver = FakeDriver("A")
+
+        with patch("src.channel_scanner.create_driver", return_value=driver):
+            report = fetcher.run(
+                "user@example.com",
+                "not-logged",
+                include_channel_ids={"B"},
+                include_channel_names={"B": "Healing Peace"},
+            )
+
+        self.assertEqual(fetcher.info_calls, ["B"])
+        self.assertEqual(fetcher.filtered_switches, ["B"])
+        self.assertEqual(report.missing_channel_ids, [])
+
+    def test_selected_reload_uses_name_when_menu_id_does_not_match(self):
+        fetcher = FakeChannelFetcher(
+            ["A", "B"],
+            channel_names={"A": "Alpha", "B": "Healing Peace"},
+        )
+        original_list_entries = fetcher._list_channel_menu_entries_once
+
+        def list_entries_with_stale_id():
+            entries = original_list_entries()
+            entries[1]["channel_id"] = "stale-menu-id"
+            return entries
+
+        fetcher._list_channel_menu_entries_once = list_entries_with_stale_id
+        driver = FakeDriver("A")
+
+        with patch("src.channel_scanner.create_driver", return_value=driver):
+            report = fetcher.run(
+                "user@example.com",
+                "not-logged",
+                include_channel_ids={"B"},
+                include_channel_names={"B": "Healing Peace"},
+            )
+
+        self.assertEqual(fetcher.info_calls, ["B"])
+        self.assertEqual(fetcher.filtered_switches, ["B"])
+        self.assertEqual(report.missing_channel_ids, [])
+
+    def test_selected_reload_does_not_click_when_channel_name_is_duplicated(self):
+        fetcher = FakeChannelFetcher(
+            ["A", "B"],
+            menu_ids_available=False,
+            channel_names={"A": "Same Name", "B": "Same Name"},
+        )
+        driver = FakeDriver("A")
+
+        with patch("src.channel_scanner.create_driver", return_value=driver):
+            report = fetcher.run(
+                "user@example.com",
+                "not-logged",
+                include_channel_ids={"B"},
+                include_channel_names={"B": "Same Name"},
+            )
+
+        self.assertEqual(fetcher.info_calls, [])
+        self.assertEqual(fetcher.filtered_switches, [])
+        self.assertEqual(report.missing_channel_ids, ["B"])
+
+    def test_add_new_falls_back_to_name_when_menu_has_no_channel_ids(self):
+        fetcher = FakeChannelFetcher(
+            ["A", "B", "C"],
+            menu_ids_available=False,
+            channel_names={"A": "Alpha", "B": "Brand New", "C": "Charlie"},
+        )
+        driver = FakeDriver("A")
+
+        with patch("src.channel_scanner.create_driver", return_value=driver):
+            report = fetcher.run(
+                "user@example.com",
+                "not-logged",
+                exclude_channel_ids={"A", "C"},
+                exclude_channel_names={"Alpha", "Charlie"},
+            )
+
+        self.assertEqual(fetcher.info_calls, ["B"])
+        self.assertEqual(fetcher.filtered_switches, ["B"])
+        self.assertEqual([item["id"] for item in report.channels], ["B"])
 
     def test_add_new_clicks_only_ids_not_already_stored(self):
         fetcher = FakeChannelFetcher(["A", "B", "C"])
