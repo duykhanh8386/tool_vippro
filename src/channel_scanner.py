@@ -396,14 +396,25 @@ class ChannelFetcher:
             for entry in entries:
                 menu_channel_id = entry.get("channel_id")
                 normalized_name = entry.get("normalized_name") or ""
-                if menu_channel_id:
-                    if menu_channel_id in excluded:
-                        continue
-                elif not normalized_name:
+                matches_existing_id = bool(
+                    menu_channel_id and menu_channel_id in excluded
+                )
+                matches_existing_name = bool(
+                    normalized_name and normalized_name in exclude_channel_names
+                )
+                if matches_existing_id or matches_existing_name:
+                    if (
+                        menu_channel_id
+                        and menu_channel_id not in report.skipped_channel_ids
+                    ):
+                        report.skipped_channel_ids.append(menu_channel_id)
                     continue
-                elif normalized_name in exclude_channel_names:
+                if not menu_channel_id and not normalized_name:
                     continue
-                elif menu_name_counts[normalized_name] != 1:
+                if (
+                    not menu_channel_id
+                    and menu_name_counts[normalized_name] != 1
+                ):
                     report.unidentified_channel_count += 1
                     continue
                 target = dict(entry)

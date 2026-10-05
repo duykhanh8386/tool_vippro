@@ -327,6 +327,30 @@ class ChannelScannerHardeningTests(unittest.TestCase):
         self.assertEqual(fetcher.filtered_switches, ["B"])
         self.assertEqual([item["id"] for item in report.channels], ["B"])
 
+    def test_add_new_skips_different_id_when_channel_name_already_exists(self):
+        fetcher = FakeChannelFetcher(
+            ["A", "B", "C"],
+            channel_names={
+                "A": "Healing Peace",
+                "B": "  HEALING   PEACE ",
+                "C": "Brand New",
+            },
+        )
+        driver = FakeDriver("A")
+
+        with patch("src.channel_scanner.create_driver", return_value=driver):
+            report = fetcher.run(
+                "user@example.com",
+                "not-logged",
+                exclude_channel_ids={"A"},
+                exclude_channel_names={"Healing Peace"},
+            )
+
+        self.assertEqual(fetcher.info_calls, ["C"])
+        self.assertEqual(fetcher.filtered_switches, ["C"])
+        self.assertEqual([item["id"] for item in report.channels], ["C"])
+        self.assertEqual(report.skipped_channel_ids, ["A", "B"])
+
     def test_add_new_clicks_only_ids_not_already_stored(self):
         fetcher = FakeChannelFetcher(["A", "B", "C"])
         driver = FakeDriver("A")
