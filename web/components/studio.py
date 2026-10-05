@@ -36,7 +36,13 @@ from web.theme import (
 
 
 def create_studio_content():
-    ui_refs = {"email_input": None, "password_input": None}
+    ui_refs = {
+        "email_input": None,
+        "password_input": None,
+        "login_title": None,
+        "login_copy": None,
+        "login_submit": None,
+    }
     try:
         page_client = context.client
     except RuntimeError:
@@ -46,6 +52,9 @@ def create_studio_content():
         "deadline": None,
         "cancel_requested": False,
         "authenticated": False,
+        "operation": "add_new",
+        "include_channel_ids": set(),
+        "exclude_channel_ids": set(),
     }
     recovery_scope_refs = {
         "toggle": None,
@@ -105,7 +114,14 @@ def create_studio_content():
         except Exception as exc:
             logger.error(f"Failed to load credentials: {exc}")
 
-    async def fetch_channel_data(email, password):
+    async def fetch_channel_data(
+        email,
+        password,
+        *,
+        operation: str,
+        include_channel_ids: set[str],
+        exclude_channel_ids: set[str],
+    ):
         run_context = create_run_context("studio_channel_scan")
         scan_state["run_context"] = run_context
         channel_fetcher = ChannelFetcher()
@@ -117,6 +133,16 @@ def create_studio_content():
                     email=email,
                     password=password,
                     on_authenticated=lambda: scan_state.update(authenticated=True),
+                    include_channel_ids=(
+                        include_channel_ids
+                        if operation == "reload_selected"
+                        else None
+                    ),
+                    exclude_channel_ids=(
+                        exclude_channel_ids
+                        if operation == "add_new"
+                        else None
+                    ),
                 )
             refreshed_channel_ids = [
                 str(channel.get("id") or "")
@@ -125,22 +151,57 @@ def create_studio_content():
             ]
             if acknowledge_channel_refresh(refreshed_channel_ids):
                 asyncio.create_task(run_audio_recovery_cycle())
-            if report.failures:
+            if operation == "reload_selected":
+                requested_count = len(include_channel_ids)
+                missing_count = len(report.missing_channel_ids)
+                message = (
+                    f"Đã load lại {len(report.channels)}/{requested_count} kênh đã chọn."
+                )
+                if missing_count:
+                    missing_preview = ", ".join(report.missing_channel_ids[:5])
+                    if missing_count > 5:
+                        missing_preview += ", ..."
+                    message += (
+                        f" Không tìm thấy {missing_count} kênh trong tài khoản; "
+                        f"dữ liệu cũ vẫn được giữ nguyên: {missing_preview}."
+                    )
+                if report.failures:
+                    message += f" Có {len(report.failures)} kênh load lại bị lỗi."
+                if report.unidentified_channel_count:
+                    message += (
+                        f" Bỏ qua an toàn {report.unidentified_channel_count} hồ sơ "
+                        "không đọc được Channel ID."
+                    )
+                result_type = (
+                    "warning"
+                    if report.failures
+                    or missing_count
+                    or report.unidentified_channel_count
+                    else "positive"
+                )
                 best_effort_ui(
-                    "notify partial channel scan",
-                    lambda: ui.notify(
-                        f"Đã lưu {len(report.channels)} kênh; "
-                        f"bỏ qua {len(report.failures)} kênh lỗi.",
-                        type="warning",
-                    ),
+                    "notify selected channel reload",
+                    lambda: ui.notify(message, type=result_type),
                 )
             else:
+                message = f"Đã thêm {len(report.channels)} kênh mới."
+                if not report.channels and not report.failures:
+                    message = "Không có kênh mới trong tài khoản này."
+                if report.failures:
+                    message += f" Có {len(report.failures)} kênh mới bị lỗi."
+                if report.unidentified_channel_count:
+                    message += (
+                        f" Bỏ qua an toàn {report.unidentified_channel_count} hồ sơ "
+                        "không đọc được Channel ID."
+                    )
+                result_type = (
+                    "warning"
+                    if report.failures or report.unidentified_channel_count
+                    else ("positive" if report.channels else "info")
+                )
                 best_effort_ui(
-                    "notify channel scan success",
-                    lambda: ui.notify(
-                        f"Đã đồng bộ {len(report.channels)} kênh.",
-                        type="positive",
-                    ),
+                    "notify add new channel scan",
+                    lambda: ui.notify(message, type=result_type),
                 )
         except TaskStopped:
             logger.info("Channel scan stopped")
@@ -173,6 +234,52 @@ def create_studio_content():
             best_effort_ui("close channel scan popup", processing_popup.close)
             best_effort_ui("refresh channel list", refresh_channel_list)
 
+    def open_channel_login(operation: str) -> None:
+        if scan_state["run_context"] is not None:
+            ui.notify("Đang quét kênh, vui lòng chờ hoặc bấm Hủy.", type="warning")
+            return
+        if operation == "reload_selected":
+            preferences = recovery_scope_snapshot()
+            if preferences["scan_mode"] != RECOVERY_SCAN_MODE_SELECTED:
+                ui.notify(
+                    "Hãy chuyển sang chế độ Danh sách kênh rồi chọn các kênh cần load lại.",
+                    type="warning",
+                )
+                return
+            selected_ids = {
+                str(channel_id).strip()
+                for channel_id in preferences["selected_channel_ids"]
+                if str(channel_id).strip()
+            }
+            if not selected_ids:
+                ui.notify("Chưa chọn kênh nào để load lại.", type="warning")
+                return
+            scan_state["operation"] = operation
+            scan_state["include_channel_ids"] = selected_ids
+            scan_state["exclude_channel_ids"] = set()
+            ui_refs["login_title"].set_text("Load lại kênh đã chọn")
+            ui_refs["login_copy"].set_text(
+                f"Đăng nhập tài khoản chứa {len(selected_ids)} kênh đã chọn. "
+                "Tool chỉ click đúng Channel ID trùng khớp."
+            )
+            ui_refs["login_submit"].set_text("Load lại")
+        else:
+            existing_ids = {
+                str(channel.id).strip()
+                for channel in (get_channels_info() or [])
+                if str(channel.id).strip()
+            }
+            scan_state["operation"] = "add_new"
+            scan_state["include_channel_ids"] = set()
+            scan_state["exclude_channel_ids"] = existing_ids
+            ui_refs["login_title"].set_text("Thêm kênh YouTube mới")
+            ui_refs["login_copy"].set_text(
+                "Đăng nhập tài khoản YouTube. Tool chỉ click các Channel ID chưa có "
+                "trong danh sách hiện tại."
+            )
+            ui_refs["login_submit"].set_text("Tìm kênh mới")
+        login_dialog.open()
+
     def on_login():
         if scan_state["run_context"] is not None:
             ui.notify("Đang quét kênh, vui lòng chờ hoặc bấm Hủy.", type="warning")
@@ -196,7 +303,15 @@ def create_studio_content():
         auth_countdown.set_text("Thời gian xác thực còn lại: 10:00")
         cancel_scan_button.set_enabled(True)
         processing_popup.open()
-        asyncio.create_task(fetch_channel_data(email, password))
+        asyncio.create_task(
+            fetch_channel_data(
+                email,
+                password,
+                operation=str(scan_state["operation"]),
+                include_channel_ids=set(scan_state["include_channel_ids"]),
+                exclude_channel_ids=set(scan_state["exclude_channel_ids"]),
+            )
+        )
 
     async def cancel_channel_scan():
         run_context = scan_state["run_context"]
@@ -479,12 +594,15 @@ def create_studio_content():
     with ui.dialog() as login_dialog:
         with ui.card().classes("app-card w-full max-w-md"):
             with ui.column().classes("gap-1 mb-2"):
-                ui.label("Thêm kênh YouTube").classes(
+                login_title = ui.label("Thêm kênh YouTube mới").classes(
                     "text-xl font-semibold leading-snug text-gray-900"
                 )
-                ui.label(
-                    "Nhập tài khoản để mở phiên đăng nhập và đồng bộ danh sách kênh."
+                ui_refs["login_title"] = login_title
+                login_copy = ui.label(
+                    "Đăng nhập tài khoản YouTube. Tool chỉ click các Channel ID chưa có "
+                    "trong danh sách hiện tại."
                 ).classes("app-section-copy")
+                ui_refs["login_copy"] = login_copy
 
             email_input = ui.input("Email").props("outlined").classes("w-full")
             ui_refs["email_input"] = email_input
@@ -531,11 +649,12 @@ def create_studio_content():
                         icon="close",
                         on_click=login_dialog.close,
                     ).classes("app-button-secondary")
-                    ui.button(
-                        "Tiếp tục",
+                    login_submit = ui.button(
+                        "Tìm kênh mới",
                         icon="arrow_forward",
                         on_click=on_login,
                     ).classes("app-button-primary")
+                    ui_refs["login_submit"] = login_submit
 
             load_credentials()
 
@@ -548,11 +667,17 @@ def create_studio_content():
             "Quản lý các kênh YouTube được sử dụng trong tác vụ tự động hóa.",
             eyebrow="Workspace",
         ):
-            ui.button(
-                "Thêm kênh",
-                icon="add",
-                on_click=login_dialog.open,
-            ).classes("app-button-primary")
+            with ui.row().classes("items-center gap-2"):
+                ui.button(
+                    "Load lại kênh",
+                    icon="refresh",
+                    on_click=lambda: open_channel_login("reload_selected"),
+                ).classes("app-button-secondary")
+                ui.button(
+                    "Thêm kênh",
+                    icon="add",
+                    on_click=lambda: open_channel_login("add_new"),
+                ).classes("app-button-primary")
 
         with app_card():
             initial_recovery_scope = recovery_scope_snapshot()
@@ -660,7 +785,7 @@ def create_studio_content():
                     "Đăng nhập để đồng bộ kênh đầu tiên và bắt đầu chạy tác vụ.",
                     icon="o_video_library",
                     action_label="Thêm kênh",
-                    on_action=login_dialog.open,
+                    on_action=lambda: open_channel_login("add_new"),
                 )
                 return
 

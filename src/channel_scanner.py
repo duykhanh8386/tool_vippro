@@ -5,7 +5,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Callable, TypeVar
+from typing import Callable, Iterable, TypeVar
 
 import requests
 from loguru import logger
@@ -98,6 +98,10 @@ class ChannelScanFailure:
 class ChannelScanReport:
     channels: list[dict] = field(default_factory=list)
     failures: list[ChannelScanFailure] = field(default_factory=list)
+    available_channel_ids: list[str] = field(default_factory=list)
+    skipped_channel_ids: list[str] = field(default_factory=list)
+    missing_channel_ids: list[str] = field(default_factory=list)
+    unidentified_channel_count: int = 0
     completed: bool = False
     end_category: ChannelScanErrorCategory | None = None
 
@@ -143,10 +147,24 @@ class ChannelFetcher:
         self.driver = None
         self.last_report = ChannelScanReport()
 
-    def run(self, email, password, on_authenticated=None):
+    def run(
+        self,
+        email,
+        password,
+        on_authenticated=None,
+        *,
+        include_channel_ids: Iterable[str] | None = None,
+        exclude_channel_ids: Iterable[str] | None = None,
+    ):
         run_context = current_run_context()
         try:
-            return self._run(email, password, on_authenticated=on_authenticated)
+            return self._run(
+                email,
+                password,
+                on_authenticated=on_authenticated,
+                include_channel_ids=include_channel_ids,
+                exclude_channel_ids=exclude_channel_ids,
+            )
         except Exception as exc:
             if run_context is not None and run_context.stopped:
                 raise TaskStopped() from exc
@@ -166,8 +184,22 @@ class ChannelFetcher:
                 finally:
                     unregister_driver(driver)
 
-    def _run(self, email, password, on_authenticated=None):
+    def _run(
+        self,
+        email,
+        password,
+        on_authenticated=None,
+        *,
+        include_channel_ids: Iterable[str] | None = None,
+        exclude_channel_ids: Iterable[str] | None = None,
+    ):
         logger.info("*** Fetching channel info ***")
+        if include_channel_ids is not None and exclude_channel_ids is not None:
+            raise ValueError(
+                "include_channel_ids and exclude_channel_ids are mutually exclusive"
+            )
+        included = self._normalize_channel_ids(include_channel_ids)
+        excluded = self._normalize_channel_ids(exclude_channel_ids)
         self.last_report = ChannelScanReport()
         self.driver = create_driver(enable_performance_log=True)
         self._run_step_with_retry(
@@ -186,12 +218,29 @@ class ChannelFetcher:
         )
         if on_authenticated is not None:
             on_authenticated()
+        if include_channel_ids is not None or exclude_channel_ids is not None:
+            return self._scan_filtered_channels(
+                include_channel_ids=(
+                    included if include_channel_ids is not None else None
+                ),
+                exclude_channel_ids=(
+                    excluded if exclude_channel_ids is not None else None
+                ),
+            )
         if initial_state == "chooser":
             self._run_step_with_retry(
                 self._select_initial_channel_once,
                 step="select_initial_channel",
             )
         return self._scan_authenticated_channels()
+
+    @staticmethod
+    def _normalize_channel_ids(values: Iterable[str] | None) -> set[str]:
+        return {
+            str(value).strip()
+            for value in (values or ())
+            if str(value).strip()
+        }
 
     def _wait_for_initial_state(self) -> str:
         def detect_initial_state(driver):
@@ -231,6 +280,205 @@ class ChannelFetcher:
         WebDriverWait(self.driver, STUDIO_LOAD_TIMEOUT_SECONDS).until(
             lambda driver: self._checkpoint_and_get(
                 lambda: self._extract_channel_id(driver.current_url) is not None
+            )
+        )
+
+    def _scan_filtered_channels(
+        self,
+        *,
+        include_channel_ids: set[str] | None,
+        exclude_channel_ids: set[str] | None,
+    ) -> ChannelScanReport:
+        """Scan only explicitly allowed account rows, never probing skipped rows."""
+        report = self.last_report
+        entries = self._run_step_with_retry(
+            self._list_channel_menu_entries_once,
+            step="read_channel_menu",
+        )
+        available_ids = list(
+            dict.fromkeys(
+                entry["channel_id"]
+                for entry in entries
+                if entry.get("channel_id")
+            )
+        )
+        report.available_channel_ids = available_ids
+        report.unidentified_channel_count = sum(
+            1 for entry in entries if not entry.get("channel_id")
+        )
+        available_set = set(available_ids)
+
+        if include_channel_ids is not None:
+            selected_ids = [
+                channel_id
+                for channel_id in available_ids
+                if channel_id in include_channel_ids
+            ]
+            report.missing_channel_ids = sorted(include_channel_ids - available_set)
+            report.skipped_channel_ids = [
+                channel_id
+                for channel_id in available_ids
+                if channel_id not in include_channel_ids
+            ]
+        else:
+            excluded = exclude_channel_ids or set()
+            selected_ids = [
+                channel_id for channel_id in available_ids if channel_id not in excluded
+            ]
+            report.skipped_channel_ids = [
+                channel_id for channel_id in available_ids if channel_id in excluded
+            ]
+
+        logger.info(
+            "Filtered channel scan: available={} selected={} skipped={} missing={} unidentified={}",
+            len(available_ids),
+            len(selected_ids),
+            len(report.skipped_channel_ids),
+            len(report.missing_channel_ids),
+            report.unidentified_channel_count,
+        )
+        for channel_index, channel_id in enumerate(selected_ids, start=1):
+            self._checkpoint()
+            current_channel_id = self._current_channel_id()
+            if current_channel_id != channel_id:
+                self._run_step_with_retry(
+                    lambda channel_id=channel_id: self._switch_to_channel_id_once(
+                        channel_id
+                    ),
+                    step="switch_channel",
+                    channel_index=channel_index,
+                    channel_id=channel_id,
+                )
+            self._scan_current_channel(
+                report,
+                channel_index,
+                expected_channel_id=channel_id,
+            )
+
+        report.completed = True
+        report.end_category = ChannelScanErrorCategory.SCAN_END
+        return report
+
+    def _list_channel_menu_entries_once(self) -> list[dict]:
+        self._open_channel_switcher_once()
+        self._checkpoint()
+        elements = self.driver.find_elements(By.XPATH, self.CHANNEL_SELECTION_XPATH)
+        return [
+            {
+                "channel_id": self._channel_id_from_account_item(element),
+                "element": element,
+            }
+            for element in elements
+        ]
+
+    def _channel_id_from_account_item(self, element) -> str | None:
+        """Read a switcher row ID without clicking the row."""
+        candidates: list[str] = []
+        for attribute in (
+            "href",
+            "data-channel-id",
+            "channel-id",
+            "external-id",
+            "data-external-id",
+            "data-channel-external-id",
+            "data-ytid",
+            "outerHTML",
+        ):
+            try:
+                value = element.get_attribute(attribute)
+            except (StaleElementReferenceException, WebDriverException):
+                value = None
+            if value:
+                candidates.append(str(value))
+
+        try:
+            for anchor in element.find_elements(By.XPATH, ".//*[@href]"):
+                href = anchor.get_attribute("href")
+                if href:
+                    candidates.append(str(href))
+        except (StaleElementReferenceException, WebDriverException):
+            pass
+
+        try:
+            javascript_candidates = self.driver.execute_script(
+                """
+                const row = arguments[0];
+                const found = [];
+                const seen = new WeakSet();
+                let visited = 0;
+                function visit(value, key, depth) {
+                    if (visited++ > 4000 || depth > 12 || value == null) return;
+                    if (typeof value === 'string') {
+                        if (
+                            value.includes('/channel/') ||
+                            /^UC[A-Za-z0-9_-]{22}$/.test(value) ||
+                            /channel.*id|external.*id|browseid/i.test(key || '')
+                        ) found.push(value);
+                        return;
+                    }
+                    if (typeof value !== 'object' || seen.has(value)) return;
+                    seen.add(value);
+                    if (Array.isArray(value)) {
+                        for (const item of value) visit(item, key, depth + 1);
+                    } else {
+                        for (const [childKey, child] of Object.entries(value)) {
+                            visit(child, childKey, depth + 1);
+                        }
+                    }
+                }
+                visit(row.data, 'data', 0);
+                visit(row.__data, '__data', 0);
+                for (const node of row.querySelectorAll('[href]')) {
+                    if (node.href) found.push(node.href);
+                }
+                return [...new Set(found)].slice(0, 100);
+                """,
+                element,
+            )
+            if isinstance(javascript_candidates, list):
+                candidates.extend(str(value) for value in javascript_candidates)
+        except (StaleElementReferenceException, WebDriverException):
+            pass
+
+        for candidate in candidates:
+            channel_id = self._extract_channel_id(candidate)
+            if channel_id:
+                return channel_id
+            exact_match = re.fullmatch(r"UC[A-Za-z0-9_-]{22}", candidate.strip())
+            if exact_match:
+                return exact_match.group(0)
+        return None
+
+    def _switch_to_channel_id_once(self, channel_id: str) -> None:
+        self._checkpoint()
+        if self._current_channel_id() == channel_id:
+            return
+        entries = self._list_channel_menu_entries_once()
+        target = next(
+            (
+                entry.get("element")
+                for entry in entries
+                if entry.get("channel_id") == channel_id
+            ),
+            None,
+        )
+        if target is None:
+            raise ChannelScanError(
+                ChannelScanErrorCategory.TRANSIENT_UI_ERROR,
+                step="switch_channel",
+                detail="Selected channel disappeared from the account menu",
+                channel_id=channel_id,
+            )
+        target.click()
+        WebDriverWait(self.driver, STUDIO_LOAD_TIMEOUT_SECONDS).until(
+            lambda driver: self._checkpoint_and_get(
+                lambda: (
+                    "channel-appeal" in str(getattr(driver, "current_url", ""))
+                    or self._extract_channel_id(
+                        str(getattr(driver, "current_url", ""))
+                    )
+                    == channel_id
+                )
             )
         )
 
@@ -286,14 +534,17 @@ class ChannelFetcher:
             channel_index += 1
 
     def _scan_current_channel(
-        self, report: ChannelScanReport, channel_index: int
+        self,
+        report: ChannelScanReport,
+        channel_index: int,
+        expected_channel_id: str | None = None,
     ) -> None:
         current_url = self._run_step_with_retry(
             lambda: str(getattr(self.driver, "current_url", "")),
             step="read_channel_state",
             channel_index=channel_index,
         )
-        channel_id = self._extract_channel_id(current_url)
+        channel_id = self._extract_channel_id(current_url) or expected_channel_id
         if "channel-appeal" in current_url:
             error = ChannelScanError(
                 ChannelScanErrorCategory.CHANNEL_ERROR,

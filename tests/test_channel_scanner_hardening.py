@@ -50,6 +50,22 @@ class ImmediateWait:
         return self.target
 
 
+class AccountItemWithoutAttributes:
+    def get_attribute(self, _name):
+        return None
+
+    def find_elements(self, _by, _selector):
+        return []
+
+
+class AccountItemDriver:
+    def __init__(self, candidates):
+        self.candidates = candidates
+
+    def execute_script(self, _script, _element):
+        return self.candidates
+
+
 class FakeChannelFetcher(ChannelFetcher):
     def __init__(
         self,
@@ -76,6 +92,7 @@ class FakeChannelFetcher(ChannelFetcher):
         self.info_calls = []
         self.menu_calls = 0
         self.switch_calls = 0
+        self.filtered_switches = []
         self.retry_waits = []
         self.persisted = []
 
@@ -123,6 +140,17 @@ class FakeChannelFetcher(ChannelFetcher):
             f"https://studio.youtube.com/channel/{self.channel_ids[self.position]}"
         )
 
+    def _list_channel_menu_entries_once(self):
+        return [
+            {"channel_id": channel_id, "element": object()}
+            for channel_id in self.channel_ids
+        ]
+
+    def _switch_to_channel_id_once(self, channel_id):
+        self.filtered_switches.append(channel_id)
+        self.position = self.channel_ids.index(channel_id)
+        self.driver.current_url = f"https://studio.youtube.com/channel/{channel_id}"
+
     def _wait_interruptibly(self, seconds):
         self._checkpoint()
         self.retry_waits.append(seconds)
@@ -143,6 +171,71 @@ class ChannelScannerHardeningTests(unittest.TestCase):
         self.assertTrue(report.completed)
         self.assertEqual([item["id"] for item in report.channels], ["A", "B", "C"])
         self.assertEqual(report.failures, [])
+        self.assertEqual(driver.quit_calls, 1)
+
+    def test_selected_reload_clicks_only_matching_channel_ids(self):
+        fetcher = FakeChannelFetcher(["A", "B", "C"])
+        driver = FakeDriver("A")
+
+        with patch("src.channel_scanner.create_driver", return_value=driver):
+            report = fetcher.run(
+                "user@example.com",
+                "not-logged",
+                include_channel_ids={"B", "missing"},
+            )
+
+        self.assertEqual(fetcher.info_calls, ["B"])
+        self.assertEqual(fetcher.filtered_switches, ["B"])
+        self.assertEqual(report.available_channel_ids, ["A", "B", "C"])
+        self.assertEqual(report.skipped_channel_ids, ["A", "C"])
+        self.assertEqual(report.missing_channel_ids, ["missing"])
+        self.assertEqual(driver.quit_calls, 1)
+
+    def test_channel_id_is_read_from_account_item_data_without_clicking(self):
+        fetcher = ChannelFetcher()
+        expected = "UC1234567890123456789012"
+        fetcher.driver = AccountItemDriver(
+            [f"https://www.youtube.com/channel/{expected}"]
+        )
+
+        channel_id = fetcher._channel_id_from_account_item(
+            AccountItemWithoutAttributes()
+        )
+
+        self.assertEqual(channel_id, expected)
+
+    def test_add_new_clicks_only_ids_not_already_stored(self):
+        fetcher = FakeChannelFetcher(["A", "B", "C"])
+        driver = FakeDriver("A")
+
+        with patch("src.channel_scanner.create_driver", return_value=driver):
+            report = fetcher.run(
+                "user@example.com",
+                "not-logged",
+                exclude_channel_ids={"A", "C"},
+            )
+
+        self.assertEqual(fetcher.info_calls, ["B"])
+        self.assertEqual(fetcher.filtered_switches, ["B"])
+        self.assertEqual(report.skipped_channel_ids, ["A", "C"])
+        self.assertEqual(report.missing_channel_ids, [])
+        self.assertEqual(driver.quit_calls, 1)
+
+    def test_empty_selected_reload_does_not_click_or_scan_any_channel(self):
+        fetcher = FakeChannelFetcher(["A", "B"])
+        driver = FakeDriver("A")
+
+        with patch("src.channel_scanner.create_driver", return_value=driver):
+            report = fetcher.run(
+                "user@example.com",
+                "not-logged",
+                include_channel_ids=set(),
+            )
+
+        self.assertTrue(report.completed)
+        self.assertEqual(fetcher.info_calls, [])
+        self.assertEqual(fetcher.filtered_switches, [])
+        self.assertEqual(report.skipped_channel_ids, ["A", "B"])
         self.assertEqual(driver.quit_calls, 1)
 
     def test_overlay_intercept_retries_click_until_it_succeeds(self):
