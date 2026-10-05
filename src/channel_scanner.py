@@ -35,9 +35,8 @@ AUTHENTICATION_TIMEOUT_SECONDS = 10 * 60
 LOGIN_FIELD_TIMEOUT_SECONDS = 30
 STUDIO_LOAD_TIMEOUT_SECONDS = 60
 ACCOUNT_MENU_TIMEOUT_SECONDS = 20
-CHANNEL_MENU_SCROLL_MAX_STEPS = 250
-CHANNEL_MENU_SCROLL_STABLE_PASSES = 2
-CHANNEL_MENU_SCROLL_SETTLE_SECONDS = 0.15
+CHANNEL_MENU_DOM_STABLE_PASSES = 2
+CHANNEL_MENU_POLL_SECONDS = 0.15
 OVERLAY_CLICK_MAX_ATTEMPTS = 3
 OVERLAY_DISMISS_TIMEOUT_SECONDS = 3 * 60
 OVERLAY_POLL_INTERVAL_SECONDS = 0.5
@@ -143,10 +142,7 @@ class ChannelFetcher:
     PASSWORD_XPATH = "//input[@type='password' and @name='Passwd']"
     NEXT_BUTTON_XPATH = "//span[(text()='Next') or (text()='Tiếp theo')]"
     CHANNEL_SELECTION_XPATH = (
-        "//ytd-account-item-renderer["
-        "contains(concat(' ', normalize-space(@class), ' '), "
-        "' ytd-account-item-section-renderer ')"
-        "]"
+        "//ytd-account-item-renderer[.//*[@id='channel-title']]"
     )
     AVATAR_BUTTON_XPATH = "//*[@id='avatar-btn'] | //ytcp-topbar-menu-button-renderer[contains(concat(' ', normalize-space(@class), ' '), ' ytcpAppHeaderAccountButton ')]"
     SWTICH_ACCOUNT_BUTTON_XPATH = "//ytd-compact-link-renderer[@class='style-scope yt-multi-page-menu-section-renderer' and @has-secondary]"
@@ -335,7 +331,14 @@ class ChannelFetcher:
         include_channel_names: Mapping[str, str],
         exclude_channel_names: set[str],
     ) -> ChannelScanReport:
-        """Scan only explicitly allowed account rows, never probing skipped rows."""
+        """Scan account rows selected by their visible channel names.
+
+        YouTube does not expose a stable per-row Channel ID on every account-menu
+        variant. Some variants even leak the active channel ID through every
+        Polymer row object. The visible ``#channel-title`` is present in each
+        chooser row, so both reload-selected and add-new deliberately filter on
+        that value and only trust the real Channel ID after entering Studio.
+        """
         report = self.last_report
         entries = self._wait_for_channel_menu_entries_ready()
         menu_name_counts = Counter(
@@ -344,16 +347,7 @@ class ChannelFetcher:
             if entry.get("normalized_name")
         )
         report.unidentified_channel_count = sum(
-            1
-            for entry in entries
-            if not entry.get("channel_id") and not entry.get("normalized_name")
-        )
-        available_ids = list(
-            dict.fromkeys(
-                entry["channel_id"]
-                for entry in entries
-                if entry.get("channel_id")
-            )
+            1 for entry in entries if not entry.get("normalized_name")
         )
         selected_targets: list[dict] = []
 
@@ -368,72 +362,44 @@ class ChannelFetcher:
 
             matched_ids: set[str] = set()
             for entry in entries:
-                menu_channel_id = entry.get("channel_id")
+                normalized_name = entry.get("normalized_name") or ""
+                name_matches = selected_ids_by_name.get(normalized_name, [])
                 expected_channel_id = None
-                if menu_channel_id in include_channel_ids:
-                    expected_channel_id = menu_channel_id
-                if expected_channel_id is None:
-                    normalized_name = entry.get("normalized_name") or ""
-                    name_matches = selected_ids_by_name.get(normalized_name, [])
-                    if (
-                        normalized_name
-                        and menu_name_counts[normalized_name] == 1
-                        and len(name_matches) == 1
-                    ):
-                        expected_channel_id = name_matches[0]
+                if (
+                    normalized_name
+                    and menu_name_counts[normalized_name] == 1
+                    and len(name_matches) == 1
+                ):
+                    expected_channel_id = name_matches[0]
 
                 if expected_channel_id and expected_channel_id not in matched_ids:
                     target = dict(entry)
+                    # Do not select a chooser row by an ID guessed from its
+                    # internal Polymer data. Verify the real ID from the Studio
+                    # URL after clicking the uniquely named row.
+                    target["channel_id"] = None
                     target["expected_channel_id"] = expected_channel_id
                     selected_targets.append(target)
                     matched_ids.add(expected_channel_id)
 
-            report.available_channel_ids = list(
-                dict.fromkeys([*available_ids, *matched_ids])
-            )
+            report.available_channel_ids = sorted(matched_ids)
             report.missing_channel_ids = sorted(include_channel_ids - matched_ids)
-            report.skipped_channel_ids = [
-                channel_id
-                for channel_id in available_ids
-                if channel_id not in include_channel_ids
-            ]
+            report.skipped_channel_ids = []
         else:
-            excluded = exclude_channel_ids or set()
-            report.available_channel_ids = available_ids
-            report.skipped_channel_ids = [
-                channel_id for channel_id in available_ids if channel_id in excluded
-            ]
+            report.available_channel_ids = []
+            report.skipped_channel_ids = []
             for entry in entries:
-                menu_channel_id = entry.get("channel_id")
                 normalized_name = entry.get("normalized_name") or ""
-                matches_existing_id = bool(
-                    menu_channel_id and menu_channel_id in excluded
-                )
-                # A real Channel ID is authoritative. Name matching is only a
-                # fallback for chooser rows where YouTube exposes no ID; two
-                # distinct channels are allowed to have the same display name.
-                matches_existing_name = bool(
-                    not menu_channel_id
-                    and normalized_name
-                    and normalized_name in exclude_channel_names
-                )
-                if matches_existing_id or matches_existing_name:
-                    if (
-                        menu_channel_id
-                        and menu_channel_id not in report.skipped_channel_ids
-                    ):
-                        report.skipped_channel_ids.append(menu_channel_id)
+                if normalized_name and normalized_name in exclude_channel_names:
                     continue
-                if not menu_channel_id and not normalized_name:
+                if not normalized_name:
                     continue
-                if (
-                    not menu_channel_id
-                    and menu_name_counts[normalized_name] != 1
-                ):
+                if menu_name_counts[normalized_name] != 1:
                     report.unidentified_channel_count += 1
                     continue
                 target = dict(entry)
-                target["expected_channel_id"] = menu_channel_id
+                target["channel_id"] = None
+                target["expected_channel_id"] = None
                 selected_targets.append(target)
 
         logger.info(
@@ -447,7 +413,7 @@ class ChannelFetcher:
         for channel_index, target in enumerate(selected_targets, start=1):
             self._checkpoint()
             expected_channel_id = target.get("expected_channel_id")
-            menu_channel_id = target.get("channel_id")
+            menu_channel_id = None
             channel_name = str(target.get("channel_name") or "")
             current_channel_id = self._current_channel_id()
             target_is_current = bool(
@@ -459,13 +425,13 @@ class ChannelFetcher:
                 try:
                     self._run_step_with_retry(
                         lambda: self._switch_to_channel_match_once(
-                            channel_id=menu_channel_id,
+                            channel_id=None,
                             channel_name=channel_name,
                             expected_channel_id=expected_channel_id,
                         ),
                         step="switch_channel",
                         channel_index=channel_index,
-                        channel_id=expected_channel_id or menu_channel_id,
+                        channel_id=expected_channel_id,
                     )
                 except ChannelScanError as exc:
                     if exc.category in {
@@ -478,7 +444,7 @@ class ChannelFetcher:
                         report,
                         exc,
                         channel_index,
-                        expected_channel_id or menu_channel_id,
+                        expected_channel_id,
                     )
                     continue
 
@@ -521,7 +487,7 @@ class ChannelFetcher:
         return self._read_visible_channel_menu_entries_once()
 
     def _wait_for_channel_menu_entries_ready(self) -> list[dict]:
-        """Wait until every chooser row has an ID or a usable fallback name.
+        """Wait for the complete DOM name list to become stable and readable.
 
         There is intentionally no wall-clock cutoff. The task's cancellation
         checkpoint remains active, so the user can stop a genuinely stuck
@@ -529,6 +495,8 @@ class ChannelFetcher:
         false "no new channels" result.
         """
         waiting_logged = False
+        previous_signature: tuple[tuple[str, str], ...] | None = None
+        stable_passes = 0
         while True:
             self._checkpoint()
             try:
@@ -542,25 +510,37 @@ class ChannelFetcher:
                         exc.detail,
                     )
                     waiting_logged = True
-                self._wait_interruptibly(CHANNEL_MENU_SCROLL_SETTLE_SECONDS)
+                self._wait_interruptibly(CHANNEL_MENU_POLL_SECONDS)
                 continue
 
-            unreadable = [
-                entry
-                for entry in entries
-                if not entry.get("channel_id")
-                and not entry.get("normalized_name")
-            ]
+            unreadable = [entry for entry in entries if not entry.get("normalized_name")]
             if not unreadable:
-                return entries
+                signature = tuple(
+                    (
+                        str(entry.get("normalized_name") or ""),
+                        str(entry.get("row_signature") or ""),
+                    )
+                    for entry in entries
+                )
+                if signature == previous_signature:
+                    stable_passes += 1
+                else:
+                    previous_signature = signature
+                    stable_passes = 1
+                if stable_passes >= CHANNEL_MENU_DOM_STABLE_PASSES:
+                    return entries
+                self._wait_interruptibly(CHANNEL_MENU_POLL_SECONDS)
+                continue
             if not waiting_logged:
                 logger.warning(
                     "Waiting without timeout for {} channel chooser row(s) "
-                    "to expose an ID or name.",
+                    "to expose a channel name.",
                     len(unreadable),
                 )
                 waiting_logged = True
-            self._wait_interruptibly(CHANNEL_MENU_SCROLL_SETTLE_SECONDS)
+            previous_signature = None
+            stable_passes = 0
+            self._wait_interruptibly(CHANNEL_MENU_POLL_SECONDS)
 
     def _read_visible_channel_menu_entries_once(self) -> list[dict]:
         elements = self.driver.find_elements(By.XPATH, self.CHANNEL_SELECTION_XPATH)
@@ -569,7 +549,11 @@ class ChannelFetcher:
             channel_name = self._channel_name_from_account_item(element)
             entries.append(
                 {
-                    "channel_id": self._channel_id_from_account_item(element),
+                    # Filtered scans intentionally identify chooser rows only
+                    # by their visible title. Per-row internal IDs differ by
+                    # YouTube UI variant and can incorrectly repeat the active
+                    # channel ID on every row.
+                    "channel_id": None,
                     "channel_name": channel_name,
                     "normalized_name": self._normalize_channel_name(channel_name),
                     "row_signature": self._channel_row_signature(element),
@@ -580,58 +564,16 @@ class ChannelFetcher:
         return entries
 
     def _list_all_channel_menu_entries_once(self) -> list[dict]:
-        """Scroll the account menu to its real end before filtering channels."""
+        """Read every account row already present in the chooser DOM.
+
+        The account menu keeps all channel rows in the DOM even when only part
+        of the list is visible. Reading the DOM directly avoids browser-size,
+        zoom and scroll-container differences between customer machines.
+        """
         self._open_channel_switcher_once()
         self._checkpoint()
-        self._scroll_channel_menu_once(reset=True)
-        self._wait_interruptibly(CHANNEL_MENU_SCROLL_SETTLE_SECONDS)
-
-        collected: dict[tuple, dict] = {}
-        stable_passes = 0
-        for _ in range(CHANNEL_MENU_SCROLL_MAX_STEPS):
-            self._checkpoint()
-            batch = self._read_visible_channel_menu_entries_once()
-            occurrences: Counter = Counter()
-            added = 0
-            for entry in batch:
-                channel_id = str(entry.get("channel_id") or "").strip()
-                if channel_id:
-                    key = ("id", channel_id)
-                else:
-                    base_key = (
-                        str(entry.get("normalized_name") or ""),
-                        str(entry.get("row_signature") or ""),
-                    )
-                    occurrences[base_key] += 1
-                    key = ("row", *base_key, occurrences[base_key])
-                if key not in collected:
-                    # The element itself can become stale while scrolling. It is
-                    # deliberately re-located immediately before a click.
-                    snapshot = dict(entry)
-                    snapshot["element"] = None
-                    collected[key] = snapshot
-                    added += 1
-
-            scroll_state = self._scroll_channel_menu_once(advance=True)
-            moved = bool(scroll_state.get("moved"))
-            if moved or added:
-                stable_passes = 0
-            else:
-                stable_passes += 1
-            if stable_passes >= CHANNEL_MENU_SCROLL_STABLE_PASSES:
-                break
-            self._wait_interruptibly(CHANNEL_MENU_SCROLL_SETTLE_SECONDS)
-        else:
-            raise ChannelScanError(
-                ChannelScanErrorCategory.TRANSIENT_UI_ERROR,
-                step="read_channel_menu",
-                detail=(
-                    "Account menu did not reach a stable end after "
-                    f"{CHANNEL_MENU_SCROLL_MAX_STEPS} scroll steps"
-                ),
-            )
-
-        if not collected:
+        entries = self._read_visible_channel_menu_entries_once()
+        if not entries:
             raise ChannelScanError(
                 ChannelScanErrorCategory.TRANSIENT_UI_ERROR,
                 step="read_channel_menu",
@@ -642,92 +584,10 @@ class ChannelFetcher:
             )
 
         logger.info(
-            "Channel account menu fully enumerated: profiles={}",
-            len(collected),
+            "Channel account menu read from DOM: profiles={}",
+            len(entries),
         )
-        return list(collected.values())
-
-    def _scroll_channel_menu_once(
-        self,
-        *,
-        reset: bool = False,
-        advance: bool = False,
-    ) -> dict:
-        """Reset or advance the nearest scrollable account-menu container."""
-        try:
-            result = self.driver.execute_script(
-                """
-                const reset = Boolean(arguments[0]);
-                const advance = Boolean(arguments[1]);
-                const rows = Array.from(document.querySelectorAll(
-                    'ytd-account-item-renderer.ytd-account-item-section-renderer'
-                ));
-                if (!rows.length) {
-                    return {scrollable: false, moved: false, atEnd: true};
-                }
-
-                let scroller = null;
-                let node = rows[0].parentElement;
-                while (node && node !== document.body) {
-                    const style = window.getComputedStyle(node);
-                    const overflowY = style ? style.overflowY : '';
-                    if (
-                        node.scrollHeight > node.clientHeight + 4 &&
-                        (overflowY === 'auto' || overflowY === 'scroll' ||
-                         overflowY === 'overlay')
-                    ) {
-                        scroller = node;
-                        break;
-                    }
-                    node = node.parentElement;
-                }
-                if (!scroller) {
-                    const candidates = Array.from(document.querySelectorAll(
-                        'ytd-multi-page-menu-renderer, #sections, #contents, tp-yt-paper-dialog'
-                    ));
-                    scroller = candidates.find((candidate) =>
-                        candidate.scrollHeight > candidate.clientHeight + 4
-                    ) || null;
-                }
-                if (!scroller) {
-                    return {scrollable: false, moved: false, atEnd: true};
-                }
-
-                const before = Number(scroller.scrollTop || 0);
-                if (reset) {
-                    scroller.scrollTop = 0;
-                } else if (advance) {
-                    const step = Math.max(
-                        240,
-                        Math.floor(Number(scroller.clientHeight || 0) * 0.75)
-                    );
-                    scroller.scrollTop = Math.min(
-                        before + step,
-                        Math.max(0, scroller.scrollHeight - scroller.clientHeight)
-                    );
-                }
-                scroller.dispatchEvent(new Event('scroll', {bubbles: true}));
-                const after = Number(scroller.scrollTop || 0);
-                const maxTop = Math.max(
-                    0,
-                    Number(scroller.scrollHeight || 0) -
-                    Number(scroller.clientHeight || 0)
-                );
-                return {
-                    scrollable: true,
-                    moved: Math.abs(after - before) > 0.5,
-                    atEnd: after >= maxTop - 1,
-                    scrollTop: after,
-                    scrollHeight: Number(scroller.scrollHeight || 0),
-                    clientHeight: Number(scroller.clientHeight || 0),
-                };
-                """,
-                reset,
-                advance,
-            )
-            return result if isinstance(result, dict) else {}
-        except (StaleElementReferenceException, WebDriverException):
-            return {}
+        return entries
 
     def _channel_row_signature(self, element) -> str:
         parts = []
@@ -890,18 +750,13 @@ class ChannelFetcher:
         if expected_channel_id and self._current_channel_id() == expected_channel_id:
             return
         entries = self._list_channel_menu_entries_once()
-        matching_entries = []
-        if channel_id:
-            matching_entries = [
-                entry for entry in entries if entry.get("channel_id") == channel_id
-            ]
-        if not matching_entries and channel_name:
-            normalized_name = self._normalize_channel_name(channel_name)
-            matching_entries = [
-                entry
-                for entry in entries
-                if entry.get("normalized_name") == normalized_name
-            ]
+        normalized_name = self._normalize_channel_name(channel_name)
+        matching_entries = [
+            entry
+            for entry in entries
+            if normalized_name
+            and entry.get("normalized_name") == normalized_name
+        ]
         target = (
             matching_entries[0].get("element")
             if len(matching_entries) == 1
@@ -909,7 +764,7 @@ class ChannelFetcher:
         )
         if target is None:
             target = self._find_channel_menu_element_once(
-                channel_id=channel_id,
+                channel_id=None,
                 channel_name=channel_name,
             )
         if target is None:
@@ -949,44 +804,19 @@ class ChannelFetcher:
         channel_id: str | None,
         channel_name: str,
     ):
-        """Find a channel row across the complete scrollable account menu."""
+        """Find one uniquely named channel row directly in the chooser DOM."""
         normalized_name = self._normalize_channel_name(channel_name)
-        matchers = []
-        if channel_id:
-            matchers.append(
-                lambda entry: entry.get("channel_id") == channel_id
-            )
-        if normalized_name:
-            matchers.append(
-                lambda entry: entry.get("normalized_name") == normalized_name
-            )
-
-        for matches_target in matchers:
-            self._open_channel_switcher_once()
-            self._scroll_channel_menu_once(reset=True)
-            self._wait_interruptibly(CHANNEL_MENU_SCROLL_SETTLE_SECONDS)
-            stable_passes = 0
-            for _ in range(CHANNEL_MENU_SCROLL_MAX_STEPS):
-                self._checkpoint()
-                matches = [
-                    entry.get("element")
-                    for entry in self._read_visible_channel_menu_entries_once()
-                    if matches_target(entry) and entry.get("element") is not None
-                ]
-                if len(matches) == 1:
-                    return matches[0]
-                if len(matches) > 1:
-                    return None
-
-                scroll_state = self._scroll_channel_menu_once(advance=True)
-                if scroll_state.get("moved"):
-                    stable_passes = 0
-                else:
-                    stable_passes += 1
-                if stable_passes >= CHANNEL_MENU_SCROLL_STABLE_PASSES:
-                    break
-                self._wait_interruptibly(CHANNEL_MENU_SCROLL_SETTLE_SECONDS)
-        return None
+        if not normalized_name:
+            return None
+        self._open_channel_switcher_once()
+        self._checkpoint()
+        matches = [
+            entry.get("element")
+            for entry in self._read_visible_channel_menu_entries_once()
+            if entry.get("normalized_name") == normalized_name
+            and entry.get("element") is not None
+        ]
+        return matches[0] if len(matches) == 1 else None
 
     def _switch_to_channel_id_once(self, channel_id: str) -> None:
         self._switch_to_channel_match_once(
@@ -1332,7 +1162,7 @@ class ChannelFetcher:
                         exc.detail,
                     )
                     waiting_logged = True
-                self._wait_interruptibly(CHANNEL_MENU_SCROLL_SETTLE_SECONDS)
+                self._wait_interruptibly(CHANNEL_MENU_POLL_SECONDS)
 
     def _switch_to_next_channel_once(self, previous_channel_id: str | None) -> None:
         self._checkpoint()

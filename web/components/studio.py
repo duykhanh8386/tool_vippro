@@ -184,7 +184,7 @@ def create_studio_content():
                 if report.unidentified_channel_count:
                     message += (
                         f" Bỏ qua an toàn {report.unidentified_channel_count} hồ sơ "
-                        "không đọc được Channel ID."
+                        "không đọc được tên kênh duy nhất."
                     )
                 result_type = (
                     "warning"
@@ -206,7 +206,7 @@ def create_studio_content():
                 if report.unidentified_channel_count:
                     message += (
                         f" Bỏ qua an toàn {report.unidentified_channel_count} hồ sơ "
-                        "không đọc được Channel ID."
+                        "không đọc được tên kênh duy nhất."
                     )
                 result_type = (
                     "warning"
@@ -285,8 +285,7 @@ def create_studio_content():
             ui_refs["login_title"].set_text("Load lại kênh đã chọn")
             ui_refs["login_copy"].set_text(
                 f"Đăng nhập tài khoản chứa {len(selected_ids)} kênh đã chọn. "
-                "Tool ưu tiên khớp Channel ID; nếu YouTube không hiện ID thì "
-                "sẽ khớp theo tên kênh."
+                "Tool đối chiếu trực tiếp theo tên kênh hiển thị trong danh sách."
             )
             ui_refs["login_submit"].set_text("Load lại")
         else:
@@ -308,7 +307,7 @@ def create_studio_content():
             scan_state["exclude_channel_names"] = existing_names
             ui_refs["login_title"].set_text("Thêm kênh YouTube mới")
             ui_refs["login_copy"].set_text(
-                "Đăng nhập tài khoản YouTube. Tool đối chiếu ID hoặc tên và "
+                "Đăng nhập tài khoản YouTube. Tool đối chiếu tên kênh và "
                 "chỉ click các kênh chưa có trong danh sách hiện tại."
             )
             ui_refs["login_submit"].set_text("Tìm kênh mới")
