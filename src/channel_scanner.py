@@ -35,6 +35,9 @@ AUTHENTICATION_TIMEOUT_SECONDS = 10 * 60
 LOGIN_FIELD_TIMEOUT_SECONDS = 30
 STUDIO_LOAD_TIMEOUT_SECONDS = 60
 ACCOUNT_MENU_TIMEOUT_SECONDS = 20
+CHANNEL_MENU_SCROLL_MAX_STEPS = 250
+CHANNEL_MENU_SCROLL_STABLE_PASSES = 2
+CHANNEL_MENU_SCROLL_SETTLE_SECONDS = 0.15
 OVERLAY_CLICK_MAX_ATTEMPTS = 3
 OVERLAY_DISMISS_TIMEOUT_SECONDS = 3 * 60
 OVERLAY_POLL_INTERVAL_SECONDS = 0.5
@@ -325,7 +328,7 @@ class ChannelFetcher:
         """Scan only explicitly allowed account rows, never probing skipped rows."""
         report = self.last_report
         entries = self._run_step_with_retry(
-            self._list_channel_menu_entries_once,
+            self._list_all_channel_menu_entries_once,
             step="read_channel_menu",
         )
         menu_name_counts = Counter(
@@ -503,6 +506,9 @@ class ChannelFetcher:
     def _list_channel_menu_entries_once(self) -> list[dict]:
         self._open_channel_switcher_once()
         self._checkpoint()
+        return self._read_visible_channel_menu_entries_once()
+
+    def _read_visible_channel_menu_entries_once(self) -> list[dict]:
         elements = self.driver.find_elements(By.XPATH, self.CHANNEL_SELECTION_XPATH)
         entries = []
         for element in elements:
@@ -512,11 +518,178 @@ class ChannelFetcher:
                     "channel_id": self._channel_id_from_account_item(element),
                     "channel_name": channel_name,
                     "normalized_name": self._normalize_channel_name(channel_name),
+                    "row_signature": self._channel_row_signature(element),
                     "active": self._account_item_is_active(element),
                     "element": element,
                 }
             )
         return entries
+
+    def _list_all_channel_menu_entries_once(self) -> list[dict]:
+        """Scroll the account menu to its real end before filtering channels."""
+        self._open_channel_switcher_once()
+        self._checkpoint()
+        self._scroll_channel_menu_once(reset=True)
+        self._wait_interruptibly(CHANNEL_MENU_SCROLL_SETTLE_SECONDS)
+
+        collected: dict[tuple, dict] = {}
+        stable_passes = 0
+        for _ in range(CHANNEL_MENU_SCROLL_MAX_STEPS):
+            self._checkpoint()
+            batch = self._read_visible_channel_menu_entries_once()
+            occurrences: Counter = Counter()
+            added = 0
+            for entry in batch:
+                channel_id = str(entry.get("channel_id") or "").strip()
+                if channel_id:
+                    key = ("id", channel_id)
+                else:
+                    base_key = (
+                        str(entry.get("normalized_name") or ""),
+                        str(entry.get("row_signature") or ""),
+                    )
+                    occurrences[base_key] += 1
+                    key = ("row", *base_key, occurrences[base_key])
+                if key not in collected:
+                    # The element itself can become stale while scrolling. It is
+                    # deliberately re-located immediately before a click.
+                    snapshot = dict(entry)
+                    snapshot["element"] = None
+                    collected[key] = snapshot
+                    added += 1
+
+            scroll_state = self._scroll_channel_menu_once(advance=True)
+            moved = bool(scroll_state.get("moved"))
+            if moved or added:
+                stable_passes = 0
+            else:
+                stable_passes += 1
+            if stable_passes >= CHANNEL_MENU_SCROLL_STABLE_PASSES:
+                break
+            self._wait_interruptibly(CHANNEL_MENU_SCROLL_SETTLE_SECONDS)
+        else:
+            raise ChannelScanError(
+                ChannelScanErrorCategory.TRANSIENT_UI_ERROR,
+                step="read_channel_menu",
+                detail=(
+                    "Account menu did not reach a stable end after "
+                    f"{CHANNEL_MENU_SCROLL_MAX_STEPS} scroll steps"
+                ),
+            )
+
+        if not collected:
+            raise ChannelScanError(
+                ChannelScanErrorCategory.TRANSIENT_UI_ERROR,
+                step="read_channel_menu",
+                detail=(
+                    "Account menu opened but no channel profiles were readable; "
+                    "retrying instead of treating the account as empty"
+                ),
+            )
+
+        logger.info(
+            "Channel account menu fully enumerated: profiles={}",
+            len(collected),
+        )
+        return list(collected.values())
+
+    def _scroll_channel_menu_once(
+        self,
+        *,
+        reset: bool = False,
+        advance: bool = False,
+    ) -> dict:
+        """Reset or advance the nearest scrollable account-menu container."""
+        try:
+            result = self.driver.execute_script(
+                """
+                const reset = Boolean(arguments[0]);
+                const advance = Boolean(arguments[1]);
+                const rows = Array.from(document.querySelectorAll(
+                    'ytd-account-item-renderer.ytd-account-item-section-renderer'
+                ));
+                if (!rows.length) {
+                    return {scrollable: false, moved: false, atEnd: true};
+                }
+
+                let scroller = null;
+                let node = rows[0].parentElement;
+                while (node && node !== document.body) {
+                    const style = window.getComputedStyle(node);
+                    const overflowY = style ? style.overflowY : '';
+                    if (
+                        node.scrollHeight > node.clientHeight + 4 &&
+                        (overflowY === 'auto' || overflowY === 'scroll' ||
+                         overflowY === 'overlay')
+                    ) {
+                        scroller = node;
+                        break;
+                    }
+                    node = node.parentElement;
+                }
+                if (!scroller) {
+                    const candidates = Array.from(document.querySelectorAll(
+                        'ytd-multi-page-menu-renderer, #sections, #contents, tp-yt-paper-dialog'
+                    ));
+                    scroller = candidates.find((candidate) =>
+                        candidate.scrollHeight > candidate.clientHeight + 4
+                    ) || null;
+                }
+                if (!scroller) {
+                    return {scrollable: false, moved: false, atEnd: true};
+                }
+
+                const before = Number(scroller.scrollTop || 0);
+                if (reset) {
+                    scroller.scrollTop = 0;
+                } else if (advance) {
+                    const step = Math.max(
+                        240,
+                        Math.floor(Number(scroller.clientHeight || 0) * 0.75)
+                    );
+                    scroller.scrollTop = Math.min(
+                        before + step,
+                        Math.max(0, scroller.scrollHeight - scroller.clientHeight)
+                    );
+                }
+                scroller.dispatchEvent(new Event('scroll', {bubbles: true}));
+                const after = Number(scroller.scrollTop || 0);
+                const maxTop = Math.max(
+                    0,
+                    Number(scroller.scrollHeight || 0) -
+                    Number(scroller.clientHeight || 0)
+                );
+                return {
+                    scrollable: true,
+                    moved: Math.abs(after - before) > 0.5,
+                    atEnd: after >= maxTop - 1,
+                    scrollTop: after,
+                    scrollHeight: Number(scroller.scrollHeight || 0),
+                    clientHeight: Number(scroller.clientHeight || 0),
+                };
+                """,
+                reset,
+                advance,
+            )
+            return result if isinstance(result, dict) else {}
+        except (StaleElementReferenceException, WebDriverException):
+            return {}
+
+    def _channel_row_signature(self, element) -> str:
+        parts = []
+        try:
+            parts.append(self._normalize_channel_name(getattr(element, "text", "")))
+        except (StaleElementReferenceException, WebDriverException):
+            pass
+        try:
+            for image in element.find_elements(By.XPATH, ".//img[@src]"):
+                src = str(image.get_attribute("src") or "").strip()
+                if src:
+                    parts.append(src)
+                    break
+        except (StaleElementReferenceException, WebDriverException):
+            pass
+        return "\u0000".join(parts)
 
     def _channel_name_from_account_item(self, element) -> str:
         for xpath in (
@@ -659,6 +832,11 @@ class ChannelFetcher:
             else None
         )
         if target is None:
+            target = self._find_channel_menu_element_once(
+                channel_id=channel_id,
+                channel_name=channel_name,
+            )
+        if target is None:
             raise ChannelScanError(
                 ChannelScanErrorCategory.CHANNEL_ERROR,
                 step="switch_channel",
@@ -688,6 +866,51 @@ class ChannelFetcher:
                 lambda: channel_switch_finished(driver)
             )
         )
+
+    def _find_channel_menu_element_once(
+        self,
+        *,
+        channel_id: str | None,
+        channel_name: str,
+    ):
+        """Find a channel row across the complete scrollable account menu."""
+        normalized_name = self._normalize_channel_name(channel_name)
+        matchers = []
+        if channel_id:
+            matchers.append(
+                lambda entry: entry.get("channel_id") == channel_id
+            )
+        if normalized_name:
+            matchers.append(
+                lambda entry: entry.get("normalized_name") == normalized_name
+            )
+
+        for matches_target in matchers:
+            self._open_channel_switcher_once()
+            self._scroll_channel_menu_once(reset=True)
+            self._wait_interruptibly(CHANNEL_MENU_SCROLL_SETTLE_SECONDS)
+            stable_passes = 0
+            for _ in range(CHANNEL_MENU_SCROLL_MAX_STEPS):
+                self._checkpoint()
+                matches = [
+                    entry.get("element")
+                    for entry in self._read_visible_channel_menu_entries_once()
+                    if matches_target(entry) and entry.get("element") is not None
+                ]
+                if len(matches) == 1:
+                    return matches[0]
+                if len(matches) > 1:
+                    return None
+
+                scroll_state = self._scroll_channel_menu_once(advance=True)
+                if scroll_state.get("moved"):
+                    stable_passes = 0
+                else:
+                    stable_passes += 1
+                if stable_passes >= CHANNEL_MENU_SCROLL_STABLE_PASSES:
+                    break
+                self._wait_interruptibly(CHANNEL_MENU_SCROLL_SETTLE_SECONDS)
+        return None
 
     def _switch_to_channel_id_once(self, channel_id: str) -> None:
         self._switch_to_channel_match_once(

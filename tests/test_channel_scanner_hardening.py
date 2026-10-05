@@ -147,7 +147,7 @@ class FakeChannelFetcher(ChannelFetcher):
             f"https://studio.youtube.com/channel/{self.channel_ids[self.position]}"
         )
 
-    def _list_channel_menu_entries_once(self):
+    def _read_visible_channel_menu_entries_once(self):
         return [
             {
                 "channel_id": channel_id if self.menu_ids_available else None,
@@ -155,11 +155,18 @@ class FakeChannelFetcher(ChannelFetcher):
                 "normalized_name": self._normalize_channel_name(
                     self.channel_names[channel_id]
                 ),
+                "row_signature": channel_id,
                 "active": index == self.position,
                 "element": object(),
             }
             for index, channel_id in enumerate(self.channel_ids)
         ]
+
+    def _list_channel_menu_entries_once(self):
+        return self._read_visible_channel_menu_entries_once()
+
+    def _scroll_channel_menu_once(self, *, reset=False, advance=False):
+        return {"scrollable": False, "moved": False, "atEnd": True}
 
     def _switch_to_channel_match_once(
         self,
@@ -350,6 +357,75 @@ class ChannelScannerHardeningTests(unittest.TestCase):
         self.assertEqual(fetcher.filtered_switches, ["C"])
         self.assertEqual([item["id"] for item in report.channels], ["C"])
         self.assertEqual(report.skipped_channel_ids, ["A", "B"])
+
+    def test_add_new_scrolls_through_all_profile_pages_before_filtering(self):
+        class PagedMenuFetcher(FakeChannelFetcher):
+            def __init__(self):
+                super().__init__(
+                    ["A", "B"],
+                    menu_ids_available=False,
+                    channel_names={"A": "Existing", "B": "Brand New"},
+                )
+                self.menu_page = 0
+
+            def _read_visible_channel_menu_entries_once(self):
+                entries = super()._read_visible_channel_menu_entries_once()
+                visible_id = ("A", "B")[self.menu_page]
+                return [
+                    entry
+                    for entry in entries
+                    if entry["row_signature"] == visible_id
+                ]
+
+            def _scroll_channel_menu_once(self, *, reset=False, advance=False):
+                if reset:
+                    moved = self.menu_page != 0
+                    self.menu_page = 0
+                    return {"scrollable": True, "moved": moved, "atEnd": False}
+                if advance and self.menu_page == 0:
+                    self.menu_page = 1
+                    return {"scrollable": True, "moved": True, "atEnd": True}
+                return {"scrollable": True, "moved": False, "atEnd": True}
+
+        fetcher = PagedMenuFetcher()
+        driver = FakeDriver("A")
+
+        with patch("src.channel_scanner.create_driver", return_value=driver):
+            report = fetcher.run(
+                "user@example.com",
+                "not-logged",
+                exclude_channel_ids={"A"},
+                exclude_channel_names={"Existing"},
+            )
+
+        self.assertEqual(fetcher.info_calls, ["B"])
+        self.assertEqual(fetcher.filtered_switches, ["B"])
+        self.assertEqual([item["id"] for item in report.channels], ["B"])
+
+    def test_add_new_retries_when_open_menu_temporarily_has_no_profiles(self):
+        class TemporarilyEmptyMenuFetcher(FakeChannelFetcher):
+            def _read_visible_channel_menu_entries_once(self):
+                if self.menu_calls == 1:
+                    return []
+                return super()._read_visible_channel_menu_entries_once()
+
+        fetcher = TemporarilyEmptyMenuFetcher(
+            ["A", "B"],
+            channel_names={"A": "Existing", "B": "Brand New"},
+        )
+        driver = FakeDriver("A")
+
+        with patch("src.channel_scanner.create_driver", return_value=driver):
+            report = fetcher.run(
+                "user@example.com",
+                "not-logged",
+                exclude_channel_ids={"A"},
+                exclude_channel_names={"Existing"},
+            )
+
+        self.assertGreaterEqual(fetcher.menu_calls, 2)
+        self.assertEqual(fetcher.info_calls, ["B"])
+        self.assertEqual([item["id"] for item in report.channels], ["B"])
 
     def test_add_new_clicks_only_ids_not_already_stored(self):
         fetcher = FakeChannelFetcher(["A", "B", "C"])
