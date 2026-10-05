@@ -66,6 +66,33 @@ class AccountItemDriver:
         return self.candidates
 
 
+class MenuRow:
+    def __init__(self, channel_id, *, active=False):
+        self.channel_id = channel_id
+        self.active = active
+
+    def get_attribute(self, name):
+        if name == "href":
+            return f"https://www.youtube.com/channel/{self.channel_id}"
+        return None
+
+    def find_elements(self, _by, _value):
+        return []
+
+
+class MenuDriver:
+    def __init__(self, rows):
+        self.rows = rows
+
+    def find_elements(self, _by, _value):
+        return self.rows
+
+    def execute_script(self, script, row):
+        if "truthyAttribute" in script:
+            return row.active
+        return []
+
+
 class FakeChannelFetcher(ChannelFetcher):
     def __init__(
         self,
@@ -133,9 +160,6 @@ class FakeChannelFetcher(ChannelFetcher):
             result = {"id": channel_id, "name": self.channel_names[channel_id]}
         self.persisted.append(channel_id)
         return result
-
-    def _read_current_channel_name_once(self):
-        return self.channel_names[self.channel_ids[self.position]]
 
     def _open_channel_switcher_once(self):
         self.menu_calls += 1
@@ -256,6 +280,28 @@ class ChannelScannerHardeningTests(unittest.TestCase):
 
         self.assertEqual(channel_id, expected)
 
+    def test_next_channel_uses_row_position_instead_of_exact_class_string(self):
+        fetcher = ChannelFetcher()
+        first = MenuRow("A", active=True)
+        second = MenuRow("B")
+        fetcher.driver = MenuDriver([first, second])
+
+        next_row = fetcher._next_channel_menu_element_once("A")
+
+        self.assertIs(next_row, second)
+
+    def test_unresolved_active_row_is_not_mistaken_for_scan_end(self):
+        fetcher = ChannelFetcher()
+        fetcher.driver = MenuDriver([MenuRow("A"), MenuRow("B")])
+
+        with self.assertRaises(ChannelScanError) as raised:
+            fetcher._next_channel_menu_element_once("missing")
+
+        self.assertEqual(
+            raised.exception.category,
+            ChannelScanErrorCategory.TRANSIENT_UI_ERROR,
+        )
+
     def test_selected_reload_falls_back_to_unique_channel_name(self):
         fetcher = FakeChannelFetcher(
             ["A", "B", "C"],
@@ -340,11 +386,11 @@ class ChannelScannerHardeningTests(unittest.TestCase):
             )
 
         self.assertEqual(fetcher.info_calls, ["B"])
-        self.assertEqual(fetcher.filtered_switches, [])
-        self.assertEqual(fetcher.switch_calls, 2)
+        self.assertEqual(fetcher.filtered_switches, ["B"])
+        self.assertEqual(fetcher.switch_calls, 0)
         self.assertEqual([item["id"] for item in report.channels], ["B"])
 
-    def test_add_new_skips_different_id_when_channel_name_already_exists(self):
+    def test_add_new_does_not_skip_new_id_only_because_name_already_exists(self):
         fetcher = FakeChannelFetcher(
             ["A", "B", "C"],
             channel_names={
@@ -363,11 +409,11 @@ class ChannelScannerHardeningTests(unittest.TestCase):
                 exclude_channel_names={"Healing Peace"},
             )
 
-        self.assertEqual(fetcher.info_calls, ["C"])
-        self.assertEqual(fetcher.filtered_switches, [])
-        self.assertEqual(fetcher.switch_calls, 2)
-        self.assertEqual([item["id"] for item in report.channels], ["C"])
-        self.assertEqual(report.skipped_channel_ids, ["A", "B"])
+        self.assertEqual(fetcher.info_calls, ["B", "C"])
+        self.assertEqual(fetcher.filtered_switches, ["B", "C"])
+        self.assertEqual(fetcher.switch_calls, 0)
+        self.assertEqual([item["id"] for item in report.channels], ["B", "C"])
+        self.assertEqual(report.skipped_channel_ids, ["A"])
 
     def test_selected_reload_scrolls_through_all_profile_pages_before_filtering(self):
         class PagedMenuFetcher(FakeChannelFetcher):
@@ -438,7 +484,7 @@ class ChannelScannerHardeningTests(unittest.TestCase):
         self.assertEqual(fetcher.info_calls, ["B"])
         self.assertEqual([item["id"] for item in report.channels], ["B"])
 
-    def test_add_new_visits_all_profiles_but_processes_only_new_ids(self):
+    def test_add_new_clicks_only_new_ids(self):
         fetcher = FakeChannelFetcher(["A", "B", "C"])
         driver = FakeDriver("A")
 
@@ -450,8 +496,8 @@ class ChannelScannerHardeningTests(unittest.TestCase):
             )
 
         self.assertEqual(fetcher.info_calls, ["B"])
-        self.assertEqual(fetcher.filtered_switches, [])
-        self.assertEqual(fetcher.switch_calls, 2)
+        self.assertEqual(fetcher.filtered_switches, ["B"])
+        self.assertEqual(fetcher.switch_calls, 0)
         self.assertEqual(report.skipped_channel_ids, ["A", "C"])
         self.assertEqual(report.missing_channel_ids, [])
         self.assertEqual(driver.quit_calls, 1)
@@ -471,10 +517,10 @@ class ChannelScannerHardeningTests(unittest.TestCase):
                 exclude_channel_names=set(),
             )
 
-        self.assertEqual(fetcher.initial_select_calls, 1)
+        self.assertEqual(fetcher.initial_select_calls, 0)
         self.assertEqual(fetcher.info_calls, ["A", "B", "C"])
-        self.assertEqual(fetcher.filtered_switches, [])
-        self.assertEqual(fetcher.switch_calls, 2)
+        self.assertEqual(fetcher.filtered_switches, ["B", "C"])
+        self.assertEqual(fetcher.switch_calls, 0)
         self.assertEqual([item["id"] for item in report.channels], ["A", "B", "C"])
         self.assertEqual(driver.quit_calls, 1)
 
@@ -494,10 +540,10 @@ class ChannelScannerHardeningTests(unittest.TestCase):
                 exclude_channel_names={"Existing"},
             )
 
-        self.assertEqual(fetcher.initial_select_calls, 1)
+        self.assertEqual(fetcher.initial_select_calls, 0)
         self.assertEqual(fetcher.info_calls, ["NEW"])
         self.assertEqual(fetcher.filtered_switches, [])
-        self.assertEqual(fetcher.switch_calls, 1)
+        self.assertEqual(fetcher.switch_calls, 0)
         self.assertEqual([item["id"] for item in report.channels], ["NEW"])
         self.assertEqual(report.skipped_channel_ids, ["OLD"])
 

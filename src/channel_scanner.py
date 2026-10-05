@@ -148,7 +148,6 @@ class ChannelFetcher:
         "' ytd-account-item-section-renderer ')"
         "]"
     )
-    NEXT_CHANNEL_SELECTION_XPATH = "//ytd-account-item-renderer[@class='style-scope ytd-account-item-section-renderer' and @enable-ring-for-active-account]/following-sibling::ytd-account-item-renderer[1]"
     AVATAR_BUTTON_XPATH = "//*[@id='avatar-btn'] | //ytcp-topbar-menu-button-renderer[contains(concat(' ', normalize-space(@class), ' '), ' ytcpAppHeaderAccountButton ')]"
     SWTICH_ACCOUNT_BUTTON_XPATH = "//ytd-compact-link-renderer[@class='style-scope yt-multi-page-menu-section-renderer' and @has-secondary]"
     ROLE_MANAGER_XPATH = "//div[@class='sublabel style-scope ytcp-topbar-menu-button-renderer']"
@@ -244,21 +243,16 @@ class ChannelFetcher:
         )
         if on_authenticated is not None:
             on_authenticated()
-        # "Add channel" deliberately uses the original sequential traversal.
-        # Reading IDs/names directly from the account chooser is not reliable:
-        # YouTube can render the rows before their metadata is attached.  That
-        # made the filtered flow see zero targets and close Chrome immediately.
-        # Visit every profile instead, then compare its Studio ID/name after the
-        # profile has loaded. Existing channels are skipped before any upsert.
         if exclude_channel_ids is not None:
-            if initial_state == "chooser":
-                self._run_step_with_retry(
-                    self._select_initial_channel_once,
-                    step="select_initial_channel",
-                )
-            return self._scan_add_new_channels_sequentially(
-                excluded_channel_ids=excluded,
-                excluded_channel_names=excluded_names,
+            # Let the chooser hydrate for as long as necessary, then click only
+            # profiles which are not already stored. This preserves the precise
+            # add-new behavior without interpreting a half-rendered menu as an
+            # empty account.
+            return self._scan_filtered_channels(
+                include_channel_ids=None,
+                exclude_channel_ids=excluded,
+                include_channel_names=included_names,
+                exclude_channel_names=excluded_names,
             )
         if include_channel_ids is not None:
             return self._scan_filtered_channels(
@@ -343,10 +337,7 @@ class ChannelFetcher:
     ) -> ChannelScanReport:
         """Scan only explicitly allowed account rows, never probing skipped rows."""
         report = self.last_report
-        entries = self._run_step_with_retry(
-            self._list_all_channel_menu_entries_once,
-            step="read_channel_menu",
-        )
+        entries = self._wait_for_channel_menu_entries_ready()
         menu_name_counts = Counter(
             entry.get("normalized_name")
             for entry in entries
@@ -418,8 +409,13 @@ class ChannelFetcher:
                 matches_existing_id = bool(
                     menu_channel_id and menu_channel_id in excluded
                 )
+                # A real Channel ID is authoritative. Name matching is only a
+                # fallback for chooser rows where YouTube exposes no ID; two
+                # distinct channels are allowed to have the same display name.
                 matches_existing_name = bool(
-                    normalized_name and normalized_name in exclude_channel_names
+                    not menu_channel_id
+                    and normalized_name
+                    and normalized_name in exclude_channel_names
                 )
                 if matches_existing_id or matches_existing_name:
                     if (
@@ -523,6 +519,48 @@ class ChannelFetcher:
         self._open_channel_switcher_once()
         self._checkpoint()
         return self._read_visible_channel_menu_entries_once()
+
+    def _wait_for_channel_menu_entries_ready(self) -> list[dict]:
+        """Wait until every chooser row has an ID or a usable fallback name.
+
+        There is intentionally no wall-clock cutoff. The task's cancellation
+        checkpoint remains active, so the user can stop a genuinely stuck
+        chooser without the scanner ever converting slow hydration into a
+        false "no new channels" result.
+        """
+        waiting_logged = False
+        while True:
+            self._checkpoint()
+            try:
+                entries = self._list_all_channel_menu_entries_once()
+            except ChannelScanError as exc:
+                if exc.category != ChannelScanErrorCategory.TRANSIENT_UI_ERROR:
+                    raise
+                if not waiting_logged:
+                    logger.warning(
+                        "Waiting without timeout for the channel chooser: {}",
+                        exc.detail,
+                    )
+                    waiting_logged = True
+                self._wait_interruptibly(CHANNEL_MENU_SCROLL_SETTLE_SECONDS)
+                continue
+
+            unreadable = [
+                entry
+                for entry in entries
+                if not entry.get("channel_id")
+                and not entry.get("normalized_name")
+            ]
+            if not unreadable:
+                return entries
+            if not waiting_logged:
+                logger.warning(
+                    "Waiting without timeout for {} channel chooser row(s) "
+                    "to expose an ID or name.",
+                    len(unreadable),
+                )
+                waiting_logged = True
+            self._wait_interruptibly(CHANNEL_MENU_SCROLL_SETTLE_SECONDS)
 
     def _read_visible_channel_menu_entries_once(self) -> list[dict]:
         elements = self.driver.find_elements(By.XPATH, self.CHANNEL_SELECTION_XPATH)
@@ -734,7 +772,29 @@ class ChannelFetcher:
         try:
             return bool(
                 self.driver.execute_script(
-                    "return arguments[0].hasAttribute('enable-ring-for-active-account');",
+                    """
+                    const row = arguments[0];
+                    const truthyAttribute = (name) => {
+                        if (!row.hasAttribute(name)) return false;
+                        const value = String(row.getAttribute(name) || '')
+                            .trim().toLowerCase();
+                        return value !== 'false' && value !== '0';
+                    };
+                    if (
+                        truthyAttribute('enable-ring-for-active-account') ||
+                        truthyAttribute('selected') ||
+                        truthyAttribute('active') ||
+                        truthyAttribute('is-selected') ||
+                        row.getAttribute('aria-current') === 'page' ||
+                        row.getAttribute('aria-checked') === 'true' ||
+                        row.getAttribute('aria-selected') === 'true'
+                    ) return true;
+                    return Boolean(row.querySelector(
+                        '[aria-current="page"], [aria-checked="true"], '
+                        '[aria-selected="true"], [selected], [active], '
+                        '[enable-ring-for-active-account]'
+                    ));
+                    """,
                     element,
                 )
             )
@@ -986,116 +1046,6 @@ class ChannelFetcher:
             )
             channel_index += 1
 
-    def _scan_add_new_channels_sequentially(
-        self,
-        *,
-        excluded_channel_ids: set[str],
-        excluded_channel_names: set[str],
-    ) -> ChannelScanReport:
-        """Traverse every account profile and save only genuinely new channels."""
-        report = self.last_report
-        channel_index = 1
-
-        while True:
-            self._checkpoint()
-            current_channel_id = self._run_step_with_retry(
-                self._current_channel_id,
-                step="read_channel_state",
-                channel_index=channel_index,
-            )
-            if (
-                current_channel_id
-                and current_channel_id not in report.available_channel_ids
-            ):
-                report.available_channel_ids.append(current_channel_id)
-
-            is_existing = bool(
-                current_channel_id
-                and current_channel_id in excluded_channel_ids
-            )
-            if not is_existing and excluded_channel_names:
-                try:
-                    current_channel_name = self._run_step_with_retry(
-                        self._read_current_channel_name_once,
-                        step="read_channel_name",
-                        channel_index=channel_index,
-                        channel_id=current_channel_id,
-                        default_category=ChannelScanErrorCategory.CHANNEL_ERROR,
-                    )
-                except ChannelScanError as exc:
-                    if exc.category in {
-                        ChannelScanErrorCategory.AUTH_ERROR,
-                        ChannelScanErrorCategory.UNKNOWN_AUTH_STATE,
-                        ChannelScanErrorCategory.FATAL_ERROR,
-                    }:
-                        raise
-                    # The full channel reader has its own bounded retry and a
-                    # better diagnostic. Do not turn a missing display name
-                    # into a false "existing channel" match.
-                    current_channel_name = ""
-                is_existing = bool(
-                    self._normalize_channel_name(current_channel_name)
-                    in excluded_channel_names
-                )
-
-            if is_existing:
-                if (
-                    current_channel_id
-                    and current_channel_id not in report.skipped_channel_ids
-                ):
-                    report.skipped_channel_ids.append(current_channel_id)
-            else:
-                self._scan_current_channel(
-                    report,
-                    channel_index,
-                    expected_channel_id=current_channel_id,
-                )
-
-            self._checkpoint()
-            self._run_step_with_retry(
-                self._open_channel_switcher_once,
-                step="open_channel_switcher",
-                channel_index=channel_index,
-                channel_id=current_channel_id,
-            )
-            self._checkpoint()
-            has_next_channel = self._run_step_with_retry(
-                self._has_next_channel,
-                step="detect_next_channel",
-                channel_index=channel_index,
-                channel_id=current_channel_id,
-            )
-            if not has_next_channel:
-                report.completed = True
-                report.end_category = ChannelScanErrorCategory.SCAN_END
-                logger.info(
-                    "Add-new sequential scan end confirmed: visited={} new={} "
-                    "skipped={} failed={}",
-                    channel_index,
-                    len(report.channels),
-                    len(report.skipped_channel_ids),
-                    len(report.failures),
-                )
-                return report
-
-            self._run_step_with_retry(
-                lambda: self._switch_to_next_channel_once(current_channel_id),
-                step="switch_channel",
-                channel_index=channel_index + 1,
-                channel_id=current_channel_id,
-            )
-            channel_index += 1
-
-    def _read_current_channel_name_once(self) -> str:
-        image_xpath = (
-            "//img[@class='thumbnail image-thumbnail style-scope "
-            "ytcp-navigation-drawer']"
-        )
-        image = WebDriverWait(
-            self.driver, STUDIO_LOAD_TIMEOUT_SECONDS
-        ).until(EC.presence_of_element_located((By.XPATH, image_xpath)))
-        return " ".join(str(image.get_attribute("alt") or "").split())
-
     def _scan_current_channel(
         self,
         report: ChannelScanReport,
@@ -1295,21 +1245,107 @@ class ChannelFetcher:
         except TimeoutException:
             return False
 
+    def _next_channel_menu_element_once(
+        self,
+        current_channel_id: str | None = None,
+    ):
+        """Return the row after the active profile without brittle class matching.
+
+        A missing active marker is an indeterminate menu state, not proof that
+        the scan reached its end. Raising here lets the bounded outer retry wait
+        for YouTube to finish hydrating the chooser instead of closing Chrome.
+        """
+        self._checkpoint()
+        rows = self.driver.find_elements(By.XPATH, self.CHANNEL_SELECTION_XPATH)
+        if not rows:
+            raise ChannelScanError(
+                ChannelScanErrorCategory.TRANSIENT_UI_ERROR,
+                step="detect_next_channel",
+                detail="Channel chooser is open but contains no readable rows yet",
+            )
+
+        active_indexes = [
+            index
+            for index, row in enumerate(rows)
+            if self._account_item_is_active(row)
+        ]
+        if len(active_indexes) != 1 and current_channel_id:
+            id_matches = [
+                index
+                for index, row in enumerate(rows)
+                if self._channel_id_from_account_item(row) == current_channel_id
+            ]
+            if len(id_matches) == 1:
+                active_indexes = id_matches
+
+        if len(active_indexes) != 1:
+            raise ChannelScanError(
+                ChannelScanErrorCategory.TRANSIENT_UI_ERROR,
+                step="detect_next_channel",
+                detail=(
+                    "Channel chooser rows are visible but the active profile "
+                    f"is not uniquely identifiable: rows={len(rows)} "
+                    f"active_matches={len(active_indexes)}"
+                ),
+                channel_id=current_channel_id,
+            )
+
+        active_index = active_indexes[0]
+        logger.debug(
+            "Channel chooser position resolved: current_id={} row={}/{}",
+            current_channel_id or "<unknown>",
+            active_index + 1,
+            len(rows),
+        )
+        next_index = active_index + 1
+        return rows[next_index] if next_index < len(rows) else None
+
     def _has_next_channel(self) -> bool:
         self._checkpoint()
-        return bool(
-            self.driver.find_elements(By.XPATH, self.NEXT_CHANNEL_SELECTION_XPATH)
-        )
+        return self._wait_for_next_channel_menu_resolution(
+            self._current_channel_id()
+        ) is not None
+
+    def _wait_for_next_channel_menu_resolution(
+        self,
+        current_channel_id: str | None,
+    ):
+        """Wait without a wall-clock cutoff for chooser metadata hydration.
+
+        The user can still stop the task through the normal cancellation
+        checkpoint. Network/navigation operations keep their safety timeouts,
+        but an already-open chooser is never interpreted as scan-end merely
+        because YouTube has not marked its active row yet.
+        """
+        waiting_logged = False
+        while True:
+            self._checkpoint()
+            try:
+                return self._next_channel_menu_element_once(current_channel_id)
+            except ChannelScanError as exc:
+                if exc.category != ChannelScanErrorCategory.TRANSIENT_UI_ERROR:
+                    raise
+                if not waiting_logged:
+                    logger.warning(
+                        "Waiting for channel chooser to identify the active row; "
+                        "the scan will not treat this as its end: {}",
+                        exc.detail,
+                    )
+                    waiting_logged = True
+                self._wait_interruptibly(CHANNEL_MENU_SCROLL_SETTLE_SECONDS)
 
     def _switch_to_next_channel_once(self, previous_channel_id: str | None) -> None:
         self._checkpoint()
-        next_button = WebDriverWait(
-            self.driver, ACCOUNT_MENU_TIMEOUT_SECONDS
-        ).until(
-            EC.element_to_be_clickable(
-                (By.XPATH, self.NEXT_CHANNEL_SELECTION_XPATH)
-            )
+        next_button = self._wait_for_next_channel_menu_resolution(
+            previous_channel_id
         )
+        if next_button is None:
+            raise ChannelScanError(
+                ChannelScanErrorCategory.TRANSIENT_UI_ERROR,
+                step="switch_channel",
+                detail="The next channel row disappeared before it could be clicked",
+                channel_id=previous_channel_id,
+            )
         next_button.click()
         WebDriverWait(self.driver, STUDIO_LOAD_TIMEOUT_SECONDS).until(
             lambda driver: self._checkpoint_and_get(
