@@ -45,12 +45,13 @@ from src.youtube_caption_api import (
     CaptionAuthenticationError,
     CaptionQuotaExceededError,
     authorize_caption_channel,
+    find_caption_oauth_client,
     get_caption_quota_status,
     has_caption_oauth,
     prepare_source_caption,
     publish_translated_caption,
 )
-from web.components.common import select_directory, select_file
+from web.components.common import select_directory
 from web.theme import app_card, page_header, section_header
 
 
@@ -778,6 +779,11 @@ def create_add_audio_page():
         "oauth_client_json": "",
         "model": DEFAULT_SUBTITLE_MODEL,
     }
+    caption_oauth_runtime = {
+        "running": False,
+        "attempted_channels": set(),
+    }
+    caption_oauth_actions = {"connect": None}
     batch_scan_state = {
         "music_folder": "",
         "recursive": True,
@@ -826,7 +832,6 @@ def create_add_audio_page():
         "scan_scope_toggle": None,
         "recent_limit_input": None,
         "subtitle_switch": None,
-        "oauth_client_input": None,
         "caption_oauth_status": None,
     }
 
@@ -1026,11 +1031,8 @@ def create_add_audio_page():
                         ]
                     if ui_refs["subtitle_switch"]:
                         ui_refs["subtitle_switch"].value = subtitle_settings["enabled"]
-                    if ui_refs["oauth_client_input"]:
-                        ui_refs["oauth_client_input"].value = subtitle_settings[
-                            "oauth_client_json"
-                        ]
                     refresh_caption_oauth_status()
+                    request_caption_oauth_if_needed()
                     refresh_video_source_controls()
                     refresh_right_panel()
                     refresh_scan_preview()
@@ -1065,6 +1067,7 @@ def create_add_audio_page():
         refresh_video_source_controls()
         refresh_caption_oauth_status()
         save_right_panel_state()
+        request_caption_oauth_if_needed()
         return True
     def create_language_input_and_chips():
         """Create manual language input and display entered languages as chips"""
@@ -1115,6 +1118,21 @@ def create_add_audio_page():
         ui_refs["refresh_language_chips"] = refresh_language_chips
         return refresh_language_chips
 
+    def request_caption_oauth_if_needed() -> None:
+        channel_id = str(selected_channel.get("id") or "").strip()
+        connector = caption_oauth_actions.get("connect")
+        if (
+            not subtitle_settings.get("enabled")
+            or not channel_id
+            or has_caption_oauth(channel_id)
+            or caption_oauth_runtime["running"]
+            or channel_id in caption_oauth_runtime["attempted_channels"]
+            or not callable(connector)
+        ):
+            return
+        caption_oauth_runtime["attempted_channels"].add(channel_id)
+        asyncio.create_task(connector(automatic=True))
+
     def refresh_caption_oauth_status() -> None:
         container = ui_refs.get("caption_oauth_status")
         if not container:
@@ -1130,9 +1148,15 @@ def create_add_audio_page():
                 ui.label("Kênh đã được cấp quyền đăng phụ đề.").classes(
                     "text-xs font-medium text-emerald-700"
                 )
+            elif find_caption_oauth_client(subtitle_settings.get("oauth_client_json")):
+                ui.label(
+                    "Tool đã có cấu hình OAuth; khi cần sẽ tự mở trang Google cấp quyền."
+                ).classes("text-xs font-medium text-orange-600")
             else:
-                ui.label("Kênh chưa được cấp quyền đăng phụ đề.").classes(
-                    "text-xs font-medium text-orange-600"
+                ui.label(
+                    "Bản tool đang thiếu cấu hình OAuth của nhà phát hành."
+                ).classes(
+                    "text-xs font-medium text-red-700"
                 )
             quota = get_caption_quota_status()
             if quota.get("blocked"):
@@ -1148,64 +1172,74 @@ def create_add_audio_page():
             subtitle_settings["enabled"] = bool(event.value)
             save_right_panel_state()
 
-        def update_client_path(_event=None) -> None:
-            if configuration_change_blocked():
-                ui_refs["oauth_client_input"].value = subtitle_settings[
-                    "oauth_client_json"
-                ]
-                return
-            subtitle_settings["oauth_client_json"] = normalize_path(
-                str(ui_refs["oauth_client_input"].value or "")
-            )
-            save_right_panel_state()
+            if subtitle_settings["enabled"]:
+                request_caption_oauth_if_needed()
 
-        def pick_client_json() -> None:
+        async def connect_caption_oauth(*, automatic: bool = False) -> bool:
             if configuration_change_blocked():
-                return
-            path = select_file(
-                initial_dir=(
-                    str(Path(subtitle_settings["oauth_client_json"]).parent)
-                    if subtitle_settings["oauth_client_json"]
-                    else None
-                ),
-                title="Chọn OAuth Client JSON của Google",
-                filetypes=(("JSON", "*.json"), ("Tất cả", "*.*")),
-            )
-            if path:
-                subtitle_settings["oauth_client_json"] = normalize_path(path)
-                ui_refs["oauth_client_input"].value = subtitle_settings[
-                    "oauth_client_json"
-                ]
-                save_right_panel_state()
-
-        async def connect_caption_oauth() -> None:
-            if configuration_change_blocked():
-                return
-            channel_id = selected_channel.get("id")
-            client_path = str(subtitle_settings["oauth_client_json"] or "").strip()
+                return False
+            channel_id = str(selected_channel.get("id") or "").strip()
             if not channel_id:
-                ui.notify("Hãy chọn kênh trước khi kết nối phụ đề.", type="warning")
-                return
-            if not client_path:
-                ui.notify("Hãy chọn OAuth Client JSON của Google.", type="warning")
-                return
+                if not automatic:
+                    ui.notify("Hãy chọn kênh trước khi cấp quyền phụ đề.", type="warning")
+                return False
+            if has_caption_oauth(channel_id):
+                refresh_caption_oauth_status()
+                return True
+            if caption_oauth_runtime["running"]:
+                if not automatic:
+                    ui.notify("Tool đang chờ Google cấp quyền phụ đề.", type="info")
+                deadline = time.monotonic() + 305
+                while caption_oauth_runtime["running"] and time.monotonic() < deadline:
+                    await asyncio.sleep(0.2)
+                return has_caption_oauth(channel_id)
+            client_file = find_caption_oauth_client(
+                subtitle_settings.get("oauth_client_json")
+            )
+            if client_file is None:
+                ui.notify(
+                    "Bản tool thiếu cấu hình OAuth phụ đề. Hãy liên hệ người phát hành tool.",
+                    type="negative",
+                )
+                refresh_caption_oauth_status()
+                return False
+            client_path = str(client_file)
+            subtitle_settings["oauth_client_json"] = client_path
+            save_right_panel_state()
+            credentials = state_manager.load_state("studio_credentials") or {}
+            login_hint = (
+                str(credentials.get("email") or "").strip()
+                if isinstance(credentials, dict)
+                else ""
+            )
             ui.notify(
-                "Trình duyệt đang mở. Hãy đăng nhập đúng tài khoản sở hữu kênh.",
+                "Tool đang mở Google. Lần đầu hãy kiểm tra đúng tài khoản rồi bấm Cho phép.",
                 type="info",
                 timeout=5000,
             )
+            caption_oauth_runtime["running"] = True
             try:
                 await asyncio.to_thread(
                     authorize_caption_channel,
                     channel_id,
                     client_path,
+                    login_hint=login_hint,
                 )
             except Exception as exc:
                 logger.exception("Could not authorize YouTube captions")
                 ui.notify(f"Kết nối phụ đề thất bại: {exc}", type="negative")
+                return False
             else:
                 ui.notify("Đã kết nối quyền đăng phụ đề cho kênh.", type="positive")
-            refresh_caption_oauth_status()
+                return True
+            finally:
+                caption_oauth_runtime["running"] = False
+                refresh_caption_oauth_status()
+
+        caption_oauth_actions["connect"] = connect_caption_oauth
+
+        async def manual_connect_caption_oauth() -> None:
+            await connect_caption_oauth()
 
         with app_card(classes="audio-add-section"):
             with ui.row().classes("w-full items-center justify-between gap-3"):
@@ -1220,25 +1254,17 @@ def create_add_audio_page():
                     on_change=update_enabled,
                 )
                 ui_refs["subtitle_switch"] = subtitle_switch
-            with ui.row().classes("w-full items-end gap-2"):
-                oauth_input = ui.input(
-                    "OAuth Client JSON",
-                    value=subtitle_settings["oauth_client_json"],
-                ).props("outlined clearable").classes("flex-1")
-                oauth_input.on("change", update_client_path)
-                ui_refs["oauth_client_input"] = oauth_input
-                ui.button("Chọn file", icon="folder_open", on_click=pick_client_json).props(
-                    "outline"
-                )
+            with ui.row().classes("w-full items-center justify-end gap-2"):
                 ui.button(
-                    "Kết nối kênh",
+                    "Cấp quyền ngay",
                     icon="link",
-                    on_click=connect_caption_oauth,
+                    on_click=manual_connect_caption_oauth,
                 ).classes("app-button-primary")
             status_container = ui.column().classes("w-full gap-1")
             ui_refs["caption_oauth_status"] = status_container
             refresh_caption_oauth_status()
             ui.label(
+                "OAuth được tool tự tìm và tự mở; người dùng chỉ xác nhận Cho phép lần đầu. "
                 "Lần đầu model nhận dạng sẽ được tải về. Khi quota YouTube hết, "
                 "audio vẫn chạy; lần sau bấm chạy lại sẽ tiếp tục các phụ đề còn thiếu."
             ).classes("text-[11px] text-gray-500")
@@ -2237,12 +2263,13 @@ def create_add_audio_page():
             return None
         subtitles_enabled = bool(subtitle_settings.get("enabled"))
         if subtitles_enabled and not has_caption_oauth(selected_channel["id"]):
-            ui.notify(
-                "Kênh chưa được cấp quyền phụ đề. Hãy chọn OAuth Client JSON "
-                "và bấm Kết nối kênh.",
-                type="warning",
-            )
-            return None
+            connector = caption_oauth_actions.get("connect")
+            if not callable(connector) or not await connector():
+                ui.notify(
+                    "Chưa cấp được quyền phụ đề nên tác vụ chưa bắt đầu.",
+                    type="warning",
+                )
+                return None
         selective_repair = video_source_state.get("mode") == "failed"
         if selective_repair:
             if video_source_state.get("failed_channel") != selected_channel["id"]:

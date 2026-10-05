@@ -5,7 +5,9 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import os
 import secrets
+import sys
 import threading
 import time
 import webbrowser
@@ -18,12 +20,15 @@ from zoneinfo import ZoneInfo
 import requests
 from loguru import logger
 
+from src.paths import get_data_dir
 from src.state_manager import state_manager
 
 
 OAUTH_STATE_NAME = "youtube_caption_oauth"
 QUOTA_STATE_NAME = "youtube_caption_quota"
 YOUTUBE_FORCE_SSL_SCOPE = "https://www.googleapis.com/auth/youtube.force-ssl"
+OAUTH_CLIENT_ENV = "TVAUTOMATION_GOOGLE_OAUTH_CLIENT"
+OAUTH_CLIENT_FILENAME = "google_oauth_client.json"
 _STATE_LOCK = threading.RLock()
 _HTTP_TIMEOUT = (30, 180)
 
@@ -141,6 +146,68 @@ def _client_configuration(client_json_path: str | Path) -> dict:
     return config
 
 
+def find_caption_oauth_client(
+    saved_path: str | Path | None = None,
+) -> Path | None:
+    """Find the publisher-provided OAuth client without asking customers for it.
+
+    Only explicit application locations are inspected. This deliberately avoids
+    recursively searching a customer's computer for JSON or credential files.
+    """
+    candidates: list[Path] = []
+    if saved_path:
+        candidates.append(Path(saved_path).expanduser())
+
+    configured_path = str(os.environ.get(OAUTH_CLIENT_ENV) or "").strip()
+    if configured_path:
+        candidates.append(Path(configured_path).expanduser())
+
+    trusted_directories: list[Path] = []
+    bundled_root = getattr(sys, "_MEIPASS", None)
+    if bundled_root:
+        trusted_directories.append(Path(bundled_root) / "assets")
+    if getattr(sys, "frozen", False):
+        trusted_directories.extend(
+            (
+                Path(sys.executable).resolve().parent / "assets",
+                Path(sys.executable).resolve().parent / "_internal" / "assets",
+            )
+        )
+    trusted_directories.extend(
+        (
+            get_data_dir(),
+            Path(__file__).resolve().parent.parent / "assets",
+        )
+    )
+
+    for directory in trusted_directories:
+        candidates.append(directory / OAUTH_CLIENT_FILENAME)
+        try:
+            candidates.extend(sorted(directory.glob("*.json")))
+        except OSError:
+            continue
+
+    inspected: set[str] = set()
+    for candidate in candidates:
+        try:
+            normalized = candidate.resolve()
+        except OSError:
+            normalized = candidate.absolute()
+        key = os.path.normcase(str(normalized))
+        if key in inspected:
+            continue
+        inspected.add(key)
+        if not normalized.is_file():
+            continue
+        try:
+            _client_configuration(normalized)
+        except CaptionAuthenticationError:
+            logger.warning("Ignored invalid YouTube OAuth client file: {}", normalized)
+            continue
+        return normalized
+    return None
+
+
 def _save_oauth_record(channel_id: str, record: dict) -> None:
     with _STATE_LOCK:
         state = _load_mapping(OAUTH_STATE_NAME)
@@ -173,6 +240,7 @@ def authorize_caption_channel(
     client_json_path: str | Path,
     *,
     timeout_seconds: float = 300,
+    login_hint: str | None = None,
 ) -> None:
     """Run a desktop OAuth PKCE flow and persist a refresh token per channel."""
     expected_channel = str(channel_id or "").strip()
@@ -215,11 +283,13 @@ def authorize_caption_channel(
         "response_type": "code",
         "scope": YOUTUBE_FORCE_SSL_SCOPE,
         "access_type": "offline",
-        "prompt": "consent select_account",
+        "prompt": "consent",
         "state": expected_state,
         "code_challenge": challenge,
         "code_challenge_method": "S256",
     }
+    if str(login_hint or "").strip():
+        params["login_hint"] = str(login_hint).strip()
     webbrowser.open(f"{auth_uri}?{urlencode(params)}", new=1, autoraise=True)
     deadline = time.monotonic() + max(30.0, float(timeout_seconds))
     server.timeout = 1.0

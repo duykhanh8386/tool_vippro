@@ -22,6 +22,12 @@ chromedriver_bin = Path(
         project_root / "vendor" / "chromedriver" / "chromedriver.exe",
     )
 )
+oauth_client_json = Path(
+    os.environ.get(
+        "TVAUTOMATION_GOOGLE_OAUTH_CLIENT",
+        project_root / "assets" / "google_oauth_client.json",
+    )
+)
 
 
 def collect_media_binaries():
@@ -42,6 +48,13 @@ def collect_chromedriver():
     return [(str(chromedriver_bin), "tools")]
 
 
+def collect_google_oauth_client():
+    """Bundle the publisher-owned OAuth client when it is available."""
+    if not oauth_client_json.is_file():
+        return []
+    return [(str(oauth_client_json), "assets")]
+
+
 datas = [
     (str(project_root / "VERSION"), "."),
     (str(project_root / "assets" / "logo.png"), "assets"),
@@ -49,6 +62,7 @@ datas = [
     (str(project_root / "vendor" / "ffmpeg" / "README.txt"), "licenses/ffmpeg"),
     (str(project_root / "vendor" / "chromedriver" / "LICENSE.chromedriver"), "licenses/chromedriver"),
     (str(project_root / "vendor" / "chromedriver" / "THIRD_PARTY_NOTICES.chromedriver"), "licenses/chromedriver"),
+    *collect_google_oauth_client(),
     *collect_data_files("nicegui"),
     *collect_data_files("certifi"),
     *copy_metadata("nicegui"),
