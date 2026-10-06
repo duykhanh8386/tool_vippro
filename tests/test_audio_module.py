@@ -107,6 +107,7 @@ class AudioUploadTests(unittest.TestCase):
             challenge="challenge",
             botguardResponse="botguard",
             sapisidhash="hash",
+            cookies=[{"name": "SAPISID", "value": "cookie-secret"}],
             cookie_string=lambda: "cookie=value",
         )
         cache_key = module._session_token_cache_key(channel)
@@ -304,7 +305,7 @@ class AudioUploadTests(unittest.TestCase):
     def test_translation_request_matches_studio_audio_table_request(self):
         module = UpdateAudioModule()
         channel = SimpleNamespace(
-            cookies=[],
+            cookies=[{"name": "SAPISID", "value": "cookie-secret"}],
             sapisidhash="hash",
             id="channel",
             delegated_session_id="delegated",
@@ -975,7 +976,7 @@ class AudioUploadTests(unittest.TestCase):
 class AudioDeleteTests(unittest.TestCase):
     def _channel(self):
         return SimpleNamespace(
-            cookies=[],
+            cookies=[{"name": "SAPISID", "value": "cookie-secret"}],
             sapisidhash="hash",
             id="channel",
             delegated_session_id="delegated",

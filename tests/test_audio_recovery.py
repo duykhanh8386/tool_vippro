@@ -550,6 +550,42 @@ class AudioRecoveryRegistryTests(unittest.TestCase):
 
         self.assertEqual(stored["channel_refresh_alerts"], {})
 
+    def test_failed_post_reload_validation_records_red_channel_details(self):
+        stored = {
+            "enabled": True,
+            "entries": {},
+            "channel_refresh_alerts": {},
+        }
+
+        def load(_name):
+            return stored.copy()
+
+        def save(_name, state):
+            stored.clear()
+            stored.update(state)
+            return True
+
+        with (
+            patch("src.audio_recovery.state_manager.load_state", side_effect=load),
+            patch("src.audio_recovery.state_manager.save_state", side_effect=save),
+        ):
+            self.assertTrue(
+                mark_channel_refresh_required(
+                    "channel-a",
+                    "sessionToken=secret rejected",
+                    now=1234,
+                    channel_name="Channel A",
+                    validation_failed=True,
+                )
+            )
+
+        alert = stored["channel_refresh_alerts"]["channel-a"]
+        self.assertEqual(alert["channel_name"], "Channel A")
+        self.assertEqual(alert["requested_at"], 1234)
+        self.assertEqual(alert["severity"], "error")
+        self.assertTrue(alert["validation_failed"])
+        self.assertNotIn("secret", alert["error"])
+
 
 class AudioRecoveryVisibilityTests(unittest.TestCase):
     def test_visibility_lookup_pages_and_rejects_draft_or_scheduled_public(self):

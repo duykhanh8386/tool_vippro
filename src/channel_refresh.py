@@ -14,6 +14,7 @@ from src.channel_store import channel_store
 from src.cookie_utils import inject_cookies_via_cdp
 from src.utils import create_driver, get_request_payload_from_performance_log
 from src.task_runtime import unregister_driver
+from src.youtube_auth import generate_sapisidhash
 
 
 def refresh_challenge_and_botguard(
@@ -56,7 +57,9 @@ def refresh_challenge_and_botguard(
                 "name": rec.get("name", ""),
                 "img_src": rec.get("img_src", ""),
                 "delegated_session_id": rec.get("delegated_session_id", ""),
-                "sapisidhash": rec.get("sapisidhash", ""),
+                # Compatibility snapshot only. Callers generate a fresh
+                # timestamped hash from these cookies for every request.
+                "sapisidhash": generate_sapisidhash(rec.get("cookies", [])),
                 "role": rec.get("role", ""),
                 "challenge": challenge,
                 "botguardResponse": botguardResponse,

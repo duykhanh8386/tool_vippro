@@ -8,6 +8,10 @@ from loguru import logger
 from src.module.model import ChannelInfo, Video, VideoType
 from src.utils import get_channels_info
 from src.task_runtime import post_with_stop
+from src.youtube_auth import (
+    sapisid_cookie_fingerprint,
+    studio_authorization_header,
+)
 
 
 class YouTubeRequestError(RuntimeError):
@@ -75,7 +79,9 @@ class IModule(ABC):
     def _session_token_cache_key(cls, channel_info) -> tuple[str, str, str, str]:
         return (
             str(getattr(channel_info, "id", "") or ""),
-            str(getattr(channel_info, "sapisidhash", "") or ""),
+            sapisid_cookie_fingerprint(
+                getattr(channel_info, "cookies", None)
+            ),
             str(getattr(channel_info, "challenge", "") or ""),
             str(getattr(channel_info, "botguardResponse", "") or ""),
         )
@@ -99,8 +105,17 @@ class IModule(ABC):
         with cls._SESSION_TOKEN_CACHE_LOCK:
             return cls._SESSION_TOKEN_FETCH_LOCKS.setdefault(key, threading.Lock())
 
+    @classmethod
+    def invalidate_session_token_cache(cls, channel_id: str) -> None:
+        """Remove cached session tokens for one channel before a real check."""
+        clean_channel_id = str(channel_id or "").strip()
+        with cls._SESSION_TOKEN_CACHE_LOCK:
+            for key in list(cls._SESSION_TOKEN_CACHE):
+                if key and key[0] == clean_channel_id:
+                    cls._SESSION_TOKEN_CACHE.pop(key, None)
+
     def _list_videos(self, channel_id: str, video_type: VideoType, limit: int=50) -> list[Video]:
-        channel_info = get_channels_info(channel_id); cookie_string = "; ".join([f"{cookie['name']}={cookie['value']}" for cookie in channel_info.cookies]); sapisidhash = channel_info.sapisidhash; session_token = self._get_session_token(channel_info)
+        channel_info = get_channels_info(channel_id); cookie_string = "; ".join([f"{cookie['name']}={cookie['value']}" for cookie in channel_info.cookies]); session_token = self._get_session_token(channel_info)
 
         payload = {"filter": {"and": {"operands": [{"channelIdIs": {"value": channel_info.id}},
     {"and": {"operands": [{"or": {"operands": [{"and": {"operands": [{"privacyIs": {"value": video_type.value}},
@@ -123,7 +138,7 @@ class IModule(ABC):
     "thumbnailEditorState": {"all": True}, "videoResolutions": {"all": True}, "scheduledPublishingDetails": {"all": True},
 
     "visibility": {"all": True},
-    "privateShare": {"all": True}, "sponsorsOnly": {"all": True}, "unlistedExpired": True, "videoTrailers": {"all": True}, "remix": {"isSource": True}, "isPaygated": True}, "context": {"client": {"clientName": 62, "clientVersion": "1.20250910.04.01", "hl": "vi", "gl": "VN", "experimentsToken": "", "utcOffsetMinutes": 420, "userInterfaceTheme": "USER_INTERFACE_THEME_DARK", "screenWidthPoints": 2560, "screenHeightPoints": 578, "screenPixelDensity": 2, "screenDensityFloat": 1.5}, "request": {"returnLogEntry": True, "internalExperimentFlags": [], "eats": "AQH2GtwBdPiAGJ2T8rGKWNAiZQVd_vf3vyyp2_FoLHT9dGCNih8CNaBwmazsAHXcXYwinRh-c35GmB1fvnAapWD1jXwQpZnFLpu81NzfUTeuNdFMKSTZfCxbEJYI", "sessionInfo": {"token": session_token}, "consistencyTokenJars": []}, "user": {"onBehalfOfUser": channel_info.delegated_session_id, "delegationContext": {"externalChannelId": channel_info.id, "roleType": {"channelRoleType": channel_info.role}}, "serializedDelegationContext": ""}, "clickTracking": {"visualElement": {"veType": 31_402}}, "clientScreenNonce": "qplwEzmZ-f8Ac7kX"}}; headers = {"origin": "https://studio.youtube.com", "user-agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36", "cookie": cookie_string, "content-type": "application/json", "authorization": f"SAPISIDHASH {sapisidhash}"}; url = "https://studio.youtube.com/youtubei/v1/creator/list_creator_videos?alt=json"; response = post_with_stop(url=url, headers=headers, json=payload)
+    "privateShare": {"all": True}, "sponsorsOnly": {"all": True}, "unlistedExpired": True, "videoTrailers": {"all": True}, "remix": {"isSource": True}, "isPaygated": True}, "context": {"client": {"clientName": 62, "clientVersion": "1.20250910.04.01", "hl": "vi", "gl": "VN", "experimentsToken": "", "utcOffsetMinutes": 420, "userInterfaceTheme": "USER_INTERFACE_THEME_DARK", "screenWidthPoints": 2560, "screenHeightPoints": 578, "screenPixelDensity": 2, "screenDensityFloat": 1.5}, "request": {"returnLogEntry": True, "internalExperimentFlags": [], "eats": "AQH2GtwBdPiAGJ2T8rGKWNAiZQVd_vf3vyyp2_FoLHT9dGCNih8CNaBwmazsAHXcXYwinRh-c35GmB1fvnAapWD1jXwQpZnFLpu81NzfUTeuNdFMKSTZfCxbEJYI", "sessionInfo": {"token": session_token}, "consistencyTokenJars": []}, "user": {"onBehalfOfUser": channel_info.delegated_session_id, "delegationContext": {"externalChannelId": channel_info.id, "roleType": {"channelRoleType": channel_info.role}}, "serializedDelegationContext": ""}, "clickTracking": {"visualElement": {"veType": 31_402}}, "clientScreenNonce": "qplwEzmZ-f8Ac7kX"}}; headers = {"origin": "https://studio.youtube.com", "user-agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36", "cookie": cookie_string, "content-type": "application/json", "authorization": studio_authorization_header(channel_info.cookies)}; url = "https://studio.youtube.com/youtubei/v1/creator/list_creator_videos?alt=json"; response = post_with_stop(url=url, headers=headers, json=payload)
 
         res = response.json(); videos = []
         for item in res.get("videos", []):
@@ -133,7 +148,7 @@ class IModule(ABC):
 
         cookie = None
     def _get_video_info(self, video_id: str, channel_id: str) -> Video:
-        channel_info = get_channels_info(channel_id); cookie_string = "; ".join([f"{cookie['name']}={cookie['value']}" for cookie in channel_info.cookies]); sapisidhash = channel_info.sapisidhash; session_token = self._get_session_token(channel_info); url = "https://studio.youtube.com/youtubei/v1/creator/get_creator_videos?alt=json"; headers = {"origin": "https://studio.youtube.com", "user-agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36", "cookie": cookie_string, "content-type": "application/json", "authorization": f"SAPISIDHASH {sapisidhash}"}
+        channel_info = get_channels_info(channel_id); cookie_string = "; ".join([f"{cookie['name']}={cookie['value']}" for cookie in channel_info.cookies]); session_token = self._get_session_token(channel_info); url = "https://studio.youtube.com/youtubei/v1/creator/get_creator_videos?alt=json"; headers = {"origin": "https://studio.youtube.com", "user-agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36", "cookie": cookie_string, "content-type": "application/json", "authorization": studio_authorization_header(channel_info.cookies)}
 
         payload = {"context": {"client": {"clientName": 62, "clientVersion": "1.20250905.02.00", "hl": "vi", "gl": "VN", "experimentsToken": "", "utcOffsetMinutes": 420, "userInterfaceTheme": "USER_INTERFACE_THEME_DARK", "screenWidthPoints": 2560, "screenHeightPoints": 544, "screenPixelDensity": 2, "screenDensityFloat": 1.5}, "request": {"returnLogEntry": True, "internalExperimentFlags": [], "eats": "AWSNWa2q-ubSn35ywNe6Myhvveym5w_4-S_D3p_lk689PZciFEJrTquCWvtc1PgiFObkpeU638J5M3CTcvCmegVUfkseMdAJaVgmOWE_S5SHQpzuXaZu1I7szwPPUQ==", "sessionInfo": {"token": session_token}, "consistencyTokenJars": []}, "user": {"onBehalfOfUser": channel_info.delegated_session_id, "delegationContext": {"externalChannelId": channel_info.id, "roleType": {"channelRoleType": channel_info.role}}, "serializedDelegationContext": ""}, "clickTracking": {"visualElement": {"veType": 74_615}}, "clientScreenNonce": "rQg33g-jDrOyosOi"}, "failOnError": True, "videoIds": [video_id], "mask": {"channelId": True, "downloadUrl": True, "origin": True, "premiere": {"all": True},
 
@@ -231,18 +246,23 @@ class IModule(ABC):
         challenge = channel_info.challenge
         bot_guard_response = channel_info.botguardResponse
         user_agent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-        headers = {
-            "origin": "https://studio.youtube.com",
-            "user-agent": user_agent,
-            "cookie": channel_info.cookie_string(),
-            "content-type": "application/json",
-            "authorization": f"SAPISIDHASH {channel_info.sapisidhash}",
-        }
+        def authenticated_headers() -> dict:
+            # SAPISIDHASH embeds a timestamp. Build it immediately before each
+            # request instead of reusing the value persisted during scanning.
+            return {
+                "origin": "https://studio.youtube.com",
+                "user-agent": user_agent,
+                "cookie": channel_info.cookie_string(),
+                "content-type": "application/json",
+                "authorization": studio_authorization_header(
+                    channel_info.cookies
+                ),
+            }
 
         def fetch_attestation_context() -> dict:
             response = post_with_stop(
                 url="https://studio.youtube.com/youtubei/v1/att/esr?alt=json",
-                headers=headers,
+                headers=authenticated_headers(),
                 json={
                     "context": self._build_context(
                         channel_id, role, delegated_session_id
@@ -257,7 +277,7 @@ class IModule(ABC):
         def fetch_reauth_context(ivctx: str) -> dict:
             response = post_with_stop(
                 url="https://studio.youtube.com/youtubei/v1/security/get_web_reauth_url?alt=json",
-                headers=headers,
+                headers=authenticated_headers(),
                 json={
                     "context": self._build_context(
                         channel_id, role, delegated_session_id
@@ -285,11 +305,7 @@ class IModule(ABC):
             channel_info = get_channels_info(channel_id)
             challenge = channel_info.challenge
             bot_guard_response = channel_info.botguardResponse
-            cookie_string = channel_info.cookie_string()
-            sapisidhash = channel_info.sapisidhash
             delegated_session_id = channel_info.delegated_session_id
-            headers["cookie"] = cookie_string
-            headers["authorization"] = f"SAPISIDHASH {sapisidhash}"
             res = fetch_attestation_context()
             if "ctx" not in res:
                 raise Exception("Youtube thay đổi thuật toán. Vui lòng lấy lại thông tin kênh. Nếu sau đó vẫn lỗi, hãy liên hệ admin!!!")
@@ -303,7 +319,7 @@ class IModule(ABC):
 
         response = post_with_stop(
             url="https://studio.youtube.com/youtubei/v1/ars/grst?alt=json",
-            headers=headers,
+            headers=authenticated_headers(),
             json={
                 "context": self._build_context(
                     channel_id,
@@ -344,3 +360,18 @@ class IModule(ABC):
                 created_at,
             )
         return session_token
+
+
+def validate_channel_session_token(channel_id: str) -> bool:
+    """Force YouTube to issue a new session token for a stored channel."""
+    clean_channel_id = str(channel_id or "").strip()
+    channel_info = get_channels_info(clean_channel_id)
+    if channel_info is None:
+        raise ValueError(f"Channel '{clean_channel_id}' not found in database")
+    IModule.invalidate_session_token_cache(clean_channel_id)
+    token = IModule()._get_session_token(channel_info)
+    if not token:
+        raise YouTubeRequestError(
+            "YouTube session token validation returned an empty token"
+        )
+    return True

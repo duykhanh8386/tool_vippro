@@ -5,6 +5,7 @@ from src.module.base import IModule, _response_json_or_error
 from src.module.model import Video, VideoType
 from src.utils import get_channels_info
 from src.task_runtime import check_stopped, post_with_stop
+from src.youtube_auth import studio_authorization_header
 class ListVideosModule(IModule):
     """Public wrapper around IModule._list_videos for use in UI pages."""
     pass
@@ -48,7 +49,6 @@ class ListVideosModule(IModule):
         if channel_info is None:
             raise ValueError(f"Channel '{channel_id}' not found in database")
         cookie_string = channel_info.cookie_string()
-        sapisidhash = channel_info.sapisidhash
         session_token = self._get_session_token(channel_info)
         payload = {"filter": {"and": {"operands": [{"channelIdIs": {"value": channel_info.id}},
     {"videoOriginIs": {"value": "VIDEO_ORIGIN_UPLOAD"}},
@@ -63,7 +63,7 @@ class ListVideosModule(IModule):
     "shorts": {"all": True}, "scheduledPublishingDetails": {"all": True}, "visibility": {"all": True}, "privateShare": {"all": True}, "sponsorsOnly": {"all": True}, "unlistedExpired": True, "videoTrailers": {"all": True}, "remix": {"isSource": True}, "isPaygated": True}, "context": {"client": {"clientName": 62, "clientVersion": "1.20260520.00.00", "hl": "vi", "gl": "VN", "experimentsToken": "", "utcOffsetMinutes": 420, "userInterfaceTheme": "USER_INTERFACE_THEME_DARK", "screenWidthPoints": 1920, "screenHeightPoints": 150, "screenPixelDensity": 1, "screenDensityFloat": 1}, "request": {"returnLogEntry": True, "internalExperimentFlags": [], "eats": self.EATS, "sessionInfo": {"token": session_token}, "consistencyTokenJars": []}, "user": {"onBehalfOfUser": channel_info.delegated_session_id, "delegationContext": {"externalChannelId": channel_info.id, "roleType": {"channelRoleType": channel_info.role}}, "serializedDelegationContext": ""}, "clickTracking": {"visualElement": {"veType": 31_402}}, "clientScreenNonce": self.CLIENT_SCREEN_NONCE}}
         if draft_only:
             payload["filter"]["and"]["operands"].insert(1, {"isDraft": {}})
-        headers = {"origin": "https://studio.youtube.com", "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36", "cookie": cookie_string, "content-type": "application/json", "authorization": f"SAPISIDHASH {sapisidhash}"}
+        headers = {"origin": "https://studio.youtube.com", "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36", "cookie": cookie_string, "content-type": "application/json", "authorization": studio_authorization_header(channel_info.cookies)}
         if page_token:
             payload["pageToken"] = page_token
         url = "https://studio.youtube.com/youtubei/v1/creator/list_creator_videos?alt=json"

@@ -11,6 +11,7 @@ from src.audio_recovery import (
     acknowledge_channel_refresh,
     get_audio_recovery_scan_preferences,
     get_audio_recovery_state,
+    get_channel_refresh_alerts,
     run_audio_recovery_cycle,
     set_audio_recovery_scan_preferences,
 )
@@ -20,6 +21,7 @@ from src.channel_scanner import (
     ChannelScanError,
 )
 from src.channel_store import channel_store
+from src.channel_validation import validate_reloaded_channel_session
 from src.license_manager import get_license_info
 from src.state_manager import state_manager
 from src.utils import get_channels_info
@@ -35,7 +37,7 @@ from web.theme import (
 )
 
 
-def create_studio_content():
+def create_studio_content(*, reload_alerts: bool = False):
     ui_refs = {
         "email_input": None,
         "password_input": None,
@@ -139,7 +141,7 @@ def create_studio_content():
                     on_authenticated=lambda: scan_state.update(authenticated=True),
                     include_channel_ids=(
                         include_channel_ids
-                        if operation == "reload_selected"
+                        if operation in {"reload_selected", "reload_alerts"}
                         else None
                     ),
                     exclude_channel_ids=(
@@ -149,7 +151,7 @@ def create_studio_content():
                     ),
                     include_channel_names=(
                         include_channel_names
-                        if operation == "reload_selected"
+                        if operation in {"reload_selected", "reload_alerts"}
                         else None
                     ),
                     exclude_channel_names=(
@@ -163,14 +165,62 @@ def create_studio_content():
                 for channel in report.channels
                 if isinstance(channel, dict) and channel.get("id")
             ]
-            if acknowledge_channel_refresh(refreshed_channel_ids):
+            validated_channel_ids = list(refreshed_channel_ids)
+            token_failures: dict[str, str] = {}
+            if operation in {"reload_selected", "reload_alerts"}:
+                validated_channel_ids = []
+                channel_names = {
+                    str(channel.get("id") or ""): str(channel.get("name") or "")
+                    for channel in report.channels
+                    if isinstance(channel, dict)
+                }
+                total_to_validate = len(refreshed_channel_ids)
+                with bind_run_context(run_context):
+                    for validation_index, channel_id in enumerate(
+                        refreshed_channel_ids, start=1
+                    ):
+                        channel_name = channel_names.get(channel_id, "")
+                        best_effort_ui(
+                            "show session token validation",
+                            lambda channel_name=channel_name,
+                            channel_id=channel_id,
+                            validation_index=validation_index: processing_status.set_text(
+                                "Đang kiểm tra session token thật "
+                                f"({validation_index}/{total_to_validate}): "
+                                f"{channel_name or channel_id}"
+                            ),
+                        )
+                        validation = await asyncio.to_thread(
+                            validate_reloaded_channel_session,
+                            channel_id,
+                            channel_name,
+                        )
+                        if not validation.successful:
+                            token_failures[channel_id] = channel_name or channel_id
+                        else:
+                            validated_channel_ids.append(channel_id)
+
+            if acknowledge_channel_refresh(validated_channel_ids):
                 asyncio.create_task(run_audio_recovery_cycle())
-            if operation == "reload_selected":
+            if operation in {"reload_selected", "reload_alerts"}:
                 requested_count = len(include_channel_ids)
                 missing_count = len(report.missing_channel_ids)
                 message = (
                     f"Đã load lại {len(report.channels)}/{requested_count} kênh đã chọn."
                 )
+                message += (
+                    f" Session token hợp lệ: {len(validated_channel_ids)}/"
+                    f"{len(refreshed_channel_ids)}."
+                )
+                if token_failures:
+                    failed_channels = ", ".join(
+                        f"{name} ({channel_id})"
+                        for channel_id, name in token_failures.items()
+                    )
+                    message += (
+                        " Kiểm tra token thất bại, cảnh báo vẫn được giữ: "
+                        f"{failed_channels}."
+                    )
                 if missing_count:
                     missing_preview = ", ".join(report.missing_channel_ids[:5])
                     if missing_count > 5:
@@ -187,7 +237,9 @@ def create_studio_content():
                         "không đọc được tên kênh duy nhất."
                     )
                 result_type = (
-                    "warning"
+                    "negative"
+                    if token_failures
+                    else "warning"
                     if report.failures
                     or missing_count
                     or report.unidentified_channel_count
@@ -252,21 +304,33 @@ def create_studio_content():
         if scan_state["run_context"] is not None:
             ui.notify("Đang quét kênh, vui lòng chờ hoặc bấm Hủy.", type="warning")
             return
-        if operation == "reload_selected":
-            preferences = recovery_scope_snapshot()
-            if preferences["scan_mode"] != RECOVERY_SCAN_MODE_SELECTED:
+        if operation in {"reload_selected", "reload_alerts"}:
+            if operation == "reload_alerts":
+                selected_ids = {
+                    str(channel_id).strip()
+                    for channel_id in get_channel_refresh_alerts()
+                    if str(channel_id).strip()
+                }
+            else:
+                preferences = recovery_scope_snapshot()
+                if preferences["scan_mode"] != RECOVERY_SCAN_MODE_SELECTED:
+                    ui.notify(
+                        "Hãy chuyển sang chế độ Danh sách kênh rồi chọn các kênh cần load lại.",
+                        type="warning",
+                    )
+                    return
+                selected_ids = {
+                    str(channel_id).strip()
+                    for channel_id in preferences["selected_channel_ids"]
+                    if str(channel_id).strip()
+                }
+            if not selected_ids:
                 ui.notify(
-                    "Hãy chuyển sang chế độ Danh sách kênh rồi chọn các kênh cần load lại.",
+                    "Không còn kênh nào đang có cảnh báo token."
+                    if operation == "reload_alerts"
+                    else "Chưa chọn kênh nào để load lại.",
                     type="warning",
                 )
-                return
-            selected_ids = {
-                str(channel_id).strip()
-                for channel_id in preferences["selected_channel_ids"]
-                if str(channel_id).strip()
-            }
-            if not selected_ids:
-                ui.notify("Chưa chọn kênh nào để load lại.", type="warning")
                 return
             stored_names = {
                 str(channel.id).strip(): str(channel.name or "").strip()
@@ -282,10 +346,19 @@ def create_studio_content():
                 if stored_names.get(channel_id)
             }
             scan_state["exclude_channel_names"] = set()
-            ui_refs["login_title"].set_text("Load lại kênh đã chọn")
+            ui_refs["login_title"].set_text(
+                "Load lại đúng kênh đang lỗi token"
+                if operation == "reload_alerts"
+                else "Load lại kênh đã chọn"
+            )
             ui_refs["login_copy"].set_text(
-                f"Đăng nhập tài khoản chứa {len(selected_ids)} kênh đã chọn. "
-                "Tool đối chiếu trực tiếp theo tên kênh hiển thị trong danh sách."
+                f"Đăng nhập tài khoản chứa {len(selected_ids)} kênh "
+                + (
+                    "đang lỗi token. "
+                    if operation == "reload_alerts"
+                    else "đã chọn. "
+                )
+                + "Tool chỉ load đúng các Channel ID này và kiểm tra session token thật trước khi gỡ cảnh báo."
             )
             ui_refs["login_submit"].set_text("Load lại")
         else:
@@ -692,6 +765,13 @@ def create_studio_content():
                     ui_refs["login_submit"] = login_submit
 
             load_credentials()
+
+    if reload_alerts:
+        ui.timer(
+            0.1,
+            lambda: open_channel_login("reload_alerts"),
+            once=True,
+        )
 
     license_info = get_license_info()
     expiry_text = format_expiry(license_info)

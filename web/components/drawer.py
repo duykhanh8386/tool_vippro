@@ -52,15 +52,16 @@ def _format_transfer_size(value: int) -> str:
 
 
 def _navigate(route: str) -> None:
+    target_path = route.split("?", 1)[0]
     try:
         current_route = context.client.page.path
     except RuntimeError:
         current_route = nav_state.active_route
-    message = nav_state.blocking_message(current_route, route)
+    message = nav_state.blocking_message(current_route, target_path)
     if message:
         ui.notify(message, type="warning")
         return
-    nav_state.set_active_route(route)
+    nav_state.set_active_route(target_path)
     ui.navigate.to(route)
 
 
@@ -104,32 +105,121 @@ def create_drawer():
 
             recovery_alert_container = ui.column().classes("w-full gap-1")
             recovery_alert_state = {"signature": None}
+            recovery_alert_channel_names: dict[str, str] = {}
+
+            def recovery_alert_channel_name(
+                channel_id: str, alert: dict
+            ) -> str:
+                stored_name = str(alert.get("channel_name") or "").strip()
+                if stored_name:
+                    return stored_name
+                if channel_id not in recovery_alert_channel_names:
+                    try:
+                        channel = get_channels_info(channel_id)
+                        recovery_alert_channel_names[channel_id] = str(
+                            getattr(channel, "name", "") or channel_id
+                        )
+                    except Exception:
+                        recovery_alert_channel_names[channel_id] = channel_id
+                return recovery_alert_channel_names[channel_id]
+
+            def recovery_alert_time(alert: dict) -> str:
+                try:
+                    requested_at = float(alert.get("requested_at") or 0)
+                except (TypeError, ValueError):
+                    requested_at = 0
+                if requested_at <= 0:
+                    return "Không rõ thời điểm"
+                return time.strftime(
+                    "%d/%m/%Y %H:%M:%S", time.localtime(requested_at)
+                )
 
             def refresh_recovery_alert() -> None:
                 alerts = get_channel_refresh_alerts()
-                signature = tuple(sorted(alerts))
+                signature = tuple(
+                    sorted(
+                        (
+                            channel_id,
+                            alert.get("requested_at"),
+                            alert.get("severity"),
+                        )
+                        for channel_id, alert in alerts.items()
+                    )
+                )
                 recovery_alert_container.clear()
                 if not alerts:
                     recovery_alert_state["signature"] = None
                     return
+                has_validation_error = any(
+                    alert.get("severity") == "error"
+                    or alert.get("validation_failed")
+                    for alert in alerts.values()
+                )
+                card_classes = (
+                    "w-full p-2 bg-red-50 border border-red-300 shadow-none"
+                    if has_validation_error
+                    else "w-full p-2 bg-amber-50 border border-amber-300 shadow-none"
+                )
+                title_classes = (
+                    "text-xs font-semibold text-red-900"
+                    if has_validation_error
+                    else "text-xs font-semibold text-amber-900"
+                )
                 with recovery_alert_container:
-                    with ui.card().classes(
-                        "w-full p-2 bg-amber-50 border border-amber-300 shadow-none"
-                    ):
+                    with ui.card().classes(card_classes):
                         ui.label(
-                            f"YouTube thiếu token xác thực cho {len(alerts)} kênh. "
-                            "Hãy đăng nhập và tải lại thông tin kênh."
-                        ).classes("text-xs text-amber-900")
+                            f"YouTube chưa cấp session token cho {len(alerts)} kênh."
+                        ).classes(title_classes)
+                        for channel_id, alert in sorted(alerts.items()):
+                            is_error = bool(
+                                alert.get("severity") == "error"
+                                or alert.get("validation_failed")
+                            )
+                            detail_classes = (
+                                "w-full gap-0 rounded border border-red-200 bg-white/70 p-1.5"
+                                if is_error
+                                else "w-full gap-0 rounded border border-amber-200 bg-white/70 p-1.5"
+                            )
+                            with ui.column().classes(detail_classes):
+                                ui.label(
+                                    recovery_alert_channel_name(channel_id, alert)
+                                ).classes(
+                                    "text-xs font-semibold break-all "
+                                    + (
+                                        "text-red-900"
+                                        if is_error
+                                        else "text-amber-900"
+                                    )
+                                )
+                                ui.label(f"ID: {channel_id}").classes(
+                                    "text-[10px] font-mono break-all select-text text-gray-700"
+                                )
+                                ui.label(
+                                    f"Lỗi lúc: {recovery_alert_time(alert)}"
+                                ).classes("text-[10px] text-gray-600")
+                                if is_error:
+                                    ui.label(
+                                        "Kiểm tra session token thất bại sau khi load lại."
+                                    ).classes("text-[10px] font-medium text-red-700")
                         ui.button(
-                            "Đăng nhập lại",
+                            "Load lại đúng kênh lỗi",
                             icon="refresh",
-                            on_click=lambda: _navigate("/studio"),
-                        ).props("flat dense").classes("text-amber-800")
+                            on_click=lambda: _navigate(
+                                "/studio?reload_alerts=1"
+                            ),
+                        ).props("flat dense no-caps").classes(
+                            "text-red-800"
+                            if has_validation_error
+                            else "text-amber-800"
+                        )
                 if recovery_alert_state["signature"] != signature:
                     ui.notify(
-                        "Tự động khôi phục audio đang tạm dừng vì YouTube không "
-                        "cấp token. Vui lòng đăng nhập và tải lại kênh.",
-                        type="warning",
+                        "Kiểm tra session token thất bại; xem tên và Channel ID "
+                        "trong cảnh báo."
+                        if has_validation_error
+                        else "Tự động khôi phục audio đang tạm dừng vì YouTube không "
+                        "cấp token. Vui lòng đăng nhập và tải lại đúng kênh lỗi.",
+                        type="negative" if has_validation_error else "warning",
                         timeout=0,
                         close_button="Đóng",
                     )

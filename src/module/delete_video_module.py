@@ -5,6 +5,7 @@ from loguru import logger
 from src.module.base import IModule
 from src.utils import get_channels_info
 from src.task_runtime import check_stopped, post_with_stop
+from src.youtube_auth import studio_authorization_header
 
 
 class DeleteVideoModule(IModule):
@@ -29,7 +30,7 @@ class DeleteVideoModule(IModule):
         url = "https://studio.youtube.com/youtubei/v1/video/delete"
         headers = {
             "accept": "*/*",
-            "authorization": f"SAPISIDHASH {channel_info.sapisidhash}",
+            "authorization": studio_authorization_header(channel_info.cookies),
             "content-type": "application/json",
             "cookie": cookie_string,
             "origin": "https://studio.youtube.com",

@@ -10,6 +10,7 @@ or touches the source/original audio track.
 from __future__ import annotations
 
 import asyncio
+import re
 import tempfile
 import threading
 import time
@@ -19,6 +20,7 @@ from typing import Callable, Iterable
 from loguru import logger
 
 from src.audio_language import call_audio_update_with_retry
+from src.channel_store import channel_store
 from src.module.audio_module import update_audio_module
 from src.module.list_videos_module import list_videos_module
 from src.state_manager import state_manager
@@ -46,6 +48,10 @@ MIN_STALE_PROCESSING_SCANS = 2
 CAPTION_STATUS_CHECK_INTERVAL_SECONDS = 6 * 60 * 60
 CAPTION_REPAIR_VERIFY_SECONDS = 15 * 60
 REAUTH_ALERT_REASON = "encoded_reauth_proof_token_missing"
+_REFRESH_ALERT_SECRET_RE = re.compile(
+    r"(?i)\b(authorization|cookie|sapisidhash|sessiontoken|token)\b"
+    r"\s*[:=]\s*(?:\"[^\"]*\"|'[^']*'|\S+)"
+)
 PUBLIC_VIDEO_PRIVACY_VALUES = {
     "PUBLIC",
     "VIDEO_PRIVACY_PUBLIC",
@@ -605,30 +611,51 @@ def mark_channel_refresh_required(
     error: BaseException | str,
     *,
     now: float | None = None,
+    channel_name: str = "",
+    validation_failed: bool = False,
 ) -> bool:
     """Persist a reload warning after YouTube rejects the reauth proof flow."""
     clean_channel_id = str(channel_id or "").strip()
     if not clean_channel_id:
         return False
     requested_at = float(now if now is not None else time.time())
+    clean_channel_name = str(channel_name or "").strip()
+    if not clean_channel_name:
+        try:
+            channel = channel_store.get_channel(clean_channel_id) or {}
+            clean_channel_name = str(channel.get("name") or "").strip()
+        except Exception:
+            clean_channel_name = ""
+    error_text = " ".join(str(error or "").split())
+    error_text = _REFRESH_ALERT_SECRET_RE.sub(
+        lambda match: f"{match.group(1)}=<redacted>", error_text
+    )[:500]
     with _STATE_LOCK:
         state = _load_state()
         alerts = state.setdefault("channel_refresh_alerts", {})
         alerts[clean_channel_id] = {
             "requested_at": requested_at,
             "reason": REAUTH_ALERT_REASON,
-            "error": str(error),
+            "channel_name": clean_channel_name,
+            "error": error_text,
+            "severity": "error" if validation_failed else "warning",
+            "validation_failed": bool(validation_failed),
             "message": (
-                "YouTube không cấp token xác thực cho kênh. Vui lòng đăng nhập "
+                "Kiểm tra session token thất bại sau khi load lại kênh."
+                if validation_failed
+                else "YouTube không cấp token xác thực cho kênh. Vui lòng đăng nhập "
                 "và tải lại thông tin kênh để tiếp tục tự động khôi phục audio."
             ),
         }
         saved = state_manager.save_state(RECOVERY_STATE_NAME, state)
     if saved:
-        logger.warning(
-            "Audio auto-recovery paused for channel={}: missing encodedReauthProofToken; "
-            "login/channel reload required.",
+        log = logger.error if validation_failed else logger.warning
+        log(
+            "Audio auto-recovery paused for channel={} name={!r}: session token "
+            "validation_failed={}; login/channel reload required.",
             clean_channel_id,
+            clean_channel_name,
+            bool(validation_failed),
         )
     return saved
 

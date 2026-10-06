@@ -1,5 +1,4 @@
 # RECOVERED: reconstructed from CPython 3.12 bytecode
-import hashlib
 import json
 import re
 import time
@@ -29,6 +28,7 @@ from src.channel_store import channel_store
 from src.cookie_utils import normalize_cookies_for_storage
 from src.utils import create_driver, get_request_payload_from_performance_log
 from src.task_runtime import TaskStopped, current_run_context, unregister_driver
+from src.youtube_auth import generate_sapisidhash
 
 
 AUTHENTICATION_TIMEOUT_SECONDS = 10 * 60
@@ -1369,18 +1369,17 @@ class ChannelFetcher:
         cookies = normalize_cookies_for_storage(cookies_raw)
         logger.info(f"*** Channel info fetched successfully: {name} ***")
 
-        sapisidhash = None
-        for cookie in cookies:
-            if cookie["name"] == "SAPISID":
-                sapisid = cookie["value"]
-                sapisidhash = self._generate_sapisidhash_header(sapisid)
-        if not sapisidhash:
+        try:
+            # Kept in storage for backward compatibility only. API requests
+            # always generate their own timestamped value from the cookie.
+            sapisidhash = generate_sapisidhash(cookies)
+        except Exception as exc:
             raise ChannelScanError(
                 ChannelScanErrorCategory.AUTH_ERROR,
                 step="channel_cookies",
                 detail="Authenticated browser session is missing the SAPISID cookie",
                 channel_id=id,
-            )
+            ) from exc
 
         next_url = (
             f"https://studio.youtube.com/channel/{id}"
@@ -1486,11 +1485,9 @@ class ChannelFetcher:
 
     @staticmethod
     def _generate_sapisidhash_header(sapisid, origin="https://studio.youtube.com"):
-        time_now = round(time.time())
-        sapisidhash = hashlib.sha1(
-            f"{time_now} {sapisid} {origin}".encode("utf-8")
-        ).hexdigest()
-        return f"{time_now}_{sapisidhash}"
+        return generate_sapisidhash(
+            [{"name": "SAPISID", "value": sapisid}], origin=origin
+        )
 
     @staticmethod
     def _get_role_type(text):

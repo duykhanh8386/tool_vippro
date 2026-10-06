@@ -13,6 +13,7 @@ from src.task_runtime import (
     post_with_stop,
     wait_interruptibly,
 )
+from src.youtube_auth import studio_authorization_header
 
 _USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
 
@@ -240,7 +241,7 @@ class UploadVideoModule(IModule):
         }
         headers = {
             "Host": "studio.youtube.com", "Cookie": cookie_string,
-            "Authorization": f"SAPISIDHASH {channel_info.sapisidhash}", "Content-Type": "application/json",
+            "Authorization": studio_authorization_header(channel_info.cookies), "Content-Type": "application/json",
             "Origin": "https://studio.youtube.com", "X-Origin": "https://studio.youtube.com",
             "Referer": "https://studio.youtube.com/", "User-Agent": _USER_AGENT, "X-Goog-AuthUser": "0",
             "X-Youtube-Client-Name": "62", "X-Youtube-Client-Version": "1.20260708.06.00",

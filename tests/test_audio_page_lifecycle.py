@@ -340,6 +340,7 @@ class AudioPageLifecycleTests(unittest.IsolatedAsyncioTestCase):
             delegated_session_id="delegate",
             role="CREATOR_CHANNEL_ROLE_TYPE_OWNER",
             sapisidhash="hash",
+            cookies=[{"name": "SAPISID", "value": "cookie-secret"}],
             cookie_string=lambda: "SID=value",
         )
         response = SimpleNamespace(status_code=200, json=lambda: {"videos": []})
