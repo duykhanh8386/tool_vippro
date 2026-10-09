@@ -1,7 +1,6 @@
 # RECOVERED: clean-room implementation based on NiceGUI components & delete_back_flow pipeline API
 import asyncio
 import csv
-import random
 import threading
 from datetime import datetime
 from pathlib import Path
@@ -13,6 +12,7 @@ from src.channel_store import channel_store
 from src.module.delete_video_module import delete_video_module
 from src.module.list_videos_module import list_videos_module
 from src.module.upload_video_module import upload_video_module
+from src.music_assignment import build_balanced_music_plan
 from src.state_manager import state_manager
 from src.task_runtime import (
     TaskStopped,
@@ -828,10 +828,7 @@ def create_delete_back_flow_page():
             )
             item["duration_error"] = ""
 
-        if run_config["random_music"]:
-            music = random.choice(musics)
-        else:
-            music = musics[index % len(musics)]
+        music = run_config["music_plan"][index]
 
         await _render_delete_back_output(
             item, output_folder, music, index, run_config["overlay_png"]
@@ -1198,6 +1195,11 @@ def create_delete_back_flow_page():
             "channel_id": selected_channel["id"],
             "channel_name": channel_snapshot.name or selected_channel["id"],
             "random_music": bool(options_state["random_music"]),
+            "music_plan": build_balanced_music_plan(
+                musics,
+                videos_state["items"],
+                randomize=bool(options_state["random_music"]),
+            ),
             "overlay_png": channel_snapshot.overlay_png or "",
         }
 
@@ -1540,6 +1542,10 @@ def create_delete_back_flow_page():
                 "Nhạc ngẫu nhiên",
                 value=options_state["random_music"],
                 on_change=on_random_change,
+            )
+            random_switch.tooltip(
+                "Bật: trộn thứ tự nhạc nhưng cân bằng số lần sử dụng "
+                "(chênh tối đa 1). Tắt: ghép lần lượt theo tên file."
             )
             ui_refs["random_switch"] = random_switch
 

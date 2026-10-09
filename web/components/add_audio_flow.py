@@ -1,5 +1,5 @@
 # RECOVERED: partial depyo recovery; unresolved regions marked below
-import asyncio, random, tempfile, threading, time
+import asyncio, tempfile, threading, time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from loguru import logger
@@ -17,6 +17,7 @@ from src.module.upload_video_module import (
     VideoProcessingState,
     upload_video_module,
 )
+from src.music_assignment import build_balanced_music_plan
 from src.state_manager import state_manager
 from src.task_runtime import (
     TaskStopped,
@@ -726,10 +727,7 @@ def create_add_audio_flow_page():
             )
             item["duration_error"] = ""
 
-        if run_config["random_music"]:
-            music = random.choice(musics)
-        else:
-            music = musics[index % len(musics)]
+        music = run_config["music_plan"][index]
         item["music"] = music.name
         item["music_path"] = str(music)
 
@@ -1408,6 +1406,11 @@ def create_add_audio_flow_page():
         run_config = {
             "channel_id": selected_channel["id"],
             "random_music": bool(options_state["random_music"]),
+            "music_plan": build_balanced_music_plan(
+                musics,
+                items,
+                randomize=bool(options_state["random_music"]),
+            ),
             "audio_languages": audio_languages,
             "overlay_png": channel_snapshot.overlay_png or "",
         }
@@ -1672,7 +1675,7 @@ def create_add_audio_flow_page():
 
             save_state()
         def render_music_switch():
-            random_switch = ui.switch("Nhạc ngẫu nhiên", value=options_state["random_music"], on_change=on_random_change).props("dense size=sm").classes("text-sm"); random_switch.tooltip("Bật: mỗi video lấy 1 nhạc ngẫu nhiên. Tắt: ghép lần lượt theo tên file.")
+            random_switch = ui.switch("Nhạc ngẫu nhiên", value=options_state["random_music"], on_change=on_random_change).props("dense size=sm").classes("text-sm"); random_switch.tooltip("Bật: trộn thứ tự nhạc nhưng cân bằng số lần sử dụng (chênh tối đa 1). Tắt: ghép lần lượt theo tên file.")
             ui_refs["random_switch"] = random_switch
         with ui.row().classes("w-full gap-3 flex-wrap items-stretch"):
             build_folder_selector("video_folder", "Folder video", "Chọn folder chứa video", "movie", on_after=load_videos)
