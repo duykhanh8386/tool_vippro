@@ -10,10 +10,12 @@ from src.audio_recovery import (
     RECOVERY_SCAN_MODE_SELECTED,
     acknowledge_channel_refresh,
     get_audio_recovery_scan_preferences,
+    get_audio_recovery_registry_items,
     get_audio_recovery_state,
     get_channel_refresh_alerts,
     run_audio_recovery_cycle,
     set_audio_recovery_scan_preferences,
+    set_audio_recovery_items_enabled,
 )
 from src.channel_scanner import (
     AUTHENTICATION_TIMEOUT_SECONDS,
@@ -26,6 +28,7 @@ from src.license_manager import get_license_info
 from src.state_manager import state_manager
 from src.utils import get_channels_info
 from src.task_runtime import TaskStopped, bind_run_context, create_run_context
+from web.components.auto_registry import create_auto_registry_content
 from web.theme import (
     app_card,
     app_table,
@@ -574,23 +577,26 @@ def create_studio_content(*, reload_alerts: bool = False):
         mode = preferences["scan_mode"]
         selected = set(preferences["selected_channel_ids"])
         try:
-            registry_channel_ids = set(
-                (get_audio_recovery_state().get("entries") or {}).keys()
-            )
+            registry_channels, _ = get_audio_recovery_registry_items()
+            active_channel_count = sum(item["enabled"] for item in registry_channels)
         except Exception:
-            registry_channel_ids = set()
+            active_channel_count = 0
 
         if mode == RECOVERY_SCAN_MODE_ALL:
             summary.set_text(
-                "Mặc định: quét video công khai của toàn bộ "
-                f"{len(registry_channel_ids)} kênh đang có trong Auto Registry."
+                f"Quét video công khai của {active_channel_count} kênh đang bật "
+                "trong Auto Registry. Kênh và video đã tắt sẽ được bỏ qua."
             )
         else:
             visible_ids = {channel.id for channel in channels}
-            visible_selected = len(selected & visible_ids)
+            disabled_ids = set(
+                get_audio_recovery_state().get("disabled_channel_ids") or []
+            )
+            visible_selected = len((selected & visible_ids) - disabled_ids)
             summary.set_text(
                 f"Đã chọn {visible_selected}/{len(channels)} kênh trong danh sách. "
-                "Kênh bỏ chọn vẫn được giữ nguyên Registry và lịch sử."
+                f"{active_channel_count} kênh Registry được phép quét. "
+                "Kênh và video đã tắt sẽ được bỏ qua."
             )
 
         actions = recovery_scope_refs.get("selection_actions")
@@ -614,7 +620,7 @@ def create_studio_content(*, reload_alerts: bool = False):
         refresh_channel_list()
         if requested_mode == RECOVERY_SCAN_MODE_ALL:
             ui.notify(
-                "Auto Registry sẽ quét tất cả kênh trong lịch sử.",
+                "Auto Registry sẽ quét tất cả kênh đang bật trong lịch sử.",
                 type="positive",
             )
         else:
@@ -631,6 +637,12 @@ def create_studio_content(*, reload_alerts: bool = False):
             selected = set(preferences["selected_channel_ids"])
             if bool(event.value):
                 selected.add(channel_id)
+                if not set_audio_recovery_items_enabled(
+                    enabled=True, channel_ids=[channel_id]
+                ):
+                    ui.notify("Không thể bật tự động quét cho kênh.", type="negative")
+                    refresh_channel_list()
+                    return
             else:
                 selected.discard(channel_id)
             if not set_audio_recovery_scan_preferences(
@@ -641,11 +653,18 @@ def create_studio_content(*, reload_alerts: bool = False):
                 refresh_channel_list()
                 return
             update_recovery_scope_summary()
+            refresh_registry()
 
         return handler
 
     def select_all_recovery_channels() -> None:
-        channel_ids = [channel.id for channel in (get_channels_info() or [])]
+        disabled_ids = set(
+            get_audio_recovery_state().get("disabled_channel_ids") or []
+        )
+        channel_ids = [
+            channel.id for channel in (get_channels_info() or [])
+            if channel.id not in disabled_ids
+        ]
         if set_audio_recovery_scan_preferences(
             scan_mode=RECOVERY_SCAN_MODE_SELECTED,
             selected_channel_ids=channel_ids,
@@ -798,13 +817,13 @@ def create_studio_content(*, reload_alerts: bool = False):
             initial_recovery_scope = recovery_scope_snapshot()
             with section_header(
                 "Phạm vi Auto Registry",
-                "Chọn quét toàn bộ kênh trong lịch sử hoặc chỉ các kênh đánh dấu bên dưới.",
+                "Mặc định quét tất cả các kênh. Kênh Deactive vẫn ở trong danh sách và được bỏ qua khi quét.",
             ):
                 pass
             with ui.row().classes("w-full items-center gap-3 flex-wrap"):
                 recovery_scope_toggle = ui.toggle(
                     {
-                        RECOVERY_SCAN_MODE_ALL: "Tất cả các kênh",
+                        RECOVERY_SCAN_MODE_ALL: "Tất cả các kênh (mặc định)",
                         RECOVERY_SCAN_MODE_SELECTED: "Danh sách kênh",
                     },
                     value=initial_recovery_scope["scan_mode"],
@@ -861,6 +880,10 @@ def create_studio_content(*, reload_alerts: bool = False):
 
             channels_container = ui.column().classes("w-full gap-0")
 
+        refresh_registry = create_auto_registry_content(
+            on_change=lambda: refresh_channel_list()
+        )
+
         with app_card(compact=True):
             with ui.row().classes("w-full items-center gap-3"):
                 with ui.element("div").classes(
@@ -885,6 +908,9 @@ def create_studio_content(*, reload_alerts: bool = False):
         preferences = recovery_scope_snapshot()
         recovery_scan_mode = preferences["scan_mode"]
         recovery_selected_ids = set(preferences["selected_channel_ids"])
+        disabled_channel_ids = set(
+            get_audio_recovery_state().get("disabled_channel_ids") or []
+        )
         channels_container.clear()
         channel_count_label.set_text(f"{len(channels)} kênh")
         more_actions_button.set_visibility(bool(channels))
@@ -892,6 +918,7 @@ def create_studio_content(*, reload_alerts: bool = False):
         if toggle is not None and toggle.value != recovery_scan_mode:
             toggle.value = recovery_scan_mode
         update_recovery_scope_summary(channels)
+        refresh_registry()
 
         with channels_container:
             if not channels:
@@ -911,18 +938,22 @@ def create_studio_content(*, reload_alerts: bool = False):
                     ui.label("Quét")
                     ui.label("Kênh")
                     ui.label("Channel ID")
-                    ui.label("Trạng thái")
+                    ui.label("Auto Registry")
                     ui.label("")
                 for channel_data in channels:
                     name = channel_data.name
                     avatar = channel_data.img_src
                     channel_id = channel_data.id
+                    recovery_channel_active = (
+                        channel_id not in disabled_channel_ids
+                        and (
+                            recovery_scan_mode == RECOVERY_SCAN_MODE_ALL
+                            or channel_id in recovery_selected_ids
+                        )
+                    )
                     with ui.element("div").classes("app-table-row"):
                         recovery_checkbox = ui.checkbox(
-                            value=(
-                                recovery_scan_mode == RECOVERY_SCAN_MODE_ALL
-                                or channel_id in recovery_selected_ids
-                            ),
+                            value=recovery_channel_active,
                             on_change=create_recovery_channel_toggle_handler(
                                 channel_id
                             ),
@@ -930,7 +961,7 @@ def create_studio_content(*, reload_alerts: bool = False):
                         if recovery_scan_mode == RECOVERY_SCAN_MODE_ALL:
                             recovery_checkbox.props("disable")
                             recovery_checkbox.tooltip(
-                                "Chế độ Tất cả các kênh đang bật"
+                                "Quản lý bật/tắt kênh trong danh sách Auto Registry bên dưới"
                             )
                         with ui.row().classes("items-center gap-3 min-w-0"):
                             if avatar:
@@ -952,7 +983,10 @@ def create_studio_content(*, reload_alerts: bool = False):
                         ui.label(channel_id).classes(
                             "text-xs text-gray-500 truncate"
                         ).tooltip(channel_id)
-                        status_badge("Đã kết nối", "success")
+                        status_badge(
+                            "Active" if recovery_channel_active else "Deactive",
+                            "success" if recovery_channel_active else "neutral",
+                        )
                         ui.button(
                             icon="delete_outline",
                             on_click=create_delete_click_handler(channel_id, name),
