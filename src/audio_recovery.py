@@ -241,6 +241,7 @@ def _default_state() -> dict:
         "selected_channel_ids": [],
         "disabled_channel_ids": [],
         "disabled_video_ids": {},
+        "removed_video_ids": {},
         "interval_seconds": DEFAULT_RECOVERY_INTERVAL_SECONDS,
         "retry_cooldown_seconds": DEFAULT_RECOVERY_RETRY_COOLDOWN_SECONDS,
         "initial_grace_seconds": DEFAULT_INITIAL_RECOVERY_GRACE_SECONDS,
@@ -268,6 +269,9 @@ def _load_state() -> dict:
     )
     state["disabled_video_ids"] = _normalize_video_ids_by_channel(
         state.get("disabled_video_ids")
+    )
+    state["removed_video_ids"] = _normalize_video_ids_by_channel(
+        state.get("removed_video_ids")
     )
     if not isinstance(state.get("channel_refresh_alerts"), dict):
         state["channel_refresh_alerts"] = {}
@@ -353,8 +357,11 @@ def _video_is_in_recovery_scope(state: dict, channel_id: str, video_id: str) -> 
     clean_channel = str(channel_id or "").strip()
     clean_video = str(video_id or "").strip()
     disabled = _normalize_video_ids_by_channel(state.get("disabled_video_ids"))
+    entries = (state.get("entries") or {}).get(clean_channel, {})
     return (
         bool(clean_video)
+        and isinstance(entries, dict)
+        and isinstance(entries.get(clean_video), dict)
         and _channel_is_in_recovery_scope(state, clean_channel)
         and clean_video not in disabled.get(clean_channel, [])
     )
@@ -446,6 +453,14 @@ def register_audio_recovery(
                 previous["processing_observations"]
             )
         videos[clean_video] = updated_entry
+        # A new manual submission can enroll a previously removed video again.
+        removed = _normalize_video_ids_by_channel(state.get("removed_video_ids"))
+        remaining = [video for video in removed.get(clean_channel, []) if video != clean_video]
+        if remaining:
+            removed[clean_channel] = remaining
+        else:
+            removed.pop(clean_channel, None)
+        state["removed_video_ids"] = removed
         saved = state_manager.save_state(RECOVERY_STATE_NAME, state)
     if saved:
         logger.info(
@@ -524,6 +539,10 @@ def import_add_audio_flow_recovery_state() -> int:
             recovery_state.get("entries", {}).get(channel_id, {}) or {}
         )
         existing_video_ids = set(existing_videos)
+        removed_video_ids = set(
+            _normalize_video_ids_by_channel(recovery_state.get("removed_video_ids"))
+            .get(channel_id, [])
+        )
 
     imported = 0
     for item in statuses.values():
@@ -531,7 +550,11 @@ def import_add_audio_flow_recovery_state() -> int:
             continue
         video_id = str(item.get("video_id") or "").strip()
         audio_path = str(item.get("music_path") or "").strip()
-        if not video_id or not audio_path or video_id in existing_video_ids:
+        if (
+            not video_id or not audio_path
+            or video_id in existing_video_ids
+            or video_id in removed_video_ids
+        ):
             continue
 
         language_results = item.get("audio_language_results") or {}
@@ -681,7 +704,13 @@ def _enabled_recovery_video_ids(channel_id: str, video_ids: Iterable[str]) -> li
             return []
         disabled = _normalize_video_ids_by_channel(state.get("disabled_video_ids"))
         excluded = set(disabled.get(channel_id, []))
-        return [video_id for video_id in video_ids if video_id not in excluded]
+        entries = (state.get("entries") or {}).get(channel_id, {})
+        if not isinstance(entries, dict):
+            return []
+        return [
+            video_id for video_id in video_ids
+            if video_id not in excluded and isinstance(entries.get(video_id), dict)
+        ]
 
 
 def set_audio_recovery_items_enabled(
@@ -726,6 +755,70 @@ def set_audio_recovery_items_enabled(
             else:
                 disabled_videos.pop(channel_id, None)
         state["disabled_video_ids"] = disabled_videos
+        return state_manager.save_state(RECOVERY_STATE_NAME, state)
+
+
+def remove_audio_recovery_items(
+    *,
+    channel_ids: Iterable[str] = (),
+    video_ids_by_channel: Mapping[str, Iterable[str]] | None = None,
+) -> bool:
+    """Remove selected registry entries and stop scheduling their recovery.
+
+    Remember removed video IDs so the legacy startup import cannot resurrect
+    them. Other registry entries and manual-page history remain intact.
+    """
+    clean_channels = set(_normalize_channel_ids(channel_ids))
+    clean_videos = _normalize_video_ids_by_channel(video_ids_by_channel)
+    if not clean_channels and not clean_videos:
+        return False
+    with _STATE_LOCK:
+        state = _load_state()
+        entries = state["entries"]
+        removed = _normalize_video_ids_by_channel(state.get("removed_video_ids"))
+        disabled_videos = _normalize_video_ids_by_channel(state.get("disabled_video_ids"))
+        empty_channels = set()
+
+        for channel_id in clean_channels:
+            channel_entries = entries.pop(channel_id, {})
+            if isinstance(channel_entries, dict):
+                removed[channel_id] = sorted(
+                    set(removed.get(channel_id, [])) | set(channel_entries)
+                )
+            disabled_videos.pop(channel_id, None)
+            empty_channels.add(channel_id)
+
+        for channel_id, video_ids in clean_videos.items():
+            channel_entries = entries.get(channel_id)
+            if isinstance(channel_entries, dict):
+                for video_id in video_ids:
+                    channel_entries.pop(video_id, None)
+                if not channel_entries:
+                    entries.pop(channel_id, None)
+                    empty_channels.add(channel_id)
+            removed[channel_id] = sorted(
+                set(removed.get(channel_id, [])) | set(video_ids)
+            )
+            excluded = set(disabled_videos.get(channel_id, [])) - set(video_ids)
+            if excluded:
+                disabled_videos[channel_id] = sorted(excluded)
+            else:
+                disabled_videos.pop(channel_id, None)
+
+        state["disabled_channel_ids"] = [
+            channel_id for channel_id in state.get("disabled_channel_ids", [])
+            if channel_id not in clean_channels
+        ]
+        state["selected_channel_ids"] = [
+            channel_id for channel_id in state.get("selected_channel_ids", [])
+            if channel_id not in clean_channels
+        ]
+        state["disabled_video_ids"] = disabled_videos
+        state["removed_video_ids"] = _normalize_video_ids_by_channel(removed)
+        alerts = state.get("channel_refresh_alerts") or {}
+        for channel_id in empty_channels:
+            alerts.pop(channel_id, None)
+        state["channel_refresh_alerts"] = alerts
         return state_manager.save_state(RECOVERY_STATE_NAME, state)
 
 

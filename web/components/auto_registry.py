@@ -7,6 +7,7 @@ from nicegui import ui
 
 from src.audio_recovery import (
     get_audio_recovery_registry_items,
+    remove_audio_recovery_items,
     set_audio_recovery_items_enabled,
 )
 from src.utils import get_channels_info
@@ -112,6 +113,75 @@ def create_auto_registry_content(*, on_change: Callable[[], None] | None = None)
         if row is not None:
             set_items_enabled("channels", not row["enabled"], [row])
 
+    def confirm_remove(scope: str, items: list[dict] | None = None) -> None:
+        table = tables[scope]
+        selected = list(table.selected if items is None else items)
+        if not selected:
+            ui.notify("Hãy tick chọn kênh hoặc video cần xóa.", type="info")
+            return
+        item_type = "kênh" if scope == "channels" else "video"
+        channel_ids = []
+        video_ids_by_channel = {}
+        if scope == "channels":
+            channel_ids = [row["channel_id"] for row in selected]
+        else:
+            for row in selected:
+                video_ids_by_channel.setdefault(row["channel_id"], []).append(
+                    row["video_id"]
+                )
+
+        def remove() -> None:
+            if not remove_audio_recovery_items(
+                channel_ids=channel_ids, video_ids_by_channel=video_ids_by_channel
+            ):
+                ui.notify("Không thể xóa các mục khỏi Auto Registry.", type="negative")
+                return
+            dialog.close()
+            refresh()
+            if on_change is not None:
+                on_change()
+            ui.notify(
+                f"Đã xóa {len(selected)} {item_type} khỏi Auto Registry.",
+                type="positive",
+            )
+
+        with ui.dialog() as dialog:
+            with ui.card().classes("app-card w-full max-w-lg"):
+                ui.label("Xóa khỏi Auto Registry").classes("app-section-title")
+                message = (
+                    f"Xóa {len(selected)} {item_type} khỏi danh sách "
+                    "và ngừng tự động quét."
+                )
+                if scope == "channels":
+                    video_count = sum(row["video_count"] for row in selected)
+                    message += (
+                        f" Toàn bộ {video_count} video của các kênh này "
+                        "cũng sẽ được gỡ khỏi Registry."
+                    )
+                ui.label(message).classes("app-section-copy")
+                with ui.column().classes(
+                    "w-full max-h-48 overflow-auto gap-1 rounded border border-gray-200 p-2"
+                ):
+                    for row in selected:
+                        description = row["channel_id"]
+                        if scope == "videos":
+                            description += f' / {row["video_id"]}'
+                        ui.label(description).classes("text-xs font-mono break-all")
+                with ui.row().classes("w-full justify-end gap-2"):
+                    ui.button("Hủy", on_click=dialog.close).classes("app-button-secondary")
+                    ui.button("Xóa", icon="delete_outline", on_click=remove).classes(
+                        "app-button-danger"
+                    )
+        dialog.open()
+
+    def remove_row(scope: str, event) -> None:
+        row_id = str(event.args.get("id") or "")
+        row = next(
+            (item for item in tables[scope].rows if item["id"] == row_id), None
+        )
+        if row is not None:
+            confirm_remove(scope, [row])
+
     def create_table(scope: str, columns: list[dict]) -> None:
         with ui.row().classes("w-full items-center gap-2 flex-wrap"):
             search = ui.input("Tìm theo ID hoặc tên kênh").props(
@@ -131,6 +201,11 @@ def create_auto_registry_content(*, on_change: Callable[[], None] | None = None)
             ).classes("app-button-secondary").props("no-caps").tooltip(
                 "Bật lại tự động quét các mục đã tick chọn"
             )
+            remove_selected = ui.button(
+                "Xóa khỏi danh sách",
+                icon="delete_outline",
+                on_click=lambda: confirm_remove(scope),
+            ).classes("app-button-danger").props("no-caps")
         table = ui.table(
             columns=columns,
             rows=[],
@@ -148,17 +223,25 @@ def create_auto_registry_content(*, on_change: Callable[[], None] | None = None)
             '{{ props.row.inactive_reason }}</q-tooltip>'
             '</q-badge></q-td>',
         )
+        channel_action = (
+            '<q-btn flat dense no-caps '
+            ':label="props.row.enabled ? \'Deactive\' : \'Active\'" '
+            ':color="props.row.enabled ? \'negative\' : \'positive\'" '
+            ':icon="props.row.enabled ? \'pause_circle_outline\' : \'play_circle_outline\'" '
+            '@click="$parent.$emit(\'toggle-active\', {id: props.row.id})" />'
+            if scope == "channels" else ""
+        )
+        table.add_slot(
+            "body-cell-actions",
+            '<q-td :props="props"><div class="row no-wrap items-center q-gutter-xs">'
+            + channel_action
+            + '<q-btn flat dense no-caps label="Xóa" icon="delete_outline" color="negative" '
+            '@click="$parent.$emit(\'remove-item\', {id: props.row.id})" />'
+            '</div></q-td>',
+        )
         if scope == "channels":
-            table.add_slot(
-                "body-cell-actions",
-                '<q-td :props="props"><q-btn flat dense no-caps '
-                ':label="props.row.enabled ? \'Deactive\' : \'Active\'" '
-                ':color="props.row.enabled ? \'negative\' : \'positive\'" '
-                ':icon="props.row.enabled ? \'pause_circle_outline\' : \'play_circle_outline\'" '
-                '@click="$parent.$emit(\'toggle-active\', {id: props.row.id})" />'
-                '</q-td>',
-            )
             table.on("toggle-active", toggle_channel)
+        table.on("remove-item", lambda event: remove_row(scope, event))
         table.add_slot(
             "no-data",
             '<div class="w-full text-center text-grey q-pa-md">'
@@ -168,6 +251,7 @@ def create_auto_registry_content(*, on_change: Callable[[], None] | None = None)
         search.bind_value_to(table, "filter", forward=lambda value: value or "")
         deactivate.bind_enabled_from(table, "selected", backward=bool)
         activate.bind_enabled_from(table, "selected", backward=bool)
+        remove_selected.bind_enabled_from(table, "selected", backward=bool)
         ui.label().bind_text_from(
             table, "selected", backward=lambda rows: f"Đã chọn {len(rows)} mục"
         ).classes("text-xs text-gray-500")
@@ -176,7 +260,7 @@ def create_auto_registry_content(*, on_change: Callable[[], None] | None = None)
     with app_card():
         with section_header(
             "Auto Registry",
-            "Tick chọn các mục rồi bấm Active / Deactive, hoặc dùng nút trên từng dòng kênh.",
+            "Tick chọn các mục để Active, Deactive hoặc xóa khỏi danh sách; có thể dùng nút trên từng dòng.",
         ):
             ui.button(icon="refresh", on_click=refresh).props(
                 "flat round dense"
@@ -208,6 +292,7 @@ def create_auto_registry_content(*, on_change: Callable[[], None] | None = None)
                     {"name": "name", "label": "Kênh", "field": "name"},
                     {"name": "languages", "label": "Ngôn ngữ audio", "field": "languages"},
                     {"name": "status", "label": "Trạng thái", "field": "status"},
+                    {"name": "actions", "label": "Thao tác", "field": "id", "sortable": False},
                 ])
     refresh()
     ui.timer(5.0, refresh)

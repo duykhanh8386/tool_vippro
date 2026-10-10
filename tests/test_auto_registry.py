@@ -12,9 +12,11 @@ from src.audio_recovery import (
     get_audio_recovery_registry_items,
     get_audio_recovery_scan_preferences,
     get_audio_recovery_state,
+    import_add_audio_flow_recovery_state,
     is_audio_recovery_channel_enabled,
     is_audio_recovery_video_enabled,
     register_audio_recovery,
+    remove_audio_recovery_items,
     run_audio_recovery_cycle,
     set_audio_recovery_items_enabled,
     set_audio_recovery_scan_preferences,
@@ -135,6 +137,74 @@ class AutoRegistryPersistenceTests(RegistryStorage, unittest.TestCase):
             ))
         self.assertTrue(is_audio_recovery_channel_enabled("channel-a"))
 
+    def test_removing_channel_removes_all_its_videos_and_scope_settings(self):
+        set_audio_recovery_scan_preferences(
+            scan_mode=RECOVERY_SCAN_MODE_SELECTED,
+            selected_channel_ids=["channel-a", "channel-b"],
+        )
+        set_audio_recovery_items_enabled(
+            enabled=False, channel_ids=["channel-a"],
+            video_ids_by_channel={"channel-a": ["video-shared"]},
+        )
+        self.assertTrue(remove_audio_recovery_items(channel_ids=[" channel-a "]))
+        state = get_audio_recovery_state()
+        self.assertEqual(state["entries"], {"channel-b": self.original_entries["channel-b"]})
+        self.assertEqual(state["selected_channel_ids"], ["channel-b"])
+        self.assertEqual(state["disabled_channel_ids"], [])
+        self.assertEqual(state["disabled_video_ids"], {})
+        self.assertEqual(state["last_cycle_result"], {"repaired": 3})
+        self.assertFalse(is_audio_recovery_video_enabled("channel-a", "video-shared"))
+        channels, videos = get_audio_recovery_registry_items()
+        self.assertEqual([row["channel_id"] for row in channels], ["channel-b"])
+        self.assertEqual(len(videos), 1)
+
+    def test_removing_video_keeps_other_videos_and_prunes_empty_channel(self):
+        self.assertTrue(remove_audio_recovery_items(
+            video_ids_by_channel={"channel-a": ["video-shared"]}
+        ))
+        self.assertFalse(is_audio_recovery_video_enabled("channel-a", "video-shared"))
+        self.assertTrue(is_audio_recovery_video_enabled("channel-b", "video-shared"))
+        self.assertTrue(is_audio_recovery_video_enabled("channel-a", "video-other"))
+        self.assertTrue(remove_audio_recovery_items(
+            video_ids_by_channel={"channel-a": ["video-other"]}
+        ))
+        self.assertNotIn("channel-a", get_audio_recovery_state()["entries"])
+        self.assertIn("channel-b", get_audio_recovery_state()["entries"])
+
+    def test_removed_videos_stay_removed_after_restart_and_legacy_import(self):
+        self.manager.save_state("add_audio_flow", {
+            "selected_channel": "channel-a",
+            "statuses": {
+                video_id: {
+                    "video_id": video_id, "music_path": "source.mp3",
+                    "audio_language_results": {"en": {"status": "successful"}},
+                }
+                for video_id in ("video-shared", "video-other")
+            },
+        })
+        checkpoint = self.manager.load_state("add_audio_flow")
+        remove_audio_recovery_items(channel_ids=["channel-a"])
+        self.manager._conn.close()
+        self.manager._conn = None
+        self.assertEqual(import_add_audio_flow_recovery_state(), 0)
+        self.assertNotIn("channel-a", get_audio_recovery_state()["entries"])
+        self.assertEqual(self.manager.load_state("add_audio_flow"), checkpoint)
+
+    def test_explicit_registration_can_reenroll_removed_video(self):
+        remove_audio_recovery_items(video_ids_by_channel={"channel-a": ["video-shared"]})
+        self.assertTrue(register_audio_recovery(
+            channel_id="channel-a", video_id="video-shared", audio_path="new.mp3",
+            languages=["en"], repeat_times=1, extra_minutes=0,
+        ))
+        self.assertTrue(is_audio_recovery_video_enabled("channel-a", "video-shared"))
+        self.assertNotIn("video-shared", get_audio_recovery_state()["removed_video_ids"].get("channel-a", []))
+
+    def test_failed_remove_leaves_registry_and_preferences_intact(self):
+        before = get_audio_recovery_state()
+        with patch.object(self.manager, "save_state", return_value=False):
+            self.assertFalse(remove_audio_recovery_items(channel_ids=["channel-a"]))
+        self.assertEqual(get_audio_recovery_state(), before)
+
 
 class AutoRegistryCycleTests(RegistryStorage, unittest.IsolatedAsyncioTestCase):
     def setUp(self):
@@ -185,6 +255,29 @@ class AutoRegistryCycleTests(RegistryStorage, unittest.IsolatedAsyncioTestCase):
         captions.assert_not_called()
         self.assertEqual(result["failed"], 0)
         self.assertEqual(result["deferred_initial_grace"], 0)
+
+    async def test_removing_video_during_visibility_check_stops_snapshot_scan(self):
+        seen = []
+
+        def visibility(channel_id, video_ids):
+            seen.append((channel_id, video_ids))
+            if channel_id == "channel-a":
+                remove_audio_recovery_items(
+                    video_ids_by_channel={"channel-a": ["video-shared"]}
+                )
+            return {video_id: True for video_id in video_ids}, set()
+
+        with (
+            patch("src.audio_recovery._get_registered_video_public_statuses", side_effect=visibility),
+            patch("src.audio_recovery.update_audio_module._get_video_translation_payload", return_value={}) as scan,
+        ):
+            await run_audio_recovery_cycle(now=2000)
+        self.assertIn(("channel-a", ["video-shared", "video-other"]), seen)
+        self.assertEqual(
+            [(call.args[1], call.args[0]) for call in scan.call_args_list],
+            [("channel-a", ["video-other"]), ("channel-b", ["video-shared"])],
+        )
+        self.assertFalse(is_audio_recovery_video_enabled("channel-a", "video-shared"))
 
     async def test_disabling_video_during_scan_prevents_upload(self):
         source = Path(self.folder.name) / "source.mp3"
@@ -421,6 +514,46 @@ class AutoRegistryUiTests(RegistryStorage, unittest.TestCase):
             self.click_action("Deactive")
         self.assertEqual(len(channels.selected), 1)
         self.assertTrue(is_audio_recovery_channel_enabled("channel-a"))
+        self.assertEqual(self.notify.call_args.kwargs["type"], "negative")
+
+    def test_bulk_remove_waits_for_confirmation_and_updates_both_lists(self):
+        channels, videos = self.tables
+        channels.selected = [channels.rows[0]]
+        self.click_action("Xóa khỏi danh sách")
+        self.assertEqual(len(channels.rows), 2)
+        self.click_action("Xóa")
+        self.assertEqual([row["id"] for row in channels.rows], ["channel-b"])
+        self.assertEqual([row["id"] for row in videos.rows], ["channel-b:video-shared"])
+        self.assertEqual(channels.selected, [])
+
+    def test_row_remove_video_only_removes_that_row(self):
+        channels, videos = self.tables
+        listener = next(
+            listener for listener in videos._event_listeners.values()
+            if listener.type == "removeItem"
+        )
+        with self.client:
+            listener.handler(SimpleNamespace(args={"id": "channel-a:video-shared"}))
+        self.click_action("Xóa")
+        self.assertEqual(len(channels.rows), 2)
+        self.assertEqual(
+            [row["id"] for row in videos.rows],
+            ["channel-a:video-other", "channel-b:video-shared"],
+        )
+
+    def test_cancel_remove_preserves_data_and_failed_save_keeps_selection(self):
+        channels = self.tables[0]
+        channels.selected = [channels.rows[0]]
+        before = get_audio_recovery_state()
+        self.click_action("Xóa khỏi danh sách")
+        self.click_action("Hủy")
+        self.assertEqual(get_audio_recovery_state(), before)
+        self.assertEqual(len(channels.selected), 1)
+        self.click_action("Xóa khỏi danh sách")
+        with patch("web.components.auto_registry.remove_audio_recovery_items", return_value=False):
+            self.click_action("Xóa", index=1)
+        self.assertEqual(get_audio_recovery_state(), before)
+        self.assertEqual(len(channels.selected), 1)
         self.assertEqual(self.notify.call_args.kwargs["type"], "negative")
 
 
