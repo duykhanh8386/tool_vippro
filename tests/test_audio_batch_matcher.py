@@ -12,6 +12,7 @@ from src.audio_batch_matcher import (
     match_audio_files_sequentially,
     normalize_title,
 )
+from src.utils import normalize_path, validate_path_text
 
 
 def video(video_id: str, title: str, duration_seconds: float = 60):
@@ -134,6 +135,26 @@ class AudioBatchMatcherTests(unittest.TestCase):
         self.assertEqual(normalize_title("Nhạc thư giãn"), "nhacthugian")
         self.assertEqual(result.matched[0].path, str(expected))
         self.assertEqual(result.matched[0].status, "title")
+
+    def test_all_match_modes_preserve_joined_emoji_in_folders_and_filenames(self):
+        title = "Best Tagalog Christmas Songs Medley \U0001f384\U0001f636\u200d\U0001f32b\ufe0f"
+        expected = self.touch(f"Giang sinh \U0001f636\u200d\U0001f32b\ufe0f/{title}.mp3")
+        videos = [video("abcdefghijk", title)]
+        folder = normalize_path(str(expected.parent))
+        modes = (
+            ("duration", lambda: match_audio_files(videos, folder, duration_reader=lambda _path: 60)),
+            ("title", lambda: match_audio_files_by_title(videos, folder)),
+            ("sequential", lambda: match_audio_files_sequentially(videos, folder)),
+        )
+        for mode, match in modes:
+            with self.subTest(mode=mode):
+                result = match()
+                self.assertEqual(result.audio_file_count, 1)
+                self.assertEqual(result.matched[0].path, str(expected))
+                self.assertEqual(result.matched[0].title, title)
+                self.assertEqual(result.matched[0].status, mode)
+                self.assertEqual(validate_path_text(result.matched[0].path), (True, None))
+                self.assertTrue(expected.is_file())
 
     def test_duplicate_channel_titles_are_not_auto_matched(self):
         self.touch("Same title.mp3")

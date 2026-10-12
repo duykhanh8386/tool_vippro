@@ -1,5 +1,5 @@
 # RECOVERED: reconstructed from CPython 3.12 bytecode
-import errno, json, math, os, re, stat, subprocess, sys, tempfile, threading, time, unicodedata
+import errno, json, math, os, re, stat, subprocess, sys, tempfile, threading, time
 from enum import Enum
 from pathlib import Path
 from loguru import logger
@@ -736,8 +736,10 @@ def create_driver(enable_performance_log: bool = False, *, start_offscreen: bool
 
 
 def normalize_path(path_text: str) -> str:
-    cleaned = unicodedata.normalize("NFC", path_text.strip())
-    return "".join(ch for ch in cleaned if unicodedata.category(ch)[0] != "C")
+    """Trim pasted whitespace while preserving the exact filesystem Unicode."""
+    # Emoji joiners/tags and combining accents are part of the actual filename.
+    # Removing them or applying NFC can point to a different file on Windows.
+    return path_text.strip()
 
 
 def validate_path_text(path_text: str) -> tuple[(bool, str | None)]:
