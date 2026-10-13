@@ -106,6 +106,7 @@ class ChannelScanReport:
     skipped_channel_ids: list[str] = field(default_factory=list)
     missing_channel_ids: list[str] = field(default_factory=list)
     unidentified_channel_count: int = 0
+    deleted_channel_count: int = 0
     completed: bool = False
     end_category: ChannelScanErrorCategory | None = None
 
@@ -151,6 +152,7 @@ class ChannelFetcher:
     def __init__(self):
         self.driver = None
         self.last_report = ChannelScanReport()
+        self._noted_deleted_rows: set[tuple[int, str]] = set()
 
     def run(
         self,
@@ -222,6 +224,7 @@ class ChannelFetcher:
             if self._normalize_channel_name(name)
         }
         self.last_report = ChannelScanReport()
+        self._noted_deleted_rows.clear()
         self.driver = create_driver(enable_performance_log=True)
         self._run_step_with_retry(
             lambda: self._login(email, password),
@@ -262,10 +265,14 @@ class ChannelFetcher:
                 exclude_channel_names=excluded_names,
             )
         if initial_state == "chooser":
-            self._run_step_with_retry(
+            selected = self._run_step_with_retry(
                 self._select_initial_channel_once,
                 step="select_initial_channel",
             )
+            if selected is False:
+                self.last_report.completed = True
+                self.last_report.end_category = ChannelScanErrorCategory.SCAN_END
+                return self.last_report
         return self._scan_authenticated_channels()
 
     @staticmethod
@@ -308,20 +315,24 @@ class ChannelFetcher:
                 exception_type=type(exc).__name__,
             ) from exc
 
-    def _select_initial_channel_once(self) -> None:
+    def _select_initial_channel_once(self) -> bool:
         if self._extract_channel_id(self.driver.current_url):
-            return
-        channel_selection_button = WebDriverWait(
-            self.driver, LOGIN_FIELD_TIMEOUT_SECONDS
-        ).until(
-            EC.element_to_be_clickable((By.XPATH, self.CHANNEL_SELECTION_XPATH))
-        )
-        channel_selection_button.click()
-        WebDriverWait(self.driver, STUDIO_LOAD_TIMEOUT_SECONDS).until(
-            lambda driver: self._checkpoint_and_get(
-                lambda: self._extract_channel_id(driver.current_url) is not None
+            return True
+        entries = self._wait_for_channel_menu_entries_ready()
+        for entry in entries:
+            if entry.get("deleted") or self._account_item_is_deleted(
+                entry["element"]
+            ):
+                self._note_deleted_channel(entry)
+                continue
+            entry["element"].click()
+            WebDriverWait(self.driver, STUDIO_LOAD_TIMEOUT_SECONDS).until(
+                lambda driver: self._checkpoint_and_get(
+                    lambda: self._extract_channel_id(driver.current_url) is not None
+                )
             )
-        )
+            return True
+        return False
 
     def _scan_filtered_channels(
         self,
@@ -344,7 +355,7 @@ class ChannelFetcher:
         menu_name_counts = Counter(
             entry.get("normalized_name")
             for entry in entries
-            if entry.get("normalized_name")
+            if entry.get("normalized_name") and not entry.get("deleted")
         )
         report.unidentified_channel_count = sum(
             1 for entry in entries if not entry.get("normalized_name")
@@ -362,6 +373,8 @@ class ChannelFetcher:
 
             matched_ids: set[str] = set()
             for entry in entries:
+                if entry.get("deleted"):
+                    continue
                 normalized_name = entry.get("normalized_name") or ""
                 name_matches = selected_ids_by_name.get(normalized_name, [])
                 expected_channel_id = None
@@ -382,8 +395,20 @@ class ChannelFetcher:
                     selected_targets.append(target)
                     matched_ids.add(expected_channel_id)
 
+            deleted_ids: set[str] = set()
+            for entry in entries:
+                if not entry.get("deleted"):
+                    continue
+                name_matches = selected_ids_by_name.get(
+                    entry.get("normalized_name") or "", []
+                )
+                if len(name_matches) == 1 and name_matches[0] not in matched_ids:
+                    deleted_ids.add(name_matches[0])
+                    self._note_deleted_channel(entry)
             report.available_channel_ids = sorted(matched_ids)
-            report.missing_channel_ids = sorted(include_channel_ids - matched_ids)
+            report.missing_channel_ids = sorted(
+                include_channel_ids - matched_ids - deleted_ids
+            )
             report.skipped_channel_ids = []
         else:
             report.available_channel_ids = []
@@ -391,6 +416,9 @@ class ChannelFetcher:
             for entry in entries:
                 normalized_name = entry.get("normalized_name") or ""
                 if normalized_name and normalized_name in exclude_channel_names:
+                    continue
+                if entry.get("deleted"):
+                    self._note_deleted_channel(entry)
                     continue
                 if not normalized_name:
                     continue
@@ -545,7 +573,7 @@ class ChannelFetcher:
     def _read_visible_channel_menu_entries_once(self) -> list[dict]:
         elements = self.driver.find_elements(By.XPATH, self.CHANNEL_SELECTION_XPATH)
         entries = []
-        for element in elements:
+        for menu_index, element in enumerate(elements, start=1):
             channel_name = self._channel_name_from_account_item(element)
             entries.append(
                 {
@@ -556,12 +584,54 @@ class ChannelFetcher:
                     "channel_id": None,
                     "channel_name": channel_name,
                     "normalized_name": self._normalize_channel_name(channel_name),
+                    "menu_index": menu_index,
+                    "deleted": self._account_item_is_deleted(element),
                     "row_signature": self._channel_row_signature(element),
                     "active": self._account_item_is_active(element),
                     "element": element,
                 }
             )
         return entries
+
+    @staticmethod
+    def _deleted_channel_status(value: str) -> bool:
+        decomposed = unicodedata.normalize("NFKD", value).casefold()
+        plain = "".join(ch for ch in decomposed if not unicodedata.combining(ch))
+        plain = " ".join(plain.replace("đ", "d").split())
+        return plain in {
+            "da xoa kenh",
+            "kenh da bi xoa",
+            "deleted channel",
+            "channel deleted",
+        } or plain.endswith((" da xoa kenh", " deleted channel"))
+
+    def _account_item_is_deleted(self, element) -> bool:
+        """Read YouTube's deleted-status line without mistaking the title for it."""
+        try:
+            lines = [
+                line.strip()
+                for line in str(getattr(element, "text", "") or "").splitlines()
+            ]
+        except (StaleElementReferenceException, WebDriverException):
+            return False
+        channel_name = self._normalize_channel_name(
+            self._channel_name_from_account_item(element)
+        )
+        return any(
+            self._deleted_channel_status(line)
+            for line in lines
+            if line and self._normalize_channel_name(line) != channel_name
+        )
+
+    def _note_deleted_channel(self, entry: dict) -> None:
+        name = str(entry.get("channel_name") or "")
+        menu_index = int(entry.get("menu_index") or 0)
+        key = (menu_index, self._normalize_channel_name(name))
+        if key in self._noted_deleted_rows:
+            return
+        self._noted_deleted_rows.add(key)
+        self.last_report.deleted_channel_count += 1
+        logger.warning("Skipping deleted YouTube channel row {}: {}", menu_index, name)
 
     def _list_all_channel_menu_entries_once(self) -> list[dict]:
         """Read every account row already present in the chooser DOM.
@@ -775,6 +845,14 @@ class ChannelFetcher:
                     "Selected channel was missing or its name was not unique in the "
                     "account menu"
                 ),
+                channel_id=expected_channel_id or channel_id,
+                retryable=False,
+            )
+        if self._account_item_is_deleted(target):
+            raise ChannelScanError(
+                ChannelScanErrorCategory.CHANNEL_ERROR,
+                step="switch_channel",
+                detail="YouTube marked the selected channel as deleted",
                 channel_id=expected_channel_id or channel_id,
                 retryable=False,
             )
@@ -1127,8 +1205,18 @@ class ChannelFetcher:
             active_index + 1,
             len(rows),
         )
-        next_index = active_index + 1
-        return rows[next_index] if next_index < len(rows) else None
+        for next_index in range(active_index + 1, len(rows)):
+            row = rows[next_index]
+            if self._account_item_is_deleted(row):
+                self._note_deleted_channel(
+                    {
+                        "menu_index": next_index + 1,
+                        "channel_name": self._channel_name_from_account_item(row),
+                    }
+                )
+                continue
+            return row
+        return None
 
     def _has_next_channel(self) -> bool:
         self._checkpoint()

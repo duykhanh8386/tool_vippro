@@ -234,6 +234,10 @@ def create_studio_content(*, reload_alerts: bool = False):
                     )
                 if report.failures:
                     message += f" Có {len(report.failures)} kênh load lại bị lỗi."
+                if report.deleted_channel_count:
+                    message += (
+                        f" Bỏ qua {report.deleted_channel_count} kênh đã bị xóa."
+                    )
                 if report.unidentified_channel_count:
                     message += (
                         f" Bỏ qua an toàn {report.unidentified_channel_count} hồ sơ "
@@ -245,6 +249,7 @@ def create_studio_content(*, reload_alerts: bool = False):
                     else "warning"
                     if report.failures
                     or missing_count
+                    or report.deleted_channel_count
                     or report.unidentified_channel_count
                     else "positive"
                 )
@@ -258,6 +263,10 @@ def create_studio_content(*, reload_alerts: bool = False):
                     message = "Không có kênh mới trong tài khoản này."
                 if report.failures:
                     message += f" Có {len(report.failures)} kênh mới bị lỗi."
+                if report.deleted_channel_count:
+                    message += (
+                        f" Bỏ qua {report.deleted_channel_count} kênh đã bị xóa."
+                    )
                 if report.unidentified_channel_count:
                     message += (
                         f" Bỏ qua an toàn {report.unidentified_channel_count} hồ sơ "
@@ -265,7 +274,9 @@ def create_studio_content(*, reload_alerts: bool = False):
                     )
                 result_type = (
                     "warning"
-                    if report.failures or report.unidentified_channel_count
+                    if report.failures
+                    or report.deleted_channel_count
+                    or report.unidentified_channel_count
                     else ("positive" if report.channels else "info")
                 )
                 best_effort_ui(

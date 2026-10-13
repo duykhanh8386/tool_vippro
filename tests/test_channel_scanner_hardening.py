@@ -93,6 +93,37 @@ class MenuDriver:
         return []
 
 
+class StatusMenuRow(MenuRow):
+    def __init__(self, channel_id, driver, *, title=None, status="", active=False):
+        super().__init__(channel_id, active=active)
+        self.driver = driver
+        self.title = title or channel_id
+        self.text = "\n".join(part for part in (self.title, status) if part)
+
+    def click(self):
+        for row in self.driver.rows:
+            row.active = False
+        self.active = True
+        self.driver.current_url = f"https://studio.youtube.com/channel/{self.channel_id}"
+
+
+class StatusMenuDriver(MenuDriver):
+    def __init__(self, rows, current_url):
+        super().__init__(rows)
+        self.current_url = current_url
+
+
+class PredicateWait:
+    def __init__(self, driver, *args, **kwargs):
+        self.driver = driver
+
+    def until(self, predicate):
+        result = predicate(self.driver)
+        if not result:
+            raise TimeoutException("condition was not satisfied")
+        return result
+
+
 class FakeChannelFetcher(ChannelFetcher):
     def __init__(
         self,
@@ -106,6 +137,7 @@ class FakeChannelFetcher(ChannelFetcher):
         stop_during_channel=None,
         menu_ids_available=True,
         channel_names=None,
+        deleted_channel_ids=(),
         initial_state="channel",
     ):
         super().__init__()
@@ -125,6 +157,7 @@ class FakeChannelFetcher(ChannelFetcher):
             channel_id: str((channel_names or {}).get(channel_id) or channel_id)
             for channel_id in self.channel_ids
         }
+        self.deleted_channel_ids = set(deleted_channel_ids)
         self.info_calls = []
         self.menu_calls = 0
         self.switch_calls = 0
@@ -189,6 +222,8 @@ class FakeChannelFetcher(ChannelFetcher):
                     self.channel_names[channel_id]
                 ),
                 "row_signature": channel_id,
+                "menu_index": index + 1,
+                "deleted": channel_id in self.deleted_channel_ids,
                 "active": index == self.position,
                 "element": object(),
             }
@@ -245,6 +280,127 @@ class ChannelScannerHardeningTests(unittest.TestCase):
         self.assertEqual([item["id"] for item in report.channels], ["A", "B", "C"])
         self.assertEqual(report.failures, [])
         self.assertEqual(driver.quit_calls, 1)
+
+    def test_deleted_channel_status_is_read_from_row_status_not_title(self):
+        fetcher = ChannelFetcher()
+        driver = StatusMenuDriver([], "https://studio.youtube.com/channel/A")
+        deleted = StatusMenuRow(
+            "B", driver, title="Lo Mejor Bandas Románticas", status="Đã xoá kênh"
+        )
+        english = StatusMenuRow("C", driver, status="Deleted channel")
+        title_only = StatusMenuRow(
+            "D", driver, title="Deleted channel", status="100 subscribers"
+        )
+
+        self.assertTrue(fetcher._account_item_is_deleted(deleted))
+        self.assertTrue(fetcher._account_item_is_deleted(english))
+        self.assertFalse(fetcher._account_item_is_deleted(title_only))
+
+    def test_full_scan_skips_deleted_middle_row_and_loads_channel_below(self):
+        driver = StatusMenuDriver([], "https://studio.youtube.com/channel/A")
+        driver.rows = [
+            StatusMenuRow("A", driver, active=True),
+            StatusMenuRow("B", driver, status="Đã xóa kênh"),
+            StatusMenuRow("C", driver),
+        ]
+        fetcher = ChannelFetcher()
+        fetcher.driver = driver
+
+        with (
+            patch("src.channel_scanner.WebDriverWait", PredicateWait),
+            patch.object(
+                fetcher,
+                "_get_channel_info",
+                side_effect=lambda: {
+                    "id": fetcher._current_channel_id(),
+                    "name": fetcher._current_channel_id(),
+                },
+            ),
+        ):
+            report = fetcher._scan_authenticated_channels()
+
+        self.assertTrue(report.completed)
+        self.assertEqual([item["id"] for item in report.channels], ["A", "C"])
+        self.assertEqual(report.deleted_channel_count, 1)
+        self.assertEqual(fetcher._current_channel_id(), "C")
+
+    def test_initial_chooser_skips_deleted_first_row(self):
+        driver = StatusMenuDriver([], "https://www.youtube.com/account_switcher")
+        driver.rows = [
+            StatusMenuRow("A", driver, status="Đã xoá kênh"),
+            StatusMenuRow("B", driver),
+        ]
+        fetcher = ChannelFetcher()
+        fetcher.driver = driver
+
+        with (
+            patch("src.channel_scanner.WebDriverWait", PredicateWait),
+            patch.object(
+                fetcher,
+                "_wait_for_channel_menu_entries_ready",
+                side_effect=fetcher._read_visible_channel_menu_entries_once,
+            ),
+        ):
+            selected = fetcher._select_initial_channel_once()
+
+        self.assertTrue(selected)
+        self.assertEqual(fetcher._current_channel_id(), "B")
+        self.assertEqual(fetcher.last_report.deleted_channel_count, 1)
+
+    def test_initial_chooser_with_only_deleted_channels_has_clean_end(self):
+        driver = StatusMenuDriver([], "https://www.youtube.com/account_switcher")
+        driver.rows = [StatusMenuRow("A", driver, status="Đã xoá kênh")]
+        fetcher = ChannelFetcher()
+        fetcher.driver = driver
+
+        with patch.object(
+            fetcher,
+            "_wait_for_channel_menu_entries_ready",
+            side_effect=fetcher._read_visible_channel_menu_entries_once,
+        ):
+            selected = fetcher._select_initial_channel_once()
+
+        self.assertFalse(selected)
+        self.assertEqual(fetcher.last_report.deleted_channel_count, 1)
+
+    def test_selected_reload_skips_deleted_channel_and_continues(self):
+        fetcher = FakeChannelFetcher(
+            ["A", "B", "C"], deleted_channel_ids={"B"}
+        )
+        driver = FakeDriver("A")
+
+        with patch("src.channel_scanner.create_driver", return_value=driver):
+            report = fetcher.run(
+                "user@example.com",
+                "not-logged",
+                include_channel_ids={"B", "C"},
+                include_channel_names={"B": "B", "C": "C"},
+            )
+
+        self.assertTrue(report.completed)
+        self.assertEqual([item["id"] for item in report.channels], ["C"])
+        self.assertEqual(report.deleted_channel_count, 1)
+        self.assertEqual(report.missing_channel_ids, [])
+        self.assertEqual(fetcher.filtered_switches, ["C"])
+
+    def test_add_new_skips_deleted_channel_and_finds_later_one(self):
+        fetcher = FakeChannelFetcher(
+            ["A", "B", "C"], deleted_channel_ids={"B"}
+        )
+        driver = FakeDriver("A")
+
+        with patch("src.channel_scanner.create_driver", return_value=driver):
+            report = fetcher.run(
+                "user@example.com",
+                "not-logged",
+                exclude_channel_ids={"A"},
+                exclude_channel_names={"A"},
+            )
+
+        self.assertTrue(report.completed)
+        self.assertEqual([item["id"] for item in report.channels], ["C"])
+        self.assertEqual(report.deleted_channel_count, 1)
+        self.assertEqual(fetcher.filtered_switches, ["C"])
 
     def test_selected_reload_clicks_only_matching_channel_names(self):
         fetcher = FakeChannelFetcher(["A", "B", "C"])
