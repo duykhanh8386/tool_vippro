@@ -423,16 +423,18 @@ def create_drawer():
                                 )
                             finished_at = status.get("last_cycle_finished_at")
                             if finished_at:
+                                deferred_video_scope = int(
+                                    status.get("deferred_video_scope") or 0
+                                )
                                 deferred_visibility = int(
-                                    status.get("deferred_non_public") or 0
-                                ) + int(
                                     status.get("deferred_visibility_unknown") or 0
                                 )
                                 ui.label(
                                     f"Lần quét cuối {time.strftime('%H:%M:%S', time.localtime(finished_at))} · "
                                     f"đã gửi lại {status.get('repaired', 0)}, "
                                     f"phụ đề failed đã sửa {status.get('captions_repaired', 0)}, "
-                                    f"hoãn {deferred_visibility} chưa công khai, "
+                                    f"hoãn {deferred_video_scope} ngoài loại đã chọn, "
+                                    f"{deferred_visibility} chưa đọc được trạng thái, "
                                     f"lỗi {int(status.get('failed') or 0) + int(status.get('captions_failed') or 0)}"
                                 ).classes("text-[10px] text-emerald-800")
                             else:

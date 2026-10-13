@@ -8,6 +8,9 @@ from nicegui import context, ui
 from src.audio_recovery import (
     RECOVERY_SCAN_MODE_ALL,
     RECOVERY_SCAN_MODE_SELECTED,
+    RECOVERY_VIDEO_SCOPE_BOTH,
+    RECOVERY_VIDEO_SCOPE_PUBLIC,
+    RECOVERY_VIDEO_SCOPE_SCHEDULED,
     acknowledge_channel_refresh,
     get_audio_recovery_scan_preferences,
     get_audio_recovery_registry_items,
@@ -613,6 +616,7 @@ def create_studio_content(*, reload_alerts: bool = False):
             logger.error("Could not read Auto Registry channel scope: {}", exc)
             return {
                 "scan_mode": RECOVERY_SCAN_MODE_ALL,
+                "video_scan_scope": RECOVERY_VIDEO_SCOPE_PUBLIC,
                 "selected_channel_ids": [],
             }
 
@@ -624,6 +628,11 @@ def create_studio_content(*, reload_alerts: bool = False):
         preferences = recovery_scope_snapshot()
         mode = preferences["scan_mode"]
         selected = set(preferences["selected_channel_ids"])
+        video_kind = {
+            RECOVERY_VIDEO_SCOPE_PUBLIC: "video công khai",
+            RECOVERY_VIDEO_SCOPE_SCHEDULED: "video đã lên lịch",
+            RECOVERY_VIDEO_SCOPE_BOTH: "video công khai và đã lên lịch",
+        }[preferences["video_scan_scope"]]
         try:
             registry_channels, _ = get_audio_recovery_registry_items()
             active_channel_count = sum(item["enabled"] for item in registry_channels)
@@ -632,7 +641,7 @@ def create_studio_content(*, reload_alerts: bool = False):
 
         if mode == RECOVERY_SCAN_MODE_ALL:
             summary.set_text(
-                f"Quét video công khai của {active_channel_count} kênh đang bật "
+                f"Quét {video_kind} của {active_channel_count} kênh đang bật "
                 "trong Auto Registry. Kênh và video đã tắt sẽ được bỏ qua."
             )
         else:
@@ -643,7 +652,7 @@ def create_studio_content(*, reload_alerts: bool = False):
             visible_selected = len((selected & visible_ids) - disabled_ids)
             summary.set_text(
                 f"Đã chọn {visible_selected}/{len(channels)} kênh trong danh sách. "
-                f"{active_channel_count} kênh Registry được phép quét. "
+                f"Quét {video_kind} của {active_channel_count} kênh Registry. "
                 "Kênh và video đã tắt sẽ được bỏ qua."
             )
 

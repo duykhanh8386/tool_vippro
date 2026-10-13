@@ -12,7 +12,10 @@ from src.audio_recovery import (
     DEFAULT_STALE_PROCESSING_SECONDS,
     RECOVERY_SCAN_MODE_ALL,
     RECOVERY_SCAN_MODE_SELECTED,
-    _get_registered_video_public_statuses,
+    RECOVERY_VIDEO_SCOPE_BOTH,
+    RECOVERY_VIDEO_SCOPE_PUBLIC,
+    RECOVERY_VIDEO_SCOPE_SCHEDULED,
+    _get_registered_video_scan_statuses,
     _monitor_failed_caption_tracks,
     _monitor_loop,
     _record_processing_observations,
@@ -306,6 +309,7 @@ class AudioRecoveryRegistryTests(unittest.TestCase):
 
         self.assertEqual(preferences["scan_mode"], RECOVERY_SCAN_MODE_ALL)
         self.assertEqual(preferences["selected_channel_ids"], [])
+        self.assertEqual(preferences["video_scan_scope"], RECOVERY_VIDEO_SCOPE_PUBLIC)
 
     def test_selected_scan_scope_is_persisted_without_changing_registry(self):
         stored = {
@@ -588,6 +592,50 @@ class AudioRecoveryRegistryTests(unittest.TestCase):
 
 
 class AudioRecoveryVisibilityTests(unittest.TestCase):
+    def test_video_scope_distinguishes_scheduled_private_from_unscheduled_and_draft(self):
+        videos = [
+            SimpleNamespace(id="public", privacy="VIDEO_PRIVACY_PUBLIC"),
+            SimpleNamespace(id="scheduled-private", privacy="VIDEO_PRIVACY_PRIVATE", scheduled_publishing_details={"time": "later"}),
+            SimpleNamespace(id="scheduled-public", privacy="VIDEO_PRIVACY_PUBLIC", scheduled_publishing_details={"time": "later"}),
+            SimpleNamespace(id="private", privacy="VIDEO_PRIVACY_PRIVATE"),
+            SimpleNamespace(id="unlisted", privacy="VIDEO_PRIVACY_UNLISTED"),
+            SimpleNamespace(id="draft", privacy="VIDEO_PRIVACY_PUBLIC", draft_status={"isDraft": True}, scheduled_publishing_details={"time": "later"}),
+        ]
+        requested = [video.id for video in videos] + ["missing"]
+        for scope, expected in (
+            (RECOVERY_VIDEO_SCOPE_PUBLIC, {"public"}),
+            (RECOVERY_VIDEO_SCOPE_SCHEDULED, {"scheduled-private", "scheduled-public"}),
+            (RECOVERY_VIDEO_SCOPE_BOTH, {"public", "scheduled-private", "scheduled-public"}),
+        ):
+            with self.subTest(scope=scope), patch(
+                "src.audio_recovery.list_videos_module.list_all_videos",
+                return_value=(videos, None),
+            ):
+                matches, unresolved = _get_registered_video_scan_statuses(
+                    "channel", requested, video_scan_scope=scope
+                )
+            self.assertEqual({vid for vid, matches_scope in matches.items() if matches_scope}, expected)
+            self.assertEqual(unresolved, {"missing"})
+
+    def test_scheduled_scope_stops_matching_after_video_goes_public(self):
+        for scope, expected in (
+            (RECOVERY_VIDEO_SCOPE_PUBLIC, [False, True]),
+            (RECOVERY_VIDEO_SCOPE_SCHEDULED, [True, False]),
+            (RECOVERY_VIDEO_SCOPE_BOTH, [True, True]),
+        ):
+            with self.subTest(scope=scope), patch(
+                "src.audio_recovery.list_videos_module.list_all_videos",
+                side_effect=[
+                    ([SimpleNamespace(id="video", privacy="VIDEO_PRIVACY_PRIVATE", scheduled_publishing_details={"time": "later"})], None),
+                    ([SimpleNamespace(id="video", privacy="VIDEO_PRIVACY_PUBLIC", scheduled_publishing_details={})], None),
+                ],
+            ):
+                actual = [
+                    _get_registered_video_scan_statuses("channel", ["video"], video_scan_scope=scope)[0]["video"]
+                    for _ in range(2)
+                ]
+            self.assertEqual(actual, expected)
+
     def test_visibility_lookup_pages_and_rejects_draft_or_scheduled_public(self):
         with patch(
             "src.audio_recovery.list_videos_module.list_all_videos",
@@ -622,7 +670,7 @@ class AudioRecoveryVisibilityTests(unittest.TestCase):
                 ),
             ],
         ) as list_videos:
-            public_statuses, unresolved = _get_registered_video_public_statuses(
+            public_statuses, unresolved = _get_registered_video_scan_statuses(
                 "channel",
                 [
                     "public-video",
@@ -649,14 +697,86 @@ class AudioRecoveryVisibilityTests(unittest.TestCase):
 class AudioRecoveryCycleTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.visibility_patch = patch(
-            "src.audio_recovery._get_registered_video_public_statuses",
-            side_effect=lambda _channel_id, video_ids: (
+            "src.audio_recovery._get_registered_video_scan_statuses",
+            side_effect=lambda _channel_id, video_ids, **_kwargs: (
                 {video_id: True for video_id in video_ids},
                 set(),
             ),
         )
         self.visibility_patch.start()
         self.addCleanup(self.visibility_patch.stop)
+
+    async def test_each_video_scope_repairs_only_matching_active_registry_videos(self):
+        from src.audio_recovery import update_audio_module
+
+        videos = [
+            SimpleNamespace(id="public", privacy="VIDEO_PRIVACY_PUBLIC"),
+            SimpleNamespace(id="scheduled", privacy="VIDEO_PRIVACY_PRIVATE", scheduled_publishing_details={"time": "later"}),
+            SimpleNamespace(id="private", privacy="VIDEO_PRIVACY_PRIVATE"),
+            SimpleNamespace(id="draft", privacy="VIDEO_PRIVACY_PUBLIC", draft_status="DRAFT"),
+            SimpleNamespace(id="disabled-scheduled", privacy="VIDEO_PRIVACY_PRIVATE", scheduled_publishing_details={"time": "later"}),
+        ]
+
+        def fetch(video_ids, _channel_id):
+            return {
+                "videoTranslations": [{"videoId": vid} for vid in video_ids],
+                "audioTracks": [
+                    {"videoId": vid, "audioTrackId": f"failed-{vid}", "language": "en",
+                     "source": "AUDIO_TRACK_SOURCE_CREATOR", "audioContentTypeString": "dubbed",
+                     "status": "AUDIO_TRACK_STATUS_FAILED"}
+                    for vid in video_ids
+                ],
+            }
+
+        def render_audio(*, output_file, **_kwargs):
+            Path(output_file).write_bytes(b"rendered")
+
+        async def run_retry(operation, **_kwargs):
+            return operation()
+
+        with tempfile.TemporaryDirectory() as folder:
+            source = Path(folder) / "source.mp3"
+            source.write_bytes(b"source")
+            for scope, expected in (
+                (RECOVERY_VIDEO_SCOPE_PUBLIC, ["public"]),
+                (RECOVERY_VIDEO_SCOPE_SCHEDULED, ["scheduled"]),
+                (RECOVERY_VIDEO_SCOPE_BOTH, ["public", "scheduled"]),
+            ):
+                state = {
+                    "enabled": True, "video_scan_scope": scope, "initial_grace_seconds": 0,
+                    "retry_cooldown_seconds": 0, "disabled_video_ids": {"channel": ["disabled-scheduled"]},
+                    "entries": {"channel": {
+                        vid: {"audio_path": str(source), "languages": ["en"], "repeat_times": 1}
+                        for vid in [video.id for video in videos] + ["missing"]
+                    }},
+                }
+                caption_monitor = AsyncMock(return_value={"repaired": 0, "failed": 0, "quota_message": ""})
+                with (
+                    self.subTest(scope=scope),
+                    patch("src.audio_recovery.get_audio_recovery_state", return_value=state),
+                    patch("src.audio_recovery._load_state", return_value=state),
+                    patch("src.audio_recovery.state_manager.save_state", return_value=True),
+                    patch("src.audio_recovery._get_registered_video_scan_statuses", side_effect=_get_registered_video_scan_statuses),
+                    patch("src.audio_recovery.list_videos_module.list_all_videos", return_value=(videos, None)),
+                    patch.object(update_audio_module, "_get_video_translation_payload", side_effect=fetch) as query,
+                    patch.object(update_audio_module, "_get_video_info", return_value=SimpleNamespace(duration_ms=60_000)),
+                    patch.object(update_audio_module, "delete_track_ids", return_value=200) as delete,
+                    patch.object(update_audio_module, "add", return_value=200) as add,
+                    patch("src.audio_recovery.multiply_audio", side_effect=render_audio),
+                    patch("src.audio_recovery.call_audio_update_with_retry", new=AsyncMock(side_effect=run_retry)),
+                    patch("src.audio_recovery._monitor_failed_caption_tracks", caption_monitor),
+                ):
+                    result = await run_audio_recovery_cycle(now=2000)
+                    query.assert_called_once_with(expected, "channel")
+                    self.assertEqual([call.kwargs["id_video"] for call in add.call_args_list], expected)
+                    self.assertEqual([call.args[0] for call in delete.call_args_list], expected)
+                    self.assertEqual(set(caption_monitor.await_args.kwargs["entries"]), set(expected))
+                    self.assertEqual(result["repaired"], len(expected))
+                    self.assertEqual(result["failed"], 0)
+                    self.assertEqual(result["video_scan_scope"], scope)
+                    self.assertEqual(result["deferred_video_scope"], 4 - len(expected))
+                    self.assertEqual(result["deferred_visibility_unknown"], 1)
+                    self.assertEqual(len(state["entries"]["channel"]), 6)
 
     async def test_selected_scope_scans_only_selected_registry_channels(self):
         state = {
@@ -1053,7 +1173,7 @@ class AudioRecoveryCycleTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch(
-                "src.audio_recovery._get_registered_video_public_statuses",
+                "src.audio_recovery._get_registered_video_scan_statuses",
                 return_value=(
                     {"public-video": True, "private-video": False},
                     set(),
@@ -1074,7 +1194,7 @@ class AudioRecoveryCycleTests(unittest.IsolatedAsyncioTestCase):
         ):
             result = await run_audio_recovery_cycle(now=2000)
 
-        self.assertEqual(result["deferred_non_public"], 1)
+        self.assertEqual(result["deferred_video_scope"], 1)
         caption_monitor.assert_awaited_once()
         self.assertEqual(
             set(caption_monitor.await_args.kwargs["entries"]),
@@ -1134,7 +1254,7 @@ class AudioRecoveryCycleTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch(
-                "src.audio_recovery._get_registered_video_public_statuses",
+                "src.audio_recovery._get_registered_video_scan_statuses",
                 visibility,
             ),
             patch("src.audio_recovery.get_audio_recovery_state", return_value=state),
@@ -1152,8 +1272,8 @@ class AudioRecoveryCycleTests(unittest.IsolatedAsyncioTestCase):
             public_result = await run_audio_recovery_cycle(now=2000)
 
         fetch.assert_called_once_with(["video"], "channel")
-        self.assertEqual(private_result["deferred_non_public"], 1)
-        self.assertEqual(public_result["deferred_non_public"], 0)
+        self.assertEqual(private_result["deferred_video_scope"], 1)
+        self.assertEqual(public_result["deferred_video_scope"], 0)
         self.assertIn("video", state["entries"]["channel"])
 
 

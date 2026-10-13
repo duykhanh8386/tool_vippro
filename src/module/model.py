@@ -63,8 +63,8 @@ class Video:
     # used both enum and object shapes for this field.
     draft_status: object = ""
     # A scheduled upload can carry a public target while it is not publicly
-    # visible yet. Preserve these fields so recovery can require real public
-    # visibility instead of relying on the privacy target alone.
+    # visible yet. Preserve these fields so recovery can distinguish scheduled
+    # uploads from public videos instead of relying on the privacy target alone.
     scheduled_publishing_details: object = ""
     visibility: object = ""
 

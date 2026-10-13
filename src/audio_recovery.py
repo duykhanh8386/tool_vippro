@@ -40,6 +40,14 @@ RECOVERY_SCAN_MODES = {
     RECOVERY_SCAN_MODE_ALL,
     RECOVERY_SCAN_MODE_SELECTED,
 }
+RECOVERY_VIDEO_SCOPE_PUBLIC = "public"
+RECOVERY_VIDEO_SCOPE_SCHEDULED = "scheduled"
+RECOVERY_VIDEO_SCOPE_BOTH = "public_and_scheduled"
+RECOVERY_VIDEO_SCOPE_LABELS = {
+    RECOVERY_VIDEO_SCOPE_PUBLIC: "Chỉ video công khai",
+    RECOVERY_VIDEO_SCOPE_SCHEDULED: "Chỉ video đã lên lịch",
+    RECOVERY_VIDEO_SCOPE_BOTH: "Công khai và đã lên lịch",
+}
 DEFAULT_RECOVERY_INTERVAL_SECONDS = 15 * 60
 DEFAULT_RECOVERY_RETRY_COOLDOWN_SECONDS = 15 * 60
 DEFAULT_INITIAL_RECOVERY_GRACE_SECONDS = 15 * 60
@@ -90,9 +98,10 @@ _RUNTIME_STATUS = {
     "captions_repaired": 0,
     "captions_failed": 0,
     "caption_quota_message": "",
-    "deferred_non_public": 0,
+    "deferred_video_scope": 0,
     "deferred_visibility_unknown": 0,
     "scan_mode": RECOVERY_SCAN_MODE_ALL,
+    "video_scan_scope": RECOVERY_VIDEO_SCOPE_PUBLIC,
     "selected_channel_ids": [],
     "_upload_progress": None,
 }
@@ -183,15 +192,34 @@ def _is_currently_public_video(video: object) -> bool:
     return True
 
 
-def _get_registered_video_public_statuses(
+def _is_currently_scheduled_video(video: object) -> bool:
+    if _status_indicates_draft(getattr(video, "draft_status", "")):
+        return False
+    if _status_indicates_draft(getattr(video, "video_status", "")):
+        return False
+    return bool(getattr(video, "scheduled_publishing_details", None))
+
+
+def _video_matches_recovery_scope(video: object, video_scan_scope: str) -> bool:
+    scope = _normalize_recovery_video_scope(video_scan_scope)
+    if scope == RECOVERY_VIDEO_SCOPE_PUBLIC:
+        return _is_currently_public_video(video)
+    if scope == RECOVERY_VIDEO_SCOPE_SCHEDULED:
+        return _is_currently_scheduled_video(video)
+    return _is_currently_public_video(video) or _is_currently_scheduled_video(video)
+
+
+def _get_registered_video_scan_statuses(
     channel_id: str,
     video_ids: Iterable[str],
+    *,
+    video_scan_scope: str = RECOVERY_VIDEO_SCOPE_PUBLIC,
 ) -> tuple[dict[str, bool], set[str]]:
-    """Resolve whether registered IDs are currently and actually public.
+    """Resolve whether registered IDs match the selected video scope.
 
-    Returns ``(public_status_by_video_id, unresolved_video_ids)``. Draft rows
+    Returns ``(matches_by_video_id, unresolved_video_ids)``. Draft rows
     are not consistently returned by Studio's unfiltered listing; unresolved
-    IDs are therefore deferred just like known non-public videos and remain
+    IDs are therefore deferred just like videos outside the scope and remain
     registered for a later cycle.
     """
     requested = list(
@@ -199,7 +227,7 @@ def _get_registered_video_public_statuses(
     )
     requested = [video_id for video_id in requested if video_id]
     remaining = set(requested)
-    public_status_by_video_id: dict[str, bool] = {}
+    matches_by_video_id: dict[str, bool] = {}
     seen_page_tokens: set[str] = set()
     page_token: str | None = None
 
@@ -213,8 +241,8 @@ def _get_registered_video_public_statuses(
             video_id = str(getattr(video, "id", "") or "").strip()
             if video_id not in remaining:
                 continue
-            public_status_by_video_id[video_id] = _is_currently_public_video(
-                video
+            matches_by_video_id[video_id] = _video_matches_recovery_scope(
+                video, video_scan_scope
             )
             remaining.discard(video_id)
 
@@ -229,7 +257,7 @@ def _get_registered_video_public_statuses(
         seen_page_tokens.add(clean_page_token)
         page_token = clean_page_token
 
-    return public_status_by_video_id, remaining
+    return matches_by_video_id, remaining
 
 
 def _default_state() -> dict:
@@ -238,6 +266,7 @@ def _default_state() -> dict:
         # Existing installations intentionally migrate to the product default:
         # every channel which already has entries in the persistent registry.
         "scan_mode": RECOVERY_SCAN_MODE_ALL,
+        "video_scan_scope": RECOVERY_VIDEO_SCOPE_PUBLIC,
         "selected_channel_ids": [],
         "disabled_channel_ids": [],
         "disabled_video_ids": {},
@@ -261,6 +290,9 @@ def _load_state() -> dict:
     if not isinstance(state.get("entries"), dict):
         state["entries"] = {}
     state["scan_mode"] = _normalize_recovery_scan_mode(state.get("scan_mode"))
+    state["video_scan_scope"] = _normalize_recovery_video_scope(
+        state.get("video_scan_scope")
+    )
     state["selected_channel_ids"] = _normalize_channel_ids(
         state.get("selected_channel_ids")
     )
@@ -302,6 +334,11 @@ def _normalize_recovery_scan_mode(value: object) -> str:
     return mode
 
 
+def _normalize_recovery_video_scope(value: object) -> str:
+    scope = str(value or "").strip().casefold()
+    return scope if scope in RECOVERY_VIDEO_SCOPE_LABELS else RECOVERY_VIDEO_SCOPE_PUBLIC
+
+
 def _normalize_channel_ids(channel_ids: object) -> list[str]:
     if isinstance(channel_ids, str):
         values = [channel_ids]
@@ -321,6 +358,7 @@ def _normalize_channel_ids(channel_ids: object) -> list[str]:
 def _scan_preferences_from_state(state: dict) -> dict:
     return {
         "scan_mode": _normalize_recovery_scan_mode(state.get("scan_mode")),
+        "video_scan_scope": _normalize_recovery_video_scope(state.get("video_scan_scope")),
         "selected_channel_ids": _normalize_channel_ids(
             state.get("selected_channel_ids")
         ),
@@ -655,25 +693,28 @@ def get_audio_recovery_registry_items() -> tuple[list[dict], list[dict]]:
 
 
 def get_audio_recovery_scan_preferences() -> dict:
-    """Return the persisted channel scope used by automatic recovery."""
+    """Return the persisted channel and video scopes for automatic recovery."""
     with _STATE_LOCK:
         return _scan_preferences_from_state(_load_state())
 
 
 def set_audio_recovery_scan_preferences(
     *,
-    scan_mode: str,
+    scan_mode: str | None = None,
     selected_channel_ids: Iterable[str] | None = None,
+    video_scan_scope: str | None = None,
 ) -> bool:
     """Persist the scan mode without changing registry entries or history.
 
     ``selected_channel_ids`` is deliberately preserved when switching to the
     all-channels mode, allowing the previous custom list to be restored later.
     """
-    clean_mode = _normalize_recovery_scan_mode(scan_mode)
     with _STATE_LOCK:
         state = _load_state()
-        state["scan_mode"] = clean_mode
+        if scan_mode is not None:
+            state["scan_mode"] = _normalize_recovery_scan_mode(scan_mode)
+        if video_scan_scope is not None:
+            state["video_scan_scope"] = _normalize_recovery_video_scope(video_scan_scope)
         if selected_channel_ids is not None:
             state["selected_channel_ids"] = _normalize_channel_ids(
                 selected_channel_ids
@@ -1641,7 +1682,7 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
     unreadable: list[str] = []
     deferred_busy = 0
     deferred_initial_grace = 0
-    deferred_non_public = 0
+    deferred_video_scope = 0
     deferred_visibility_unknown = 0
     scope_skipped_channel_ids: set[str] = set()
     cancelled_by_clear = False
@@ -1664,9 +1705,10 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
         captions_repaired=0,
         captions_failed=0,
         caption_quota_message="",
-        deferred_non_public=0,
+        deferred_video_scope=0,
         deferred_visibility_unknown=0,
         scan_mode=RECOVERY_SCAN_MODE_ALL,
+        video_scan_scope=RECOVERY_VIDEO_SCOPE_PUBLIC,
         selected_channel_ids=[],
         _upload_progress=None,
     )
@@ -1690,6 +1732,7 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
         )
         _update_runtime_status(
             scan_mode=scan_preferences["scan_mode"],
+            video_scan_scope=scan_preferences["video_scan_scope"],
             selected_channel_ids=sorted(selected_channel_ids),
         )
         refresh_alerts = state.get("channel_refresh_alerts") or {}
@@ -1805,12 +1848,13 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
             channel_requires_refresh = False
             try:
                 (
-                    public_status_by_video_id,
+                    matches_by_video_id,
                     unresolved_video_ids,
                 ) = await asyncio.to_thread(
-                    _get_registered_video_public_statuses,
+                    _get_registered_video_scan_statuses,
                     channel_id,
                     video_ids,
+                    video_scan_scope=scan_preferences["video_scan_scope"],
                 )
             except Exception as exc:
                 failed += len(video_ids)
@@ -1827,27 +1871,27 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
                 )
                 continue
 
-            public_video_ids = _enabled_recovery_video_ids(channel_id, [
+            matching_video_ids = _enabled_recovery_video_ids(channel_id, [
                 video_id
                 for video_id in video_ids
-                if public_status_by_video_id.get(video_id) is True
+                if matches_by_video_id.get(video_id) is True
             ])
-            known_non_public = [
+            outside_video_scope = [
                 video_id
                 for video_id in video_ids
-                if public_status_by_video_id.get(video_id) is False
+                if matches_by_video_id.get(video_id) is False
             ]
-            deferred_non_public += len(known_non_public)
+            deferred_video_scope += len(outside_video_scope)
             deferred_visibility_unknown += len(unresolved_video_ids)
-            if known_non_public or unresolved_video_ids:
+            if outside_video_scope or unresolved_video_ids:
                 logger.info(
-                    "Audio auto-recovery deferred non-public videos: channel={} "
-                    "non_public={} visibility_unresolved={}",
+                    "Audio auto-recovery deferred videos: channel={} "
+                    "outside_video_scope={} visibility_unresolved={}",
                     channel_id,
-                    len(known_non_public),
+                    len(outside_video_scope),
                     len(unresolved_video_ids),
                 )
-            if not public_video_ids:
+            if not matching_video_ids:
                 continue
 
             if not is_audio_recovery_channel_enabled(channel_id):
@@ -1856,15 +1900,15 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
 
             eligible_entries = {
                 video_id: eligible_entries[video_id]
-                for video_id in public_video_ids
+                for video_id in matching_video_ids
             }
-            video_ids = public_video_ids
+            video_ids = matching_video_ids
 
             # Caption recovery is intentionally narrower than audio recovery:
             # only recently submitted tracks are monitored, and only an
             # explicit YouTube ``failed`` status is updated. Missing tracks are
             # never inserted here. This runs after the visibility filter so a
-            # draft/private/scheduled video cannot consume caption quota.
+            # draft or unscheduled private video cannot consume caption quota.
             if not caption_quota_message:
                 caption_result = await _monitor_failed_caption_tracks(
                     channel_id=channel_id,
@@ -2200,10 +2244,11 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
             "reauth_required": sorted(get_channel_refresh_alerts()),
             "deferred_busy": deferred_busy,
             "deferred_initial_grace": deferred_initial_grace,
-            "deferred_non_public": deferred_non_public,
+            "deferred_video_scope": deferred_video_scope,
             "deferred_visibility_unknown": deferred_visibility_unknown,
             "cancelled_by_clear": cancelled_by_clear,
             "scan_mode": scan_preferences["scan_mode"],
+            "video_scan_scope": scan_preferences["video_scan_scope"],
             "scope_skipped_channel_ids": sorted(scope_skipped_channel_ids),
         }
         with _STATE_LOCK:
@@ -2222,8 +2267,9 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
         )
         final_message = (
             f"Quét xong: đã gửi lại {repaired}, hoãn "
-            f"{deferred_non_public + deferred_visibility_unknown} video chưa "
-            f"công khai, lỗi {failed}; phụ đề failed đã sửa "
+            f"{deferred_video_scope} video ngoài loại đã chọn, "
+            f"{deferred_visibility_unknown} video chưa đọc được trạng thái, "
+            f"lỗi {failed}; phụ đề failed đã sửa "
             f"{captions_repaired}, lỗi {captions_failed}"
         )
         return result
@@ -2254,7 +2300,7 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
                     captions_repaired=captions_repaired,
                     captions_failed=captions_failed,
                     caption_quota_message=caption_quota_message,
-                    deferred_non_public=deferred_non_public,
+                    deferred_video_scope=deferred_video_scope,
                     deferred_visibility_unknown=deferred_visibility_unknown,
                     _upload_progress=None,
                 )

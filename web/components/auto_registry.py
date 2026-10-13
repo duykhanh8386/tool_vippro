@@ -6,9 +6,13 @@ from loguru import logger
 from nicegui import ui
 
 from src.audio_recovery import (
+    RECOVERY_VIDEO_SCOPE_LABELS,
+    RECOVERY_VIDEO_SCOPE_PUBLIC,
     get_audio_recovery_registry_items,
+    get_audio_recovery_scan_preferences,
     remove_audio_recovery_items,
     set_audio_recovery_items_enabled,
+    set_audio_recovery_scan_preferences,
 )
 from src.utils import get_channels_info
 from web.theme import app_card, section_header
@@ -16,10 +20,12 @@ from web.theme import app_card, section_header
 
 def create_auto_registry_content(*, on_change: Callable[[], None] | None = None):
     tables = {}
+    preference_sync = {"active": False}
 
     def refresh() -> None:
         try:
             channel_items, video_items = get_audio_recovery_registry_items()
+            preferences = get_audio_recovery_scan_preferences()
             names = {
                 channel.id: channel.name for channel in (get_channels_info() or [])
             }
@@ -27,6 +33,13 @@ def create_auto_registry_content(*, on_change: Callable[[], None] | None = None)
             logger.error("Could not read Auto Registry: {}", exc)
             ui.notify("Không thể tải danh sách Auto Registry.", type="negative")
             return
+
+        preference_sync["active"] = True
+        try:
+            if video_scope.value != preferences["video_scan_scope"]:
+                video_scope.set_value(preferences["video_scan_scope"])
+        finally:
+            preference_sync["active"] = False
 
         channel_rows = [
             {
@@ -65,6 +78,22 @@ def create_auto_registry_content(*, on_change: Callable[[], None] | None = None)
             f"({active_channels} Active · {len(channel_rows) - active_channels} Deactive) · "
             f"{len(video_rows)} video · "
             f'{sum(item["enabled"] for item in video_items)} video được phép tự động quét'
+            f' · {RECOVERY_VIDEO_SCOPE_LABELS[preferences["video_scan_scope"]]}'
+        )
+
+    def change_video_scope(event) -> None:
+        if preference_sync["active"]:
+            return
+        if not set_audio_recovery_scan_preferences(video_scan_scope=event.value):
+            refresh()
+            ui.notify("Không thể lưu loại video tự động quét.", type="negative")
+            return
+        refresh()
+        if on_change is not None:
+            on_change()
+        ui.notify(
+            "Đã lưu loại video tự động quét; áp dụng từ vòng quét tiếp theo.",
+            type="positive",
         )
 
     def set_items_enabled(
@@ -266,6 +295,16 @@ def create_auto_registry_content(*, on_change: Callable[[], None] | None = None)
                 "flat round dense"
             ).tooltip("Làm mới Auto Registry")
         summary = ui.label("").classes("text-xs text-gray-500")
+        ui.label("Loại video tự động quét").classes("text-sm font-medium")
+        video_scope = ui.toggle(
+            RECOVERY_VIDEO_SCOPE_LABELS,
+            value=RECOVERY_VIDEO_SCOPE_PUBLIC,
+            on_change=change_video_scope,
+        ).props("no-caps").classes("w-full")
+        ui.label(
+            "Chọn video công khai, video đang chờ đến lịch công khai hoặc cả hai. "
+            "Lựa chọn áp dụng từ vòng quét tiếp theo và được lưu khi mở lại ứng dụng."
+        ).classes("text-xs text-gray-500")
         ui.label(
             "Mặc định tự động quét tất cả các kênh Active. Kênh Deactive vẫn ở trong "
             "danh sách và có thể Active lại bằng nút; toàn bộ video của kênh Deactive "

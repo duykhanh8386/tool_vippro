@@ -8,6 +8,9 @@ from unittest.mock import AsyncMock, Mock, patch
 from src.audio_recovery import (
     RECOVERY_SCAN_MODE_ALL,
     RECOVERY_SCAN_MODE_SELECTED,
+    RECOVERY_VIDEO_SCOPE_BOTH,
+    RECOVERY_VIDEO_SCOPE_PUBLIC,
+    RECOVERY_VIDEO_SCOPE_SCHEDULED,
     _monitor_failed_caption_tracks,
     get_audio_recovery_registry_items,
     get_audio_recovery_scan_preferences,
@@ -59,6 +62,43 @@ class RegistryStorage:
 
 
 class AutoRegistryPersistenceTests(RegistryStorage, unittest.TestCase):
+    def test_video_scope_survives_restart_without_changing_channel_preferences(self):
+        set_audio_recovery_scan_preferences(
+            scan_mode=RECOVERY_SCAN_MODE_SELECTED, selected_channel_ids=["channel-a"]
+        )
+        set_audio_recovery_items_enabled(
+            enabled=False, video_ids_by_channel={"channel-a": ["video-other"]}
+        )
+        for scope in (RECOVERY_VIDEO_SCOPE_SCHEDULED, RECOVERY_VIDEO_SCOPE_BOTH):
+            with self.subTest(scope=scope):
+                self.assertTrue(set_audio_recovery_scan_preferences(video_scan_scope=scope))
+                self.manager._conn.close()
+                self.manager._conn = None
+                preferences = get_audio_recovery_scan_preferences()
+                self.assertEqual(preferences["video_scan_scope"], scope)
+                self.assertEqual(preferences["scan_mode"], RECOVERY_SCAN_MODE_SELECTED)
+                self.assertEqual(preferences["selected_channel_ids"], ["channel-a"])
+                self.assertEqual(get_audio_recovery_state()["entries"], self.original_entries)
+                self.assertFalse(is_audio_recovery_video_enabled("channel-a", "video-other"))
+        set_audio_recovery_scan_preferences(scan_mode=RECOVERY_SCAN_MODE_ALL)
+        self.assertEqual(
+            get_audio_recovery_scan_preferences()["video_scan_scope"], RECOVERY_VIDEO_SCOPE_BOTH
+        )
+
+    def test_missing_or_invalid_video_scope_defaults_to_public(self):
+        self.assertEqual(
+            get_audio_recovery_scan_preferences()["video_scan_scope"], RECOVERY_VIDEO_SCOPE_PUBLIC
+        )
+        for invalid in ("unknown", None, []):
+            with self.subTest(scope=invalid):
+                self.manager.save_state("audio_recovery", {
+                    "entries": self.original_entries, "video_scan_scope": invalid,
+                })
+                self.assertEqual(
+                    get_audio_recovery_scan_preferences()["video_scan_scope"],
+                    RECOVERY_VIDEO_SCOPE_PUBLIC,
+                )
+
     def test_disabled_channels_survive_restart_scope_changes_and_registration(self):
         self.assertTrue(set_audio_recovery_items_enabled(
             enabled=False, channel_ids=[" channel-a ", "channel-a", ""]
@@ -225,12 +265,12 @@ class AutoRegistryCycleTests(RegistryStorage, unittest.IsolatedAsyncioTestCase):
         translations = Mock(return_value={"videoTranslations": [], "audioTracks": []})
         captions = AsyncMock(return_value={})
         with (
-            patch("src.audio_recovery._get_registered_video_public_statuses", visibility),
+            patch("src.audio_recovery._get_registered_video_scan_statuses", visibility),
             patch("src.audio_recovery.update_audio_module._get_video_translation_payload", translations),
             patch("src.audio_recovery._monitor_failed_caption_tracks", captions),
         ):
             result = await run_audio_recovery_cycle(now=2000)
-        visibility.assert_called_once_with("channel-a", ["video-other"])
+        visibility.assert_called_once_with("channel-a", ["video-other"], video_scan_scope="public")
         translations.assert_called_once_with(["video-other"], "channel-a")
         self.assertEqual(list(captions.call_args.kwargs["entries"]), ["video-other"])
         self.assertEqual(result["scope_skipped_channel_ids"], ["channel-b"])
@@ -245,7 +285,7 @@ class AutoRegistryCycleTests(RegistryStorage, unittest.IsolatedAsyncioTestCase):
             },
         )
         with (
-            patch("src.audio_recovery._get_registered_video_public_statuses") as visibility,
+            patch("src.audio_recovery._get_registered_video_scan_statuses") as visibility,
             patch("src.audio_recovery.update_audio_module._get_video_translation_payload") as translations,
             patch("src.audio_recovery._monitor_failed_caption_tracks", new=AsyncMock()) as captions,
         ):
@@ -259,7 +299,7 @@ class AutoRegistryCycleTests(RegistryStorage, unittest.IsolatedAsyncioTestCase):
     async def test_removing_video_during_visibility_check_stops_snapshot_scan(self):
         seen = []
 
-        def visibility(channel_id, video_ids):
+        def visibility(channel_id, video_ids, **_kwargs):
             seen.append((channel_id, video_ids))
             if channel_id == "channel-a":
                 remove_audio_recovery_items(
@@ -268,7 +308,7 @@ class AutoRegistryCycleTests(RegistryStorage, unittest.IsolatedAsyncioTestCase):
             return {video_id: True for video_id in video_ids}, set()
 
         with (
-            patch("src.audio_recovery._get_registered_video_public_statuses", side_effect=visibility),
+            patch("src.audio_recovery._get_registered_video_scan_statuses", side_effect=visibility),
             patch("src.audio_recovery.update_audio_module._get_video_translation_payload", return_value={}) as scan,
         ):
             await run_audio_recovery_cycle(now=2000)
@@ -303,7 +343,7 @@ class AutoRegistryCycleTests(RegistryStorage, unittest.IsolatedAsyncioTestCase):
             }], "audioTracks": []}
 
         with (
-            patch("src.audio_recovery._get_registered_video_public_statuses", return_value=({"video-shared": True}, set())),
+            patch("src.audio_recovery._get_registered_video_scan_statuses", return_value=({"video-shared": True}, set())),
             patch("src.audio_recovery.update_audio_module._get_video_translation_payload", side_effect=scan),
             patch("src.audio_recovery.update_audio_module._get_video_info") as video_info,
             patch("src.audio_recovery.update_audio_module.add") as add,
@@ -345,7 +385,7 @@ class AutoRegistryCycleTests(RegistryStorage, unittest.IsolatedAsyncioTestCase):
             return operation()
 
         with (
-            patch("src.audio_recovery._get_registered_video_public_statuses", return_value=({"video-shared": True}, set())),
+            patch("src.audio_recovery._get_registered_video_scan_statuses", return_value=({"video-shared": True}, set())),
             patch("src.audio_recovery.update_audio_module._get_video_translation_payload", return_value=payload),
             patch("src.audio_recovery.update_audio_module._get_video_info", return_value=SimpleNamespace(duration_ms=60000)),
             patch("src.audio_recovery.multiply_audio", side_effect=render),
@@ -434,6 +474,38 @@ class AutoRegistryUiTests(RegistryStorage, unittest.TestCase):
         )
         with self.client:
             listener.handler(None)
+
+    def video_scope_control(self):
+        return next(
+            element for element in self.client.elements.values()
+            if isinstance(element, self.ui.toggle)
+        )
+
+    def test_video_scope_control_saves_all_choices(self):
+        control = self.video_scope_control()
+        self.assertEqual(control.value, RECOVERY_VIDEO_SCOPE_PUBLIC)
+        for scope in (RECOVERY_VIDEO_SCOPE_SCHEDULED, RECOVERY_VIDEO_SCOPE_BOTH, RECOVERY_VIDEO_SCOPE_PUBLIC):
+            with self.subTest(scope=scope), self.client:
+                control.set_value(scope)
+                self.assertEqual(get_audio_recovery_scan_preferences()["video_scan_scope"], scope)
+                self.assertEqual(get_audio_recovery_state()["entries"], self.original_entries)
+
+    def test_video_scope_control_restores_selection_when_save_fails(self):
+        control = self.video_scope_control()
+        with patch("web.components.auto_registry.set_audio_recovery_scan_preferences", return_value=False), self.client:
+            control.set_value(RECOVERY_VIDEO_SCOPE_SCHEDULED)
+        self.assertEqual(control.value, RECOVERY_VIDEO_SCOPE_PUBLIC)
+        self.assertEqual(
+            get_audio_recovery_scan_preferences()["video_scan_scope"], RECOVERY_VIDEO_SCOPE_PUBLIC
+        )
+        self.notify.assert_called_with("Không thể lưu loại video tự động quét.", type="negative")
+
+    def test_refresh_syncs_video_scope_without_saving_again(self):
+        set_audio_recovery_scan_preferences(video_scan_scope=RECOVERY_VIDEO_SCOPE_BOTH)
+        with patch("web.components.auto_registry.set_audio_recovery_scan_preferences") as save, self.client:
+            self.refresh()
+        self.assertEqual(self.video_scope_control().value, RECOVERY_VIDEO_SCOPE_BOTH)
+        save.assert_not_called()
 
     def test_channel_action_updates_both_lists_and_preserves_unlisted_channels(self):
         channels, videos = self.tables
