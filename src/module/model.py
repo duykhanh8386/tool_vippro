@@ -37,6 +37,7 @@ class ChannelInfo:
     cookies: list = field(default_factory=list)
     cookies_expires_at: Optional[int] = None
     overlay_png: str = ""
+    owner_email: str = ""
 
     def cookie_string(self) -> str:
         """Return cookies formatted as a single header string."""

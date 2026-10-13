@@ -225,6 +225,7 @@ class ChannelFetcher:
         }
         self.last_report = ChannelScanReport()
         self._noted_deleted_rows.clear()
+        self._owner_email = str(email or "").strip().casefold()
         self.driver = create_driver(enable_performance_log=True)
         self._run_step_with_retry(
             lambda: self._login(email, password),
@@ -1550,6 +1551,7 @@ class ChannelFetcher:
                 "challenge": challenge,
                 "botguardResponse": botguardResponse,
                 "cookies": cookies,
+                "owner_email": self._owner_email,
             }
         )
         return dict(id=id, name=name, img_src=img_src, cookies=cookies)

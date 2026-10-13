@@ -9,6 +9,12 @@ from src.audio_recovery import (
     register_audio_recovery,
     register_caption_monitor,
 )
+from src.channel_groups import (
+    ALL_GMAILS,
+    channel_gmail,
+    filter_channels_by_gmail,
+    gmail_filter_options,
+)
 from src.audio_batch_matcher import (
     AudioBatchMatchResult,
     build_audio_rename_plan,
@@ -681,6 +687,23 @@ def _audio_workflow_signature(
 def create_channel_selection(channels, on_channel_select):
     """Create a channel selection interface similar to studio page"""
     selected_channel = {"id": None}
+    selected_gmail = {"value": ALL_GMAILS}
+
+    def handle_gmail_change(event):
+        new_gmail = event.value
+        old_gmail = selected_gmail["value"]
+        if new_gmail == old_gmail:
+            return
+        visible_ids = {
+            channel.id for channel in filter_channels_by_gmail(channels, new_gmail)
+        }
+        if selected_channel["id"] and selected_channel["id"] not in visible_ids:
+            if on_channel_select(None) is False:
+                gmail_select.value = old_gmail
+                return
+            selected_channel["id"] = None
+        selected_gmail["value"] = new_gmail
+        refresh_channel_display()
 
     def handle_channel_click(channel_id):
         new_channel_id = None if selected_channel["id"] == channel_id else channel_id
@@ -698,7 +721,7 @@ def create_channel_selection(channels, on_channel_select):
             if not channels:
                 ui.label("Không có kênh nào. Hãy thêm kênh trước.").classes("text-gray-500 italic")
                 return
-            for channel_data in channels:
+            for channel_data in filter_channels_by_gmail(channels, selected_gmail["value"]):
                 name = channel_data.name
                 avatar = channel_data.img_src
                 cid = channel_data.id
@@ -719,13 +742,27 @@ def create_channel_selection(channels, on_channel_select):
                             ui.image(avatar).classes("w-6 h-6 rounded-full")
                         else:
                             ui.icon("o_account_circle").classes("text-xl text-gray-400")
-                        ui.label(name).classes("text-xs font-medium text-gray-900 flex-1 truncate")
+                        with ui.column().classes("gap-0 flex-1 min-w-0"):
+                            ui.label(name).classes("text-xs font-medium text-gray-900 truncate w-full")
+                            ui.label(channel_gmail(channel_data) or "Chưa xác định Gmail").classes(
+                                "text-[10px] text-gray-500 truncate w-full"
+                            )
                         if is_selected:
                             ui.icon("check_circle").classes("text-green-600 text-sm")
 
     with app_card(classes="audio-add-section"):
         ui.label("Chọn kênh").classes("app-section-title")
         ui.label("Kênh sở hữu các video cần cập nhật audio.").classes("app-section-copy")
+        gmail_select = ui.select(
+            gmail_filter_options(channels),
+            value=ALL_GMAILS,
+            label="Lọc kênh theo Gmail đã quét",
+            on_change=handle_gmail_change,
+        ).props("outlined dense options-dense").classes("w-full max-w-sm mb-3")
+        if any(not channel_gmail(channel) for channel in channels):
+            ui.label(
+                "Kênh cũ chưa có Gmail: vào Tài khoản & kênh → Quét Gmail để cập nhật."
+            ).classes("text-xs text-gray-500 mb-2")
         channels_container = ui.row().classes("gap-2 flex-wrap")
         refresh_channel_display()
     return selected_channel, refresh_channel_display

@@ -621,6 +621,7 @@ def get_channels_info(channel_id: str | None = None) -> list[ChannelInfo] | Chan
             cookies=rec.get("cookies", []), cookies_expires_at=rec.get("cookies_expires_at"), role=rec.get("role", ""),
             challenge=rec.get("challenge", ""), botguardResponse=rec.get("botguardResponse", ""),
             overlay_png=rec.get("overlay_png", ""),
+            owner_email=rec.get("owner_email", ""),
         )
     rows = channel_store.list_channels()
     channels = []
@@ -633,6 +634,7 @@ def get_channels_info(channel_id: str | None = None) -> list[ChannelInfo] | Chan
             cookies=r.get("cookies", []), cookies_expires_at=r.get("cookies_expires_at"), role=r.get("role", ""),
             challenge=r.get("challenge", ""), botguardResponse=r.get("botguardResponse", ""),
             overlay_png=r.get("overlay_png", ""),
+            owner_email=r.get("owner_email", ""),
         ))
     logger.info(f"Total channels loaded: {len(channels)}")
     return channels

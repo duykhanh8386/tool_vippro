@@ -22,6 +22,12 @@ from src.channel_scanner import (
     ChannelFetcher,
     ChannelScanError,
 )
+from src.channel_groups import (
+    ALL_GMAILS,
+    channel_gmail,
+    filter_channels_by_gmail,
+    gmail_filter_options,
+)
 from src.channel_store import channel_store
 from src.channel_validation import validate_reloaded_channel_session
 from src.license_manager import get_license_info
@@ -68,6 +74,7 @@ def create_studio_content(*, reload_alerts: bool = False):
         "summary": None,
         "selection_actions": None,
     }
+    gmail_filter = {"value": ALL_GMAILS}
 
     def client_is_alive() -> bool:
         return page_client is not None and not getattr(page_client, "_deleted", False)
@@ -257,6 +264,24 @@ def create_studio_content(*, reload_alerts: bool = False):
                     "notify selected channel reload",
                     lambda: ui.notify(message, type=result_type),
                 )
+            elif operation == "sync_gmail":
+                message = f"Đã quét {len(report.channels)} kênh của Gmail {email.strip().casefold()}."
+                if report.channels:
+                    gmail_filter["value"] = email.strip().casefold()
+                if report.failures:
+                    message += f" Có {len(report.failures)} kênh bị lỗi."
+                if report.deleted_channel_count:
+                    message += f" Bỏ qua {report.deleted_channel_count} kênh đã bị xóa."
+                best_effort_ui(
+                    "notify Gmail channel scan",
+                    lambda: ui.notify(
+                        message,
+                        type=(
+                            "warning" if report.failures else
+                            "positive" if report.channels else "info"
+                        ),
+                    ),
+                )
             else:
                 message = f"Đã thêm {len(report.channels)} kênh mới."
                 if not report.channels and not report.failures:
@@ -375,6 +400,18 @@ def create_studio_content(*, reload_alerts: bool = False):
                 + "Tool chỉ load đúng các Channel ID này và kiểm tra session token thật trước khi gỡ cảnh báo."
             )
             ui_refs["login_submit"].set_text("Load lại")
+        elif operation == "sync_gmail":
+            scan_state["operation"] = operation
+            scan_state["include_channel_ids"] = set()
+            scan_state["exclude_channel_ids"] = set()
+            scan_state["include_channel_names"] = {}
+            scan_state["exclude_channel_names"] = set()
+            ui_refs["login_title"].set_text("Quét kênh theo Gmail")
+            ui_refs["login_copy"].set_text(
+                "Đăng nhập Gmail cần đồng bộ. Tool quét các kênh đang có trong "
+                "tài khoản này và lưu Gmail cho từng kênh, kể cả kênh đã lưu trước đây."
+            )
+            ui_refs["login_submit"].set_text("Quét Gmail")
         else:
             stored_channels = list(get_channels_info() or [])
             existing_ids = {
@@ -889,6 +926,7 @@ def create_studio_content(*, reload_alerts: bool = False):
                             on_click=confirm_delete_all,
                         ).classes("text-red-600")
 
+            gmail_filter_container = ui.column().classes("w-full")
             channels_container = ui.column().classes("w-full gap-0")
 
         refresh_registry = create_auto_registry_content(
@@ -916,6 +954,35 @@ def create_studio_content(*, reload_alerts: bool = False):
 
     def refresh_channel_list():
         channels = get_channels_info() or []
+        gmail_options = gmail_filter_options(channels)
+        if gmail_filter["value"] not in gmail_options:
+            gmail_filter["value"] = ALL_GMAILS
+        visible_channels = filter_channels_by_gmail(channels, gmail_filter["value"])
+
+        def on_gmail_change(event):
+            if event.value != gmail_filter["value"]:
+                gmail_filter["value"] = event.value
+                refresh_channel_list()
+
+        gmail_filter_container.clear()
+        with gmail_filter_container:
+            with ui.row().classes("items-center gap-2 w-full flex-wrap"):
+                ui.select(
+                    gmail_options,
+                    value=gmail_filter["value"],
+                    label="Lọc kênh theo Gmail đã quét",
+                    on_change=on_gmail_change,
+                ).props("outlined dense options-dense").classes("w-full max-w-sm")
+                ui.button(
+                    "Quét Gmail",
+                    icon="manage_search",
+                    on_click=lambda: open_channel_login("sync_gmail"),
+                ).props("outline no-caps").classes("app-button-secondary")
+            if any(not channel_gmail(channel) for channel in channels):
+                ui.label(
+                    "Kênh cũ chưa có Gmail nằm trong ‘Chưa xác định Gmail’. "
+                    "Bấm Quét Gmail và đăng nhập Gmail tương ứng để cập nhật."
+                ).classes("text-xs text-gray-500")
         preferences = recovery_scope_snapshot()
         recovery_scan_mode = preferences["scan_mode"]
         recovery_selected_ids = set(preferences["selected_channel_ids"])
@@ -923,7 +990,10 @@ def create_studio_content(*, reload_alerts: bool = False):
             get_audio_recovery_state().get("disabled_channel_ids") or []
         )
         channels_container.clear()
-        channel_count_label.set_text(f"{len(channels)} kênh")
+        channel_count_label.set_text(
+            f"{len(visible_channels)}/{len(channels)} kênh"
+            if gmail_filter["value"] != ALL_GMAILS else f"{len(channels)} kênh"
+        )
         more_actions_button.set_visibility(bool(channels))
         toggle = recovery_scope_refs.get("toggle")
         if toggle is not None and toggle.value != recovery_scan_mode:
@@ -951,7 +1021,7 @@ def create_studio_content(*, reload_alerts: bool = False):
                     ui.label("Channel ID")
                     ui.label("Auto Registry")
                     ui.label("")
-                for channel_data in channels:
+                for channel_data in visible_channels:
                     name = channel_data.name
                     avatar = channel_data.img_src
                     channel_id = channel_data.id
@@ -988,7 +1058,7 @@ def create_studio_content(*, reload_alerts: bool = False):
                                 ui.label(name).classes(
                                     "text-sm font-semibold text-gray-800 truncate"
                                 )
-                                ui.label("YouTube channel").classes(
+                                ui.label(channel_gmail(channel_data) or "Chưa xác định Gmail").classes(
                                     "text-[11px] text-gray-400"
                                 )
                         ui.label(channel_id).classes(

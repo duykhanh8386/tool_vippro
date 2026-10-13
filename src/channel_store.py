@@ -52,6 +52,7 @@ CREATE TABLE IF NOT EXISTS channels (
     botguardResponse      TEXT,
     cookies_json          TEXT NOT NULL DEFAULT '[]',
     cookies_expires_at    INTEGER,
+    owner_email           TEXT NOT NULL DEFAULT '',
     created_at            INTEGER NOT NULL,
     updated_at            INTEGER NOT NULL
 )
@@ -65,6 +66,8 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE channels ADD COLUMN cookies_expires_at INTEGER")
     if "overlay_png" not in cols:
         conn.execute("ALTER TABLE channels ADD COLUMN overlay_png TEXT")
+    if "owner_email" not in cols:
+        conn.execute("ALTER TABLE channels ADD COLUMN owner_email TEXT NOT NULL DEFAULT ''")
     conn.commit()
 
 
@@ -87,6 +90,7 @@ def _row_to_record(row: sqlite3.Row) -> dict:
         "botguardResponse": row["botguardResponse"] or "",
         "cookies": cookies,
         "cookies_expires_at": row["cookies_expires_at"],
+        "owner_email": row["owner_email"] or "",
         "overlay_png": (
             row["overlay_png"] if "overlay_png" in row.keys() else ""
         ) or "",
@@ -128,6 +132,7 @@ class ChannelStore:
         cookies = record.get("cookies") or []
         cookies_json = json.dumps(cookies, ensure_ascii=False)
         cookies_expires_at = _compute_cookies_expires_at(cookies)
+        owner_email = str(record.get("owner_email") or "").strip().casefold()
 
         with self._lock:
             self.conn.execute(
@@ -135,8 +140,8 @@ class ChannelStore:
                 INSERT INTO channels (
                     id, name, img_src, sapisidhash, delegated_session_id,
                     role, challenge, botguardResponse, cookies_json, cookies_expires_at,
-                    created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    owner_email, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     name=excluded.name,
                     img_src=excluded.img_src,
@@ -147,6 +152,8 @@ class ChannelStore:
                     botguardResponse=excluded.botguardResponse,
                     cookies_json=excluded.cookies_json,
                     cookies_expires_at=excluded.cookies_expires_at,
+                    owner_email=CASE WHEN excluded.owner_email != ''
+                        THEN excluded.owner_email ELSE channels.owner_email END,
                     updated_at=excluded.updated_at
                 """,
                 (
@@ -160,6 +167,7 @@ class ChannelStore:
                     botguardResponse,
                     cookies_json,
                     cookies_expires_at,
+                    owner_email,
                     now,
                     now,
                 ),

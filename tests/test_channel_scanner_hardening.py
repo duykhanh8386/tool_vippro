@@ -280,6 +280,7 @@ class ChannelScannerHardeningTests(unittest.TestCase):
         self.assertEqual([item["id"] for item in report.channels], ["A", "B", "C"])
         self.assertEqual(report.failures, [])
         self.assertEqual(driver.quit_calls, 1)
+        self.assertEqual(fetcher._owner_email, "user@example.com")
 
     def test_deleted_channel_status_is_read_from_row_status_not_title(self):
         fetcher = ChannelFetcher()
