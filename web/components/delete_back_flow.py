@@ -1222,6 +1222,9 @@ def create_delete_back_flow_page():
             active_run["parent"] = run_context
             active_run["children"].clear()
             set_processing_ui(True)
+            push_log("Đang kiểm tra phiên YouTube trước khi xử lý video...", "info")
+            with bind_run_context(run_context):
+                await asyncio.to_thread(upload_video_module.validate_session, run_config["channel_id"])
             push_log(
                 f"Bắt đầu Delete-Back Flow — tối đa {MAX_ACTIVE_VIDEOS} video song song",
                 "info",
@@ -1235,10 +1238,13 @@ def create_delete_back_flow_page():
             )
             stopped = stop_requested["value"] or run_context.stopped
             update_parallel_progress(total_items, stats)
+        except TaskStopped:
+            stopped = True
         except Exception as exc:
             errors.append(f"Lỗi batch: {exc}")
             save_state()
             logger.exception("Delete-Back batch failed: {}", exc)
+            push_log(f"Batch thất bại: {exc}", "error")
         finally:
             # Persist and release backend ownership even if the old page was
             # closed and one of its UI elements can no longer be updated.
@@ -1445,6 +1451,8 @@ def create_delete_back_flow_page():
             channels,
             on_channel_select,
             initial_selected_ids=selected_channel["id"],
+            can_change_selection=lambda: not configuration_change_blocked(),
+            selection_state=selected_channel,
         )
         ui_refs["refresh_channel_display"] = refresh_channel_display
 

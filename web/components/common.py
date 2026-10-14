@@ -5,6 +5,12 @@ from tkinter import filedialog
 
 from loguru import logger
 from nicegui import ui
+from src.channel_groups import (
+    ALL_GMAILS,
+    channel_gmail,
+    filter_channels_by_gmail,
+    gmail_filter_options,
+)
 from web.theme import app_card
 
 
@@ -98,37 +104,87 @@ def create_channel_selection(
     channels,
     on_channel_select,
     multi_select: bool = False,
-    initial_selected_ids: list[str] | None = None,
+    initial_selected_ids: list[str] | str | None = None,
+    *,
+    can_change_selection=None,
+    selection_state: dict | None = None,
 ):
+    channels = list(channels or [])
+    initial_ids = (
+        [initial_selected_ids] if isinstance(initial_selected_ids, str)
+        else list(initial_selected_ids or [])
+    )
+    selected_gmail = {"value": ALL_GMAILS}
     if multi_select:
-        selected_ids = list(initial_selected_ids or [])
+        selected_ids = initial_ids
     else:
-        selected_channel = {"id": (initial_selected_ids or [None])[0]}
+        selected_channel = selection_state if selection_state is not None else {}
+        selected_channel.setdefault("id", (initial_ids or [None])[0])
+
+    def change_allowed():
+        return can_change_selection is None or can_change_selection()
+
+    def visible_channels():
+        return filter_channels_by_gmail(channels, selected_gmail["value"])
+
+    def handle_gmail_change(event):
+        previous = selected_gmail["value"]
+        requested = event.value
+        if requested == previous:
+            return
+        if not change_allowed():
+            gmail_select.set_value(previous)
+            return
+        visible_ids = {
+            channel.id for channel in filter_channels_by_gmail(channels, requested)
+        }
+        if multi_select:
+            retained_ids = [cid for cid in selected_ids if cid in visible_ids]
+            if retained_ids != selected_ids:
+                if on_channel_select(retained_ids) is False:
+                    gmail_select.set_value(previous)
+                    return
+                selected_ids[:] = retained_ids
+        elif selected_channel["id"] and selected_channel["id"] not in visible_ids:
+            if on_channel_select(None) is False:
+                gmail_select.set_value(previous)
+                return
+            selected_channel["id"] = None
+        selected_gmail["value"] = requested
+        refresh_channel_display()
 
     def handle_channel_click(channel_id: str):
+        if not change_allowed():
+            return
         if multi_select:
-            if channel_id in selected_ids:
-                selected_ids.remove(channel_id)
+            requested_ids = list(selected_ids)
+            if channel_id in requested_ids:
+                requested_ids.remove(channel_id)
             else:
-                selected_ids.append(channel_id)
-            on_channel_select(list(selected_ids))
-        elif selected_channel["id"] == channel_id:
-            selected_channel["id"] = None
-            on_channel_select(None)
+                requested_ids.append(channel_id)
+            if on_channel_select(requested_ids) is False:
+                return
+            selected_ids[:] = requested_ids
         else:
-            selected_channel["id"] = channel_id
-            on_channel_select(channel_id)
+            requested_id = None if selected_channel["id"] == channel_id else channel_id
+            if on_channel_select(requested_id) is False:
+                return
+            selected_channel["id"] = requested_id
         refresh_channel_display()
 
     def select_all():
-        selected_ids.clear()
-        selected_ids.extend(c.id for c in channels)
-        on_channel_select(list(selected_ids))
+        if not change_allowed():
+            return
+        requested_ids = [c.id for c in visible_channels()]
+        if on_channel_select(requested_ids) is False:
+            return
+        selected_ids[:] = requested_ids
         refresh_channel_display()
 
     def deselect_all():
+        if not change_allowed() or on_channel_select([]) is False:
+            return
         selected_ids.clear()
-        on_channel_select([])
         refresh_channel_display()
 
     def refresh_channel_display():
@@ -140,7 +196,7 @@ def create_channel_selection(
                 )
                 return
 
-            for channel_data in channels:
+            for channel_data in visible_channels():
                 name = channel_data.name
                 avatar = channel_data.img_src
                 cid = channel_data.id
@@ -171,9 +227,13 @@ def create_channel_selection(
                             ui.icon("o_account_circle").classes(
                                 "text-xl text-gray-400"
                             )
-                        ui.label(name).classes(
-                            "text-xs font-medium text-gray-900 flex-1 truncate"
-                        )
+                        with ui.column().classes("gap-0 flex-1 min-w-0"):
+                            ui.label(name).classes(
+                                "text-xs font-medium text-gray-900 truncate w-full"
+                            )
+                            ui.label(channel_gmail(channel_data) or "Chưa xác định Gmail").classes(
+                                "text-[10px] text-gray-500 truncate w-full"
+                            )
 
                         if is_selected:
                             ui.icon("check_circle").classes(
@@ -197,6 +257,16 @@ def create_channel_selection(
                         "dense flat size=sm"
                     ).classes("text-gray-500 text-xs")
 
+        gmail_select = ui.select(
+            gmail_filter_options(channels),
+            value=ALL_GMAILS,
+            label="Lọc kênh theo Gmail đã quét",
+            on_change=handle_gmail_change,
+        ).props("outlined dense options-dense").classes("w-full max-w-sm mb-3")
+        if any(not channel_gmail(channel) for channel in channels):
+            ui.label(
+                "Kênh cũ chưa có Gmail: vào Tài khoản & kênh → Quét Gmail để cập nhật."
+            ).classes("text-xs text-gray-500 mb-2")
         channels_container = ui.row().classes("gap-2 flex-wrap")
         refresh_channel_display()
 

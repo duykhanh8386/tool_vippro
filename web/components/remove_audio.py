@@ -641,7 +641,11 @@ def create_remove_audio_page():
         (
             remove_channel_state,
             refresh_remove_channel_display,
-        ) = create_channel_selection(channels, on_channel_select)
+        ) = create_channel_selection(
+            channels, on_channel_select,
+            can_change_selection=lambda: not configuration_change_blocked(),
+            selection_state=selected_remove_channel,
+        )
         ui_refs["refresh_remove_channel_display"] = refresh_remove_channel_display
 
         with app_card():

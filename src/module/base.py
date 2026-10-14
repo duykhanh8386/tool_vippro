@@ -1,5 +1,6 @@
 # RECOVERED: depyo output corrected from CPython 3.12 disassembly
 import json
+from copy import deepcopy
 import threading
 import time
 from abc import ABC
@@ -71,12 +72,12 @@ class IModule(ABC):
     pass
 
     _SESSION_TOKEN_TTL_SECONDS = 120.0
-    _SESSION_TOKEN_CACHE: dict[tuple[str, str, str, str], tuple[str, float]] = {}
+    _SESSION_TOKEN_CACHE: dict[tuple[str, ...], tuple[str, float]] = {}
     _SESSION_TOKEN_CACHE_LOCK = threading.RLock()
-    _SESSION_TOKEN_FETCH_LOCKS: dict[tuple[str, str, str, str], threading.Lock] = {}
+    _SESSION_TOKEN_FETCH_LOCKS: dict[tuple[str, ...], threading.Lock] = {}
 
     @classmethod
-    def _session_token_cache_key(cls, channel_info) -> tuple[str, str, str, str]:
+    def _session_token_cache_key(cls, channel_info) -> tuple[str, ...]:
         return (
             str(getattr(channel_info, "id", "") or ""),
             sapisid_cookie_fingerprint(
@@ -84,10 +85,13 @@ class IModule(ABC):
             ),
             str(getattr(channel_info, "challenge", "") or ""),
             str(getattr(channel_info, "botguardResponse", "") or ""),
+            str(getattr(channel_info, "delegated_session_id", "") or ""),
+            str(getattr(channel_info, "role", "") or ""),
+            json.dumps(getattr(channel_info, "studio_context", {}) or {}, sort_keys=True),
         )
 
     @classmethod
-    def _cached_session_token(cls, key: tuple[str, str, str, str]) -> str | None:
+    def _cached_session_token(cls, key: tuple[str, ...]) -> str | None:
         with cls._SESSION_TOKEN_CACHE_LOCK:
             cached = cls._SESSION_TOKEN_CACHE.get(key)
             if cached is None:
@@ -100,7 +104,7 @@ class IModule(ABC):
 
     @classmethod
     def _session_token_fetch_lock(
-        cls, key: tuple[str, str, str, str]
+        cls, key: tuple[str, ...]
     ) -> threading.Lock:
         with cls._SESSION_TOKEN_CACHE_LOCK:
             return cls._SESSION_TOKEN_FETCH_LOCKS.setdefault(key, threading.Lock())
@@ -238,7 +242,7 @@ class IModule(ABC):
         self,
         channel_info,
         *,
-        original_cache_key: tuple[str, str, str, str],
+        original_cache_key: tuple[str, ...],
     ) -> str:
         channel_id = channel_info.id
         role = channel_info.role
@@ -246,12 +250,32 @@ class IModule(ABC):
         challenge = channel_info.challenge
         bot_guard_response = channel_info.botguardResponse
         user_agent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+        def session_context() -> dict:
+            context = self._build_context(channel_id, role, delegated_session_id)
+            captured = getattr(channel_info, "studio_context", {}) or {}
+            if isinstance(captured, dict):
+                # Use the browser's actual client/delegation context rather than
+                # inventing a client version or discarding serialized delegation.
+                user = captured.get("user")
+                if isinstance(user, dict):
+                    captured_id = (user.get("delegationContext") or {}).get("externalChannelId")
+                    if captured_id and captured_id != channel_id:
+                        raise YouTubeRequestError("Studio context belongs to a different channel; reload the selected channel")
+                for field in ("client", "user", "clientScreenNonce"):
+                    if captured.get(field):
+                        context[field] = deepcopy(captured[field])
+                if isinstance(captured.get("request"), dict):
+                    context["request"] = deepcopy(captured["request"])
+                    context["request"].pop("sessionInfo", None)
+                    context["request"].pop("reauthRequestInfo", None)
+            return context
+
         def authenticated_headers() -> dict:
             # SAPISIDHASH embeds a timestamp. Build it immediately before each
             # request instead of reusing the value persisted during scanning.
             return {
                 "origin": "https://studio.youtube.com",
-                "user-agent": user_agent,
+                "user-agent": (getattr(channel_info, "studio_context", {}) or {}).get("client", {}).get("userAgent") or user_agent,
                 "cookie": channel_info.cookie_string(),
                 "content-type": "application/json",
                 "authorization": studio_authorization_header(
@@ -264,9 +288,7 @@ class IModule(ABC):
                 url="https://studio.youtube.com/youtubei/v1/att/esr?alt=json",
                 headers=authenticated_headers(),
                 json={
-                    "context": self._build_context(
-                        channel_id, role, delegated_session_id
-                    ),
+                    "context": session_context(),
                     "challenge": challenge,
                     "botguardResponse": bot_guard_response,
                     "xguardClientStatus": 0,
@@ -279,9 +301,7 @@ class IModule(ABC):
                 url="https://studio.youtube.com/youtubei/v1/security/get_web_reauth_url?alt=json",
                 headers=authenticated_headers(),
                 json={
-                    "context": self._build_context(
-                        channel_id, role, delegated_session_id
-                    ),
+                    "context": session_context(),
                     "continueUrl": "https://studio.youtube.com/reauth",
                     "flow": "REAUTH_FLOW_YT_STUDIO_COLD_LOAD",
                     "ivctx": ivctx,
@@ -291,52 +311,46 @@ class IModule(ABC):
             )
             return _response_json_or_error(response, "reauth request")
 
-        res = fetch_attestation_context()
-        if "ctx" not in res:
-            raise Exception("Youtube thay đổi thuật toán. Vui lòng lấy lại thông tin kênh. Nếu sau đó vẫn lỗi, hãy liên hệ admin!!!")
-        ivctx = res["ctx"]
-
-        res = fetch_reauth_context(ivctx)
-        if "encodedReauthProofToken" not in res:
-            logger.warning("Missing encodedReauthProofToken for channel {}, refreshing challenge...", channel_id)
-            from src.channel_refresh import refresh_challenge_and_botguard
-            from src.utils import get_channels_info
-            refresh_challenge_and_botguard(channel_id)
-            channel_info = get_channels_info(channel_id)
-            challenge = channel_info.challenge
-            bot_guard_response = channel_info.botguardResponse
-            delegated_session_id = channel_info.delegated_session_id
-            res = fetch_attestation_context()
-            if "ctx" not in res:
-                raise Exception("Youtube thay đổi thuật toán. Vui lòng lấy lại thông tin kênh. Nếu sau đó vẫn lỗi, hãy liên hệ admin!!!")
-            ivctx = res["ctx"]
-            res = fetch_reauth_context(ivctx)
-            if "encodedReauthProofToken" not in res:
-                raise Exception("Retry failed: encodedReauthProofToken vẫn không có sau khi refresh challenge. Vui lòng lấy lại thông tin kênh hoặc liên hệ admin!")
-            logger.info("Retry successful after refreshing challenge for {}", channel_id)
+        for attempt in range(2):
+            try:
+                res = fetch_attestation_context()
+                if not res.get("ctx"):
+                    raise YouTubeRequestError("YouTube attestation response is missing ctx")
+                res = fetch_reauth_context(res["ctx"])
+                if not res.get("encodedReauthProofToken") or not res.get("sessionRiskCtx"):
+                    raise YouTubeRequestError("YouTube reauth response is missing encodedReauthProofToken or sessionRiskCtx")
+                break
+            except YouTubeRequestError as exc:
+                # Refresh one time for malformed/expired attestation state.
+                # Do not hide permission errors, rate limits or server failures.
+                if attempt or exc.status_code not in {None, 400}:
+                    raise
+                logger.warning("Refreshing Studio authentication after a rejected token request: channel={} HTTP={}", channel_id, exc.status_code)
+                from src.channel_refresh import refresh_challenge_and_botguard
+                refresh_challenge_and_botguard(channel_id)
+                refreshed = get_channels_info(channel_id)
+                if refreshed is None:
+                    raise YouTubeRequestError("Channel was removed while refreshing Studio authentication") from exc
+                channel_info = refreshed
+                role = channel_info.role
+                challenge = channel_info.challenge
+                bot_guard_response = channel_info.botguardResponse
+                delegated_session_id = channel_info.delegated_session_id
         encoded_reauth_proof_token = res["encodedReauthProofToken"]
         session_risk_ctx = res["sessionRiskCtx"]
 
+        context = session_context()
+        # Keep the session-token endpoint's original user-block shape. The
+        # reauth proof carries the delegation for this request.
+        context["user"].pop("onBehalfOfUser", None)
+        context["request"]["reauthRequestInfo"] = {
+            "encodedReauthProofToken": encoded_reauth_proof_token
+        }
         response = post_with_stop(
             url="https://studio.youtube.com/youtubei/v1/ars/grst?alt=json",
             headers=authenticated_headers(),
             json={
-                "context": self._build_context(
-                    channel_id,
-                    "CREATOR_CHANNEL_ROLE_TYPE_OWNER",
-                    delegated_session_id,
-                    client_version="1.20241125.01.00",
-                    hl="vi",
-                    theme="USER_INTERFACE_THEME_LIGHT",
-                    screen_width=1847,
-                    screen_height=285,
-                    include_on_behalf_of_user=False,
-                    extra_request_fields={
-                        "reauthRequestInfo": {
-                            "encodedReauthProofToken": encoded_reauth_proof_token
-                        }
-                    },
-                ),
+                "context": context,
                 "ctx": session_risk_ctx,
             },
         )

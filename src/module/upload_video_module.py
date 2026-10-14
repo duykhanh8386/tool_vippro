@@ -68,6 +68,16 @@ class UploadVideoModule(IModule):
     _MAX_CHUNK_RETRIES = 5
     _UPLOAD_TIMEOUT = (30, 180)
 
+    def validate_session(self, channel_id: str) -> bool:
+        """Check Studio authentication before starting a batch of uploads."""
+        check_stopped()
+        channel_info = get_channels_info(channel_id)
+        if channel_info is None:
+            raise ValueError(f"Không tìm thấy kênh: {channel_id}")
+        self._get_session_token(channel_info)
+        check_stopped()
+        return True
+
     pass
     pass
     def upload(self, channel_id: str, file_path: str, index: int = 0, progress: dict | None = None) -> dict:

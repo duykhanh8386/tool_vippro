@@ -53,6 +53,7 @@ CREATE TABLE IF NOT EXISTS channels (
     cookies_json          TEXT NOT NULL DEFAULT '[]',
     cookies_expires_at    INTEGER,
     owner_email           TEXT NOT NULL DEFAULT '',
+    studio_context_json   TEXT NOT NULL DEFAULT '{}',
     created_at            INTEGER NOT NULL,
     updated_at            INTEGER NOT NULL
 )
@@ -68,6 +69,8 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE channels ADD COLUMN overlay_png TEXT")
     if "owner_email" not in cols:
         conn.execute("ALTER TABLE channels ADD COLUMN owner_email TEXT NOT NULL DEFAULT ''")
+    if "studio_context_json" not in cols:
+        conn.execute("ALTER TABLE channels ADD COLUMN studio_context_json TEXT NOT NULL DEFAULT '{}'")
     conn.commit()
 
 
@@ -79,6 +82,10 @@ def _row_to_record(row: sqlite3.Row) -> dict:
             cookies = json.loads(raw)
         except Exception:
             cookies = []
+    try:
+        studio_context = json.loads(row["studio_context_json"] or "{}")
+    except (ValueError, TypeError):
+        studio_context = {}
     return {
         "id": row["id"],
         "name": row["name"] or "",
@@ -91,6 +98,7 @@ def _row_to_record(row: sqlite3.Row) -> dict:
         "cookies": cookies,
         "cookies_expires_at": row["cookies_expires_at"],
         "owner_email": row["owner_email"] or "",
+        "studio_context": studio_context if isinstance(studio_context, dict) else {},
         "overlay_png": (
             row["overlay_png"] if "overlay_png" in row.keys() else ""
         ) or "",
@@ -133,6 +141,10 @@ class ChannelStore:
         cookies_json = json.dumps(cookies, ensure_ascii=False)
         cookies_expires_at = _compute_cookies_expires_at(cookies)
         owner_email = str(record.get("owner_email") or "").strip().casefold()
+        studio_context = record.get("studio_context")
+        studio_context_json = json.dumps(
+            studio_context if isinstance(studio_context, dict) else {}, ensure_ascii=False
+        )
 
         with self._lock:
             self.conn.execute(
@@ -140,8 +152,8 @@ class ChannelStore:
                 INSERT INTO channels (
                     id, name, img_src, sapisidhash, delegated_session_id,
                     role, challenge, botguardResponse, cookies_json, cookies_expires_at,
-                    owner_email, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    owner_email, studio_context_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     name=excluded.name,
                     img_src=excluded.img_src,
@@ -154,6 +166,8 @@ class ChannelStore:
                     cookies_expires_at=excluded.cookies_expires_at,
                     owner_email=CASE WHEN excluded.owner_email != ''
                         THEN excluded.owner_email ELSE channels.owner_email END,
+                    studio_context_json=CASE WHEN excluded.studio_context_json != '{}'
+                        THEN excluded.studio_context_json ELSE channels.studio_context_json END,
                     updated_at=excluded.updated_at
                 """,
                 (
@@ -168,6 +182,7 @@ class ChannelStore:
                     cookies_json,
                     cookies_expires_at,
                     owner_email,
+                    studio_context_json,
                     now,
                     now,
                 ),

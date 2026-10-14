@@ -5,6 +5,8 @@ from typing import Awaitable, Callable, Iterable, TypeVar
 from loguru import logger
 from nicegui import context, ui
 from src.audio_recovery import (
+    _is_currently_public_video,
+    _is_currently_scheduled_video,
     get_audio_mutation_guard,
     register_audio_recovery,
     register_caption_monitor,
@@ -75,10 +77,11 @@ MAX_AUDIO_UPLOAD_CONCURRENCY = 5
 _AUDIO_UPLOAD_CONCURRENCY_MODE = "delete_then_add_parallel_v2"
 DEFAULT_RECENT_VIDEO_LIMIT = 50
 MAX_RECENT_VIDEO_LIMIT = 10_000
-VIDEO_SCAN_SCOPES = {"all", "public", "draft", "recent"}
+VIDEO_SCAN_SCOPES = {"all", "public", "scheduled", "draft", "recent"}
 VIDEO_SCAN_SCOPE_LABELS = {
     "all": "tất cả video",
     "public": "video công khai",
+    "scheduled": "video đã lên lịch",
     "draft": "video bản nháp",
     "recent": "video đăng gần nhất",
 }
@@ -415,8 +418,7 @@ def _normalize_recent_video_limit(value: object) -> int:
 
 
 def _is_public_video(video: object) -> bool:
-    privacy = str(getattr(video, "privacy", "") or "").upper()
-    return privacy in {"PUBLIC", "VIDEO_PRIVACY_PUBLIC", "PRIVACY_PUBLIC"}
+    return _is_currently_public_video(video)
 
 
 def _draft_status_is_draft(value: object) -> bool:
@@ -461,7 +463,7 @@ def _fetch_channel_videos(
     scope: str = "all",
     recent_limit: int = DEFAULT_RECENT_VIDEO_LIMIT,
 ):
-    """Fetch videos newest-first for all, public-only, or recent-N scans."""
+    """Fetch videos newest-first for the selected scope, across all pages."""
     normalized_scope = scope if scope in VIDEO_SCAN_SCOPES else "all"
     normalized_limit = _normalize_recent_video_limit(recent_limit)
     videos = []
@@ -483,6 +485,8 @@ def _fetch_channel_videos(
                 continue
             seen_ids.add(video.id)
             if normalized_scope == "public" and not _is_public_video(video):
+                continue
+            if normalized_scope == "scheduled" and not _is_currently_scheduled_video(video):
                 continue
             videos.append(video)
             if normalized_scope == "recent" and len(videos) >= normalized_limit:
@@ -3311,6 +3315,7 @@ def create_add_audio_page():
                         {
                             "all": "Tất cả video",
                             "public": "Chỉ công khai",
+                            "scheduled": "Đã lên lịch",
                             "draft": "Bản nháp",
                             "recent": "Đăng gần nhất",
                         },

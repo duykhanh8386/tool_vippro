@@ -1491,6 +1491,7 @@ class ChannelFetcher:
             payload_json = json.loads(payload)
             challenge = payload_json["challenge"]
             botguardResponse = payload_json["botguardResponse"]
+            studio_context = payload_json.get("context") or {}
         except TimeoutError:
             raise
         except (json.JSONDecodeError, KeyError, TypeError) as exc:
@@ -1505,6 +1506,10 @@ class ChannelFetcher:
                 exception_type=type(exc).__name__,
             ) from exc
 
+        # Analytics can rotate the cookies used by its attestation request.
+        # Store the cookies from the same browser session as the captured proof.
+        cookies = normalize_cookies_for_storage(self.driver.get_cookies())
+        sapisidhash = generate_sapisidhash(cookies)
         url = f"https://studio.youtube.com/channel/{id}"
         cookie_string = "; ".join(
             [f"{cookie['name']}={cookie['value']}" for cookie in cookies]
@@ -1552,6 +1557,7 @@ class ChannelFetcher:
                 "botguardResponse": botguardResponse,
                 "cookies": cookies,
                 "owner_email": self._owner_email,
+                "studio_context": studio_context,
             }
         )
         return dict(id=id, name=name, img_src=img_src, cookies=cookies)

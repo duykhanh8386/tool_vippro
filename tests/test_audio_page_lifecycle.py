@@ -286,6 +286,14 @@ class AudioPageLifecycleTests(unittest.IsolatedAsyncioTestCase):
             SimpleNamespace(id="public", privacy="VIDEO_PRIVACY_PUBLIC"),
             SimpleNamespace(id="private", privacy="VIDEO_PRIVACY_PRIVATE"),
             SimpleNamespace(id="unlisted", privacy="VIDEO_PRIVACY_UNLISTED"),
+            SimpleNamespace(
+                id="scheduled-public", privacy="VIDEO_PRIVACY_PUBLIC",
+                scheduled_publishing_details={"time": "tomorrow"},
+            ),
+            SimpleNamespace(
+                id="draft-public", privacy="VIDEO_PRIVACY_PUBLIC",
+                draft_status="VIDEO_DRAFT_STATUS_DRAFT",
+            ),
         ]
         with patch(
             "web.components.audio.list_videos_module.list_all_videos",
@@ -294,6 +302,47 @@ class AudioPageLifecycleTests(unittest.IsolatedAsyncioTestCase):
             selected = _fetch_channel_videos("channel", scope="public")
 
         self.assertEqual([video.id for video in selected], ["public"])
+
+    def test_scheduled_scan_follows_all_pages_and_keeps_only_scheduled_uploads(self):
+        scheduled_private = SimpleNamespace(
+            id="scheduled-private", privacy="VIDEO_PRIVACY_PRIVATE",
+            scheduled_publishing_details={"time": "tomorrow"},
+        )
+        scheduled_public = SimpleNamespace(
+            id="scheduled-public", privacy="VIDEO_PRIVACY_PUBLIC",
+            scheduled_publishing_details={"time": "next-week"},
+        )
+        pages = [
+            ([
+                SimpleNamespace(id="public", privacy="VIDEO_PRIVACY_PUBLIC"),
+                SimpleNamespace(id="private", privacy="VIDEO_PRIVACY_PRIVATE"),
+                SimpleNamespace(id="unlisted", privacy="VIDEO_PRIVACY_UNLISTED"),
+                scheduled_private,
+                SimpleNamespace(
+                    id="draft", privacy="VIDEO_PRIVACY_PRIVATE", draft_status={"isDraft": True},
+                    scheduled_publishing_details={"time": "tomorrow"},
+                ),
+            ], "next-page"),
+            ([
+                scheduled_private,
+                SimpleNamespace(id="published", privacy="VIDEO_PRIVACY_PUBLIC", scheduled_publishing_details={}),
+                scheduled_public,
+                SimpleNamespace(
+                    id="draft-status", privacy="VIDEO_PRIVACY_PRIVATE", video_status="VIDEO_STATUS_DRAFT",
+                    scheduled_publishing_details={"time": "tomorrow"},
+                ),
+            ], None),
+        ]
+        with patch(
+            "web.components.audio.list_videos_module.list_all_videos", side_effect=pages,
+        ) as list_videos:
+            selected = _fetch_channel_videos("channel", scope="scheduled", recent_limit=1)
+
+        self.assertEqual([video.id for video in selected], ["scheduled-private", "scheduled-public"])
+        self.assertEqual(list_videos.call_count, 2)
+        self.assertEqual(list_videos.call_args_list[1].kwargs["page_token"], "next-page")
+        self.assertTrue(all(call.kwargs["limit"] == 50 for call in list_videos.call_args_list))
+        self.assertTrue(all("draft_only" not in call.kwargs for call in list_videos.call_args_list))
 
     def test_draft_scan_requests_the_server_side_draft_filter(self):
         videos = [

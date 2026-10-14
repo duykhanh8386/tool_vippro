@@ -45,11 +45,20 @@ class ChannelGmailGroupsTests(unittest.TestCase):
                 store.upsert_channel({"id": "new", "name": "Refreshed"})
                 self.assertEqual(store.get_channel("new")["owner_email"], "user@example.com")
                 self.assertEqual(store.get_channel("old")["name"], "Old channel")
+                self.assertEqual(store.get_channel("old")["studio_context"], {})
+                browser_context = {
+                    "client": {"clientName": 62, "clientVersion": "from-browser"},
+                    "user": {"serializedDelegationContext": "delegation"},
+                }
+                store.upsert_channel({"id": "new", "name": "New channel", "studio_context": browser_context})
+                store.upsert_channel({"id": "new", "name": "Partial refresh"})
+                self.assertEqual(store.get_channel("new")["studio_context"], browser_context)
 
                 from src.utils import get_channels_info
 
                 with patch("src.channel_store.channel_store", store):
                     self.assertEqual(get_channels_info("new").owner_email, "user@example.com")
+                    self.assertEqual(get_channels_info("new").studio_context, browser_context)
                     self.assertEqual(
                         {channel.id: channel.owner_email for channel in get_channels_info()},
                         {"old": "", "new": "user@example.com"},
