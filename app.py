@@ -63,6 +63,11 @@ def main() -> None:
     if initialize_first_run():
         logger.info("First run initialized. Sign in and add channels for this app.")
 
+    from src.state_manager import state_manager
+
+    if not state_manager.clear_state("studio_credentials"):
+        logger.error("Could not remove previously saved channel login credentials")
+
     from nicegui import app, ui
 
     from src.route_manager import router

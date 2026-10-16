@@ -43,12 +43,23 @@ class StateManager:
                 # normal application shutdown.  FULL asks SQLite to flush each
                 # committed transaction to durable storage before reporting it.
                 self._conn.execute("PRAGMA synchronous = FULL")
+                self._conn.execute("PRAGMA secure_delete = ON")
                 self._conn.execute(_CREATE_TABLE_SQL)
+                # Older builds persisted the shared channel login form in
+                # plaintext. Remove it without loading any secrets into the UI.
+                deleted_credentials = self._conn.execute(
+                    "DELETE FROM app_state WHERE page_name = ?",
+                    ("studio_credentials",),
+                ).rowcount
                 self._conn.commit()
+                if deleted_credentials:
+                    self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         return self._conn
 
     def save_state(self, page_name: str, state: Dict[str, Any]) -> bool:
         """Save state for a specific page."""
+        if page_name == "studio_credentials":
+            return False
         try:
             with self._lock:
                 conn = self._get_conn()
@@ -65,6 +76,8 @@ class StateManager:
 
     def load_state(self, page_name: str) -> Optional[Dict[str, Any]]:
         """Load state for a specific page."""
+        if page_name == "studio_credentials":
+            return None
         try:
             with self._lock:
                 row = self._get_conn().execute(

@@ -1247,12 +1247,6 @@ def create_add_audio_page():
             client_path = str(client_file)
             subtitle_settings["oauth_client_json"] = client_path
             save_right_panel_state()
-            credentials = state_manager.load_state("studio_credentials") or {}
-            login_hint = (
-                str(credentials.get("email") or "").strip()
-                if isinstance(credentials, dict)
-                else ""
-            )
             ui.notify(
                 "Tool đang mở Google. Lần đầu hãy kiểm tra đúng tài khoản rồi bấm Cho phép.",
                 type="info",
@@ -1264,7 +1258,6 @@ def create_add_audio_page():
                     authorize_caption_channel,
                     channel_id,
                     client_path,
-                    login_hint=login_hint,
                 )
             except Exception as exc:
                 logger.exception("Could not authorize YouTube captions")

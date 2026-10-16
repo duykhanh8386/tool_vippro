@@ -34,7 +34,6 @@ from src.channel_groups import (
 from src.channel_store import channel_store
 from src.channel_validation import validate_reloaded_channel_session
 from src.license_manager import get_license_info
-from src.state_manager import state_manager
 from src.utils import get_channels_info
 from src.task_runtime import TaskStopped, bind_run_context, create_run_context
 from web.components.auto_registry import create_auto_registry_content
@@ -51,8 +50,6 @@ from web.theme import (
 
 def create_studio_content(*, reload_alerts: bool = False):
     ui_refs = {
-        "email_input": None,
-        "password_input": None,
         "login_title": None,
         "login_copy": None,
         "login_submit": None,
@@ -95,41 +92,14 @@ def create_studio_content(*, reload_alerts: bool = False):
             logger.warning("Studio UI action '{}' was skipped: {}", action, exc)
             return False
 
-    def save_credentials():
-        """Save login credentials to file (remember me functionality)."""
-        try:
-            if ui_refs["email_input"] and ui_refs["password_input"]:
-                state_manager.save_state(
-                    "studio_credentials",
-                    {
-                        "email": ui_refs["email_input"].value,
-                        "password": ui_refs["password_input"].value,
-                        "remember_me": True,
-                    },
-                )
-        except Exception as exc:
-            logger.error(f"Failed to save credentials: {exc}")
-
-    def load_credentials():
-        """Load saved credentials into the existing dialog inputs."""
-        try:
-            state = state_manager.load_state("studio_credentials")
-            if not state or not state.get("remember_me"):
-                return
-
-            def update_ui():
-                try:
-                    if ui_refs["email_input"] and "email" in state:
-                        ui_refs["email_input"].value = state["email"]
-                    if ui_refs["password_input"] and "password" in state:
-                        ui_refs["password_input"].value = state["password"]
-                    logger.info("Credentials loaded")
-                except Exception as exc:
-                    logger.error(f"Failed to update UI: {exc}")
-
-            ui.timer(0.5, update_ui, once=True)
-        except Exception as exc:
-            logger.error(f"Failed to load credentials: {exc}")
+    def clear_login_inputs():
+        """Keep credentials only for the scan that the user submits."""
+        email_input.value = ""
+        password_input.value = ""
+        password_input.props("type=password")
+        for element in password_input.descendants():
+            if isinstance(element, ui.icon):
+                element.props("name=visibility_off")
 
     async def fetch_channel_data(
         email,
@@ -438,6 +408,7 @@ def create_studio_content(*, reload_alerts: bool = False):
                 "chỉ click các kênh chưa có trong danh sách hiện tại."
             )
             ui_refs["login_submit"].set_text("Tìm kênh mới")
+        clear_login_inputs()
         login_dialog.open()
 
     def on_login():
@@ -449,10 +420,7 @@ def create_studio_content(*, reload_alerts: bool = False):
         if not email or not password:
             ui.notify("Vui lòng nhập đầy đủ email và mật khẩu.", type="warning")
             return
-        if remember_checkbox.value:
-            save_credentials()
-        else:
-            state_manager.clear_state("studio_credentials")
+        clear_login_inputs()
         login_dialog.close()
         scan_state["deadline"] = time.monotonic() + AUTHENTICATION_TIMEOUT_SECONDS
         scan_state["cancel_requested"] = False
@@ -492,6 +460,7 @@ def create_studio_content(*, reload_alerts: bool = False):
 
     async def stop_scan_when_client_disconnects():
         """Stop the owned Selenium session when this page is closed/reloaded."""
+        clear_login_inputs()
         run_context = scan_state["run_context"]
         if run_context is None:
             return
@@ -788,38 +757,19 @@ def create_studio_content(*, reload_alerts: bool = False):
                 ).classes("app-section-copy")
                 ui_refs["login_copy"] = login_copy
 
-            email_input = ui.input("Email").props("outlined").classes("w-full")
-            ui_refs["email_input"] = email_input
-            password_input = (
-                ui.input("Mật khẩu", password=True, password_toggle_button=True)
-                .props("outlined")
+            email_input = (
+                ui.input("Email")
+                .props('outlined autocomplete=off autocapitalize=off spellcheck=false')
                 .classes("w-full")
             )
-            ui_refs["password_input"] = password_input
-            def on_remember_change(event):
-                if not event.value:
-                    state_manager.clear_state("studio_credentials")
-
-            remember_checkbox = ui.checkbox(
-                "Ghi nhớ thông tin đăng nhập",
-                value=True,
-                on_change=on_remember_change,
-            ).classes("text-sm text-gray-600")
-
-            def clear_login_inputs():
-                email_input.value = ""
-                password_input.value = ""
-                remember_checkbox.value = False
-                if state_manager.clear_state("studio_credentials"):
-                    ui.notify(
-                        "Đã xóa thông tin đăng nhập khỏi biểu mẫu và dữ liệu đã lưu.",
-                        type="positive",
-                    )
-                else:
-                    ui.notify(
-                        "Đã xóa biểu mẫu nhưng không thể xóa dữ liệu đã lưu.",
-                        type="warning",
-                    )
+            password_input = (
+                ui.input("Mật khẩu", password=True, password_toggle_button=True)
+                .props('outlined autocomplete=new-password')
+                .classes("w-full")
+            )
+            ui.label(
+                "Tool không lưu email hoặc mật khẩu. Vui lòng nhập lại mỗi lần."
+            ).classes("app-section-copy")
 
             with ui.row().classes("w-full justify-between items-center mt-2"):
                 ui.button(
@@ -840,7 +790,9 @@ def create_studio_content(*, reload_alerts: bool = False):
                     ).classes("app-button-primary")
                     ui_refs["login_submit"] = login_submit
 
-            load_credentials()
+    login_dialog.on_value_change(
+        lambda event: clear_login_inputs() if not event.value else None
+    )
 
     if reload_alerts:
         ui.timer(
