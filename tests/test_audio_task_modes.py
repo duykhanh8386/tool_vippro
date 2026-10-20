@@ -1,3 +1,4 @@
+import asyncio
 import copy
 import inspect
 import tempfile
@@ -5,7 +6,7 @@ import unittest
 from contextlib import ExitStack
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from nicegui import Client, ui
 from nicegui.page import page
@@ -117,6 +118,13 @@ class AudioTaskModeTests(unittest.IsolatedAsyncioTestCase):
                       if isinstance(element, ui.button) and element.text == text)
         listener = next(listener for listener in button._event_listeners.values() if listener.type == "click")
         return inspect.getclosurevars(listener.handler).nonlocals["callback"]
+
+    def scan_scope_controls(self, client):
+        toggle = next(element for element in client.elements.values()
+                      if isinstance(element, ui.toggle) and set(element.options) == audio.VIDEO_SCAN_SCOPES)
+        number = next(element for element in client.elements.values()
+                      if isinstance(element, ui.number) and element._props.get("label") == "Số video muốn quét")
+        return toggle, number
 
     async def test_combined_workflow_still_deletes_before_adding_every_language(self):
         self.state.states["audio_add"] = self.saved_add_state()
@@ -257,6 +265,168 @@ class AudioTaskModeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.state.states["audio_add_only"]["video_ids"], [])
         self.assertEqual(self.state.states["audio_add"], {"keep": "combined"})
         self.assertEqual(self.state.states["audio_remove"], {"keep": "remove"})
+
+    async def test_remove_scan_caps_drafts_before_reading_audio_and_saves_actual_result_scope(self):
+        self.state.states["audio_remove"] = {
+            "selected_channel": self.channel.id,
+            "scan_settings": {"scan_scope": "draft", "recent_limit": 2},
+        }
+        client = self.render(remove_only=True)
+        scope, number = self.scan_scope_controls(client)
+        self.assertEqual(scope.options, audio.VIDEO_SCAN_SCOPE_OPTIONS)
+        self.assertFalse(number._props.get("disable"))
+        with client:
+            number.value = 3
+
+        def find_attention(video_ids, channel_id, unreadable):
+            unreadable.append("draft-1")
+            return {"draft-0", "draft-2"}
+
+        with (
+            patch.object(remove_audio.list_videos_module, "list_all_videos", return_value=(
+                [SimpleNamespace(id=f"draft-{i}") for i in range(5)], "unused"),
+            ) as fetch,
+            patch.object(remove_audio.update_audio_module, "get_audio_attention_video_ids", side_effect=find_attention) as scan,
+            client,
+        ):
+            await self.button_callback(client, "Quét video cần xử lý")()
+
+        fetch.assert_called_once_with(self.channel.id, limit=3, page_token=None, draft_only=True)
+        self.assertEqual(scan.call_args.args[0], ["draft-0", "draft-1", "draft-2"])
+        saved = self.state.states["audio_remove"]
+        self.assertEqual(saved["ids"], ["draft-0", "draft-2"])
+        self.assertEqual(saved["scan_settings"], {"scan_scope": "draft", "recent_limit": 3})
+        self.assertEqual(saved["scan_state"]["total"], 3)
+        self.assertEqual(saved["scan_state"]["matched"], 2)
+        self.assertEqual(saved["scan_state"]["skipped"], 1)
+        self.assertEqual(saved["scan_state"]["last_scan_scope"], "draft")
+        self.assertEqual(saved["scan_state"]["last_scan_limit"], 3)
+        self.delete.assert_not_called()
+        self.add.assert_not_called()
+        self.assertFalse(scope._props.get("disable"))
+        self.assertFalse(number._props.get("disable"))
+
+    async def test_remove_scan_applies_every_scope_to_the_ids_sent_for_audio_checks(self):
+        videos = [
+            SimpleNamespace(id="public", privacy="VIDEO_PRIVACY_PUBLIC"),
+            SimpleNamespace(id="scheduled", privacy="VIDEO_PRIVACY_PRIVATE", scheduled_publishing_details={"time": "later"}),
+            SimpleNamespace(id="draft", privacy="VIDEO_PRIVACY_PRIVATE", draft_status="DRAFT"),
+            SimpleNamespace(id="private", privacy="VIDEO_PRIVACY_PRIVATE"),
+        ]
+        expected_by_scope = {
+            "all": ["public", "scheduled", "draft", "private"],
+            "public": ["public"],
+            "scheduled": ["scheduled"],
+            "draft": ["draft"],
+            "recent": ["public", "scheduled"],
+        }
+        for scope, expected in expected_by_scope.items():
+            with self.subTest(scope=scope):
+                self.state.states["audio_remove"] = {
+                    "selected_channel": self.channel.id,
+                    "scan_settings": {"scan_scope": scope, "recent_limit": 2},
+                }
+                client = self.render(remove_only=True)
+                _, number = self.scan_scope_controls(client)
+                self.assertEqual(bool(number._props.get("disable")), scope not in {"draft", "recent"})
+                with (
+                    patch.object(remove_audio.list_videos_module, "list_all_videos", return_value=(
+                        [videos[2]] if scope == "draft" else videos, None,
+                    )) as fetch,
+                    patch.object(remove_audio.update_audio_module, "get_audio_attention_video_ids", return_value=set(expected)) as scan,
+                    client,
+                ):
+                    await self.button_callback(client, "Quét video cần xử lý")()
+
+                self.assertEqual(scan.call_args.args[0], expected)
+                self.assertEqual(self.state.states["audio_remove"]["ids"], expected)
+                self.assertEqual(fetch.call_args.kwargs["limit"], 2 if scope in {"draft", "recent"} else 50)
+                self.assertEqual(fetch.call_args.kwargs.get("draft_only", False), scope == "draft")
+                self.assertEqual(self.state.states["audio_remove"]["scan_state"]["last_scan_scope"], scope)
+
+    async def test_remove_scan_preferences_restore_and_clear_independently_of_add_tasks(self):
+        self.state.states["audio_add"] = {"keep": "combined"}
+        self.state.states["audio_add_only"] = {"keep": "add only"}
+        self.state.states["audio_remove"] = {"selected_channel": self.channel.id, "ids": ["video"]}
+        client = self.render(remove_only=True)
+        scope, number = self.scan_scope_controls(client)
+        self.assertEqual(scope.value, "all")
+        self.assertEqual(number.value, 50)
+        self.assertTrue(number._props.get("disable"))
+        with client:
+            scope.value = "recent"
+            number.value = 0
+            self.assertEqual(number.value, 1)
+            number.value = 10001
+            self.assertEqual(number.value, 10000)
+            number.value = 17
+
+        reopened = self.render(remove_only=True)
+        restored_scope, restored_number = self.scan_scope_controls(reopened)
+        self.assertEqual(restored_scope.value, "recent")
+        self.assertEqual(restored_number.value, 17)
+        self.assertFalse(restored_number._props.get("disable"))
+        self.assertEqual(self.state.states["audio_remove"]["ids"], ["video"])
+        with reopened:
+            self.button_callback(reopened, "Xóa dữ liệu")()
+        self.assertEqual(self.state.states["audio_remove"]["scan_settings"], {"scan_scope": "all", "recent_limit": 50})
+        self.assertEqual(restored_scope.value, "all")
+        self.assertTrue(restored_number._props.get("disable"))
+        self.assertEqual(self.state.states["audio_add"], {"keep": "combined"})
+        self.assertEqual(self.state.states["audio_add_only"], {"keep": "add only"})
+
+    async def test_remove_scan_blocks_scope_and_count_changes_until_scan_finishes(self):
+        self.state.states["audio_remove"] = {
+            "selected_channel": self.channel.id,
+            "scan_settings": {"scan_scope": "draft", "recent_limit": 3},
+        }
+        client = self.render(remove_only=True)
+        scope, number = self.scan_scope_controls(client)
+        started, release = asyncio.Event(), asyncio.Event()
+
+        async def dispatch(function, *args, **kwargs):
+            if function is remove_audio._fetch_channel_videos:
+                started.set()
+                await release.wait()
+                return []
+            return function(*args, **kwargs)
+
+        with (
+            patch.object(remove_audio.asyncio, "to_thread", new=AsyncMock(side_effect=dispatch)),
+            patch.object(remove_audio.update_audio_module, "get_audio_attention_video_ids", return_value=set()),
+            client,
+        ):
+            task = asyncio.create_task(self.button_callback(client, "Quét video cần xử lý")())
+            try:
+                await asyncio.wait_for(started.wait(), timeout=2)
+                self.assertTrue(scope._props.get("disable"))
+                self.assertTrue(number._props.get("disable"))
+                scope.value = "public"
+                number.value = 20
+                self.assertEqual(scope.value, "draft")
+                self.assertEqual(number.value, 3)
+            finally:
+                release.set()
+                await task
+
+        self.assertFalse(scope._props.get("disable"))
+        self.assertFalse(number._props.get("disable"))
+        self.assertEqual(self.state.states["audio_remove"]["scan_settings"], {"scan_scope": "draft", "recent_limit": 3})
+
+    async def test_failed_remove_scan_preserves_previous_ids_and_reenables_scan_controls(self):
+        self.state.states["audio_remove"] = {
+            "selected_channel": self.channel.id, "ids": ["previous-video"],
+            "scan_settings": {"scan_scope": "recent", "recent_limit": 4},
+        }
+        client = self.render(remove_only=True)
+        scope, number = self.scan_scope_controls(client)
+        with patch.object(remove_audio, "_fetch_channel_videos", side_effect=RuntimeError("scan failed")), client:
+            await self.button_callback(client, "Quét video cần xử lý")()
+
+        self.assertEqual(self.state.states["audio_remove"]["ids"], ["previous-video"])
+        self.assertFalse(scope._props.get("disable"))
+        self.assertFalse(number._props.get("disable"))
+        self.delete.assert_not_called()
 
 
 class AudioTaskRouteTests(unittest.TestCase):

@@ -30,6 +30,16 @@ from src.audio_language import (
     invalid_language_codes,
     parse_language_codes,
 )
+from src.audio_video_scan import (
+    DEFAULT_RECENT_VIDEO_LIMIT,
+    MAX_RECENT_VIDEO_LIMIT,
+    VIDEO_SCAN_SCOPES,
+    VIDEO_SCAN_SCOPE_LABELS,
+    VIDEO_SCAN_SCOPE_OPTIONS,
+    _fetch_all_channel_videos,
+    _fetch_channel_videos,
+    _normalize_recent_video_limit,
+)
 from src.module.audio_module import update_audio_module
 from src.module.list_videos_module import list_videos_module
 from src.module.model import Video
@@ -75,16 +85,6 @@ DEFAULT_AUDIO_UPLOAD_CONCURRENCY = 3
 MIN_AUDIO_UPLOAD_CONCURRENCY = 3
 MAX_AUDIO_UPLOAD_CONCURRENCY = 5
 _AUDIO_UPLOAD_CONCURRENCY_MODE = "delete_then_add_parallel_v2"
-DEFAULT_RECENT_VIDEO_LIMIT = 50
-MAX_RECENT_VIDEO_LIMIT = 10_000
-VIDEO_SCAN_SCOPES = {"all", "public", "scheduled", "draft", "recent"}
-VIDEO_SCAN_SCOPE_LABELS = {
-    "all": "tất cả video",
-    "public": "video công khai",
-    "scheduled": "video đã lên lịch",
-    "draft": "video bản nháp",
-    "recent": "video đăng gần nhất",
-}
 
 
 class _AudioRunControl:
@@ -409,14 +409,6 @@ def _is_youtube_auth_error(exc: BaseException) -> bool:
     return "http 401" in message or "authentication credential" in message
 
 
-def _normalize_recent_video_limit(value: object) -> int:
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError):
-        parsed = DEFAULT_RECENT_VIDEO_LIMIT
-    return max(1, min(MAX_RECENT_VIDEO_LIMIT, parsed))
-
-
 def _is_public_video(video: object) -> bool:
     return _is_currently_public_video(video)
 
@@ -455,53 +447,6 @@ def _is_draft_video(video: object) -> bool:
     return _draft_status_is_draft(
         getattr(video, "draft_status", "")
     ) or _draft_status_is_draft(getattr(video, "video_status", ""))
-
-
-def _fetch_channel_videos(
-    channel_id: str,
-    *,
-    scope: str = "all",
-    recent_limit: int = DEFAULT_RECENT_VIDEO_LIMIT,
-):
-    """Fetch newest-first; recent_limit also caps a draft-only scan."""
-    normalized_scope = scope if scope in VIDEO_SCAN_SCOPES else "all"
-    normalized_limit = _normalize_recent_video_limit(recent_limit)
-    videos = []
-    seen_ids = set()
-    seen_tokens = set()
-    page_token = None
-    while True:
-        page_size = 50
-        if normalized_scope in {"recent", "draft"}:
-            page_size = min(50, normalized_limit - len(videos))
-        list_kwargs = {"limit": page_size, "page_token": page_token}
-        if normalized_scope == "draft":
-            list_kwargs["draft_only"] = True
-        page, next_token = list_videos_module.list_all_videos(
-            channel_id, **list_kwargs
-        )
-        for video in page:
-            if not video.id or video.id in seen_ids:
-                continue
-            seen_ids.add(video.id)
-            if normalized_scope == "public" and not _is_public_video(video):
-                continue
-            if normalized_scope == "scheduled" and not _is_currently_scheduled_video(video):
-                continue
-            videos.append(video)
-            if normalized_scope in {"recent", "draft"} and len(videos) >= normalized_limit:
-                return videos
-        if not next_token:
-            return videos
-        if next_token in seen_tokens:
-            raise RuntimeError("YouTube trả về mã phân trang bị lặp; đã dừng quét để tránh treo.")
-        seen_tokens.add(next_token)
-        page_token = next_token
-
-
-def _fetch_all_channel_videos(channel_id: str):
-    """Backward-compatible all-video scan used by manual matching."""
-    return _fetch_channel_videos(channel_id, scope="all")
 
 
 def _select_videos_by_ids(videos: Iterable[Video], video_ids: Iterable[str]):
@@ -3318,13 +3263,7 @@ def create_add_audio_page(*, delete_existing: bool = True):
                         "text-xs font-semibold text-gray-700"
                     )
                     scan_scope_toggle = ui.toggle(
-                        {
-                            "all": "Tất cả video",
-                            "public": "Chỉ công khai",
-                            "scheduled": "Đã lên lịch",
-                            "draft": "Bản nháp",
-                            "recent": "Đăng gần nhất",
-                        },
+                        VIDEO_SCAN_SCOPE_OPTIONS,
                         value=video_source_state["scan_scope"],
                         on_change=on_scan_scope_change,
                     ).props("no-caps disable")

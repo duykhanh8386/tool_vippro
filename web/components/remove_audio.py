@@ -7,6 +7,16 @@ from nicegui import context, ui
 from loguru import logger
 
 from src.audio_recovery import get_audio_mutation_guard
+from src.audio_video_scan import (
+    DEFAULT_RECENT_VIDEO_LIMIT,
+    MAX_RECENT_VIDEO_LIMIT,
+    VIDEO_SCAN_SCOPES,
+    VIDEO_SCAN_SCOPE_LABELS,
+    VIDEO_SCAN_SCOPE_OPTIONS,
+    _fetch_all_channel_videos,
+    _fetch_channel_videos,
+    _normalize_recent_video_limit,
+)
 from src.module.audio_module import update_audio_module
 from src.module.list_videos_module import list_videos_module
 from src.state_manager import state_manager
@@ -77,30 +87,6 @@ def _clamp_remove_concurrency(value: object) -> int:
     return max(MIN_REMOVE_AUDIO_CONCURRENCY, min(MAX_REMOVE_AUDIO_CONCURRENCY, parsed))
 
 
-def _fetch_all_channel_videos(channel_id: str):
-    """Fetch every channel page while guarding against repeated page tokens."""
-    videos = []
-    seen_ids = set()
-    seen_tokens = set()
-    page_token = None
-    while True:
-        page, next_token = list_videos_module.list_all_videos(
-            channel_id, limit=50, page_token=page_token
-        )
-        for video in page:
-            if video.id and video.id not in seen_ids:
-                seen_ids.add(video.id)
-                videos.append(video)
-        if not next_token:
-            return videos
-        if next_token in seen_tokens:
-            raise RuntimeError(
-                "YouTube trả về mã phân trang bị lặp; đã dừng quét để tránh treo."
-            )
-        seen_tokens.add(next_token)
-        page_token = next_token
-
-
 def create_remove_audio_page():
     try:
         page_client = context.client
@@ -132,12 +118,15 @@ def create_remove_audio_page():
     # destructive request so a restart can verify what YouTube received.
     delete_requested = {}
     performance_settings = {"max_concurrency": DEFAULT_REMOVE_AUDIO_CONCURRENCY}
+    scan_settings = {"scan_scope": "all", "recent_limit": DEFAULT_RECENT_VIDEO_LIMIT}
     scan_state = {
         "source_active": False,
         "channel_id": None,
         "total": 0,
         "matched": 0,
         "skipped": 0,
+        "last_scan_scope": None,
+        "last_scan_limit": None,
     }
     scan_runtime = {"running": False}
     suppress_autosave = {"value": False}
@@ -147,6 +136,8 @@ def create_remove_audio_page():
         "scan_button": None,
         "scan_status_container": None,
         "concurrency_input": None,
+        "scan_scope_toggle": None,
+        "recent_limit_input": None,
     }
 
     def configuration_change_blocked() -> bool:
@@ -178,6 +169,7 @@ def create_remove_audio_page():
             "video_processing_status": video_processing_status,
             "delete_requested": delete_requested,
             "performance_settings": performance_settings,
+            "scan_settings": scan_settings,
             "scan_state": scan_state,
         }
         try:
@@ -205,6 +197,11 @@ def create_remove_audio_page():
                 (state.get("performance_settings") or {}).get("max_concurrency")
             )
             scan_state.update(state.get("scan_state") or {})
+            saved_scan = state.get("scan_settings") or {}
+            scan_settings["scan_scope"] = (
+                saved_scan.get("scan_scope") if saved_scan.get("scan_scope") in VIDEO_SCAN_SCOPES else "all"
+            )
+            scan_settings["recent_limit"] = _normalize_recent_video_limit(saved_scan.get("recent_limit"))
             if restored_statuses != (state.get("video_processing_status") or {}):
                 save_remove_state()
 
@@ -218,6 +215,11 @@ def create_remove_audio_page():
                         ui_refs["concurrency_input"].value = performance_settings[
                             "max_concurrency"
                         ]
+                    if ui_refs["scan_scope_toggle"]:
+                        ui_refs["scan_scope_toggle"].value = scan_settings["scan_scope"]
+                    if ui_refs["recent_limit_input"]:
+                        ui_refs["recent_limit_input"].value = scan_settings["recent_limit"]
+                    refresh_scan_controls()
                     refresh_scan_status()
                     refresh_right_panel()
                     logger.info("Remove audio state loaded and UI updated")
@@ -243,6 +245,8 @@ def create_remove_audio_page():
                 total=0,
                 matched=0,
                 skipped=0,
+                last_scan_scope=None,
+                last_scan_limit=None,
             )
             refresh_right_panel()
         selected_remove_channel["id"] = channel_id
@@ -260,9 +264,13 @@ def create_remove_audio_page():
                     "text-xs text-blue-600"
                 )
             elif scan_state.get("channel_id"):
+                scope = scan_state.get("last_scan_scope") or "all"
+                scope_label = VIDEO_SCAN_SCOPE_LABELS.get(scope, "video")
+                if scope in {"recent", "draft"} and scan_state.get("last_scan_limit"):
+                    scope_label = f"{scan_state['last_scan_limit']} {scope_label}"
                 ui.label(
                     f"Đã bắt {scan_state.get('matched', 0)}/{scan_state.get('total', 0)} "
-                    "video có audio Đang xử lý / Không xử lý được / "
+                    f"video trong phạm vi {scope_label} có audio Đang xử lý / Không xử lý được / "
                     "Không đủ điều kiện / Đã xoá."
                 ).classes("text-xs font-medium text-emerald-700")
                 if scan_state.get("skipped", 0):
@@ -363,14 +371,54 @@ def create_remove_audio_page():
         refresh_scan_status()
         save_remove_state()
 
-    def set_scan_busy(busy: bool) -> None:
-        scan_runtime["running"] = busy
+    def refresh_scan_controls() -> None:
+        busy = scan_runtime["running"] or _REMOVE_AUDIO_RUN_GUARD.locked()
         button = ui_refs.get("scan_button")
         if button:
-            if busy:
+            if scan_runtime["running"]:
                 button.props("disable loading")
+            elif busy:
+                button.props("disable", remove="loading")
             else:
                 button.props(remove="disable loading")
+        toggle = ui_refs.get("scan_scope_toggle")
+        if toggle:
+            if busy:
+                toggle.props("disable")
+            else:
+                toggle.props(remove="disable")
+        number = ui_refs.get("recent_limit_input")
+        if number:
+            enabled = not busy and scan_settings["scan_scope"] in {"draft", "recent"}
+            if enabled:
+                number.props(remove="disable")
+            else:
+                number.props("disable")
+
+    def on_scan_scope_change(event) -> None:
+        if configuration_change_blocked():
+            ui_refs["scan_scope_toggle"].value = scan_settings["scan_scope"]
+            return
+        scope = str(event.value or "all")
+        scan_settings["scan_scope"] = scope if scope in VIDEO_SCAN_SCOPES else "all"
+        refresh_scan_controls()
+        save_remove_state()
+
+    def on_recent_limit_change(_event=None) -> None:
+        number = ui_refs.get("recent_limit_input")
+        if configuration_change_blocked():
+            if number:
+                number.value = scan_settings["recent_limit"]
+            return
+        limit = _normalize_recent_video_limit(number.value if number else None)
+        scan_settings["recent_limit"] = limit
+        if number:
+            number.value = limit
+        save_remove_state()
+
+    def set_scan_busy(busy: bool) -> None:
+        scan_runtime["running"] = busy
+        refresh_scan_controls()
         refresh_scan_status()
 
     async def handle_channel_scan():
@@ -386,8 +434,15 @@ def create_remove_audio_page():
 
         set_scan_busy(True)
         try:
-            ui.notify("Đang quét toàn bộ video và trạng thái audio...", type="info")
-            videos = await asyncio.to_thread(_fetch_all_channel_videos, channel_id)
+            scan_scope = scan_settings["scan_scope"]
+            recent_limit = scan_settings["recent_limit"]
+            scan_label = VIDEO_SCAN_SCOPE_LABELS[scan_scope]
+            if scan_scope in {"recent", "draft"}:
+                scan_label = f"{recent_limit} {scan_label}"
+            ui.notify(f"Đang đọc {scan_label} và trạng thái audio...", type="info")
+            videos = await asyncio.to_thread(
+                _fetch_channel_videos, channel_id, scope=scan_scope, recent_limit=recent_limit,
+            )
             unreadable_ids: list[str] = []
             matched_ids = await asyncio.to_thread(
                 update_audio_module.get_audio_attention_video_ids,
@@ -408,17 +463,19 @@ def create_remove_audio_page():
                 total=len(videos),
                 matched=len(ordered_ids),
                 skipped=len(unreadable_ids),
+                last_scan_scope=scan_scope,
+                last_scan_limit=recent_limit if scan_scope in {"recent", "draft"} else None,
             )
             refresh_right_panel()
             save_remove_state()
             if ordered_ids:
                 ui.notify(
-                    f"Đã tìm thấy {len(ordered_ids)}/{len(videos)} video cần xóa audio.",
+                    f"Đã tìm thấy {len(ordered_ids)}/{len(videos)} video cần xóa audio trong {scan_label}.",
                     type="positive",
                 )
             else:
                 ui.notify(
-                    f"Đã quét {len(videos)} video, không thấy trạng thái audio cần xử lý.",
+                    f"Đã quét {len(videos)} video trong {scan_label}, không thấy trạng thái audio cần xử lý.",
                     type="warning",
                 )
         except Exception as exc:
@@ -619,12 +676,15 @@ def create_remove_audio_page():
             video_processing_status.clear()
             delete_requested.clear()
             performance_settings["max_concurrency"] = DEFAULT_REMOVE_AUDIO_CONCURRENCY
+            scan_settings.update(scan_scope="all", recent_limit=DEFAULT_RECENT_VIDEO_LIMIT)
             scan_state.update(
                 source_active=False,
                 channel_id=None,
                 total=0,
                 matched=0,
                 skipped=0,
+                last_scan_scope=None,
+                last_scan_limit=None,
             )
             selected_remove_channel["id"] = None
             refresh_right_panel()
@@ -633,6 +693,11 @@ def create_remove_audio_page():
                 ui_refs["refresh_remove_channel_display"]()
             if ui_refs["concurrency_input"]:
                 ui_refs["concurrency_input"].value = DEFAULT_REMOVE_AUDIO_CONCURRENCY
+            if ui_refs["scan_scope_toggle"]:
+                ui_refs["scan_scope_toggle"].value = "all"
+            if ui_refs["recent_limit_input"]:
+                ui_refs["recent_limit_input"].value = DEFAULT_RECENT_VIDEO_LIMIT
+            refresh_scan_controls()
         finally:
             suppress_autosave["value"] = False
         save_remove_state()
@@ -673,6 +738,23 @@ def create_remove_audio_page():
             ):
                 pass
             with ui.row().classes("w-full items-end gap-3 flex-wrap"):
+                with ui.column().classes("gap-1"):
+                    ui.label("Phạm vi quét trên kênh").classes("text-xs font-semibold text-gray-700")
+                    ui_refs["scan_scope_toggle"] = ui.toggle(
+                        VIDEO_SCAN_SCOPE_OPTIONS,
+                        value=scan_settings["scan_scope"],
+                        on_change=on_scan_scope_change,
+                    ).props("no-caps")
+                recent_limit_input = ui.number(
+                    "Số video muốn quét", value=scan_settings["recent_limit"],
+                    min=1, max=MAX_RECENT_VIDEO_LIMIT, step=1,
+                    on_change=on_recent_limit_change,
+                ).props("outlined").classes("w-44")
+                recent_limit_input.tooltip(
+                    "Áp dụng cho Bản nháp và Đăng gần nhất. Số video có audio lỗi có thể ít hơn số video đã quét."
+                )
+                ui_refs["recent_limit_input"] = recent_limit_input
+            with ui.row().classes("w-full items-end gap-3 flex-wrap"):
                 scan_button = ui.button(
                     "Quét video cần xử lý",
                     icon="manage_search",
@@ -703,6 +785,7 @@ def create_remove_audio_page():
                 ).classes("text-xs text-gray-600 pb-3")
             scan_status_container = ui.column().classes("w-full gap-0")
             ui_refs["scan_status_container"] = scan_status_container
+            refresh_scan_controls()
             refresh_scan_status()
 
         with app_card():
