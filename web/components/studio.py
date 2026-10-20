@@ -422,8 +422,8 @@ def create_studio_content(*, reload_alerts: bool = False):
             scan_state["exclude_channel_names"] = existing_names
             ui_refs["login_title"].set_text("Thêm kênh YouTube mới")
             ui_refs["login_copy"].set_text(
-                "Đăng nhập tài khoản YouTube. Tool đối chiếu tên kênh và "
-                "chỉ click các kênh chưa có trong danh sách hiện tại."
+                "Đăng nhập tài khoản YouTube. Tool xác minh Channel ID thực "
+                "và chỉ thêm các kênh chưa có trong danh sách hiện tại."
             )
             ui_refs["login_submit"].set_text("Tìm kênh mới")
         clear_login_inputs()
@@ -770,8 +770,8 @@ def create_studio_content(*, reload_alerts: bool = False):
                 )
                 ui_refs["login_title"] = login_title
                 login_copy = ui.label(
-                    "Đăng nhập tài khoản YouTube. Tool chỉ click các Channel ID chưa có "
-                    "trong danh sách hiện tại."
+                    "Đăng nhập tài khoản YouTube. Tool xác minh Channel ID thực "
+                    "và chỉ thêm các kênh chưa có trong danh sách hiện tại."
                 ).classes("app-section-copy")
                 ui_refs["login_copy"] = login_copy
 

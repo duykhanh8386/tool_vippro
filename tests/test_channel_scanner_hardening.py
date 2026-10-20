@@ -1,6 +1,6 @@
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import requests
 from selenium.common.exceptions import (
@@ -281,12 +281,142 @@ class FakeChannelFetcher(ChannelFetcher):
             expected_channel_id=channel_id,
         )
 
+    def _switch_to_chooser_row_once(self, target):
+        position = next(
+            index for index, entry in enumerate(self._read_visible_channel_menu_entries_once())
+            if entry["row_signature"] == target["row_signature"]
+        )
+        resolved_id = self.channel_ids[position]
+        if self._current_channel_id() == resolved_id:
+            return
+        self.filtered_switches.append(resolved_id)
+        self.position = position
+        self.driver.current_url = f"https://studio.youtube.com/channel/{resolved_id}"
+
     def _wait_interruptibly(self, seconds):
         self._checkpoint()
         self.retry_waits.append(seconds)
 
 
 class ChannelScannerHardeningTests(unittest.TestCase):
+    def scan_dom_menu(self, driver, *, excluded_ids=(), excluded_names=(), on_open=None):
+        fetcher = ChannelFetcher()
+        fetcher.driver = driver
+        read_ids = []
+
+        def read_channel():
+            channel_id = fetcher._current_channel_id()
+            read_ids.append(channel_id)
+            row = next(row for row in driver.rows if row.channel_id == channel_id)
+            return {"id": channel_id, "name": row.title}
+
+        with (
+            patch.object(fetcher, "_open_channel_switcher_once", side_effect=on_open),
+            patch.object(fetcher, "_wait_interruptibly"),
+            patch.object(fetcher, "_get_channel_info", side_effect=read_channel),
+            patch("src.channel_scanner.WebDriverWait", PredicateWait),
+        ):
+            report = fetcher._scan_filtered_channels(
+                include_channel_ids=None, exclude_channel_ids=set(excluded_ids),
+                include_channel_names={}, exclude_channel_names=set(excluded_names),
+            )
+        return report, read_ids
+
+    def test_add_new_resolves_rows_11_and_19_by_real_ids_in_a_23_row_menu(self):
+        ids = [f"UC{i:022d}" for i in range(23)]
+        driver = StatusMenuDriver([], f"https://studio.youtube.com/channel/{ids[0]}")
+        new_rows = {10, 18}
+        driver.rows = [
+            TitledMenuRow(channel_id, driver,
+                          title="🎧 เพลงเพราะไทยแลนด์" if i in new_rows else f"Existing {i}",
+                          account_name="Account")
+            for i, channel_id in enumerate(ids)
+        ]
+        driver.rows[0].active = True
+
+        report, read_ids = self.scan_dom_menu(
+            driver, excluded_ids={channel_id for i, channel_id in enumerate(ids) if i not in new_rows},
+            excluded_names={f"existing {i}" for i in range(23) if i not in new_rows},
+        )
+
+        self.assertEqual(read_ids, [ids[10], ids[18]])
+        self.assertEqual([channel["id"] for channel in report.channels], [ids[10], ids[18]])
+        self.assertEqual(report.unidentified_channel_count, 0)
+        self.assertEqual(report.failures, [])
+
+    def test_same_name_rows_match_full_text_even_when_the_menu_reorders(self):
+        driver = StatusMenuDriver([], "https://studio.youtube.com/channel/OTHER")
+        for channel_id in ("A", "B"):
+            row = TitledMenuRow(channel_id, driver, title="🎧 เพลงเพราะไทยแลนด์", account_name="Account")
+            row.text += f"\n@handle-{channel_id}"
+            driver.rows.append(row)
+        reordered = {"done": False}
+
+        def reopen_menu():
+            if driver.current_url.endswith("/A") and not reordered["done"]:
+                driver.rows.reverse()
+                reordered["done"] = True
+
+        report, read_ids = self.scan_dom_menu(driver, on_open=reopen_menu)
+
+        self.assertTrue(reordered["done"])
+        self.assertEqual(read_ids, ["A", "B"])
+        self.assertEqual(report.failures, [])
+
+    def test_duplicate_menu_rows_for_one_verified_id_are_only_loaded_once(self):
+        driver = StatusMenuDriver([], "https://studio.youtube.com/channel/A")
+        driver.rows = [
+            TitledMenuRow("A", driver, title="🎧 เพลงเพราะไทยแลนด์", account_name="Account")
+            for _ in range(2)
+        ]
+        for row in driver.rows:
+            row.active = True
+
+        report, read_ids = self.scan_dom_menu(driver)
+
+        self.assertEqual(read_ids, ["A"])
+        self.assertEqual([channel["id"] for channel in report.channels], ["A"])
+        self.assertEqual(report.failures, [])
+
+    def test_identical_title_rows_still_skip_existing_ids_before_saving(self):
+        driver = StatusMenuDriver([], "https://studio.youtube.com/channel/A")
+        driver.rows = [TitledMenuRow(channel_id, driver, title="Same title", account_name="Account")
+                       for channel_id in ("A", "B")]
+        driver.rows[0].active = True
+
+        report, read_ids = self.scan_dom_menu(driver, excluded_ids={"A"}, excluded_names={"same title"})
+
+        self.assertEqual(read_ids, ["B"])
+        self.assertEqual(report.skipped_channel_ids, ["A"])
+        self.assertEqual([channel["id"] for channel in report.channels], ["B"])
+
+    def test_changed_ambiguous_row_count_does_not_click_a_stale_position(self):
+        fetcher = ChannelFetcher()
+        fetcher.driver = FakeDriver("OTHER")
+        elements = [Mock() for _ in range(3)]
+        entries = [{"normalized_name": "same", "row_signature": "same-row", "element": element}
+                   for element in elements]
+        target = {"normalized_name": "same", "row_signature": "same-row", "row_match_count": 2,
+                  "row_occurrence": 1}
+        with patch.object(fetcher, "_wait_for_channel_menu_entries_ready", return_value=entries):
+            with self.assertRaises(ChannelScanError) as caught:
+                fetcher._switch_to_chooser_row_once(target)
+
+        self.assertEqual(caught.exception.category, ChannelScanErrorCategory.TRANSIENT_UI_ERROR)
+        for element in elements:
+            element.click.assert_not_called()
+
+    def test_previously_active_snapshot_row_is_reopened_after_switching_away(self):
+        driver = StatusMenuDriver([], "https://studio.youtube.com/channel/B")
+        driver.rows = [TitledMenuRow(channel_id, driver, title=channel_id, account_name="Account")
+                       for channel_id in ("A", "B")]
+        driver.rows[1].active = True
+
+        report, read_ids = self.scan_dom_menu(driver)
+
+        self.assertEqual(read_ids, ["A", "B"])
+        self.assertEqual(report.failures, [])
+
     def test_channel_title_is_used_instead_of_shared_account_label(self):
         driver = StatusMenuDriver([], "")
         fetcher = ChannelFetcher()
@@ -353,8 +483,8 @@ class ChannelScannerHardeningTests(unittest.TestCase):
             patch("src.channel_scanner.create_driver", return_value=FakeDriver("A")),
             patch("src.channel_scanner.logger") as log,
         ):
-            report = fetcher.run("user@example.test", "test-only", exclude_channel_ids=set(),
-                                 exclude_channel_names=set())
+            report = fetcher.run("user@example.test", "test-only", include_channel_ids={"A"},
+                                 include_channel_names={"A": "Parsed label"})
 
         self.assertEqual(report.unidentified_channel_count, 2)
         self.assertEqual([entry["menu_index"] for entry in report.unidentified_channels], [1, 2])
@@ -643,7 +773,7 @@ class ChannelScannerHardeningTests(unittest.TestCase):
         self.assertEqual(fetcher.switch_calls, 0)
         self.assertEqual([item["id"] for item in report.channels], ["B"])
 
-    def test_add_new_treats_an_existing_normalized_name_as_already_added(self):
+    def test_add_new_verifies_ids_when_a_new_channel_has_an_existing_name(self):
         fetcher = FakeChannelFetcher(
             ["A", "B", "C"],
             channel_names={
@@ -662,11 +792,11 @@ class ChannelScannerHardeningTests(unittest.TestCase):
                 exclude_channel_names={"Healing Peace"},
             )
 
-        self.assertEqual(fetcher.info_calls, ["C"])
-        self.assertEqual(fetcher.filtered_switches, ["C"])
+        self.assertEqual(fetcher.info_calls, ["B", "C"])
+        self.assertEqual(fetcher.filtered_switches, ["B", "C"])
         self.assertEqual(fetcher.switch_calls, 0)
-        self.assertEqual([item["id"] for item in report.channels], ["C"])
-        self.assertEqual(report.skipped_channel_ids, [])
+        self.assertEqual([item["id"] for item in report.channels], ["B", "C"])
+        self.assertEqual(report.skipped_channel_ids, ["A"])
 
     def test_selected_reload_uses_all_dom_names_when_internal_ids_repeat(self):
         class RepeatedMenuIdFetcher(FakeChannelFetcher):

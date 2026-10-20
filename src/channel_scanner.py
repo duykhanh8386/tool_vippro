@@ -245,10 +245,8 @@ class ChannelFetcher:
         if on_authenticated is not None:
             on_authenticated()
         if exclude_channel_ids is not None:
-            # Let the chooser hydrate for as long as necessary, then click only
-            # profiles which are not already stored. This preserves the precise
-            # add-new behavior without interpreting a half-rendered menu as an
-            # empty account.
+            # Let the chooser hydrate, filter known unique names, then verify
+            # ambiguous rows in Studio before persisting only new Channel IDs.
             return self._scan_filtered_channels(
                 include_channel_ids=None,
                 exclude_channel_ids=excluded,
@@ -344,16 +342,17 @@ class ChannelFetcher:
         include_channel_names: Mapping[str, str],
         exclude_channel_names: set[str],
     ) -> ChannelScanReport:
-        """Scan account rows selected by their visible channel names.
+        """Select reloads by name and resolve ambiguous add-new rows in Studio.
 
         YouTube does not expose a stable per-row Channel ID on every account-menu
         variant. Some variants even leak the active channel ID through every
         Polymer row object. The visible ``#channel-title`` is present in each
-        chooser row, so both reload-selected and add-new deliberately filter on
-        that value and only trust the real Channel ID after entering Studio.
+        chooser row. Ambiguous add-new rows are selected by their full DOM row
+        and verified using the real Channel ID after entering Studio.
         """
         report = self.last_report
         entries = self._wait_for_channel_menu_entries_ready()
+        initial_channel_id = self._current_channel_id()
         menu_name_counts = Counter(
             entry.get("normalized_name")
             for entry in entries
@@ -419,9 +418,15 @@ class ChannelFetcher:
         else:
             report.available_channel_ids = []
             report.skipped_channel_ids = []
+            row_counts = Counter(
+                (entry.get("normalized_name"), str(entry.get("row_signature") or ""))
+                for entry in entries if not entry.get("deleted")
+            )
+            row_occurrences: Counter = Counter()
             for entry in entries:
                 normalized_name = entry.get("normalized_name") or ""
-                if normalized_name and normalized_name in exclude_channel_names:
+                ambiguous_name = menu_name_counts[normalized_name] > 1
+                if normalized_name and normalized_name in exclude_channel_names and not ambiguous_name:
                     logger.info(
                         "Skipping chooser row by saved-name filter: row={} parsed_name={!r}",
                         entry.get("menu_index"),
@@ -433,12 +438,20 @@ class ChannelFetcher:
                     continue
                 if not normalized_name:
                     continue
-                if menu_name_counts[normalized_name] != 1:
-                    self._note_unidentified_channel(entry, reason="ambiguous_name")
-                    continue
                 target = dict(entry)
                 target["channel_id"] = None
                 target["expected_channel_id"] = None
+                if ambiguous_name:
+                    row_key = (normalized_name, str(entry.get("row_signature") or ""))
+                    target["resolve_menu_row"] = True
+                    target["row_occurrence"] = row_occurrences[row_key]
+                    target["row_match_count"] = row_counts[row_key]
+                    row_occurrences[row_key] += 1
+                    logger.info(
+                        "Channel chooser name needs ID verification: row={} parsed_name={!r}",
+                        entry.get("menu_index"),
+                        str(entry.get("channel_name") or "")[:200],
+                    )
                 selected_targets.append(target)
 
         logger.info(
@@ -449,6 +462,7 @@ class ChannelFetcher:
             len(report.missing_channel_ids),
             report.unidentified_channel_count,
         )
+        scanned_channel_ids: set[str] = set()
         for channel_index, target in enumerate(selected_targets, start=1):
             self._checkpoint()
             expected_channel_id = target.get("expected_channel_id")
@@ -458,12 +472,17 @@ class ChannelFetcher:
             target_is_current = bool(
                 (expected_channel_id and current_channel_id == expected_channel_id)
                 or (menu_channel_id and current_channel_id == menu_channel_id)
-                or (target.get("active") and current_channel_id)
+                or (
+                    target.get("active") and current_channel_id
+                    and current_channel_id == initial_channel_id
+                )
             )
-            if not target_is_current:
+            if target.get("resolve_menu_row") or not target_is_current:
                 try:
                     self._run_step_with_retry(
-                        lambda: self._switch_to_channel_match_once(
+                        lambda: self._switch_to_chooser_row_once(target)
+                        if target.get("resolve_menu_row")
+                        else self._switch_to_channel_match_once(
                             channel_id=None,
                             channel_name=channel_name,
                             expected_channel_id=expected_channel_id,
@@ -488,6 +507,11 @@ class ChannelFetcher:
                     continue
 
             actual_channel_id = self._current_channel_id()
+            if exclude_channel_ids is not None and actual_channel_id:
+                logger.info(
+                    "Channel chooser ID verified: row={} parsed_name={!r} channel_id={}",
+                    target.get("menu_index"), channel_name[:200], actual_channel_id,
+                )
             if expected_channel_id and actual_channel_id != expected_channel_id:
                 error = ChannelScanError(
                     ChannelScanErrorCategory.CHANNEL_ERROR,
@@ -510,11 +534,20 @@ class ChannelFetcher:
                 if actual_channel_id not in report.skipped_channel_ids:
                     report.skipped_channel_ids.append(actual_channel_id)
                 continue
+            if actual_channel_id and actual_channel_id in scanned_channel_ids:
+                logger.info(
+                    "Skipping repeated chooser row for verified channel: row={} channel_id={}",
+                    target.get("menu_index"), actual_channel_id,
+                )
+                continue
+            channel_count_before = len(report.channels)
             self._scan_current_channel(
                 report,
                 channel_index,
                 expected_channel_id=actual_channel_id or expected_channel_id,
             )
+            if actual_channel_id and len(report.channels) > channel_count_before:
+                scanned_channel_ids.add(actual_channel_id)
 
         report.completed = True
         report.end_category = ChannelScanErrorCategory.SCAN_END
@@ -690,7 +723,9 @@ class ChannelFetcher:
     def _channel_row_signature(self, element) -> str:
         parts = []
         try:
-            parts.append(self._normalize_channel_name(getattr(element, "text", "")))
+            get_attribute = getattr(element, "get_attribute", None)
+            dom_text = get_attribute("textContent") if callable(get_attribute) else ""
+            parts.append(self._normalize_channel_name(dom_text or getattr(element, "text", "")))
         except (StaleElementReferenceException, WebDriverException):
             pass
         try:
@@ -762,8 +797,8 @@ class ChannelFetcher:
                         row.getAttribute('aria-selected') === 'true'
                     ) return true;
                     return Boolean(row.querySelector(
-                        '[aria-current="page"], [aria-checked="true"], '
-                        '[aria-selected="true"], [selected], [active], '
+                        '[aria-current="page"], [aria-checked="true"], ' +
+                        '[aria-selected="true"], [selected], [active], ' +
                         '[enable-ring-for-active-account]'
                     ));
                     """,
@@ -850,6 +885,62 @@ class ChannelFetcher:
             if exact_match:
                 return exact_match.group(0)
         return None
+
+    def _switch_to_chooser_row_once(self, target: dict) -> None:
+        """Resolve one ambiguous add-new row, without guessing a Channel ID.
+
+        The full DOM text and avatar distinguish same-title rows when possible.
+        Otherwise use the row's occurrence only while the matching row count is
+        unchanged. Its actual ID is read from Studio before any local update.
+        """
+        entries = self._wait_for_channel_menu_entries_ready()
+        matching = [
+            entry for entry in entries
+            if entry.get("normalized_name") == target.get("normalized_name")
+            and not entry.get("deleted")
+        ]
+        signature_matches = [
+            entry for entry in matching
+            if entry.get("row_signature") == target.get("row_signature")
+        ]
+        selected = None
+        if len(signature_matches) == 1:
+            selected = signature_matches[0]
+        elif signature_matches and len(signature_matches) == target.get("row_match_count"):
+            occurrence = target.get("row_occurrence", -1)
+            if 0 <= occurrence < len(signature_matches):
+                selected = signature_matches[occurrence]
+        if selected is None:
+            raise ChannelScanError(
+                ChannelScanErrorCategory.TRANSIENT_UI_ERROR,
+                step="resolve_channel_row",
+                detail=(
+                    "The ambiguous chooser rows changed while selecting a channel; "
+                    "retrying with a fresh menu instead of guessing an ID"
+                ),
+            )
+        element = selected.get("element")
+        if element is None:
+            raise ChannelScanError(
+                ChannelScanErrorCategory.CHANNEL_ERROR,
+                step="resolve_channel_row",
+                detail="The selected chooser row is no longer available",
+                retryable=False,
+            )
+        current_channel_id = self._current_channel_id()
+        if selected.get("active") and current_channel_id:
+            return
+        self._checkpoint()
+        element.click()
+        WebDriverWait(self.driver, STUDIO_LOAD_TIMEOUT_SECONDS).until(
+            lambda driver: self._checkpoint_and_get(
+                lambda: "channel-appeal" in str(driver.current_url)
+                or bool(
+                    self._extract_channel_id(str(driver.current_url))
+                    and self._extract_channel_id(str(driver.current_url)) != current_channel_id
+                )
+            )
+        )
 
     def _switch_to_channel_match_once(
         self,
