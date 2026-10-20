@@ -45,10 +45,16 @@ class ChannelScannerBrowserTests(unittest.TestCase):
                 values = list(enumerate(CHANNEL_IDS))
                 if cls.fixture["copies"]:
                     values = [(10, CHANNEL_IDS[10]), (10, CHANNEL_IDS[10])]
+                elif cls.fixture.get("homonyms"):
+                    values = [(10, CHANNEL_IDS[10]), (18, CHANNEL_IDS[18])]
+                if cls.fixture.get("active_last"):
+                    values.sort(key=lambda item: item[1] == active)
                 rows = []
                 for index, channel_id in values:
                     title = "🎧 เพลงเพราะไทยแลนด์" if index in AMBIGUOUS_ROWS else f"Existing {index}"
                     selected = 'active="true"' if channel_id == active else ""
+                    if cls.fixture.get("ring_all"):
+                        selected += ' enable-ring-for-active-account="true"'
                     rows.append(
                         f'<ytd-account-item-renderer {selected} data-channel-id="{active}" '
                         f'onclick="location.href=\'/channel/{channel_id}\'">'
@@ -80,6 +86,9 @@ class ChannelScannerBrowserTests(unittest.TestCase):
             cls.thread.join(timeout=2)
 
         cls.addClassCleanup(close_server)
+
+    def setUp(self):
+        self.fixture.update(copies=False, homonyms=False, active_last=False, ring_all=False)
 
     def scan(self, start_id, *, excluded_ids=(), excluded_names=()):
         self.driver.get(f"http://127.0.0.1:{self.server.server_port}/channel/{start_id}")
@@ -115,6 +124,14 @@ class ChannelScannerBrowserTests(unittest.TestCase):
     def test_current_channel_dom_copies_are_saved_once(self):
         self.fixture["copies"] = True
         self.assertEqual(self.scan(CHANNEL_IDS[10]), [CHANNEL_IDS[10]])
+
+    def test_static_ring_feature_flag_does_not_mark_both_homonyms_as_current(self):
+        self.fixture.update(homonyms=True, ring_all=True)
+        self.assertEqual(self.scan(CHANNEL_IDS[10]), [CHANNEL_IDS[10], CHANNEL_IDS[18]])
+
+    def test_identical_homonym_rows_are_both_read_when_active_channel_moves_last(self):
+        self.fixture.update(homonyms=True, active_last=True)
+        self.assertEqual(self.scan(CHANNEL_IDS[0]), [CHANNEL_IDS[10], CHANNEL_IDS[18]])
 
     def test_active_row_javascript_handles_root_and_child_markers(self):
         self.fixture["copies"] = False

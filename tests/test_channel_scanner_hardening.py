@@ -6,6 +6,7 @@ import requests
 from selenium.common.exceptions import (
     ElementClickInterceptedException,
     InvalidSessionIdException,
+    StaleElementReferenceException,
     TimeoutException,
 )
 
@@ -105,12 +106,31 @@ class StatusMenuRow(MenuRow):
             row.active = False
         self.active = True
         self.driver.current_url = f"https://studio.youtube.com/channel/{self.channel_id}"
+        self.driver.document = StatusMenuDriver.Document(self.driver)
 
 
 class StatusMenuDriver(MenuDriver):
     def __init__(self, rows, current_url):
         super().__init__(rows)
         self.current_url = current_url
+        self.document = self.Document(self)
+
+    def find_element(self, _by, _value):
+        return self.document
+
+    def execute_script(self, script, *args):
+        if script == "return document.readyState":
+            return "complete"
+        return super().execute_script(script, *args)
+
+    class Document:
+        def __init__(self, driver):
+            self.driver = driver
+
+        def is_enabled(self):
+            if self.driver.document is not self:
+                raise StaleElementReferenceException("document navigated")
+            return True
 
 
 class TitledMenuRow(StatusMenuRow):
@@ -362,6 +382,38 @@ class ChannelScannerHardeningTests(unittest.TestCase):
         self.assertTrue(reordered["done"])
         self.assertEqual(read_ids, ["A", "B"])
         self.assertEqual(report.failures, [])
+
+    def test_same_name_rows_without_other_distinctions_are_both_read_when_active_moves_last(self):
+        driver = StatusMenuDriver([], "https://studio.youtube.com/channel/OTHER")
+        driver.rows = [
+            TitledMenuRow(channel_id, driver, title="🎧 เพลงเพราะไทยแลนด์", account_name="Account")
+            for channel_id in ("A", "B")
+        ]
+
+        def reopen_menu():
+            driver.rows.sort(key=lambda row: row.active)
+
+        report, read_ids = self.scan_dom_menu(driver, on_open=reopen_menu)
+
+        self.assertEqual(read_ids, ["A", "B"])
+        self.assertEqual(report.failures, [])
+
+    def test_three_identical_titles_are_all_read_despite_active_row_reordering(self):
+        for active_last in (False, True):
+            with self.subTest(active_last=active_last):
+                driver = StatusMenuDriver([], "https://studio.youtube.com/channel/OTHER")
+                driver.rows = [
+                    TitledMenuRow(channel_id, driver, title="Same title", account_name="Account")
+                    for channel_id in ("A", "B", "C")
+                ]
+
+                def reopen_menu():
+                    driver.rows.sort(key=lambda row: row.active == active_last)
+
+                report, read_ids = self.scan_dom_menu(driver, on_open=reopen_menu)
+
+                self.assertCountEqual(read_ids, ["A", "B", "C"])
+                self.assertEqual(report.failures, [])
 
     def test_duplicate_menu_rows_for_one_verified_id_are_only_loaded_once(self):
         driver = StatusMenuDriver([], "https://studio.youtube.com/channel/A")

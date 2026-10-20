@@ -463,11 +463,13 @@ class ChannelFetcher:
             report.unidentified_channel_count,
         )
         scanned_channel_ids: set[str] = set()
+        verified_channel_ids: set[str] = set()
         for channel_index, target in enumerate(selected_targets, start=1):
             self._checkpoint()
             expected_channel_id = target.get("expected_channel_id")
             menu_channel_id = None
             channel_name = str(target.get("channel_name") or "")
+            target["verified_channel_ids"] = verified_channel_ids
             current_channel_id = self._current_channel_id()
             target_is_current = bool(
                 (expected_channel_id and current_channel_id == expected_channel_id)
@@ -507,6 +509,8 @@ class ChannelFetcher:
                     continue
 
             actual_channel_id = self._current_channel_id()
+            if actual_channel_id:
+                verified_channel_ids.add(actual_channel_id)
             if exclude_channel_ids is not None and actual_channel_id:
                 logger.info(
                     "Channel chooser ID verified: row={} parsed_name={!r} channel_id={}",
@@ -776,6 +780,8 @@ class ChannelFetcher:
             return ""
 
     def _account_item_is_active(self, element) -> bool:
+        # enable-ring-for-active-account enables styling on every row; it does
+        # not identify which account is currently selected.
         try:
             return bool(
                 self.driver.execute_script(
@@ -788,7 +794,6 @@ class ChannelFetcher:
                         return value !== 'false' && value !== '0';
                     };
                     if (
-                        truthyAttribute('enable-ring-for-active-account') ||
                         truthyAttribute('selected') ||
                         truthyAttribute('active') ||
                         truthyAttribute('is-selected') ||
@@ -798,8 +803,7 @@ class ChannelFetcher:
                     ) return true;
                     return Boolean(row.querySelector(
                         '[aria-current="page"], [aria-checked="true"], ' +
-                        '[aria-selected="true"], [selected], [active], ' +
-                        '[enable-ring-for-active-account]'
+                        '[aria-selected="true"], [selected], [active]'
                     ));
                     """,
                     element,
@@ -890,56 +894,91 @@ class ChannelFetcher:
         """Resolve one ambiguous add-new row, without guessing a Channel ID.
 
         The full DOM text and avatar distinguish same-title rows when possible.
-        Otherwise use the row's occurrence only while the matching row count is
-        unchanged. Its actual ID is read from Studio before any local update.
+        Indistinguishable rows may move when the active channel changes. Probe
+        other rows when a click returns an already verified ID, tracking tried
+        positions separately for each current channel. Only a URL-verified ID
+        can cause a repeated channel to be skipped.
         """
-        entries = self._wait_for_channel_menu_entries_ready()
-        matching = [
-            entry for entry in entries
-            if entry.get("normalized_name") == target.get("normalized_name")
-            and not entry.get("deleted")
-        ]
-        signature_matches = [
-            entry for entry in matching
-            if entry.get("row_signature") == target.get("row_signature")
-        ]
-        selected = None
-        if len(signature_matches) == 1:
-            selected = signature_matches[0]
-        elif signature_matches and len(signature_matches) == target.get("row_match_count"):
-            occurrence = target.get("row_occurrence", -1)
-            if 0 <= occurrence < len(signature_matches):
-                selected = signature_matches[occurrence]
-        if selected is None:
-            raise ChannelScanError(
-                ChannelScanErrorCategory.TRANSIENT_UI_ERROR,
-                step="resolve_channel_row",
-                detail=(
-                    "The ambiguous chooser rows changed while selecting a channel; "
-                    "retrying with a fresh menu instead of guessing an ID"
-                ),
-            )
-        element = selected.get("element")
-        if element is None:
-            raise ChannelScanError(
-                ChannelScanErrorCategory.CHANNEL_ERROR,
-                step="resolve_channel_row",
-                detail="The selected chooser row is no longer available",
-                retryable=False,
-            )
-        current_channel_id = self._current_channel_id()
-        if selected.get("active") and current_channel_id:
-            return
-        self._checkpoint()
-        element.click()
-        WebDriverWait(self.driver, STUDIO_LOAD_TIMEOUT_SECONDS).until(
-            lambda driver: self._checkpoint_and_get(
-                lambda: "channel-appeal" in str(driver.current_url)
-                or bool(
-                    self._extract_channel_id(str(driver.current_url))
-                    and self._extract_channel_id(str(driver.current_url)) != current_channel_id
+        verified_ids = target.get("verified_channel_ids", set())
+        tried_positions: dict[str | None, set[int]] = defaultdict(set)
+        row_count = max(1, int(target.get("row_match_count") or 1))
+        for _ in range(row_count * row_count + 1):
+            entries = self._wait_for_channel_menu_entries_ready()
+            signature_matches = [
+                entry for entry in entries
+                if entry.get("normalized_name") == target.get("normalized_name")
+                and entry.get("row_signature") == target.get("row_signature")
+                and not entry.get("deleted")
+            ]
+            if not signature_matches or len(signature_matches) != row_count:
+                raise ChannelScanError(
+                    ChannelScanErrorCategory.TRANSIENT_UI_ERROR,
+                    step="resolve_channel_row",
+                    detail=(
+                        "The ambiguous chooser rows changed while selecting a channel; "
+                        "retrying with a fresh menu instead of guessing an ID"
+                    ),
                 )
+            current_channel_id = self._current_channel_id()
+            active_positions = [
+                index for index, entry in enumerate(signature_matches) if entry.get("active")
+            ]
+            tried = tried_positions[current_channel_id]
+            if len(active_positions) == 1 and current_channel_id in verified_ids:
+                # The active row can move to either end of the chooser. Its
+                # current URL is already known, so visit another row instead.
+                tried.add(active_positions[0])
+            candidates = [index for index in range(row_count) if index not in tried]
+            if not candidates:
+                return
+            occurrence = target.get("row_occurrence", 0)
+            position = occurrence if occurrence in candidates else candidates[0]
+            tried.add(position)
+            selected = signature_matches[position]
+            element = selected.get("element")
+            if element is None:
+                raise ChannelScanError(
+                    ChannelScanErrorCategory.CHANNEL_ERROR,
+                    step="resolve_channel_row",
+                    detail="The selected chooser row is no longer available",
+                    retryable=False,
+                )
+            if selected.get("active") and len(active_positions) == 1 and current_channel_id:
+                return
+            self._checkpoint()
+            previous_document = self.driver.find_element(By.TAG_NAME, "html")
+            element.click()
+
+            def channel_switch_finished(driver) -> bool:
+                url = str(driver.current_url)
+                if "channel-appeal" in url:
+                    return True
+                actual_id = self._extract_channel_id(url)
+                return bool(actual_id) and (
+                    actual_id != current_channel_id
+                    or (
+                        EC.staleness_of(previous_document)(driver)
+                        and driver.execute_script("return document.readyState") == "complete"
+                    )
+                )
+
+            WebDriverWait(self.driver, STUDIO_LOAD_TIMEOUT_SECONDS).until(
+                lambda driver: self._checkpoint_and_get(lambda: channel_switch_finished(driver))
             )
+            actual_channel_id = self._current_channel_id()
+            if row_count == 1 or not actual_channel_id or actual_channel_id not in verified_ids:
+                return
+            logger.info(
+                "Chooser row returned an already verified ID; checking remaining rows: "
+                "row={} channel_id={}",
+                selected.get("menu_index"), actual_channel_id,
+            )
+
+        raise ChannelScanError(
+            ChannelScanErrorCategory.CHANNEL_ERROR,
+            step="resolve_channel_row",
+            detail="Could not finish verifying indistinguishable chooser rows from Studio URLs",
+            retryable=False,
         )
 
     def _switch_to_channel_match_once(
