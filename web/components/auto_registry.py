@@ -306,6 +306,10 @@ def create_auto_registry_content(*, on_change: Callable[[], None] | None = None)
             "Lựa chọn áp dụng từ vòng quét tiếp theo và được lưu khi mở lại ứng dụng."
         ).classes("text-xs text-gray-500")
         ui.label(
+            "Video còn ít nhất một ngôn ngữ audio đã xuất bản dùng được sẽ được bỏ qua. "
+            "Chỉ tự động xóa và thêm lại audio khi không còn bản audio tốt."
+        ).classes("text-xs text-gray-500")
+        ui.label(
             "Mặc định tự động quét tất cả các kênh Active. Kênh Deactive vẫn ở trong "
             "danh sách và có thể Active lại bằng nút; toàn bộ video của kênh Deactive "
             "được bỏ qua. Deactive video chỉ áp dụng cho ID đó. Trạng thái được lưu "

@@ -1046,11 +1046,12 @@ def build_audio_recovery_plan(
     *,
     observation_sink: dict | None = None,
 ) -> tuple[list[dict], set[str]]:
-    """Build language-level repairs from one Studio response.
+    """Build repairs only for videos without any healthy creator dub.
 
     Returns ``(actions, unreadable_video_ids)``. Each action contains only
-    failed track IDs for one registered language; healthy creator dubs and the
-    original/source track are left untouched.
+    failed track IDs for one registered language. Any healthy creator dub,
+    including languages outside the registry, protects the entire video.
+    Original/source audio and published subtitles do not count as healthy dubs.
     """
     requested_order = requested_order or list(requested_entries)
     requested = set(requested_entries)
@@ -1211,6 +1212,13 @@ def build_audio_recovery_plan(
     for video_id, entry in requested_entries.items():
         if video_id not in readable_ids or not isinstance(entry, dict):
             continue
+        if any("healthy" in states for states in observations.get(video_id, {}).values()):
+            logger.info(
+                "Audio auto-recovery skipped video={}: at least one dubbed audio "
+                "language is still healthy.",
+                video_id,
+            )
+            continue
         for language in entry.get("languages") or []:
             clean_language = str(language or "").strip()
             if not clean_language:
@@ -1258,8 +1266,9 @@ def _record_processing_observations(
     """Persist in-flight track ages and return only provably stale repairs.
 
     A language is eligible only when the same exact Audio Track ID remains in
-    PROCESSING across multiple scans for the full stale window. Healthy or
-    terminal evidence clears the timer, as does a changed/missing Track ID.
+    PROCESSING across multiple scans for the full stale window. A healthy dub
+    protects the whole video and clears all its timers. Otherwise terminal
+    evidence or a changed/missing Track ID clears the language's timer.
     This makes the decision survive app restarts without treating one delayed
     Studio response as a failure.
     """
@@ -1278,6 +1287,15 @@ def _record_processing_observations(
             entry = channel_entries.get(video_id)
             if not isinstance(entry, dict) or not isinstance(requested_entry, dict):
                 continue
+            video_observations = observations.get(video_id) or {}
+            if any(
+                "healthy" in (observed.get("states") or [])
+                for observed in video_observations.values()
+            ):
+                if "processing_observations" in entry:
+                    entry.pop("processing_observations", None)
+                    changed = True
+                continue
             registered_languages = {
                 str(language).strip().casefold(): str(language).strip()
                 for language in requested_entry.get("languages") or []
@@ -1293,7 +1311,6 @@ def _record_processing_observations(
                 trackers.pop(obsolete_key, None)
                 changed = True
 
-            video_observations = observations.get(video_id) or {}
             for language_key, display_language in registered_languages.items():
                 observed = video_observations.get(language_key) or {}
                 states = set(observed.get("states") or [])
