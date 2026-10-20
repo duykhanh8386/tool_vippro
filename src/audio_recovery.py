@@ -1,10 +1,10 @@
 """Persistent background recovery for creator-uploaded YouTube audio tracks.
 
 The registry lives in the app SQLite database, so it survives browser/NiceGUI
-disconnects and process restarts on the same machine or VM. The monitor only
-replaces registered languages for which Studio returns an explicit terminal
-failure; it never infers failure from an omitted row, deletes healthy languages,
-or touches the source/original audio track.
+disconnects and process restarts on the same machine or VM. Videos with any
+healthy creator dub are skipped. Otherwise the monitor replaces failed tracks
+and adds missing registered languages, without touching the source/original
+audio or treating an unreadable response as an empty video.
 """
 
 from __future__ import annotations
@@ -1048,23 +1048,22 @@ def build_audio_recovery_plan(
 ) -> tuple[list[dict], set[str]]:
     """Build repairs only for videos without any healthy creator dub.
 
-    Returns ``(actions, unreadable_video_ids)``. Each action contains only
-    failed track IDs for one registered language. Any healthy creator dub,
+    Returns ``(actions, unreadable_video_ids)``. Each action either replaces
+    failed track IDs or adds a missing registered language. Any healthy creator dub,
     including languages outside the registry, protects the entire video.
     Original/source audio and published subtitles do not count as healthy dubs.
     """
     requested_order = requested_order or list(requested_entries)
     requested = set(requested_entries)
+    groups = payload.get("videoTranslations") or []
+    tracks = payload.get("audioTracks") or []
+    if not isinstance(groups, list) or not isinstance(tracks, list):
+        return [], requested
     terminal_targets, unreadable_ids = (
         update_audio_module._terminal_repair_targets_from_payload(
             payload, requested_order
         )
     )
-    readable_ids = requested - unreadable_ids
-
-    groups = payload.get("videoTranslations") or []
-    if not isinstance(groups, list):
-        groups = []
     valid_groups = [group for group in groups if isinstance(group, dict)]
     group_ids = [
         update_audio_module._translation_group_video_id(group)
@@ -1088,7 +1087,10 @@ def build_audio_recovery_plan(
     translations_by_track: dict[tuple[str, str], dict] = {}
     for video_id, group in group_pairs:
         translations = group.get("translations") or []
-        if not isinstance(translations, list):
+        if not isinstance(translations, list) or any(
+            not isinstance(item, dict) for item in translations
+        ):
+            unreadable_ids.add(video_id)
             continue
         clean_items = [item for item in translations if isinstance(item, dict)]
         translations_by_video[video_id] = clean_items
@@ -1114,7 +1116,10 @@ def build_audio_recovery_plan(
         track_id: str = "",
     ) -> None:
         clean_language = str(language or "").strip().casefold()
-        if not clean_language:
+        # A healthy track still protects its video when Studio omits the
+        # language. Keep that evidence under the empty key; it never produces
+        # a language-level repair action.
+        if not clean_language and state != "healthy":
             return
         observations.setdefault(video_id, {}).setdefault(
             clean_language, set()
@@ -1125,7 +1130,6 @@ def build_audio_recovery_plan(
                 clean_language, {}
             ).setdefault(state, set()).add(clean_track_id)
 
-    tracks = payload.get("audioTracks") or []
     if isinstance(tracks, list):
         for track in tracks:
             if not isinstance(track, dict):
@@ -1154,6 +1158,8 @@ def build_audio_recovery_plan(
                 track, assume_audio=True
             ):
                 state = "inflight"
+            elif not track_id and str(track.get("statusLabel") or "").strip() in {"-", "–", "—"}:
+                state = "missing"
             else:
                 state = "healthy"
             observe(video_id, language, state, track_id)
@@ -1176,6 +1182,8 @@ def build_audio_recovery_plan(
                 state = "terminal"
             elif update_audio_module._audio_payload_needs_attention(item):
                 state = "inflight"
+            elif not track_id and str(audio.get("statusLabel") or "").strip() in {"-", "–", "—"}:
+                state = "missing"
             else:
                 state = "healthy"
             observe(video_id, language, state, track_id)
@@ -1209,6 +1217,7 @@ def build_audio_recovery_plan(
         for video_id, video_actions in terminal_targets.items()
     }
     actions: list[dict] = []
+    readable_ids = requested - unreadable_ids
     for video_id, entry in requested_entries.items():
         if video_id not in readable_ids or not isinstance(entry, dict):
             continue
@@ -1247,10 +1256,20 @@ def build_audio_recovery_plan(
                     }
                 )
                 continue
-            # Absence is not proof of failure. Studio may omit a published
-            # language from one response collection, so automatically adding a
-            # "missing" row can duplicate an already-published track. Wait for
-            # an explicit terminal status in a later scan instead.
+            # The response describes this video, neither collection has a
+            # healthy dub, and this language has no active/failed track. Add it
+            # directly: a dash/empty row has no Track ID to delete.
+            if not states or states == {"missing"}:
+                logger.info(
+                    "Audio auto-recovery detected missing audio: video={} language={}",
+                    video_id, clean_language,
+                )
+                actions.append({
+                    "video_id": video_id,
+                    "language": clean_language,
+                    "track_ids": [],
+                    "reason": "missing",
+                })
 
     return actions, unreadable_ids
 

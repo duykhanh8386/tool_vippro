@@ -92,7 +92,7 @@ class AudioRecoveryPlanTests(unittest.TestCase):
         self.assertEqual(unreadable, set())
         self.assertEqual(actions, [])
 
-    def test_absent_registered_language_is_not_assumed_failed(self):
+    def test_absent_registered_languages_are_added_without_deleting_tracks(self):
         actions, unreadable = build_audio_recovery_plan(
             {
                 "videoTranslations": [
@@ -100,12 +100,100 @@ class AudioRecoveryPlanTests(unittest.TestCase):
                 ],
                 "audioTracks": [],
             },
-            {"video": {"languages": ["fr"]}},
+            {"video": {"languages": ["fr", "es"]}},
             ["video"],
         )
 
         self.assertEqual(unreadable, set())
+        self.assertEqual(actions, [
+            {"video_id": "video", "language": "fr", "track_ids": [], "reason": "missing"},
+            {"video_id": "video", "language": "es", "track_ids": [], "reason": "missing"},
+        ])
+
+    def test_all_dash_audio_rows_are_added_even_with_published_subtitles(self):
+        for empty_audio in (None, {}, {"statusLabel": "-"}):
+            with self.subTest(empty_audio=empty_audio):
+                payload = {
+                    "videoTranslations": [{"videoId": "video", "translations": [
+                        {"languageCode": language, "audioTranslation": empty_audio,
+                         "captionTranslation": {"publishStatus": "PUBLISHED"}}
+                        for language in ("en", "fr")
+                    ]}],
+                    "audioTracks": [],
+                }
+
+                actions, unreadable = build_audio_recovery_plan(
+                    payload, {"video": {"languages": ["en", "fr"]}}, ["video"]
+                )
+
+                self.assertEqual(unreadable, set())
+                self.assertEqual([(a["language"], a["reason"], a["track_ids"]) for a in actions],
+                                 [("en", "missing", []), ("fr", "missing", [])])
+
+    def test_missing_and_failed_languages_are_both_recovered_without_any_healthy_audio(self):
+        payload = {
+            "videoTranslations": [{"videoId": "video", "translations": [
+                {"languageCode": "fr", "audioTranslation": {}},
+                {"languageCode": "es", "audioTranslation": {
+                    "audioTrackId": "deleted-es", "statusLabel": "Đã xoá"}},
+            ]}], "audioTracks": [],
+        }
+
+        actions, unreadable = build_audio_recovery_plan(
+            payload, {"video": {"languages": ["fr", "es"]}}, ["video"]
+        )
+
+        self.assertEqual(unreadable, set())
+        self.assertEqual([(a["language"], a["reason"], a["track_ids"]) for a in actions],
+                         [("fr", "missing", []), ("es", "terminal", ["deleted-es"])])
+
+    def test_missing_audio_is_added_while_existing_processing_track_is_left_to_finish(self):
+        payload = {
+            "videoTranslations": [{"videoId": "video", "translations": [
+                {"languageCode": "it", "audioTranslation": {
+                    "audioTrackId": "processing-it", "statusLabel": "Đang xử lý... 95%"}},
+            ]}], "audioTracks": [],
+        }
+
+        actions, unreadable = build_audio_recovery_plan(
+            payload, {"video": {"languages": ["it", "es"]}}, ["video"]
+        )
+
+        self.assertEqual(unreadable, set())
+        self.assertEqual(actions, [
+            {"video_id": "video", "language": "es", "track_ids": [], "reason": "missing"}
+        ])
+
+    def test_healthy_track_without_readable_language_still_protects_entire_video(self):
+        payload = {
+            "videoTranslations": [{"videoId": "video", "translations": []}],
+            "audioTracks": [{
+                "videoId": "video", "audioTrackId": "healthy-unknown-language",
+                "source": "AUDIO_TRACK_SOURCE_CREATOR", "audioContentTypeString": "dubbed",
+                "status": "AUDIO_TRACK_STATUS_READY",
+            }],
+        }
+
+        actions, unreadable = build_audio_recovery_plan(
+            payload, {"video": {"languages": ["es"]}}, ["video"]
+        )
+
         self.assertEqual(actions, [])
+        self.assertEqual(unreadable, set())
+
+    def test_malformed_response_is_not_treated_as_all_audio_missing(self):
+        for payload in (
+            {"videoTranslations": "invalid", "audioTracks": []},
+            {"videoTranslations": [{"videoId": "video", "translations": "invalid"}], "audioTracks": []},
+            {"videoTranslations": [{"videoId": "video", "translations": []}], "audioTracks": "invalid"},
+        ):
+            with self.subTest(payload=payload):
+                actions, unreadable = build_audio_recovery_plan(
+                    payload, {"video": {"languages": ["es"]}}, ["video"]
+                )
+
+                self.assertEqual(actions, [])
+                self.assertEqual(unreadable, {"video"})
 
     def test_omitted_video_is_unreadable_not_treated_as_missing_audio(self):
         actions, unreadable = build_audio_recovery_plan(
@@ -1831,7 +1919,7 @@ class AudioRecoveryCycleTests(unittest.IsolatedAsyncioTestCase):
                 payload["audioTracks"][0]["status"] = "AUDIO_TRACK_STATUS_FAILED"
                 result = await run_audio_recovery_cycle(now=2000)
 
-        self.assertEqual(result["repaired"], 2)
+        self.assertEqual(result["repaired"], 3)
         self.assertEqual(result["failed"], 0)
         self.assertEqual([call.args for call in deleted.call_args_list], [
             ("video", "channel", ["audio-en"]),
@@ -1839,7 +1927,7 @@ class AudioRecoveryCycleTests(unittest.IsolatedAsyncioTestCase):
         ])
         self.assertEqual(
             [call.kwargs["language"] for call in added.call_args_list],
-            ["en", "es"],
+            ["en", "es", "fr"],
         )
         for call in added.call_args_list:
             progress = call.kwargs["progress"]
@@ -1850,7 +1938,7 @@ class AudioRecoveryCycleTests(unittest.IsolatedAsyncioTestCase):
         runtime_status = get_audio_recovery_runtime_status()
         self.assertFalse(runtime_status["active"])
         self.assertEqual(runtime_status["phase"], "idle")
-        self.assertEqual(runtime_status["repaired"], 2)
+        self.assertEqual(runtime_status["repaired"], 3)
         self.assertEqual(runtime_status["failed"], 0)
         self.assertEqual(runtime_status["upload_sent"], 0)
         self.assertEqual(runtime_status["upload_total"], 0)
@@ -1900,6 +1988,75 @@ class AudioRecoveryCycleTests(unittest.IsolatedAsyncioTestCase):
         record.assert_not_called()
         self.assertEqual(state["entries"]["channel"]["video"]["languages"], ["es", "it"])
         self.assertNotIn("processing_observations", state["entries"]["channel"]["video"])
+
+    async def test_cycle_adds_missing_registered_audio_and_observes_retry_cooldown(self):
+        from src.audio_recovery import update_audio_module
+
+        for failed_es in (False, True):
+            with self.subTest(failed_es=failed_es), tempfile.TemporaryDirectory() as folder:
+                source = Path(folder) / "source.mp3"
+                source.write_bytes(b"source")
+                state = {
+                    "enabled": True, "initial_grace_seconds": 0,
+                    "retry_cooldown_seconds": DEFAULT_RECOVERY_RETRY_COOLDOWN_SECONDS,
+                    "entries": {"channel": {"video": {
+                        "audio_path": str(source), "languages": ["en", "es"],
+                        "repeat_times": 1, "attempts": {},
+                    }}},
+                }
+                payload = {
+                    "videoTranslations": [{"videoId": "video", "translations": [
+                        {"languageCode": language, "audioTranslation": {"statusLabel": "-"}}
+                        for language in ("en", "es", "fr")
+                    ]}],
+                    "audioTracks": [{
+                        "videoId": "video", "audioTrackId": "original", "language": "ak",
+                        "source": "AUDIO_TRACK_SOURCE_UPLOAD", "audioContentTypeString": "original",
+                        "status": "AUDIO_TRACK_STATUS_READY",
+                    }],
+                }
+                if failed_es:
+                    payload["videoTranslations"][0]["translations"][1]["audioTranslation"] = {
+                        "audioTrackId": "deleted-es", "statusLabel": "Đã xoá",
+                    }
+
+                def render_audio(*, output_file, **_kwargs):
+                    Path(output_file).write_bytes(b"rendered")
+
+                async def run_retry(operation, **_kwargs):
+                    return operation()
+
+                with (
+                    patch("src.audio_recovery.get_audio_recovery_state", return_value=state),
+                    patch("src.audio_recovery._load_state", return_value=state),
+                    patch("src.audio_recovery.state_manager.save_state", return_value=True),
+                    patch.object(update_audio_module, "_get_video_translation_payload", return_value=payload),
+                    patch.object(update_audio_module, "_get_video_info", return_value=SimpleNamespace(duration_ms=60000)) as info,
+                    patch.object(update_audio_module, "delete_track_ids", return_value=200) as delete,
+                    patch.object(update_audio_module, "add", return_value=200) as add,
+                    patch("src.audio_recovery.multiply_audio", side_effect=render_audio) as render,
+                    patch("src.audio_recovery.call_audio_update_with_retry", new=AsyncMock(side_effect=run_retry)),
+                ):
+                    result = await run_audio_recovery_cycle(now=2000)
+                    # Studio can still show dashes immediately after an upload.
+                    # The saved attempt must prevent re-uploading every cycle.
+                    repeated = await run_audio_recovery_cycle(now=2060)
+
+                self.assertEqual(result["repaired"], 2)
+                self.assertEqual(result["failed"], 0)
+                self.assertEqual(result["unreadable"], [])
+                self.assertEqual(repeated["repaired"], 0)
+                self.assertEqual(repeated["failed"], 0)
+                self.assertEqual([call.kwargs["language"] for call in add.call_args_list], ["en", "es"])
+                info.assert_called_once()
+                render.assert_called_once()
+                if failed_es:
+                    delete.assert_called_once_with("video", "channel", ["deleted-es"])
+                else:
+                    delete.assert_not_called()
+                attempts = state["entries"]["channel"]["video"]["attempts"]
+                self.assertEqual(set(attempts), {"en", "es"})
+                self.assertTrue(all(attempt["succeeded"] for attempt in attempts.values()))
 
 
 if __name__ == "__main__":

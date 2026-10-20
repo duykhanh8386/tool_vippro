@@ -307,7 +307,8 @@ def create_auto_registry_content(*, on_change: Callable[[], None] | None = None)
         ).classes("text-xs text-gray-500")
         ui.label(
             "Video còn ít nhất một ngôn ngữ audio đã xuất bản dùng được sẽ được bỏ qua. "
-            "Chỉ tự động xóa và thêm lại audio khi không còn bản audio tốt."
+            "Khi không còn bản audio tốt, tool sửa audio lỗi và thêm các ngôn ngữ còn thiếu "
+            "theo danh sách đã đăng ký, kể cả video toàn dấu “-”."
         ).classes("text-xs text-gray-500")
         ui.label(
             "Mặc định tự động quét tất cả các kênh Active. Kênh Deactive vẫn ở trong "
