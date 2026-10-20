@@ -6,6 +6,7 @@ from typing import Awaitable, Callable, Iterable, TypeVar
 from nicegui import context, ui
 from loguru import logger
 
+from src.audio_recovery import get_audio_mutation_guard
 from src.module.audio_module import update_audio_module
 from src.module.list_videos_module import list_videos_module
 from src.state_manager import state_manager
@@ -434,6 +435,23 @@ def create_remove_audio_page():
             set_scan_busy(False)
 
     async def handle_remove_audio():
+        channel_id = selected_remove_channel["id"]
+        if not channel_id:
+            ui.notify("Vui lòng chọn kênh", type="warning")
+            return
+        channel_guard = get_audio_mutation_guard(channel_id)
+        if not channel_guard.acquire(blocking=False):
+            ui.notify(
+                "Một tác vụ audio khác đang cập nhật kênh này. Vui lòng thử lại sau ít giây.",
+                type="warning",
+            )
+            return
+        try:
+            await execute_remove_audio()
+        finally:
+            channel_guard.release()
+
+    async def execute_remove_audio():
         if scan_runtime["running"]:
             ui.notify("Hãy chờ quét trạng thái audio hoàn tất.", type="warning")
             return

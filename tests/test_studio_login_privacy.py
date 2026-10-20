@@ -15,6 +15,22 @@ from src.state_manager import StateManager
 from web.components import studio
 
 
+class ChannelIdentificationWarningTests(unittest.TestCase):
+    def test_warning_distinguishes_empty_names_from_ambiguous_parsed_names(self):
+        report = ChannelScanReport(unidentified_channel_count=3, unidentified_channels=[
+            {"reason": "empty_name", "channel_name": ""},
+            {"reason": "ambiguous_name", "channel_name": "Parsed label"},
+            {"reason": "ambiguous_name", "channel_name": "Parsed label"},
+        ])
+        message = studio._channel_identification_warning(report)
+        self.assertIn("1 mục chưa đọc được tên", message)
+        self.assertIn("2 mục có tên tool đọc được không duy nhất", message)
+        self.assertIn("Parsed label", message)
+
+    def test_successful_scan_does_not_show_identification_warning(self):
+        self.assertEqual(studio._channel_identification_warning(ChannelScanReport()), "")
+
+
 class LoginStatePrivacyTests(unittest.TestCase):
     def setUp(self):
         folder = tempfile.TemporaryDirectory()

@@ -411,6 +411,33 @@ class AudioPageLifecycleTests(unittest.IsolatedAsyncioTestCase):
         operands = post.call_args.kwargs["json"]["filter"]["and"]["operands"]
         self.assertIn({"isDraft": {}}, operands)
 
+    def test_draft_scan_stops_at_selected_count_across_pages(self):
+        pages = [
+            ([SimpleNamespace(id=f"draft-{i}") for i in range(50)], "next"),
+            ([SimpleNamespace(id=f"draft-{i}") for i in range(49, 75)], "unused"),
+        ]
+        with patch(
+            "web.components.audio.list_videos_module.list_all_videos", side_effect=pages,
+        ) as list_videos:
+            videos = _fetch_channel_videos("channel", scope="draft", recent_limit=60)
+
+        self.assertEqual([video.id for video in videos], [f"draft-{i}" for i in range(60)])
+        self.assertEqual(list_videos.call_count, 2)
+        self.assertEqual(list_videos.call_args_list[0].kwargs["limit"], 50)
+        self.assertEqual(list_videos.call_args_list[1].kwargs["limit"], 10)
+        self.assertEqual(list_videos.call_args_list[1].kwargs["page_token"], "next")
+        self.assertTrue(all(call.kwargs["draft_only"] for call in list_videos.call_args_list))
+
+    def test_draft_scan_handles_small_limit_and_fewer_available_drafts(self):
+        for count, limit, expected in ((5, 2, 2), (2, 10, 2), (3, 0, 1)):
+            with self.subTest(available=count, limit=limit), patch(
+                "web.components.audio.list_videos_module.list_all_videos",
+                return_value=([SimpleNamespace(id=f"draft-{i}") for i in range(count)], None),
+            ) as list_videos:
+                videos = _fetch_channel_videos("channel", scope="draft", recent_limit=limit)
+                self.assertEqual(len(videos), expected)
+                list_videos.assert_called_once()
+
     def test_recent_scan_stops_at_selected_newest_video_count(self):
         pages = [
             ([SimpleNamespace(id="A"), SimpleNamespace(id="B")], "next"),

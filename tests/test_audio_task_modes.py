@@ -1,0 +1,283 @@
+import copy
+import inspect
+import tempfile
+import unittest
+from contextlib import ExitStack
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
+
+from nicegui import Client, ui
+from nicegui.page import page
+
+from src.audio_recovery import get_audio_mutation_guard
+from src.module.model import Video
+from web.components import audio, remove_audio
+
+
+class MemoryStateManager:
+    def __init__(self):
+        self.states = {}
+
+    def save_state(self, key, state):
+        self.states[key] = copy.deepcopy(state)
+        return True
+
+    def load_state(self, key):
+        return copy.deepcopy(self.states.get(key))
+
+
+class AudioTaskModeTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.patches = ExitStack()
+        self.addCleanup(self.patches.close)
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        self.music = Path(folder.name) / "music.mp3"
+        self.music.write_bytes(b"test audio")
+        self.state = MemoryStateManager()
+        self.channel = SimpleNamespace(
+            id="mode-test-channel", name="Test channel", img_src="", owner_email="test@example.test",
+        )
+        self.events = []
+        self.timers = []
+
+        def timer(_interval, callback, **kwargs):
+            if kwargs.get("once"):
+                self.timers.append(callback)
+            return Mock()
+
+        for module in (audio, remove_audio):
+            self.patches.enter_context(patch.object(module, "state_manager", self.state))
+            self.patches.enter_context(patch.object(
+                module, "get_channels_info",
+                side_effect=lambda channel_id=None: self.channel if channel_id else [self.channel],
+            ))
+        self.patches.enter_context(patch.object(audio.ui, "timer", side_effect=timer))
+        self.patches.enter_context(patch.object(audio.ui, "notify"))
+        self.patches.enter_context(patch.object(audio, "find_caption_oauth_client", return_value=None))
+
+        def delete(**_kwargs):
+            self.events.append("delete")
+            return 200
+
+        def delete_tracks(*_args):
+            self.events.append("delete_tracks")
+            return 200
+
+        self.delete = self.patches.enter_context(patch.object(
+            audio.update_audio_module, "delete", side_effect=delete,
+        ))
+        self.delete_tracks = self.patches.enter_context(patch.object(
+            audio.update_audio_module, "delete_track_ids", side_effect=delete_tracks,
+        ))
+
+        def add(**kwargs):
+            self.events.append("add:" + kwargs["language"])
+            return 200
+
+        self.add = self.patches.enter_context(patch.object(audio.update_audio_module, "add", side_effect=add))
+        self.patches.enter_context(patch.object(
+            audio.update_audio_module, "_get_video_info", return_value=Video(
+                id="video", channel_id=self.channel.id, title="", description="", thumbnail="", duration_ms=60000,
+            ),
+        ))
+        self.patches.enter_context(patch.object(audio, "multiply_audio"))
+        self.recovery = self.patches.enter_context(patch.object(audio, "register_audio_recovery", return_value=True))
+
+    def saved_add_state(self):
+        return {
+            "selected_channel": self.channel.id,
+            "video_ids": ["video"],
+            "id_to_path": {"video": str(self.music)},
+            "selected_languages": ["en", "vi"],
+            "performance_settings": {
+                "mode": audio._AUDIO_UPLOAD_CONCURRENCY_MODE,
+                "max_concurrency": audio.DEFAULT_AUDIO_UPLOAD_CONCURRENCY,
+            },
+            "video_source_state": {"mode": "manual", "scan_scope": "all", "recent_limit": 50},
+        }
+
+    def render(self, *, delete_existing=True, remove_only=False):
+        route = "/audio/remove" if remove_only else ("/audio/add" if delete_existing else "/audio/add-only")
+        client = Client(page(route), request=None)
+        self.addCleanup(client.delete)
+        self.timers.clear()
+        with client:
+            if remove_only:
+                remove_audio.create_remove_audio_page()
+            else:
+                audio.create_add_audio_page(delete_existing=delete_existing)
+            for callback in list(self.timers):
+                callback()
+        return client
+
+    def button_callback(self, client, text):
+        button = next(element for element in client.elements.values()
+                      if isinstance(element, ui.button) and element.text == text)
+        listener = next(listener for listener in button._event_listeners.values() if listener.type == "click")
+        return inspect.getclosurevars(listener.handler).nonlocals["callback"]
+
+    async def test_combined_workflow_still_deletes_before_adding_every_language(self):
+        self.state.states["audio_add"] = self.saved_add_state()
+        client = self.render()
+        with client:
+            await self.button_callback(client, "Bắt đầu xóa & thêm audio")()
+        self.assertEqual(self.events, ["delete", "add:en", "add:vi"])
+        self.assertEqual(self.state.states["audio_add"]["video_cleanup_status"]["video"], "successful")
+        self.assertNotIn("audio_add_only", self.state.states)
+        self.assertFalse(get_audio_mutation_guard(self.channel.id).locked())
+
+    async def test_add_only_never_deletes_and_keeps_combined_checkpoint(self):
+        combined = {"keep": "combined task checkpoint"}
+        self.state.states["audio_add"] = copy.deepcopy(combined)
+        self.state.states["audio_add_only"] = self.saved_add_state()
+        client = self.render(delete_existing=False)
+        with client:
+            await self.button_callback(client, "Bắt đầu thêm audio")()
+        self.assertEqual(self.events, ["add:en", "add:vi"])
+        self.delete.assert_not_called()
+        self.delete_tracks.assert_not_called()
+        self.assertEqual(self.state.states["audio_add"], combined)
+        self.assertEqual(self.state.states["audio_add_only"]["video_processing_status"]["video"],
+                         {"en": "successful", "vi": "successful"})
+        self.assertEqual(self.state.states["audio_add_only"]["video_cleanup_status"], {})
+        self.assertTrue(self.recovery.call_args.kwargs["merge_languages"])
+        labels = [element.text for element in client.elements.values() if isinstance(element, ui.label)]
+        self.assertIn("Thành công", labels)
+        self.assertNotIn("Chờ xóa audio cũ", labels)
+
+    async def test_add_only_error_scan_never_deletes_failed_track_ids(self):
+        saved = self.saved_add_state()
+        saved["video_source_state"].update({
+            "mode": "failed", "failed_channel": self.channel.id,
+            "failed_targets": {"video": [{"language": "en", "track_ids": ["failed-track"]}]},
+        })
+        self.state.states["audio_add_only"] = saved
+        client = self.render(delete_existing=False)
+        with patch.object(audio.update_audio_module, "get_terminal_audio_repair_targets", return_value={
+            "video": [{"language": "en", "track_ids": ["failed-track"]}],
+        }), client:
+            await self.button_callback(client, "Bắt đầu thêm audio")()
+        self.assertEqual(self.events, ["add:en"])
+        self.delete.assert_not_called()
+        self.delete_tracks.assert_not_called()
+
+    async def test_remove_only_requires_no_audio_file_or_languages_and_never_adds(self):
+        self.state.states["audio_remove"] = {"selected_channel": self.channel.id, "ids": ["video"]}
+        self.state.states["audio_add"] = {"keep": "combined"}
+        self.state.states["audio_add_only"] = {"keep": "add only"}
+        client = self.render(remove_only=True)
+        with client:
+            await self.button_callback(client, "Bắt đầu xóa")()
+        self.assertEqual(self.events, ["delete"])
+        self.add.assert_not_called()
+        self.assertEqual(self.state.states["audio_remove"]["video_processing_status"]["video"], "successful")
+        self.assertEqual(self.state.states["audio_add"], {"keep": "combined"})
+        self.assertEqual(self.state.states["audio_add_only"], {"keep": "add only"})
+        self.assertFalse(get_audio_mutation_guard(self.channel.id).locked())
+
+    async def test_combined_error_scan_keeps_targeted_delete_before_add(self):
+        saved = self.saved_add_state()
+        saved["video_source_state"].update({
+            "mode": "failed", "failed_channel": self.channel.id,
+            "failed_targets": {"video": [{"language": "en", "track_ids": ["failed-track"]}]},
+        })
+        self.state.states["audio_add"] = saved
+        client = self.render()
+        with patch.object(audio.update_audio_module, "get_terminal_audio_repair_targets", return_value={
+            "video": [{"language": "en", "track_ids": ["failed-track"]}],
+        }), client:
+            await self.button_callback(client, "Bắt đầu xóa & thêm audio")()
+        self.assertEqual(self.events, ["delete_tracks", "add:en"])
+        self.delete.assert_not_called()
+        self.delete_tracks.assert_called_once_with("video", self.channel.id, ["failed-track"])
+
+    async def test_completed_add_only_checkpoint_skips_upload_when_run_again(self):
+        self.state.states["audio_add_only"] = self.saved_add_state()
+        for _ in range(2):
+            client = self.render(delete_existing=False)
+            with client:
+                await self.button_callback(client, "Bắt đầu thêm audio")()
+        self.assertEqual(self.events, ["add:en", "add:vi"])
+        self.delete.assert_not_called()
+        self.delete_tracks.assert_not_called()
+
+    async def test_remove_only_is_blocked_by_other_audio_mutations_on_the_same_channel(self):
+        self.state.states["audio_remove"] = {"selected_channel": self.channel.id, "ids": ["video"]}
+        client = self.render(remove_only=True)
+        guard = get_audio_mutation_guard(self.channel.id)
+        guard.acquire()
+        try:
+            with client:
+                await self.button_callback(client, "Bắt đầu xóa")()
+            self.assertTrue(guard.locked())
+            self.delete.assert_not_called()
+            self.add.assert_not_called()
+        finally:
+            guard.release()
+
+    async def test_draft_limit_is_editable_saved_and_applied_before_checking_audio(self):
+        saved = self.saved_add_state()
+        saved["video_source_state"].update(mode="failed", scan_scope="draft", recent_limit=2)
+        self.state.states["audio_add"] = saved
+        client = self.render()
+        number = next(element for element in client.elements.values()
+                      if isinstance(element, ui.number) and element._props.get("label") == "Số video muốn quét")
+        self.assertFalse(number._props.get("disable"))
+        with client:
+            number.value = 3
+        self.assertEqual(self.state.states["audio_add"]["video_source_state"]["recent_limit"], 3)
+        with (
+            patch.object(audio.list_videos_module, "list_all_videos", return_value=(
+                [Video(id=f"draft-{i}", channel_id=self.channel.id, title="", description="",
+                       thumbnail="", duration_ms=60000) for i in range(5)], "unused"),
+            ) as list_videos,
+            patch.object(audio.update_audio_module, "get_terminal_audio_repair_targets", return_value={
+                "draft-0": [{"language": "en", "track_ids": ["failed-track"]}],
+            }) as targets,
+            client,
+        ):
+            await self.button_callback(client, "Quét ID audio cần xử lý")()
+        list_videos.assert_called_once_with(self.channel.id, limit=3, page_token=None, draft_only=True)
+        self.assertEqual(targets.call_args.args[0], ["draft-0", "draft-1", "draft-2"])
+        source = self.state.states["audio_add"]["video_source_state"]
+        self.assertEqual(source["scan_total"], 3)
+        self.assertEqual(source["last_scan_limit"], 3)
+        self.assertEqual(self.state.states["audio_add"]["video_ids"], ["draft-0"])
+        self.assertFalse(number._props.get("disable"))
+
+    async def test_clearing_add_only_does_not_clear_other_tasks(self):
+        self.state.states["audio_add"] = {"keep": "combined"}
+        self.state.states["audio_remove"] = {"keep": "remove"}
+        self.state.states["audio_add_only"] = self.saved_add_state()
+        client = self.render(delete_existing=False)
+        with client:
+            self.button_callback(client, "Xóa dữ liệu")()
+        self.assertEqual(self.state.states["audio_add_only"]["video_ids"], [])
+        self.assertEqual(self.state.states["audio_add"], {"keep": "combined"})
+        self.assertEqual(self.state.states["audio_remove"], {"keep": "remove"})
+
+
+class AudioTaskRouteTests(unittest.TestCase):
+    def test_all_three_task_routes_remain_available(self):
+        from web.views import audio as views
+
+        with (
+            patch.object(views, "create_drawer"),
+            patch.object(views.nav_state, "set_active_route"),
+            patch.object(views, "create_add_audio_page") as render_add,
+            patch.object(views, "create_remove_audio_page") as render_remove,
+        ):
+            views.add_audio_page()
+            render_add.assert_called_once_with()
+            render_add.reset_mock()
+            views.add_only_audio_page()
+            render_add.assert_called_once_with(delete_existing=False)
+            views.remove_audio_page()
+            render_remove.assert_called_once_with()
+        self.assertTrue({"/audio/add", "/audio/remove", "/audio/add-only"}.issubset(views.router.routes))
+
+
+if __name__ == "__main__":
+    unittest.main()

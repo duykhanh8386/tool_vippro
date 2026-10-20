@@ -24,6 +24,7 @@ from src.channel_scanner import (
     AUTHENTICATION_TIMEOUT_SECONDS,
     ChannelFetcher,
     ChannelScanError,
+    ChannelScanReport,
 )
 from src.channel_groups import (
     ALL_GMAILS,
@@ -46,6 +47,31 @@ from web.theme import (
     section_header,
     status_badge,
 )
+
+
+def _channel_identification_warning(report: ChannelScanReport) -> str:
+    if not report.unidentified_channel_count:
+        return ""
+    details = report.unidentified_channels
+    if not details:
+        return (
+            f" Chưa nhận diện được {report.unidentified_channel_count} mục trong menu kênh. "
+            "Xem log để biết tên tool đã đọc và lý do bỏ qua."
+        )
+    empty_count = sum(detail["reason"] == "empty_name" for detail in details)
+    ambiguous = [detail for detail in details if detail["reason"] != "empty_name"]
+    reasons = []
+    if empty_count:
+        reasons.append(f"{empty_count} mục chưa đọc được tên")
+    if ambiguous:
+        names = list(dict.fromkeys(detail["channel_name"] for detail in ambiguous))
+        preview = ", ".join(repr(name[:80]) for name in names[:3])
+        reasons.append(f"{len(ambiguous)} mục có tên tool đọc được không duy nhất ({preview})")
+    return (
+        f" Chưa nhận diện được {report.unidentified_channel_count} mục trong menu: "
+        + "; ".join(reasons)
+        + ". Xem log để biết từng mục."
+    )
 
 
 def create_studio_content(*, reload_alerts: bool = False):
@@ -218,11 +244,7 @@ def create_studio_content(*, reload_alerts: bool = False):
                     message += (
                         f" Bỏ qua {report.deleted_channel_count} kênh đã bị xóa."
                     )
-                if report.unidentified_channel_count:
-                    message += (
-                        f" Bỏ qua an toàn {report.unidentified_channel_count} hồ sơ "
-                        "không đọc được tên kênh duy nhất."
-                    )
+                message += _channel_identification_warning(report)
                 result_type = (
                     "negative"
                     if token_failures
@@ -257,7 +279,7 @@ def create_studio_content(*, reload_alerts: bool = False):
                 )
             else:
                 message = f"Đã thêm {len(report.channels)} kênh mới."
-                if not report.channels and not report.failures:
+                if not report.channels and not report.failures and not report.unidentified_channel_count:
                     message = "Không có kênh mới trong tài khoản này."
                 if report.failures:
                     message += f" Có {len(report.failures)} kênh mới bị lỗi."
@@ -265,11 +287,7 @@ def create_studio_content(*, reload_alerts: bool = False):
                     message += (
                         f" Bỏ qua {report.deleted_channel_count} kênh đã bị xóa."
                     )
-                if report.unidentified_channel_count:
-                    message += (
-                        f" Bỏ qua an toàn {report.unidentified_channel_count} hồ sơ "
-                        "không đọc được tên kênh duy nhất."
-                    )
+                message += _channel_identification_warning(report)
                 result_type = (
                     "warning"
                     if report.failures

@@ -106,6 +106,7 @@ class ChannelScanReport:
     skipped_channel_ids: list[str] = field(default_factory=list)
     missing_channel_ids: list[str] = field(default_factory=list)
     unidentified_channel_count: int = 0
+    unidentified_channels: list[dict] = field(default_factory=list)
     deleted_channel_count: int = 0
     completed: bool = False
     end_category: ChannelScanErrorCategory | None = None
@@ -358,9 +359,11 @@ class ChannelFetcher:
             for entry in entries
             if entry.get("normalized_name") and not entry.get("deleted")
         )
-        report.unidentified_channel_count = sum(
-            1 for entry in entries if not entry.get("normalized_name")
-        )
+        report.unidentified_channel_count = 0
+        report.unidentified_channels.clear()
+        for entry in entries:
+            if not entry.get("normalized_name") and not entry.get("deleted"):
+                self._note_unidentified_channel(entry, reason="empty_name")
         selected_targets: list[dict] = []
 
         if include_channel_ids is not None:
@@ -385,6 +388,8 @@ class ChannelFetcher:
                     and len(name_matches) == 1
                 ):
                     expected_channel_id = name_matches[0]
+                elif name_matches:
+                    self._note_unidentified_channel(entry, reason="ambiguous_name")
 
                 if expected_channel_id and expected_channel_id not in matched_ids:
                     target = dict(entry)
@@ -417,6 +422,11 @@ class ChannelFetcher:
             for entry in entries:
                 normalized_name = entry.get("normalized_name") or ""
                 if normalized_name and normalized_name in exclude_channel_names:
+                    logger.info(
+                        "Skipping chooser row by saved-name filter: row={} parsed_name={!r}",
+                        entry.get("menu_index"),
+                        str(entry.get("channel_name") or "")[:200],
+                    )
                     continue
                 if entry.get("deleted"):
                     self._note_deleted_channel(entry)
@@ -424,7 +434,7 @@ class ChannelFetcher:
                 if not normalized_name:
                     continue
                 if menu_name_counts[normalized_name] != 1:
-                    report.unidentified_channel_count += 1
+                    self._note_unidentified_channel(entry, reason="ambiguous_name")
                     continue
                 target = dict(entry)
                 target["channel_id"] = None
@@ -634,6 +644,23 @@ class ChannelFetcher:
         self.last_report.deleted_channel_count += 1
         logger.warning("Skipping deleted YouTube channel row {}: {}", menu_index, name)
 
+    def _note_unidentified_channel(self, entry: dict, *, reason: str) -> None:
+        detail = {
+            "menu_index": entry.get("menu_index"),
+            "channel_name": str(entry.get("channel_name") or ""),
+            "normalized_name": str(entry.get("normalized_name") or ""),
+            "reason": reason,
+        }
+        self.last_report.unidentified_channels.append(detail)
+        self.last_report.unidentified_channel_count += 1
+        logger.warning(
+            "Channel chooser identity skipped: row={} reason={} parsed_name={!r} normalized_name={!r}",
+            detail["menu_index"],
+            reason,
+            detail["channel_name"][:200],
+            detail["normalized_name"][:200],
+        )
+
     def _list_all_channel_menu_entries_once(self) -> list[dict]:
         """Read every account row already present in the chooser DOM.
 
@@ -677,18 +704,32 @@ class ChannelFetcher:
         return "\u0000".join(parts)
 
     def _channel_name_from_account_item(self, element) -> str:
+        title_xpath = ".//*[@id='channel-title']"
         for xpath in (
+            title_xpath,
             ".//*[@id='account-name']",
             ".//*[contains(concat(' ', normalize-space(@class), ' '), ' account-name ')]",
-            ".//yt-formatted-string[@id='channel-title']",
         ):
             try:
-                for candidate in element.find_elements(By.XPATH, xpath):
-                    text = " ".join(str(getattr(candidate, "text", "") or "").split())
-                    if text:
-                        return text
+                candidates = element.find_elements(By.XPATH, xpath)
             except (StaleElementReferenceException, WebDriverException):
                 continue
+            for candidate in candidates:
+                try:
+                    # WebElement.text can be empty or partial for off-screen
+                    # rows and clipped/hidden spans. Read the title node's DOM
+                    # text first, preserving Thai, other scripts and emoji.
+                    get_attribute = getattr(candidate, "get_attribute", None)
+                    dom_text = get_attribute("textContent") if callable(get_attribute) else ""
+                    text = " ".join(str(dom_text or getattr(candidate, "text", "") or "").split())
+                    if text:
+                        return text
+                except (StaleElementReferenceException, WebDriverException):
+                    continue
+            if xpath == title_xpath and candidates:
+                # A present-but-empty title is still loading. Returning an
+                # account label here could make distinct channels look equal.
+                return ""
         try:
             lines = [
                 " ".join(line.split())

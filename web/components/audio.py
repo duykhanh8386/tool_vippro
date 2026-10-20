@@ -463,7 +463,7 @@ def _fetch_channel_videos(
     scope: str = "all",
     recent_limit: int = DEFAULT_RECENT_VIDEO_LIMIT,
 ):
-    """Fetch videos newest-first for the selected scope, across all pages."""
+    """Fetch newest-first; recent_limit also caps a draft-only scan."""
     normalized_scope = scope if scope in VIDEO_SCAN_SCOPES else "all"
     normalized_limit = _normalize_recent_video_limit(recent_limit)
     videos = []
@@ -472,7 +472,7 @@ def _fetch_channel_videos(
     page_token = None
     while True:
         page_size = 50
-        if normalized_scope == "recent":
+        if normalized_scope in {"recent", "draft"}:
             page_size = min(50, normalized_limit - len(videos))
         list_kwargs = {"limit": page_size, "page_token": page_token}
         if normalized_scope == "draft":
@@ -489,7 +489,7 @@ def _fetch_channel_videos(
             if normalized_scope == "scheduled" and not _is_currently_scheduled_video(video):
                 continue
             videos.append(video)
-            if normalized_scope == "recent" and len(videos) >= normalized_limit:
+            if normalized_scope in {"recent", "draft"} and len(videos) >= normalized_limit:
                 return videos
         if not next_token:
             return videos
@@ -770,7 +770,10 @@ def create_channel_selection(channels, on_channel_select):
         channels_container = ui.row().classes("gap-2 flex-wrap")
         refresh_channel_display()
     return selected_channel, refresh_channel_display
-def create_add_audio_page():
+def create_add_audio_page(*, delete_existing: bool = True):
+    state_key = "audio_add" if delete_existing else "audio_add_only"
+    task_title = "Xóa & thêm audio" if delete_existing else "Thêm audio"
+    start_label = "Bắt đầu xóa & thêm audio" if delete_existing else "Bắt đầu thêm audio"
     try:
         page_client = context.client
     except RuntimeError:
@@ -882,7 +885,7 @@ def create_add_audio_page():
             best_effort_ui(
                 "notify locked add-audio configuration",
                 lambda: ui.notify(
-                    "Quy trình xóa và thêm audio đang chạy; chưa thể thay đổi dữ liệu.",
+                    "Tác vụ audio đang chạy; chưa thể thay đổi dữ liệu.",
                     type="warning",
                 ),
             )
@@ -930,14 +933,14 @@ def create_add_audio_page():
                 "batch_scan_state": batch_scan_state,
                 "video_source_state": video_source_state,
             }
-            return state_manager.save_state("audio_add", state)
+            return state_manager.save_state(state_key, state)
         except Exception as e:
             logger.error(f"Failed to save right panel state: {e}")
             return False
     def load_right_panel_state():
         """Load the saved state from file"""
         try:
-            state = state_manager.load_state("audio_add")
+            state = state_manager.load_state(state_key)
             if not state:
                 return
             needs_checkpoint_save = False
@@ -1351,6 +1354,8 @@ def create_add_audio_page():
                 concurrency_input.on("change", update_concurrency)
                 ui.label(
                     "Chạy đồng thời 3–5 video; mỗi video luôn xóa audio cũ trước rồi mới thêm lần lượt các ngôn ngữ."
+                    if delete_existing
+                    else "Chạy đồng thời 3–5 video; thêm lần lượt audio theo ngôn ngữ cho từng video."
                 ).classes("app-section-copy flex-1")
 
     def parse_ids_from_text(text: str) -> list[str]:
@@ -1447,7 +1452,7 @@ def create_add_audio_page():
         if recent_limit_input:
             recent_enabled = (
                 mode == "failed"
-                and video_source_state.get("scan_scope") == "recent"
+                and video_source_state.get("scan_scope") in {"recent", "draft"}
                 and not scan_runtime["running"]
             )
             if recent_enabled:
@@ -1497,10 +1502,10 @@ def create_add_audio_page():
                 return
             last_scope = video_source_state.get("last_scan_scope") or "all"
             scope_label = VIDEO_SCAN_SCOPE_LABELS.get(last_scope, "video")
-            if last_scope == "recent":
+            if last_scope in {"recent", "draft"} and video_source_state.get("last_scan_limit"):
                 scope_label = (
                     f"{video_source_state.get('last_scan_limit') or 0} "
-                    "video đăng gần nhất"
+                    f"{VIDEO_SCAN_SCOPE_LABELS[last_scope]}"
                 )
             failed_language_count = sum(
                 len(actions)
@@ -1726,8 +1731,8 @@ def create_add_audio_page():
                 video_source_state.get("recent_limit")
             )
             scan_label = VIDEO_SCAN_SCOPE_LABELS[scan_scope]
-            if scan_scope == "recent":
-                scan_label = f"{recent_limit} video đăng gần nhất"
+            if scan_scope in {"recent", "draft"}:
+                scan_label = f"{recent_limit} {VIDEO_SCAN_SCOPE_LABELS[scan_scope]}"
             ui.notify(
                 f"Đang đọc {scan_label} và trạng thái audio...", type="info"
             )
@@ -1758,7 +1763,7 @@ def create_add_audio_page():
             video_source_state["scan_skipped"] = len(unreadable_ids)
             video_source_state["last_scan_scope"] = scan_scope
             video_source_state["last_scan_limit"] = (
-                recent_limit if scan_scope == "recent" else None
+                recent_limit if scan_scope in {"recent", "draft"} else None
             )
             replace_active_video_list(
                 [video.id for video in failed_videos],
@@ -1779,7 +1784,7 @@ def create_add_audio_page():
                     f"{len(videos) - len(unreadable_ids)}/{len(videos)} video từ {scan_label}. "
                     + (
                         f"Đã tự khôi phục file nhạc cho {restored_audio_count} video; "
-                        "có thể bấm Bắt đầu xóa & thêm audio."
+                        f"có thể bấm {start_label}."
                         if restored_audio_count
                         else "Bây giờ hãy chọn cách ghép."
                     ),
@@ -2046,13 +2051,13 @@ def create_add_audio_page():
                     status_color = "text-yellow-600"
                     status_icon = "schedule"
                 elif (
-                    cleanup_status == "successful"
+                    (not delete_existing or cleanup_status == "successful")
                     and effective_success == total_languages
                 ):
                     overall_status = "successful"
                     status_color = "text-green-600"
                     status_icon = "check_circle"
-                elif cleanup_status == "unsuccessful" or unsuccessful_count > 0:
+                elif (delete_existing and cleanup_status == "unsuccessful") or unsuccessful_count > 0:
                     overall_status = "unsuccessful"
                     status_color = "text-red-600"
                     status_icon = "error"
@@ -2086,26 +2091,27 @@ def create_add_audio_page():
                             ui.label(match_label).classes(
                                 "px-2 text-[10px] font-medium text-emerald-600"
                             )
-                        if video_source_state.get("mode") == "failed":
-                            cleanup_labels = {
-                                "pending": ("Chờ xóa đúng audio lỗi", "text-gray-500"),
-                                "processing": ("Đang xóa audio lỗi", "text-blue-600"),
-                                "successful": ("Đã xóa audio lỗi", "text-emerald-600"),
-                                "unsuccessful": ("Xóa audio lỗi thất bại", "text-red-600"),
-                            }
-                        else:
-                            cleanup_labels = {
-                                "pending": ("Chờ xóa audio cũ", "text-gray-500"),
-                                "processing": ("Đang xóa audio cũ", "text-blue-600"),
-                                "successful": ("Đã xóa audio cũ", "text-emerald-600"),
-                                "unsuccessful": ("Xóa audio thất bại", "text-red-600"),
-                            }
-                        cleanup_text, cleanup_color = cleanup_labels.get(
-                            cleanup_status, cleanup_labels["pending"]
-                        )
-                        ui.label(cleanup_text).classes(
-                            f"px-2 text-[10px] font-medium {cleanup_color}"
-                        )
+                        if delete_existing:
+                            if video_source_state.get("mode") == "failed":
+                                cleanup_labels = {
+                                    "pending": ("Chờ xóa đúng audio lỗi", "text-gray-500"),
+                                    "processing": ("Đang xóa audio lỗi", "text-blue-600"),
+                                    "successful": ("Đã xóa audio lỗi", "text-emerald-600"),
+                                    "unsuccessful": ("Xóa audio lỗi thất bại", "text-red-600"),
+                                }
+                            else:
+                                cleanup_labels = {
+                                    "pending": ("Chờ xóa audio cũ", "text-gray-500"),
+                                    "processing": ("Đang xóa audio cũ", "text-blue-600"),
+                                    "successful": ("Đã xóa audio cũ", "text-emerald-600"),
+                                    "unsuccessful": ("Xóa audio thất bại", "text-red-600"),
+                                }
+                            cleanup_text, cleanup_color = cleanup_labels.get(
+                                cleanup_status, cleanup_labels["pending"]
+                            )
+                            ui.label(cleanup_text).classes(
+                                f"px-2 text-[10px] font-medium {cleanup_color}"
+                            )
 
                     def make_path_on_change(video_id: str, input_ref):
                         def _on_change(e=None):
@@ -2269,7 +2275,7 @@ def create_add_audio_page():
                             ui.label(f"Ngôn ngữ {error_lang}: {error_message}").classes("text-sm text-red-700 whitespace-normal break-words")
     async def _execute_add_audio():
         if _ADD_AUDIO_RUN_GUARD.locked():
-            ui.notify("Quy trình xóa và thêm audio đang chạy ở một trang khác.", type="warning")
+            ui.notify("Tác vụ audio đang chạy ở một trang khác.", type="warning")
             return None
         if not selected_channel["id"]:
             ui.notify("Hãy chọn kênh", type="warning")
@@ -2345,14 +2351,14 @@ def create_add_audio_page():
                 logger.error(err)
             return None
         if not _ADD_AUDIO_RUN_GUARD.acquire(blocking=False):
-            ui.notify("Quy trình xóa và thêm audio đang chạy ở một trang khác.", type="warning")
+            ui.notify("Tác vụ audio đang chạy ở một trang khác.", type="warning")
             return None
         _own_audio_run_lock(_ADD_AUDIO_RUN_GUARD)
         channel_mutation_guard = get_audio_mutation_guard(selected_channel["id"])
         if not channel_mutation_guard.acquire(blocking=False):
             _release_audio_run_lock(_ADD_AUDIO_RUN_GUARD)
             ui.notify(
-                "Tự động khôi phục audio đang cập nhật một track. "
+                "Một tác vụ audio khác đang cập nhật kênh này. "
                 "Vui lòng thử lại sau ít giây.",
                 type="warning",
             )
@@ -2369,7 +2375,9 @@ def create_add_audio_page():
             return None
         with ui.dialog() as progress_dialog:
             with ui.card().classes("app-card w-96"):
-                ui.label("Đang xóa và thêm âm thanh...").classes("text-base font-semibold")
+                ui.label(
+                    "Đang xóa và thêm âm thanh..." if delete_existing else "Đang thêm âm thanh..."
+                ).classes("text-base font-semibold")
                 current_video_label = ui.label("").classes("text-sm font-medium text-blue-600")
                 status_label = ui.label("").classes("text-sm text-gray-600")
                 remaining_label = ui.label("").classes("text-xs text-gray-500")
@@ -2379,7 +2387,7 @@ def create_add_audio_page():
         best_effort_ui("open progress dialog", progress_dialog.open)
         total_videos = len(job_video_ids)
         tasks_by_video = {
-            video_id: len(actions) + 1
+            video_id: len(actions) + int(delete_existing)
             for video_id, actions in repair_actions_by_video.items()
         }
         total_tasks = sum(tasks_by_video.values())
@@ -2795,10 +2803,10 @@ def create_add_audio_page():
                     video_workflow_signatures[vid] = workflow_signature
 
                 existing_status = video_processing_status.setdefault(vid, {})
-                if video_cleanup_status.get(vid) == "successful":
+                if delete_existing and video_cleanup_status.get(vid) == "successful":
                     completed_tasks += 1
                     completed_by_video[vid] += 1
-                else:
+                elif delete_existing:
                     # In error-scan mode this invalidates only the exact failed
                     # languages, never every configured language.
                     existing_status.clear()
@@ -2912,7 +2920,7 @@ def create_add_audio_page():
                         languages=languages_for_video,
                         repeat_times=repeat_times,
                         extra_minutes=extra_minutes,
-                        merge_languages=selective_repair,
+                        merge_languages=selective_repair or not delete_existing,
                     )
                     caption_result = await run_caption_workflow(
                         vid=vid,
@@ -2943,7 +2951,10 @@ def create_add_audio_page():
                         remaining_label.set_text(
                             f"Còn lại: {total_videos - video_index} video"
                         ),
-                        status_label.set_text("Bước 2/2: Đang lấy thông tin video..."),
+                        status_label.set_text(
+                            "Bước 2/2: Đang lấy thông tin video..."
+                            if delete_existing else "Đang lấy thông tin video..."
+                        ),
                     ),
                 )
                 video_info = await asyncio.to_thread(
@@ -3025,7 +3036,7 @@ def create_add_audio_page():
                         languages=languages_for_video,
                         repeat_times=repeat_times,
                         extra_minutes=extra_minutes,
-                        merge_languages=selective_repair,
+                        merge_languages=selective_repair or not delete_existing,
                     )
                     caption_result = await run_caption_workflow(
                         vid=vid,
@@ -3138,8 +3149,10 @@ def create_add_audio_page():
     page = ui.column().classes("app-page audio-add-page")
     with page:
         with page_header(
-            "Xóa & thêm audio",
-            "Quét video cần xử lý, xóa audio cũ trước rồi thêm audio mới theo ngôn ngữ.",
+            task_title,
+            "Quét video cần xử lý, xóa audio cũ trước rồi thêm audio mới theo ngôn ngữ."
+            if delete_existing
+            else "Thêm audio theo ngôn ngữ cho các video đã chọn.",
             eyebrow="Tác vụ",
         ):
             pass
@@ -3317,13 +3330,16 @@ def create_add_audio_page():
                     ).props("no-caps disable")
                     ui_refs["scan_scope_toggle"] = scan_scope_toggle
                 recent_limit_input = ui.number(
-                    "Số video gần nhất",
+                    "Số video muốn quét",
                     value=video_source_state["recent_limit"],
                     min=1,
                     max=MAX_RECENT_VIDEO_LIMIT,
                     step=1,
                     on_change=on_recent_limit_change,
                 ).props("outlined disable").classes("w-44")
+                recent_limit_input.tooltip(
+                    "Áp dụng cho Bản nháp và Đăng gần nhất. Số video có audio lỗi có thể ít hơn số video đã quét."
+                )
                 ui_refs["recent_limit_input"] = recent_limit_input
             video_source_status_container = ui.column().classes("w-full gap-0")
             refresh_video_source_controls()
@@ -3458,7 +3474,7 @@ def create_add_audio_page():
                 return
 
             try:
-                state = state_manager.load_state("audio_add") or {}
+                state = state_manager.load_state(state_key) or {}
                 refreshed_statuses = _restore_language_statuses(
                     state.get("video_processing_status"), reset_processing=False
                 )
@@ -3606,7 +3622,7 @@ def create_add_audio_page():
 
         with ui.row().classes("w-full gap-2 mt-3"):
             ui.button(
-                "Bắt đầu xóa & thêm audio",
+                start_label,
                 icon="play_arrow",
                 on_click=handle_add_audio,
             ).classes("app-button-primary flex-1")

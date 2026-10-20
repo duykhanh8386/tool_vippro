@@ -113,6 +113,28 @@ class StatusMenuDriver(MenuDriver):
         self.current_url = current_url
 
 
+class TitledMenuRow(StatusMenuRow):
+    def __init__(self, channel_id, driver, *, title, account_name, rendered_title=None):
+        super().__init__(channel_id, driver, title=title)
+        self.account_name = account_name
+        self.rendered_title = title if rendered_title is None else rendered_title
+
+    def find_elements(self, _by, selector):
+        if "channel-title" in selector:
+            return [self.Label(self.rendered_title, self.title)]
+        if "account-name" in selector:
+            return [self.Label(self.account_name, self.account_name)]
+        return []
+
+    class Label:
+        def __init__(self, rendered_text, dom_text):
+            self.text = rendered_text
+            self.dom_text = dom_text
+
+        def get_attribute(self, name):
+            return self.dom_text if name == "textContent" else None
+
+
 class PredicateWait:
     def __init__(self, driver, *args, **kwargs):
         self.driver = driver
@@ -265,6 +287,82 @@ class FakeChannelFetcher(ChannelFetcher):
 
 
 class ChannelScannerHardeningTests(unittest.TestCase):
+    def test_channel_title_is_used_instead_of_shared_account_label(self):
+        driver = StatusMenuDriver([], "")
+        fetcher = ChannelFetcher()
+        first = TitledMenuRow("A", driver, title="🎧 เพลงเพราะ A", account_name="Shared account")
+        second = TitledMenuRow("B", driver, title="🎧 เพลงเพราะ B", account_name="Shared account")
+
+        self.assertEqual(fetcher._channel_name_from_account_item(first), "🎧 เพลงเพราะ A")
+        self.assertEqual(fetcher._channel_name_from_account_item(second), "🎧 เพลงเพราะ B")
+
+    def test_full_dom_title_is_preserved_when_selenium_only_sees_an_icon(self):
+        driver = StatusMenuDriver([], "")
+        row = TitledMenuRow("A", driver, title="🎧 เพลงเพราะ A", account_name="Shared account",
+                           rendered_title="🎧")
+        self.assertEqual(ChannelFetcher()._channel_name_from_account_item(row), "🎧 เพลงเพราะ A")
+
+    def test_empty_title_waits_for_loading_instead_of_using_account_label(self):
+        driver = StatusMenuDriver([], "")
+        row = TitledMenuRow("A", driver, title="", account_name="Shared account", rendered_title="")
+        row.title = ""
+        self.assertEqual(ChannelFetcher()._channel_name_from_account_item(row), "")
+
+    def test_add_new_reads_23_rows_and_loads_two_distinct_titles_with_shared_account_label(self):
+        ids = [f"UC{i:022d}" for i in range(23)]
+        driver = StatusMenuDriver([], f"https://studio.youtube.com/channel/{ids[0]}")
+        rows = [StatusMenuRow(channel_id, driver, title=f"Existing {i}", active=(i == 0))
+                for i, channel_id in enumerate(ids[:21])]
+        rows.extend([
+            TitledMenuRow(ids[21], driver, title="🎧 เพลงเพราะ A", account_name="Shared account",
+                          rendered_title="🎧"),
+            TitledMenuRow(ids[22], driver, title="🎧 เพลงเพราะ B", account_name="Shared account",
+                          rendered_title="🎧"),
+        ])
+        driver.rows = rows
+        fetcher = ChannelFetcher()
+        fetcher.driver = driver
+
+        def read_channel():
+            channel_id = fetcher._current_channel_id()
+            row = next(row for row in rows if row.channel_id == channel_id)
+            return {"id": channel_id, "name": row.title}
+
+        with (
+            patch.object(fetcher, "_open_channel_switcher_once"),
+            patch.object(fetcher, "_wait_interruptibly"),
+            patch.object(fetcher, "_get_channel_info", side_effect=read_channel) as read_info,
+            patch("src.channel_scanner.WebDriverWait", PredicateWait),
+        ):
+            report = fetcher._scan_filtered_channels(
+                include_channel_ids=None,
+                exclude_channel_ids=set(ids[:21]),
+                include_channel_names={},
+                exclude_channel_names={f"existing {i}" for i in range(21)},
+            )
+
+        self.assertEqual([channel["id"] for channel in report.channels], ids[21:])
+        self.assertEqual([channel["name"] for channel in report.channels], ["🎧 เพลงเพราะ A", "🎧 เพลงเพราะ B"])
+        self.assertEqual(read_info.call_count, 2)
+        self.assertEqual(report.unidentified_channel_count, 0)
+        self.assertEqual(report.unidentified_channels, [])
+
+    def test_ambiguous_parsed_names_report_each_row_and_reason(self):
+        fetcher = FakeChannelFetcher(["A", "B"], channel_names={"A": "Parsed label", "B": "PARSED LABEL"})
+        with (
+            patch("src.channel_scanner.create_driver", return_value=FakeDriver("A")),
+            patch("src.channel_scanner.logger") as log,
+        ):
+            report = fetcher.run("user@example.test", "test-only", exclude_channel_ids=set(),
+                                 exclude_channel_names=set())
+
+        self.assertEqual(report.unidentified_channel_count, 2)
+        self.assertEqual([entry["menu_index"] for entry in report.unidentified_channels], [1, 2])
+        self.assertEqual([entry["reason"] for entry in report.unidentified_channels], ["ambiguous_name"] * 2)
+        self.assertEqual([entry["channel_name"] for entry in report.unidentified_channels],
+                         ["Parsed label", "PARSED LABEL"])
+        self.assertEqual(log.warning.call_count, 2)
+
     def run_fetcher(self, fetcher):
         driver = FakeDriver(fetcher.channel_ids[0])
         with patch("src.channel_scanner.create_driver", return_value=driver):
