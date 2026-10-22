@@ -1,4 +1,5 @@
 import copy
+from datetime import date, datetime, timedelta, timezone
 import tempfile
 import unittest
 from pathlib import Path
@@ -276,6 +277,73 @@ class AutoRegistryCycleTests(RegistryStorage, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["scope_skipped_channel_ids"], ["channel-b"])
         self.assertEqual(get_audio_recovery_state()["entries"], self.original_entries)
 
+    async def test_date_filter_is_applied_before_audio_and_caption_checks(self):
+        from src.audio_recovery import _get_registered_video_scan_statuses
+
+        set_audio_recovery_items_enabled(enabled=False, channel_ids=["channel-b"])
+        set_audio_recovery_scan_preferences(scan_start_date="2026-10-20", scan_date_type="uploaded")
+        zone = timezone(timedelta(hours=7))
+        rows = [SimpleNamespace(id=video_id, privacy="VIDEO_PRIVACY_PUBLIC",
+                                time_created_seconds=datetime(2026, 10, day, 12, tzinfo=zone).timestamp())
+                for video_id, day in (("video-shared", 19), ("video-other", 21))]
+        captions = AsyncMock(return_value={})
+        payload = {"videoTranslations": [{"videoId": "video-other", "translations": []}],
+                   "audioTracks": [{"videoId": "video-other", "audioTrackId": "healthy-en", "language": "en",
+                                    "source": "AUDIO_TRACK_SOURCE_CREATOR", "audioContentTypeString": "dubbed",
+                                    "status": "AUDIO_TRACK_STATUS_READY"}]}
+        with (
+            patch("src.video_scan_dates.scan_today", return_value=date(2026, 10, 22)),
+            patch("src.audio_recovery._get_registered_video_scan_statuses", side_effect=_get_registered_video_scan_statuses),
+            patch("src.audio_recovery.list_videos_module.list_all_videos", return_value=(rows, None)),
+            patch("src.audio_recovery.update_audio_module._get_video_translation_payload", return_value=payload) as query,
+            patch("src.audio_recovery._monitor_failed_caption_tracks", captions),
+        ):
+            result = await run_audio_recovery_cycle(now=2000)
+
+        query.assert_called_once_with(["video-other"], "channel-a")
+        self.assertEqual(set(captions.await_args.kwargs["entries"]), {"video-other"})
+        self.assertEqual(result["deferred_video_scope"], 1)
+        self.assertEqual(result["scan_start_date"], "2026-10-20")
+        self.assertEqual(get_audio_recovery_state()["entries"], self.original_entries)
+
+    async def test_date_type_filters_publication_and_schedules_before_recovery(self):
+        from src.audio_recovery import _get_registered_video_scan_statuses
+
+        zone = timezone(timedelta(hours=7))
+        stamp = lambda day: datetime(2026, 10, day, 12, tzinfo=zone).timestamp()
+        set_audio_recovery_items_enabled(enabled=False, channel_ids=["channel-b"])
+        register_audio_recovery(channel_id="channel-a", video_id="scheduled-video", audio_path="source.mp3",
+                                languages=["en"], repeat_times=1, extra_minutes=0, registered_at=0)
+        rows = [
+            SimpleNamespace(id="video-shared", privacy="VIDEO_PRIVACY_PUBLIC", time_created_seconds=stamp(10), time_published_seconds=stamp(21)),
+            SimpleNamespace(id="video-other", privacy="VIDEO_PRIVACY_PUBLIC", time_created_seconds=stamp(21), time_published_seconds=stamp(19)),
+            SimpleNamespace(id="scheduled-video", privacy="VIDEO_PRIVACY_PRIVATE", time_created_seconds=stamp(10), scheduled_publishing_details={"time": stamp(22)}),
+        ]
+
+        def healthy(video_ids, _channel):
+            return {"videoTranslations": [{"videoId": vid, "translations": []} for vid in video_ids],
+                    "audioTracks": [{"videoId": vid, "audioTrackId": f"healthy-{vid}", "language": "en",
+                                     "source": "AUDIO_TRACK_SOURCE_CREATOR", "audioContentTypeString": "dubbed",
+                                     "status": "AUDIO_TRACK_STATUS_READY"} for vid in video_ids]}
+
+        for date_type, expected in (("auto", ["video-shared", "scheduled-video"]),
+                                    ("uploaded", ["video-other"]), ("published", ["video-shared"]),
+                                    ("scheduled", ["scheduled-video"])):
+            set_audio_recovery_scan_preferences(video_scan_scope=RECOVERY_VIDEO_SCOPE_BOTH,
+                                                scan_start_date="2026-10-20", scan_date_type=date_type)
+            with (
+                self.subTest(date_type=date_type), patch("src.video_scan_dates.scan_today", return_value=date(2026, 10, 22)),
+                patch("src.audio_recovery._get_registered_video_scan_statuses", side_effect=_get_registered_video_scan_statuses),
+                patch("src.audio_recovery.list_videos_module.list_all_videos", return_value=(rows, None)),
+                patch("src.audio_recovery.update_audio_module._get_video_translation_payload", side_effect=healthy) as query,
+                patch("src.audio_recovery._monitor_failed_caption_tracks", new=AsyncMock(return_value={})) as captions,
+            ):
+                result = await run_audio_recovery_cycle(now=2000)
+            self.assertEqual(query.call_args.args[0], expected)
+            self.assertEqual(set(captions.await_args.kwargs["entries"]), set(expected))
+            self.assertEqual(result["scan_date_type"], date_type)
+            self.assertEqual(result["repaired"], 0)
+
     async def test_all_disabled_videos_skip_youtube_calls(self):
         set_audio_recovery_items_enabled(
             enabled=False,
@@ -480,6 +548,57 @@ class AutoRegistryUiTests(RegistryStorage, unittest.TestCase):
             element for element in self.client.elements.values()
             if isinstance(element, self.ui.toggle)
         )
+
+    def test_calendar_saves_reloads_and_clears_without_changing_registered_videos(self):
+        calendar = next(element for element in self.client.elements.values()
+                        if isinstance(element, self.ui.input) and element._props.get("label") == "Quét từ ngày")
+        self.assertEqual(calendar._props["type"], "date")
+        with self.client:
+            calendar.value = "2026-10-20"
+        self.assertEqual(get_audio_recovery_scan_preferences()["scan_start_date"], "2026-10-20")
+        self.assertEqual(get_audio_recovery_state()["entries"], self.original_entries)
+        self.manager._conn.close()
+        self.manager._conn = None
+        self.assertEqual(get_audio_recovery_scan_preferences()["scan_start_date"], "2026-10-20")
+        with self.client:
+            calendar.value = "9999-01-01"
+        self.assertEqual(calendar.value, "2026-10-20")
+        with self.client:
+            calendar.value = None
+        self.assertEqual(get_audio_recovery_scan_preferences()["scan_start_date"], "")
+
+    def test_calendar_reverts_when_save_fails_and_refresh_does_not_save_again(self):
+        calendar = next(element for element in self.client.elements.values()
+                        if isinstance(element, self.ui.input) and element._props.get("label") == "Quét từ ngày")
+        set_audio_recovery_scan_preferences(scan_start_date="2026-10-20")
+        with patch("web.components.auto_registry.set_audio_recovery_scan_preferences") as save, self.client:
+            self.refresh()
+        self.assertEqual(calendar.value, "2026-10-20")
+        save.assert_not_called()
+        with patch("web.components.auto_registry.set_audio_recovery_scan_preferences", return_value=False), self.client:
+            calendar.value = "2026-10-21"
+        self.assertEqual(calendar.value, "2026-10-20")
+
+    def test_date_type_is_saved_and_restored_without_changing_registry_entries(self):
+        basis = next(element for element in self.client.elements.values()
+                     if isinstance(element, self.ui.select) and element._props.get("label") == "Tính theo ngày")
+        self.assertEqual(basis.value, "auto")
+        for date_type in ("uploaded", "published", "scheduled", "auto"):
+            with self.subTest(date_type=date_type), self.client:
+                basis.value = date_type
+            self.assertEqual(get_audio_recovery_scan_preferences()["scan_date_type"], date_type)
+            self.assertEqual(get_audio_recovery_state()["entries"], self.original_entries)
+        set_audio_recovery_scan_preferences(scan_date_type="published")
+        with patch("web.components.auto_registry.set_audio_recovery_scan_preferences") as save, self.client:
+            self.refresh()
+        self.assertEqual(basis.value, "published")
+        save.assert_not_called()
+        with patch("web.components.auto_registry.set_audio_recovery_scan_preferences", return_value=False), self.client:
+            basis.value = "scheduled"
+        self.assertEqual(basis.value, "published")
+        self.manager._conn.close()
+        self.manager._conn = None
+        self.assertEqual(get_audio_recovery_scan_preferences()["scan_date_type"], "published")
 
     def test_video_scope_control_saves_all_choices(self):
         control = self.video_scope_control()

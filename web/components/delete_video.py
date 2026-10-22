@@ -4,7 +4,8 @@ import time
 from nicegui import ui
 
 from src.utils import get_channels_info
-from web.components.common import create_channel_selection, select_directory
+from web.components.common import create_channel_selection, create_scan_date_input, create_scan_date_type_select, select_directory
+from src.video_scan_dates import normalize_scan_date_type, validate_scan_start_date
 from web.components.delete_video_controller import delete_controller, video_watch_url
 from web.components.drawer import nav_state
 from web.theme import app_card, empty_state, page_header, page_shell, section_header
@@ -50,6 +51,8 @@ def create_delete_video_page():
         "progress_bar": None,
         "summary_label": None,
         "table_container": None,
+        "scan_date_input": None,
+        "scan_date_type_select": None,
         "countdown_label": None,
         "folder_label": None,
     }
@@ -224,6 +227,16 @@ def create_delete_video_page():
             stop_btn.set_enabled(running)
         if clear_btn:
             clear_btn.set_enabled(not running)
+        date_input = ui_refs["scan_date_input"]
+        if date_input:
+            date_input.set_enabled(not running)
+            if date_input.value != delete_controller.scan_start_date:
+                date_input.value = delete_controller.scan_start_date
+        date_type_select = ui_refs["scan_date_type_select"]
+        if date_type_select:
+            date_type_select.set_enabled(not running)
+            if date_type_select.value != delete_controller.scan_date_type:
+                date_type_select.value = delete_controller.scan_date_type
         if running:
             nav_state.lock("/reup/delete-video", NAV_LOCK_MSG)
         else:
@@ -273,6 +286,28 @@ def create_delete_video_page():
             _sync_tick()
         except Exception as exc:
             ui.notify(f"Lỗi khi bắt đầu quét: {exc}", type="negative")
+
+    def on_scan_date_change(event):
+        field = ui_refs["scan_date_input"]
+        if delete_controller.is_running():
+            field.value = delete_controller.scan_start_date
+            return
+        try:
+            value = validate_scan_start_date(event.value)
+        except ValueError as exc:
+            ui.notify(str(exc), type="warning")
+            field.value = delete_controller.scan_start_date
+            return
+        delete_controller.scan_start_date = value
+        delete_controller._bump()
+
+    def on_scan_date_type_change(event):
+        field = ui_refs["scan_date_type_select"]
+        if delete_controller.is_running():
+            field.value = delete_controller.scan_date_type
+            return
+        delete_controller.scan_date_type = normalize_scan_date_type(event.value)
+        delete_controller._bump()
 
     async def handle_stop():
         try:
@@ -374,6 +409,12 @@ def create_delete_video_page():
             ):
                 pass
             with ui.row().classes("items-center gap-3 flex-wrap"):
+                ui_refs["scan_date_input"] = create_scan_date_input(
+                    value=delete_controller.scan_start_date, on_change=on_scan_date_change,
+                )
+                ui_refs["scan_date_type_select"] = create_scan_date_type_select(
+                    value=delete_controller.scan_date_type, on_change=on_scan_date_type_change,
+                )
                 scan_btn = (
                     ui.button("Quét & Xóa", icon="auto_delete", on_click=handle_scan)
                     .classes("app-button-primary")

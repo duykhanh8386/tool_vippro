@@ -20,8 +20,12 @@ from src.audio_video_scan import (
 from src.module.audio_module import update_audio_module
 from src.module.list_videos_module import list_videos_module
 from src.state_manager import state_manager
+from src.video_scan_dates import (
+    DEFAULT_SCAN_DATE_TYPE, normalize_scan_date_type, normalize_scan_start_date,
+    scan_date_label, scan_today, validate_scan_start_date,
+)
 from src.utils import get_channels_info
-from web.components.common import create_channel_selection
+from web.components.common import create_channel_selection, create_scan_date_input, create_scan_date_type_select
 from web.theme import app_card, empty_state, page_header, page_shell, section_header
 
 STATE_KEY = "audio_remove"
@@ -118,7 +122,10 @@ def create_remove_audio_page():
     # destructive request so a restart can verify what YouTube received.
     delete_requested = {}
     performance_settings = {"max_concurrency": DEFAULT_REMOVE_AUDIO_CONCURRENCY}
-    scan_settings = {"scan_scope": "all", "recent_limit": DEFAULT_RECENT_VIDEO_LIMIT}
+    scan_settings = {
+        "scan_scope": "all", "recent_limit": DEFAULT_RECENT_VIDEO_LIMIT,
+        "scan_start_date": "", "scan_date_type": DEFAULT_SCAN_DATE_TYPE,
+    }
     scan_state = {
         "source_active": False,
         "channel_id": None,
@@ -127,6 +134,9 @@ def create_remove_audio_page():
         "skipped": 0,
         "last_scan_scope": None,
         "last_scan_limit": None,
+        "last_scan_start_date": "",
+        "last_scan_end_date": None,
+        "last_scan_date_type": "uploaded",
     }
     scan_runtime = {"running": False}
     suppress_autosave = {"value": False}
@@ -138,6 +148,8 @@ def create_remove_audio_page():
         "concurrency_input": None,
         "scan_scope_toggle": None,
         "recent_limit_input": None,
+        "scan_start_date_input": None,
+        "scan_date_type_select": None,
     }
 
     def configuration_change_blocked() -> bool:
@@ -202,6 +214,11 @@ def create_remove_audio_page():
                 saved_scan.get("scan_scope") if saved_scan.get("scan_scope") in VIDEO_SCAN_SCOPES else "all"
             )
             scan_settings["recent_limit"] = _normalize_recent_video_limit(saved_scan.get("recent_limit"))
+            try:
+                scan_settings["scan_start_date"] = normalize_scan_start_date(saved_scan.get("scan_start_date"))
+            except ValueError:
+                scan_settings["scan_start_date"] = ""
+            scan_settings["scan_date_type"] = normalize_scan_date_type(saved_scan.get("scan_date_type"))
             if restored_statuses != (state.get("video_processing_status") or {}):
                 save_remove_state()
 
@@ -219,6 +236,10 @@ def create_remove_audio_page():
                         ui_refs["scan_scope_toggle"].value = scan_settings["scan_scope"]
                     if ui_refs["recent_limit_input"]:
                         ui_refs["recent_limit_input"].value = scan_settings["recent_limit"]
+                    if ui_refs["scan_start_date_input"]:
+                        ui_refs["scan_start_date_input"].value = scan_settings["scan_start_date"]
+                    if ui_refs["scan_date_type_select"]:
+                        ui_refs["scan_date_type_select"].value = scan_settings["scan_date_type"]
                     refresh_scan_controls()
                     refresh_scan_status()
                     refresh_right_panel()
@@ -247,6 +268,8 @@ def create_remove_audio_page():
                 skipped=0,
                 last_scan_scope=None,
                 last_scan_limit=None,
+                last_scan_start_date="",
+                last_scan_end_date=None,
             )
             refresh_right_panel()
         selected_remove_channel["id"] = channel_id
@@ -273,6 +296,12 @@ def create_remove_audio_page():
                     f"video trong phạm vi {scope_label} có audio Đang xử lý / Không xử lý được / "
                     "Không đủ điều kiện / Đã xoá."
                 ).classes("text-xs font-medium text-emerald-700")
+                date_label = scan_date_label(
+                    scan_state.get("last_scan_start_date"), end_date=scan_state.get("last_scan_end_date"),
+                    date_type=scan_state.get("last_scan_date_type", "uploaded"),
+                )
+                if date_label:
+                    ui.label(f"Đã lọc {date_label}.").classes("text-xs text-gray-600")
                 if scan_state.get("skipped", 0):
                     ui.label(
                         f"YouTube không cho đọc {scan_state['skipped']} video."
@@ -394,6 +423,34 @@ def create_remove_audio_page():
                 number.props(remove="disable")
             else:
                 number.props("disable")
+        date_input = ui_refs.get("scan_start_date_input")
+        if date_input:
+            date_input.set_enabled(not busy)
+        date_type_select = ui_refs.get("scan_date_type_select")
+        if date_type_select:
+            date_type_select.set_enabled(not busy)
+
+    def on_scan_date_type_change(event) -> None:
+        field = ui_refs["scan_date_type_select"]
+        if configuration_change_blocked():
+            field.value = scan_settings["scan_date_type"]
+            return
+        scan_settings["scan_date_type"] = normalize_scan_date_type(event.value)
+        save_remove_state()
+
+    def on_scan_start_date_change(event) -> None:
+        field = ui_refs.get("scan_start_date_input")
+        if configuration_change_blocked():
+            field.value = scan_settings["scan_start_date"]
+            return
+        try:
+            value = validate_scan_start_date(event.value)
+        except ValueError as exc:
+            ui.notify(str(exc), type="warning")
+            field.value = scan_settings["scan_start_date"]
+            return
+        scan_settings["scan_start_date"] = value
+        save_remove_state()
 
     def on_scan_scope_change(event) -> None:
         if configuration_change_blocked():
@@ -435,13 +492,18 @@ def create_remove_audio_page():
         set_scan_busy(True)
         try:
             scan_scope = scan_settings["scan_scope"]
+            start_date = validate_scan_start_date(scan_settings["scan_start_date"])
+            date_type = normalize_scan_date_type(scan_settings["scan_date_type"])
             recent_limit = scan_settings["recent_limit"]
             scan_label = VIDEO_SCAN_SCOPE_LABELS[scan_scope]
             if scan_scope in {"recent", "draft"}:
                 scan_label = f"{recent_limit} {scan_label}"
+            if start_date:
+                scan_label += f", {scan_date_label(start_date, date_type=date_type)}"
             ui.notify(f"Đang đọc {scan_label} và trạng thái audio...", type="info")
             videos = await asyncio.to_thread(
                 _fetch_channel_videos, channel_id, scope=scan_scope, recent_limit=recent_limit,
+                start_date=start_date, date_type=date_type,
             )
             unreadable_ids: list[str] = []
             matched_ids = await asyncio.to_thread(
@@ -465,6 +527,9 @@ def create_remove_audio_page():
                 skipped=len(unreadable_ids),
                 last_scan_scope=scan_scope,
                 last_scan_limit=recent_limit if scan_scope in {"recent", "draft"} else None,
+                last_scan_start_date=start_date,
+                last_scan_date_type=date_type,
+                last_scan_end_date=scan_today().isoformat() if start_date else None,
             )
             refresh_right_panel()
             save_remove_state()
@@ -676,7 +741,10 @@ def create_remove_audio_page():
             video_processing_status.clear()
             delete_requested.clear()
             performance_settings["max_concurrency"] = DEFAULT_REMOVE_AUDIO_CONCURRENCY
-            scan_settings.update(scan_scope="all", recent_limit=DEFAULT_RECENT_VIDEO_LIMIT)
+            scan_settings.update(
+                scan_scope="all", recent_limit=DEFAULT_RECENT_VIDEO_LIMIT,
+                scan_start_date="", scan_date_type=DEFAULT_SCAN_DATE_TYPE,
+            )
             scan_state.update(
                 source_active=False,
                 channel_id=None,
@@ -685,6 +753,8 @@ def create_remove_audio_page():
                 skipped=0,
                 last_scan_scope=None,
                 last_scan_limit=None,
+                last_scan_start_date="",
+                last_scan_end_date=None,
             )
             selected_remove_channel["id"] = None
             refresh_right_panel()
@@ -697,6 +767,10 @@ def create_remove_audio_page():
                 ui_refs["scan_scope_toggle"].value = "all"
             if ui_refs["recent_limit_input"]:
                 ui_refs["recent_limit_input"].value = DEFAULT_RECENT_VIDEO_LIMIT
+            if ui_refs["scan_start_date_input"]:
+                ui_refs["scan_start_date_input"].value = ""
+            if ui_refs["scan_date_type_select"]:
+                ui_refs["scan_date_type_select"].value = DEFAULT_SCAN_DATE_TYPE
             refresh_scan_controls()
         finally:
             suppress_autosave["value"] = False
@@ -754,6 +828,12 @@ def create_remove_audio_page():
                     "Áp dụng cho Bản nháp và Đăng gần nhất. Số video có audio lỗi có thể ít hơn số video đã quét."
                 )
                 ui_refs["recent_limit_input"] = recent_limit_input
+                ui_refs["scan_start_date_input"] = create_scan_date_input(
+                    value=scan_settings["scan_start_date"], on_change=on_scan_start_date_change,
+                )
+                ui_refs["scan_date_type_select"] = create_scan_date_type_select(
+                    value=scan_settings["scan_date_type"], on_change=on_scan_date_type_change,
+                )
             with ui.row().classes("w-full items-end gap-3 flex-wrap"):
                 scan_button = ui.button(
                     "Quét video cần xử lý",

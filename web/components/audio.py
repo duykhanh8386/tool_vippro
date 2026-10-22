@@ -44,6 +44,10 @@ from src.module.audio_module import update_audio_module
 from src.module.list_videos_module import list_videos_module
 from src.module.model import Video
 from src.state_manager import state_manager
+from src.video_scan_dates import (
+    DEFAULT_SCAN_DATE_TYPE, normalize_scan_date_type, normalize_scan_start_date,
+    scan_date_label, scan_today, validate_scan_start_date,
+)
 from src.subtitle_generation import (
     DEFAULT_SUBTITLE_MODEL,
     persist_video_source_srt,
@@ -69,7 +73,7 @@ from src.youtube_caption_api import (
     prepare_source_caption,
     publish_translated_caption,
 )
-from web.components.common import select_directory
+from web.components.common import create_scan_date_input, create_scan_date_type_select, select_directory
 from web.theme import app_card, page_header, section_header
 
 
@@ -518,6 +522,10 @@ def _video_snapshot(video: Video) -> dict:
         "video_status": video.video_status,
         "copyright_check_status": video.copyright_check_status,
         "draft_status": video.draft_status,
+        "time_created_seconds": video.time_created_seconds,
+        "time_published_seconds": video.time_published_seconds,
+        "scheduled_publishing_details": video.scheduled_publishing_details,
+        "visibility": video.visibility,
     }
 
 
@@ -533,6 +541,10 @@ def _video_from_snapshot(snapshot: dict) -> Video:
         video_status=str(snapshot.get("video_status") or ""),
         copyright_check_status=str(snapshot.get("copyright_check_status") or ""),
         draft_status=snapshot.get("draft_status", ""),
+        time_created_seconds=snapshot.get("time_created_seconds", ""),
+        time_published_seconds=snapshot.get("time_published_seconds", ""),
+        scheduled_publishing_details=snapshot.get("scheduled_publishing_details", ""),
+        visibility=snapshot.get("visibility", ""),
     )
 
 
@@ -791,9 +803,14 @@ def create_add_audio_page(*, delete_existing: bool = True):
         "scan_total": 0,
         "scan_skipped": 0,
         "scan_scope": "all",
+        "scan_start_date": "",
+        "scan_date_type": DEFAULT_SCAN_DATE_TYPE,
         "recent_limit": DEFAULT_RECENT_VIDEO_LIMIT,
         "last_scan_scope": None,
         "last_scan_limit": None,
+        "last_scan_start_date": "",
+        "last_scan_end_date": None,
+        "last_scan_date_type": "uploaded",
     }
     right_panel_container = None
     scan_preview_container = None
@@ -820,6 +837,8 @@ def create_add_audio_page(*, delete_existing: bool = True):
         "failed_video_scan_button": None,
         "scan_scope_toggle": None,
         "recent_limit_input": None,
+        "scan_start_date_input": None,
+        "scan_date_type_select": None,
         "subtitle_switch": None,
         "caption_oauth_status": None,
     }
@@ -982,6 +1001,14 @@ def create_add_audio_page(*, delete_existing: bool = True):
             if video_source_state.get("scan_scope") not in VIDEO_SCAN_SCOPES:
                 video_source_state["scan_scope"] = "all"
                 needs_checkpoint_save = True
+            try:
+                video_source_state["scan_start_date"] = normalize_scan_start_date(
+                    video_source_state.get("scan_start_date")
+                )
+            except ValueError:
+                video_source_state["scan_start_date"] = ""
+                needs_checkpoint_save = True
+            video_source_state["scan_date_type"] = normalize_scan_date_type(video_source_state.get("scan_date_type"))
             restored_recent_limit = _normalize_recent_video_limit(
                 video_source_state.get("recent_limit")
             )
@@ -1018,6 +1045,10 @@ def create_add_audio_page(*, delete_existing: bool = True):
                         ui_refs["recent_limit_input"].value = video_source_state[
                             "recent_limit"
                         ]
+                    if ui_refs["scan_start_date_input"]:
+                        ui_refs["scan_start_date_input"].value = video_source_state["scan_start_date"]
+                    if ui_refs["scan_date_type_select"]:
+                        ui_refs["scan_date_type_select"].value = video_source_state["scan_date_type"]
                     if ui_refs["subtitle_switch"]:
                         ui_refs["subtitle_switch"].value = subtitle_settings["enabled"]
                     refresh_caption_oauth_status()
@@ -1050,6 +1081,8 @@ def create_add_audio_page(*, delete_existing: bool = True):
             video_source_state["scan_total"] = 0
             video_source_state["scan_skipped"] = 0
             video_source_state["last_scan_scope"] = None
+            video_source_state["last_scan_start_date"] = ""
+            video_source_state["last_scan_end_date"] = None
             video_source_state["last_scan_limit"] = None
             replace_active_video_list([])
 
@@ -1393,6 +1426,13 @@ def create_add_audio_page(*, delete_existing: bool = True):
             else:
                 scope_toggle.props("disable")
 
+        date_input = ui_refs.get("scan_start_date_input")
+        if date_input:
+            date_input.set_enabled(mode == "failed" and not scan_runtime["running"])
+        date_type_select = ui_refs.get("scan_date_type_select")
+        if date_type_select:
+            date_type_select.set_enabled(mode == "failed" and not scan_runtime["running"])
+
         recent_limit_input = ui_refs.get("recent_limit_input")
         if recent_limit_input:
             recent_enabled = (
@@ -1463,6 +1503,13 @@ def create_add_audio_page(*, delete_existing: bool = True):
                 f"đọc được {max(0, video_source_state.get('scan_total', 0) - video_source_state.get('scan_skipped', 0))}/"
                 f"{video_source_state.get('scan_total', 0)} video trong phạm vi {scope_label}."
             ).classes("text-xs font-medium text-emerald-700")
+            date_label = scan_date_label(
+                video_source_state.get("last_scan_start_date"),
+                end_date=video_source_state.get("last_scan_end_date"),
+                date_type=video_source_state.get("last_scan_date_type", "uploaded"),
+            )
+            if date_label:
+                ui.label(f"Đã lọc {date_label}.").classes("text-xs text-gray-600")
             if video_source_state.get("scan_skipped", 0):
                 ui.label(
                     f"YouTube không cho đọc trạng thái của "
@@ -1670,6 +1717,8 @@ def create_add_audio_page(*, delete_existing: bool = True):
         try:
             channel_id = selected_channel["id"]
             scan_scope = video_source_state.get("scan_scope", "all")
+            start_date = validate_scan_start_date(video_source_state.get("scan_start_date"))
+            date_type = normalize_scan_date_type(video_source_state.get("scan_date_type"))
             if scan_scope not in VIDEO_SCAN_SCOPES:
                 scan_scope = "all"
             recent_limit = _normalize_recent_video_limit(
@@ -1678,6 +1727,8 @@ def create_add_audio_page(*, delete_existing: bool = True):
             scan_label = VIDEO_SCAN_SCOPE_LABELS[scan_scope]
             if scan_scope in {"recent", "draft"}:
                 scan_label = f"{recent_limit} {VIDEO_SCAN_SCOPE_LABELS[scan_scope]}"
+            if start_date:
+                scan_label += f", {scan_date_label(start_date, date_type=date_type)}"
             ui.notify(
                 f"Đang đọc {scan_label} và trạng thái audio...", type="info"
             )
@@ -1686,6 +1737,8 @@ def create_add_audio_page(*, delete_existing: bool = True):
                 channel_id,
                 scope=scan_scope,
                 recent_limit=recent_limit,
+                start_date=start_date,
+                date_type=date_type,
             )
             check_stopped()
             unreadable_ids: list[str] = []
@@ -1707,6 +1760,9 @@ def create_add_audio_page(*, delete_existing: bool = True):
             video_source_state["scan_total"] = len(videos)
             video_source_state["scan_skipped"] = len(unreadable_ids)
             video_source_state["last_scan_scope"] = scan_scope
+            video_source_state["last_scan_start_date"] = start_date
+            video_source_state["last_scan_date_type"] = date_type
+            video_source_state["last_scan_end_date"] = scan_today().isoformat() if start_date else None
             video_source_state["last_scan_limit"] = (
                 recent_limit if scan_scope in {"recent", "draft"} else None
             )
@@ -3238,6 +3294,28 @@ def create_add_audio_page(*, delete_existing: bool = True):
                 input_ref.value = value
             save_right_panel_state()
 
+        def on_scan_start_date_change(event):
+            field = ui_refs.get("scan_start_date_input")
+            if configuration_change_blocked():
+                field.value = video_source_state["scan_start_date"]
+                return
+            try:
+                value = validate_scan_start_date(event.value)
+            except ValueError as exc:
+                ui.notify(str(exc), type="warning")
+                field.value = video_source_state["scan_start_date"]
+                return
+            video_source_state["scan_start_date"] = value
+            save_right_panel_state()
+
+        def on_scan_date_type_change(event):
+            field = ui_refs["scan_date_type_select"]
+            if configuration_change_blocked():
+                field.value = video_source_state["scan_date_type"]
+                return
+            video_source_state["scan_date_type"] = normalize_scan_date_type(event.value)
+            save_right_panel_state()
+
         with ui.card().classes("w-full bg-emerald-50 border border-emerald-200 p-3 mb-4"):
             with ui.row().classes("w-full items-center justify-between gap-3 flex-wrap"):
                 with ui.column().classes("gap-1"):
@@ -3280,6 +3358,13 @@ def create_add_audio_page(*, delete_existing: bool = True):
                     "Áp dụng cho Bản nháp và Đăng gần nhất. Số video có audio lỗi có thể ít hơn số video đã quét."
                 )
                 ui_refs["recent_limit_input"] = recent_limit_input
+                ui_refs["scan_start_date_input"] = create_scan_date_input(
+                    value=video_source_state["scan_start_date"],
+                    on_change=on_scan_start_date_change,
+                )
+                ui_refs["scan_date_type_select"] = create_scan_date_type_select(
+                    value=video_source_state["scan_date_type"], on_change=on_scan_date_type_change,
+                )
             video_source_status_container = ui.column().classes("w-full gap-0")
             refresh_video_source_controls()
             ui.separator().classes("my-1")
@@ -3473,6 +3558,10 @@ def create_add_audio_page(*, delete_existing: bool = True):
                     ui_refs["duration_tolerance_input"].value = 2.0
                 if ui_refs["scan_scope_toggle"]:
                     ui_refs["scan_scope_toggle"].value = "all"
+                if ui_refs["scan_start_date_input"]:
+                    ui_refs["scan_start_date_input"].value = ""
+                if ui_refs["scan_date_type_select"]:
+                    ui_refs["scan_date_type_select"].value = DEFAULT_SCAN_DATE_TYPE
                 if ui_refs["recent_limit_input"]:
                     ui_refs["recent_limit_input"].value = DEFAULT_RECENT_VIDEO_LIMIT
                 _clear_audio_ui_workflow_data(
@@ -3512,8 +3601,12 @@ def create_add_audio_page(*, delete_existing: bool = True):
                 video_source_state["scan_total"] = 0
                 video_source_state["scan_skipped"] = 0
                 video_source_state["scan_scope"] = "all"
+                video_source_state["scan_start_date"] = ""
+                video_source_state["scan_date_type"] = DEFAULT_SCAN_DATE_TYPE
                 video_source_state["recent_limit"] = DEFAULT_RECENT_VIDEO_LIMIT
                 video_source_state["last_scan_scope"] = None
+                video_source_state["last_scan_start_date"] = ""
+                video_source_state["last_scan_end_date"] = None
                 video_source_state["last_scan_limit"] = None
                 refresh_right_panel()
                 refresh_scan_preview()

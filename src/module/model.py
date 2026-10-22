@@ -68,6 +68,8 @@ class Video:
     # uploads from public videos instead of relying on the privacy target alone.
     scheduled_publishing_details: object = ""
     visibility: object = ""
+    time_created_seconds: object = ""
+    time_published_seconds: object = ""
 
 
 class AuthSignal(Enum):

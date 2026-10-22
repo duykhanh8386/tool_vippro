@@ -30,6 +30,10 @@ from src.module.delete_video_module import delete_video_module
 from src.module.list_videos_module import list_videos_module
 from src.paths import get_history_dir
 from src.state_manager import state_manager
+from src.video_scan_dates import (
+    DEFAULT_SCAN_DATE_TYPE, normalize_scan_date_type, normalize_scan_start_date, scan_date_bounds, scan_date_label,
+    validate_scan_start_date, video_matches_scan_dates,
+)
 from src.utils import get_channels_info
 from src.task_runtime import (
     TaskStopped,
@@ -79,6 +83,8 @@ class DeleteVideoController:
         self.all_videos = []
         self.selected_channel_ids = []
         self.max_workers = 5
+        self.scan_start_date = ""
+        self.scan_date_type = DEFAULT_SCAN_DATE_TYPE
         self.running = False
         self.polling = False
         self.next_poll_at = 0.0
@@ -104,6 +110,8 @@ class DeleteVideoController:
                 {
                     "selected_channel_ids": list(self.selected_channel_ids),
                     "max_workers": self.max_workers,
+                    "scan_start_date": self.scan_start_date,
+                    "scan_date_type": self.scan_date_type,
                     "all_videos": self.all_videos,
                     "status_text": self.status_text,
                     "history_hidden_from_queue": self._history_hidden_from_queue,
@@ -119,6 +127,11 @@ class DeleteVideoController:
             state = state_manager.load_state(_RUN_STATE_KEY) or {}
             self.selected_channel_ids = list(state.get("selected_channel_ids") or [])
             self.max_workers = max(1, int(state.get("max_workers") or 5))
+            try:
+                self.scan_start_date = normalize_scan_start_date(state.get("scan_start_date"))
+            except ValueError:
+                self.scan_start_date = ""
+            self.scan_date_type = normalize_scan_date_type(state.get("scan_date_type"))
             self._history_hidden_from_queue = bool(
                 state.get("history_hidden_from_queue", False)
             )
@@ -228,6 +241,7 @@ class DeleteVideoController:
         """Begin (or restart) processing the given channels."""
         if self.is_running():
             return
+        self.scan_start_date = validate_scan_start_date(self.scan_start_date)
         self.refresh_channel_maps()
         self.selected_channel_ids = list(channel_ids)
         self.max_workers = max(1, int(max_workers))
@@ -240,6 +254,8 @@ class DeleteVideoController:
         self.status_text = (
             f"Đang theo dõi & xóa {len(channel_ids)} kênh ({self.max_workers} luồng)..."
         )
+        if self.scan_start_date:
+            self.status_text += f" {scan_date_label(self.scan_start_date, date_type=self.scan_date_type)}."
         self._bump()
         self._run_context = create_run_context("delete_video_scan")
         self._task = asyncio.create_task(self._run_loop(self._run_context))
@@ -265,6 +281,8 @@ class DeleteVideoController:
             return False
         self.all_videos.clear()
         self.selected_channel_ids.clear()
+        self.scan_start_date = ""
+        self.scan_date_type = DEFAULT_SCAN_DATE_TYPE
         self.polling = False
         self.next_poll_at = 0.0
         self.status_text = "Đã dừng tác vụ và xóa dữ liệu trên UI."
@@ -436,6 +454,8 @@ class DeleteVideoController:
     async def _scan_channel(self, channel_id: str) -> list[dict]:
         result = []
         page_token = None
+        seen_tokens = set()
+        date_bounds = scan_date_bounds(self.scan_start_date)
 
         tracked_ids = {x["id"] for x in self.all_videos}
         while self.running:
@@ -446,6 +466,8 @@ class DeleteVideoController:
                 page_token,
             )
             for v in fetched:
+                if not video_matches_scan_dates(v, date_bounds, date_type=self.scan_date_type):
+                    continue
                 cs = v.copyright_check_status
                 if cs in (COPYRIGHT_STARTED, COPYRIGHT_NOT_STARTED):
                     result.append(self._video_dict(v, channel_id))
@@ -453,6 +475,9 @@ class DeleteVideoController:
                     result.append(self._video_dict(v, channel_id))
             if not next_token:
                 break
+            if next_token in seen_tokens:
+                raise RuntimeError("YouTube trả về mã phân trang bị lặp khi quét video.")
+            seen_tokens.add(next_token)
             page_token = next_token
         return result
 

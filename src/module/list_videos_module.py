@@ -97,6 +97,8 @@ class ListVideosModule(IModule):
                             "scheduledPublishingDetails", ""
                         ),
                         visibility=item.get("visibility", ""),
+                        time_created_seconds=item.get("timeCreatedSeconds", ""),
+                        time_published_seconds=item.get("timePublishedSeconds", ""),
                     )
                 )
             except Exception as exc:

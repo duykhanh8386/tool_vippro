@@ -12,9 +12,33 @@ from src.channel_groups import (
     gmail_filter_options,
 )
 from web.theme import app_card
+from src.video_scan_dates import DEFAULT_SCAN_DATE_TYPE, SCAN_DATE_TYPE_OPTIONS, scan_today
 
 
 _tkinter_root = None
+
+
+def create_scan_date_input(*, value: str = "", on_change):
+    with ui.column().classes("gap-1"):
+        field = ui.input("Quét từ ngày", value=value, on_change=on_change).props(
+            f"outlined type=date clearable max={scan_today().isoformat()}"
+        ).classes("w-52")
+        field.tooltip(
+            "Lọc theo loại ngày đã chọn, từ ngày bắt đầu đến hết hôm nay (giờ Việt Nam). "
+            "Để trống để quét không giới hạn ngày."
+        )
+        field.on("focus", lambda: field.props(f"max={scan_today().isoformat()}"))
+        ui.label("Đến hôm nay · giờ Việt Nam").classes("text-xs text-gray-500")
+    return field
+
+
+def create_scan_date_type_select(*, value=DEFAULT_SCAN_DATE_TYPE, on_change):
+    return ui.select(
+        SCAN_DATE_TYPE_OPTIONS, label="Tính theo ngày", value=value, on_change=on_change,
+    ).props("outlined").classes("w-64").tooltip(
+        "Tự động: video công khai dùng ngày công khai; video lên lịch dùng ngày dự kiến công khai; "
+        "bản nháp và video chưa công khai dùng ngày tải lên."
+    )
 
 
 def get_tkinter_root():

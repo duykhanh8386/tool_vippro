@@ -24,6 +24,10 @@ from src.channel_store import channel_store
 from src.module.audio_module import update_audio_module
 from src.module.list_videos_module import list_videos_module
 from src.state_manager import state_manager
+from src.video_scan_dates import (
+    DEFAULT_SCAN_DATE_TYPE, _status_indicates_draft, normalize_scan_date_type,
+    normalize_scan_start_date, scan_date_bounds, validate_scan_start_date, video_matches_scan_dates,
+)
 from src.utils import multiply_audio, normalize_path
 from src.youtube_caption_api import (
     CaptionAuthenticationError,
@@ -154,29 +158,6 @@ def _is_public_video_privacy(value: object) -> bool:
     return str(value or "").strip().upper() in PUBLIC_VIDEO_PRIVACY_VALUES
 
 
-def _status_indicates_draft(value: object) -> bool:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, (int, float)):
-        return value == 1
-    if isinstance(value, dict):
-        for key in ("isDraft", "is_draft"):
-            if key in value:
-                return _status_indicates_draft(value[key])
-        return any(
-            _status_indicates_draft(child) for child in value.values()
-        )
-    normalized = "".join(ch for ch in str(value or "").upper() if ch.isalnum())
-    if not normalized or any(
-        marker in normalized
-        for marker in ("NOTDRAFT", "NONDRAFT", "STATUSNONE", "PUBLISHED")
-    ):
-        return False
-    return normalized in {"1", "TRUE", "DRAFT"} or normalized.endswith(
-        ("STATUSDRAFT", "STATEDRAFT")
-    )
-
-
 def _is_currently_public_video(video: object) -> bool:
     if not _is_public_video_privacy(getattr(video, "privacy", "")):
         return False
@@ -214,6 +195,8 @@ def _get_registered_video_scan_statuses(
     video_ids: Iterable[str],
     *,
     video_scan_scope: str = RECOVERY_VIDEO_SCOPE_PUBLIC,
+    scan_start_date: str = "",
+    scan_date_type: str = DEFAULT_SCAN_DATE_TYPE,
 ) -> tuple[dict[str, bool], set[str]]:
     """Resolve whether registered IDs match the selected video scope.
 
@@ -227,6 +210,7 @@ def _get_registered_video_scan_statuses(
     )
     requested = [video_id for video_id in requested if video_id]
     remaining = set(requested)
+    date_bounds = scan_date_bounds(scan_start_date)
     matches_by_video_id: dict[str, bool] = {}
     seen_page_tokens: set[str] = set()
     page_token: str | None = None
@@ -243,7 +227,7 @@ def _get_registered_video_scan_statuses(
                 continue
             matches_by_video_id[video_id] = _video_matches_recovery_scope(
                 video, video_scan_scope
-            )
+            ) and video_matches_scan_dates(video, date_bounds, date_type=scan_date_type)
             remaining.discard(video_id)
 
         if not next_page_token or not remaining:
@@ -267,6 +251,8 @@ def _default_state() -> dict:
         # every channel which already has entries in the persistent registry.
         "scan_mode": RECOVERY_SCAN_MODE_ALL,
         "video_scan_scope": RECOVERY_VIDEO_SCOPE_PUBLIC,
+        "scan_start_date": "",
+        "scan_date_type": DEFAULT_SCAN_DATE_TYPE,
         "selected_channel_ids": [],
         "disabled_channel_ids": [],
         "disabled_video_ids": {},
@@ -293,6 +279,11 @@ def _load_state() -> dict:
     state["video_scan_scope"] = _normalize_recovery_video_scope(
         state.get("video_scan_scope")
     )
+    try:
+        state["scan_start_date"] = normalize_scan_start_date(state.get("scan_start_date"))
+    except ValueError:
+        state["scan_start_date"] = ""
+    state["scan_date_type"] = normalize_scan_date_type(state.get("scan_date_type"))
     state["selected_channel_ids"] = _normalize_channel_ids(
         state.get("selected_channel_ids")
     )
@@ -359,6 +350,8 @@ def _scan_preferences_from_state(state: dict) -> dict:
     return {
         "scan_mode": _normalize_recovery_scan_mode(state.get("scan_mode")),
         "video_scan_scope": _normalize_recovery_video_scope(state.get("video_scan_scope")),
+        "scan_start_date": normalize_scan_start_date(state.get("scan_start_date")),
+        "scan_date_type": normalize_scan_date_type(state.get("scan_date_type")),
         "selected_channel_ids": _normalize_channel_ids(
             state.get("selected_channel_ids")
         ),
@@ -703,6 +696,8 @@ def set_audio_recovery_scan_preferences(
     scan_mode: str | None = None,
     selected_channel_ids: Iterable[str] | None = None,
     video_scan_scope: str | None = None,
+    scan_start_date: str | None = None,
+    scan_date_type: str | None = None,
 ) -> bool:
     """Persist the scan mode without changing registry entries or history.
 
@@ -715,6 +710,10 @@ def set_audio_recovery_scan_preferences(
             state["scan_mode"] = _normalize_recovery_scan_mode(scan_mode)
         if video_scan_scope is not None:
             state["video_scan_scope"] = _normalize_recovery_video_scope(video_scan_scope)
+        if scan_start_date is not None:
+            state["scan_start_date"] = validate_scan_start_date(scan_start_date)
+        if scan_date_type is not None:
+            state["scan_date_type"] = normalize_scan_date_type(scan_date_type)
         if selected_channel_ids is not None:
             state["selected_channel_ids"] = _normalize_channel_ids(
                 selected_channel_ids
@@ -1891,6 +1890,9 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
                     channel_id,
                     video_ids,
                     video_scan_scope=scan_preferences["video_scan_scope"],
+                    **({"scan_start_date": scan_preferences["scan_start_date"],
+                        "scan_date_type": scan_preferences["scan_date_type"]}
+                       if scan_preferences["scan_start_date"] else {}),
                 )
             except Exception as exc:
                 failed += len(video_ids)
@@ -2285,6 +2287,8 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
             "cancelled_by_clear": cancelled_by_clear,
             "scan_mode": scan_preferences["scan_mode"],
             "video_scan_scope": scan_preferences["video_scan_scope"],
+            "scan_start_date": scan_preferences["scan_start_date"],
+            "scan_date_type": scan_preferences["scan_date_type"],
             "scope_skipped_channel_ids": sorted(scope_skipped_channel_ids),
         }
         with _STATE_LOCK:

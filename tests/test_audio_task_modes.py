@@ -4,6 +4,7 @@ import inspect
 import tempfile
 import unittest
 from contextlib import ExitStack
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
@@ -295,7 +296,7 @@ class AudioTaskModeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(scan.call_args.args[0], ["draft-0", "draft-1", "draft-2"])
         saved = self.state.states["audio_remove"]
         self.assertEqual(saved["ids"], ["draft-0", "draft-2"])
-        self.assertEqual(saved["scan_settings"], {"scan_scope": "draft", "recent_limit": 3})
+        self.assertEqual(saved["scan_settings"], {"scan_scope": "draft", "recent_limit": 3, "scan_start_date": "", "scan_date_type": "auto"})
         self.assertEqual(saved["scan_state"]["total"], 3)
         self.assertEqual(saved["scan_state"]["matched"], 2)
         self.assertEqual(saved["scan_state"]["skipped"], 1)
@@ -369,7 +370,7 @@ class AudioTaskModeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.state.states["audio_remove"]["ids"], ["video"])
         with reopened:
             self.button_callback(reopened, "Xóa dữ liệu")()
-        self.assertEqual(self.state.states["audio_remove"]["scan_settings"], {"scan_scope": "all", "recent_limit": 50})
+        self.assertEqual(self.state.states["audio_remove"]["scan_settings"], {"scan_scope": "all", "recent_limit": 50, "scan_start_date": "", "scan_date_type": "auto"})
         self.assertEqual(restored_scope.value, "all")
         self.assertTrue(restored_number._props.get("disable"))
         self.assertEqual(self.state.states["audio_add"], {"keep": "combined"})
@@ -382,6 +383,10 @@ class AudioTaskModeTests(unittest.IsolatedAsyncioTestCase):
         }
         client = self.render(remove_only=True)
         scope, number = self.scan_scope_controls(client)
+        calendar = next(element for element in client.elements.values()
+                        if isinstance(element, ui.input) and element._props.get("label") == "Quét từ ngày")
+        basis = next(element for element in client.elements.values()
+                     if isinstance(element, ui.select) and element._props.get("label") == "Tính theo ngày")
         started, release = asyncio.Event(), asyncio.Event()
 
         async def dispatch(function, *args, **kwargs):
@@ -401,17 +406,25 @@ class AudioTaskModeTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.wait_for(started.wait(), timeout=2)
                 self.assertTrue(scope._props.get("disable"))
                 self.assertTrue(number._props.get("disable"))
+                self.assertTrue(calendar._props.get("disable"))
+                self.assertTrue(basis._props.get("disable"))
                 scope.value = "public"
                 number.value = 20
+                calendar.value = "2026-10-20"
+                basis.value = "published"
                 self.assertEqual(scope.value, "draft")
                 self.assertEqual(number.value, 3)
+                self.assertEqual(calendar.value, "")
+                self.assertEqual(basis.value, "auto")
             finally:
                 release.set()
                 await task
 
         self.assertFalse(scope._props.get("disable"))
         self.assertFalse(number._props.get("disable"))
-        self.assertEqual(self.state.states["audio_remove"]["scan_settings"], {"scan_scope": "draft", "recent_limit": 3})
+        self.assertFalse(calendar._props.get("disable"))
+        self.assertFalse(basis._props.get("disable"))
+        self.assertEqual(self.state.states["audio_remove"]["scan_settings"], {"scan_scope": "draft", "recent_limit": 3, "scan_start_date": "", "scan_date_type": "auto"})
 
     async def test_failed_remove_scan_preserves_previous_ids_and_reenables_scan_controls(self):
         self.state.states["audio_remove"] = {
@@ -427,6 +440,117 @@ class AudioTaskModeTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(scope._props.get("disable"))
         self.assertFalse(number._props.get("disable"))
         self.delete.assert_not_called()
+
+    async def test_calendar_is_saved_restored_and_applied_in_all_three_audio_tasks(self):
+        today = date(2026, 10, 22)
+        zone = timezone(timedelta(hours=7))
+        rows = [Video(
+            id=video_id, channel_id=self.channel.id, title=video_id, description="",
+            thumbnail="", duration_ms=60000,
+            time_created_seconds=datetime(2026, 10, day, 12, tzinfo=zone).timestamp(),
+        ) for video_id, day in (("too-old", 20), ("eligible", 21), ("future", 23))]
+        for state_key, delete_existing, remove_only in (
+            ("audio_add", True, False), ("audio_add_only", False, False), ("audio_remove", True, True),
+        ):
+            with self.subTest(task=state_key):
+                settings_key = "scan_settings" if remove_only else "video_source_state"
+                saved = {"selected_channel": self.channel.id} if remove_only else self.saved_add_state()
+                saved[settings_key] = {
+                    "mode": "failed", "scan_scope": "all", "recent_limit": 50, "scan_start_date": "2026-10-20",
+                }
+                self.state.states[state_key] = saved
+                client = self.render(delete_existing=delete_existing, remove_only=remove_only)
+                calendar = next(element for element in client.elements.values()
+                                if isinstance(element, ui.input) and element._props.get("label") == "Quét từ ngày")
+                self.assertEqual(calendar._props["type"], "date")
+                self.assertEqual(calendar.value, "2026-10-20")
+                self.assertFalse(calendar._props.get("disable"))
+                with client:
+                    calendar.value = "2026-10-21"
+                self.assertEqual(self.state.states[state_key][settings_key]["scan_start_date"], "2026-10-21")
+
+                client = self.render(delete_existing=delete_existing, remove_only=remove_only)
+                calendar = next(element for element in client.elements.values()
+                                if isinstance(element, ui.input) and element._props.get("label") == "Quét từ ngày")
+                self.assertEqual(calendar.value, "2026-10-21")
+                module = remove_audio if remove_only else audio
+                method = "get_audio_attention_video_ids" if remove_only else "get_terminal_audio_repair_targets"
+                targets = {"eligible"} if remove_only else {"eligible": [{"language": "en", "track_ids": ["failed"]}]}
+                with (
+                    patch("src.video_scan_dates.scan_today", return_value=today),
+                    patch.object(module, "scan_today", return_value=today),
+                    patch.object(module.list_videos_module, "list_all_videos", return_value=(rows, None)),
+                    patch.object(module.update_audio_module, method, return_value=targets) as query,
+                    client,
+                ):
+                    await self.button_callback(client, "Quét video cần xử lý" if remove_only else "Quét ID audio cần xử lý")()
+                self.assertEqual(query.call_args.args[0], ["eligible"])
+                result_key = "scan_state" if remove_only else "video_source_state"
+                result = self.state.states[state_key][result_key]
+                self.assertEqual(result["last_scan_start_date"], "2026-10-21")
+                self.assertEqual(result["last_scan_end_date"], "2026-10-22")
+                with client:
+                    calendar.value = "9999-01-01"
+                self.assertEqual(calendar.value, "2026-10-21")
+                self.assertEqual(self.state.states[state_key][settings_key]["scan_start_date"], "2026-10-21")
+                with client:
+                    calendar.value = None
+                self.assertEqual(self.state.states[state_key][settings_key]["scan_start_date"], "")
+
+        self.delete.assert_not_called()
+        self.add.assert_not_called()
+
+    async def test_date_type_select_scans_and_restores_each_audio_task(self):
+        today = date(2026, 10, 22)
+        zone = timezone(timedelta(hours=7))
+        stamp = lambda day: datetime(2026, 10, day, 12, tzinfo=zone).timestamp()
+        rows = [
+            Video(id="upload", channel_id=self.channel.id, title="upload", description="", thumbnail="", duration_ms=60000,
+                  privacy="VIDEO_PRIVACY_PUBLIC", time_created_seconds=stamp(21), time_published_seconds=stamp(19)),
+            Video(id="publication", channel_id=self.channel.id, title="publication", description="", thumbnail="", duration_ms=60000,
+                  privacy="VIDEO_PRIVACY_PUBLIC", time_created_seconds=stamp(10), time_published_seconds=stamp(21)),
+            Video(id="schedule", channel_id=self.channel.id, title="schedule", description="", thumbnail="", duration_ms=60000,
+                  privacy="VIDEO_PRIVACY_PRIVATE", time_created_seconds=stamp(10), scheduled_publishing_details={"time": stamp(22)}),
+        ]
+        for state_key, delete_existing, remove_only in (
+            ("audio_add", True, False), ("audio_add_only", False, False), ("audio_remove", True, True),
+        ):
+            with self.subTest(task=state_key):
+                settings_key = "scan_settings" if remove_only else "video_source_state"
+                saved = {"selected_channel": self.channel.id} if remove_only else self.saved_add_state()
+                saved[settings_key] = {
+                    "mode": "failed", "scan_scope": "all", "recent_limit": 50, "scan_start_date": "2026-10-20",
+                }
+                self.state.states[state_key] = saved
+                client = self.render(delete_existing=delete_existing, remove_only=remove_only)
+                basis = next(element for element in client.elements.values()
+                             if isinstance(element, ui.select) and element._props.get("label") == "Tính theo ngày")
+                self.assertEqual(basis.value, "auto")
+                module = remove_audio if remove_only else audio
+                method = "get_audio_attention_video_ids" if remove_only else "get_terminal_audio_repair_targets"
+                for date_type, expected in (("auto", ["publication", "schedule"]), ("uploaded", ["upload"]),
+                                            ("published", ["publication"]), ("scheduled", ["schedule"])):
+                    with client:
+                        basis.value = date_type
+                    targets = set(expected) if remove_only else {
+                        video_id: [{"language": "en", "track_ids": ["failed"]}] for video_id in expected
+                    }
+                    with (
+                        self.subTest(date_type=date_type),
+                        patch("src.video_scan_dates.scan_today", return_value=today),
+                        patch.object(module.list_videos_module, "list_all_videos", return_value=(rows, None)),
+                        patch.object(module.update_audio_module, method, return_value=targets) as query,
+                        client,
+                    ):
+                        await self.button_callback(client, "Quét video cần xử lý" if remove_only else "Quét ID audio cần xử lý")()
+                    self.assertEqual(query.call_args.args[0], expected)
+                    self.assertEqual(self.state.states[state_key][settings_key]["scan_date_type"], date_type)
+                    result_key = "scan_state" if remove_only else "video_source_state"
+                    self.assertEqual(self.state.states[state_key][result_key]["last_scan_date_type"], date_type)
+                reopened = self.render(delete_existing=delete_existing, remove_only=remove_only)
+                restored = next(element for element in reopened.elements.values()
+                                if isinstance(element, ui.select) and element._props.get("label") == "Tính theo ngày")
+                self.assertEqual(restored.value, "scheduled")
 
 
 class AudioTaskRouteTests(unittest.TestCase):

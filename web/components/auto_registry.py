@@ -15,6 +15,8 @@ from src.audio_recovery import (
     set_audio_recovery_scan_preferences,
 )
 from src.utils import get_channels_info
+from src.video_scan_dates import scan_date_label, validate_scan_start_date
+from web.components.common import create_scan_date_input, create_scan_date_type_select
 from web.theme import app_card, section_header
 
 
@@ -38,6 +40,10 @@ def create_auto_registry_content(*, on_change: Callable[[], None] | None = None)
         try:
             if video_scope.value != preferences["video_scan_scope"]:
                 video_scope.set_value(preferences["video_scan_scope"])
+            if scan_date_input.value != preferences["scan_start_date"]:
+                scan_date_input.value = preferences["scan_start_date"]
+            if scan_date_type_select.value != preferences["scan_date_type"]:
+                scan_date_type_select.value = preferences["scan_date_type"]
         finally:
             preference_sync["active"] = False
 
@@ -79,6 +85,8 @@ def create_auto_registry_content(*, on_change: Callable[[], None] | None = None)
             f"{len(video_rows)} video · "
             f'{sum(item["enabled"] for item in video_items)} video được phép tự động quét'
             f' · {RECOVERY_VIDEO_SCOPE_LABELS[preferences["video_scan_scope"]]}'
+            + (f' · {scan_date_label(preferences["scan_start_date"], date_type=preferences["scan_date_type"])}'
+               if preferences["scan_start_date"] else "")
         )
 
     def change_video_scope(event) -> None:
@@ -95,6 +103,34 @@ def create_auto_registry_content(*, on_change: Callable[[], None] | None = None)
             "Đã lưu loại video tự động quét; áp dụng từ vòng quét tiếp theo.",
             type="positive",
         )
+
+    def change_scan_start_date(event) -> None:
+        if preference_sync["active"]:
+            return
+        try:
+            value = validate_scan_start_date(event.value)
+        except ValueError as exc:
+            refresh()
+            ui.notify(str(exc), type="warning")
+            return
+        if not set_audio_recovery_scan_preferences(scan_start_date=value):
+            refresh()
+            ui.notify("Không thể lưu ngày bắt đầu quét.", type="negative")
+            return
+        refresh()
+        if on_change is not None:
+            on_change()
+
+    def change_scan_date_type(event) -> None:
+        if preference_sync["active"]:
+            return
+        if not set_audio_recovery_scan_preferences(scan_date_type=event.value):
+            refresh()
+            ui.notify("Không thể lưu loại ngày quét.", type="negative")
+            return
+        refresh()
+        if on_change is not None:
+            on_change()
 
     def set_items_enabled(
         scope: str, enabled: bool, items: list[dict] | None = None
@@ -301,6 +337,9 @@ def create_auto_registry_content(*, on_change: Callable[[], None] | None = None)
             value=RECOVERY_VIDEO_SCOPE_PUBLIC,
             on_change=change_video_scope,
         ).props("no-caps").classes("w-full")
+        with ui.row().classes("items-start gap-3 flex-wrap"):
+            scan_date_input = create_scan_date_input(on_change=change_scan_start_date)
+            scan_date_type_select = create_scan_date_type_select(on_change=change_scan_date_type)
         ui.label(
             "Chọn video công khai, video đang chờ đến lịch công khai hoặc cả hai. "
             "Lựa chọn áp dụng từ vòng quét tiếp theo và được lưu khi mở lại ứng dụng."

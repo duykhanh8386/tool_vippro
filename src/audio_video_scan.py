@@ -2,6 +2,7 @@
 
 from src.audio_recovery import _is_currently_public_video, _is_currently_scheduled_video
 from src.module.list_videos_module import list_videos_module
+from src.video_scan_dates import DEFAULT_SCAN_DATE_TYPE, scan_date_bounds, video_matches_scan_dates
 
 
 DEFAULT_RECENT_VIDEO_LIMIT = 50
@@ -36,10 +37,13 @@ def _fetch_channel_videos(
     *,
     scope: str = "all",
     recent_limit: int = DEFAULT_RECENT_VIDEO_LIMIT,
+    start_date: str = "",
+    date_type: str = DEFAULT_SCAN_DATE_TYPE,
 ):
-    """Fetch newest-first; recent_limit also caps a draft-only scan."""
+    """Apply scope and upload dates before counting a recent/draft limit."""
     normalized_scope = scope if scope in VIDEO_SCAN_SCOPES else "all"
     normalized_limit = _normalize_recent_video_limit(recent_limit)
+    date_bounds = scan_date_bounds(start_date)
     videos = []
     seen_ids = set()
     seen_tokens = set()
@@ -59,6 +63,8 @@ def _fetch_channel_videos(
             if normalized_scope == "public" and not _is_currently_public_video(video):
                 continue
             if normalized_scope == "scheduled" and not _is_currently_scheduled_video(video):
+                continue
+            if not video_matches_scan_dates(video, date_bounds, date_type=date_type):
                 continue
             videos.append(video)
             if normalized_scope in {"recent", "draft"} and len(videos) >= normalized_limit:
