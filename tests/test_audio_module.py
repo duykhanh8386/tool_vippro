@@ -936,6 +936,91 @@ class AudioUploadTests(unittest.TestCase):
             },
         )
 
+    def test_manual_scan_includes_single_language_with_dash_audio_and_published_captions(self):
+        module = UpdateAudioModule()
+        for audio in (None, {}, {"statusLabel": "-"}, {"statusLabel": "–"}, {"statusLabel": "—"}):
+            for source_tracks in ([], [{
+                "videoId": "video", "audioTrackId": "original", "language": "sdp",
+                "source": "AUDIO_TRACK_SOURCE_UPLOAD", "audioContentTypeString": "original",
+                "status": "AUDIO_TRACK_STATUS_READY",
+            }]):
+                with self.subTest(audio=audio, source_tracks=source_tracks):
+                    payload = {
+                        "videoTranslations": [{"videoId": "video", "translations": [{
+                            "languageCode": "es", "audioTranslation": audio,
+                            "captionsTranslations": [{"publishStatus": "PUBLISHED"}],
+                        }]}],
+                        "audioTracks": source_tracks,
+                    }
+                    unreadable = []
+                    with patch.object(module, "_get_video_translation_payload", return_value=payload):
+                        self.assertEqual(module.get_terminal_audio_repair_targets(["video"], "channel"), {})
+                        targets = module.get_terminal_audio_repair_targets(
+                            ["video"], "channel", unreadable, include_missing_audio=True,
+                        )
+                    self.assertEqual(targets, {
+                        "video": [{"language": "", "track_ids": [], "reason": "missing"}],
+                    })
+                    self.assertEqual(unreadable, [])
+
+    def test_manual_missing_audio_scan_excludes_existing_audio_and_invalid_rows(self):
+        module = UpdateAudioModule()
+        empty_row = {"languageCode": "es", "audioTranslation": {}}
+        cases = [
+            ([], []),
+            ([empty_row, {"languageCode": "en"}], []),
+            ([{}], []),
+            ([None], []),
+            ([empty_row], "invalid"),
+            ([empty_row], [None]),
+        ]
+        for status in ("READY", "PUBLISHED", "PROCESSING", "PENDING", "INELIGIBLE"):
+            cases.extend([
+                ([{"languageCode": "es", "audioTranslation": {
+                    "audioTrackId": "existing", "status": f"AUDIO_TRACK_STATUS_{status}",
+                }}], []),
+                ([empty_row], [{
+                    "videoId": "video", "audioTrackId": "existing", "language": "es",
+                    "source": "AUDIO_TRACK_SOURCE_CREATOR", "audioContentTypeString": "dubbed",
+                    "status": f"AUDIO_TRACK_STATUS_{status}",
+                }]),
+            ])
+        for translations, tracks in cases:
+            with self.subTest(translations=translations, tracks=tracks):
+                payload = {
+                    "videoTranslations": [{"videoId": "video", "translations": translations}],
+                    "audioTracks": tracks,
+                }
+                with patch.object(module, "_get_video_translation_payload", return_value=payload):
+                    targets = module.get_terminal_audio_repair_targets(
+                        ["video"], "channel", include_missing_audio=True,
+                    )
+                self.assertFalse(any(
+                    action["reason"] == "missing" for action in targets.get("video", [])
+                ))
+
+    def test_manual_missing_audio_scan_retries_partial_batches_without_selecting_omitted_video(self):
+        module = UpdateAudioModule()
+
+        def fetch(video_ids, _channel):
+            if video_ids == ["unreadable"]:
+                raise AudioUpdateError("Precondition check failed", status_code=400)
+            video_id = "first" if len(video_ids) > 1 else video_ids[0]
+            return {"videoTranslations": [{"videoId": video_id, "translations": [
+                {"languageCode": "es", "audioTranslation": {"statusLabel": "–"}},
+            ]}], "audioTracks": []}
+
+        unreadable = []
+        with patch.object(module, "_get_video_translation_payload", side_effect=fetch) as request:
+            targets = module.get_terminal_audio_repair_targets(
+                ["first", "second", "unreadable"], "channel", unreadable, include_missing_audio=True,
+            )
+        self.assertEqual(list(targets), ["first", "second"])
+        self.assertEqual(unreadable, ["unreadable"])
+        self.assertEqual([call.args[0] for call in request.call_args_list], [
+            ["first", "second", "unreadable"], ["second"], ["unreadable"],
+        ])
+
     def test_terminal_repair_scan_ignores_processing_and_published_rows(self):
         module = UpdateAudioModule()
         payload = {

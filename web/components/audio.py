@@ -472,7 +472,7 @@ def _select_terminal_repair_actions(
     video_ids: Iterable[str],
     selected_languages: Iterable[str],
 ) -> dict[str, list[dict]]:
-    """Restrict an error-scan result to configured languages, case-insensitively."""
+    """Resolve scanned failures or missing audio to configured languages."""
     configured = {
         str(language or "").strip().casefold(): str(language or "").strip()
         for language in selected_languages
@@ -483,9 +483,23 @@ def _select_terminal_repair_actions(
     for video_id in dict.fromkeys(str(value or "").strip() for value in video_ids):
         if not video_id:
             continue
+        scanned_actions = raw_targets.get(video_id) or []
+        if any(
+            isinstance(action, dict)
+            and action.get("reason") == "missing"
+            and not action.get("language")
+            for action in scanned_actions
+        ):
+            selected[video_id] = [
+                {"language": language, "track_ids": [], "reason": "missing"}
+                for language in configured.values()
+            ]
+            if not selected[video_id]:
+                selected.pop(video_id)
+            continue
         actions: list[dict] = []
         seen_languages: set[str] = set()
-        for action in raw_targets.get(video_id) or []:
+        for action in scanned_actions:
             if not isinstance(action, dict):
                 continue
             scanned_language = str(action.get("language") or "").strip()
@@ -1111,7 +1125,8 @@ def create_add_audio_page(*, delete_existing: bool = True):
                                 save_right_panel_state()
                         return _remove
                     ui.label(language).classes(chip_classes).on("click", create_remove_handler(language))
-            pass  # TODO: bytecode recovery incomplete
+            refresh_video_source_controls()
+            refresh_right_panel()
         def on_language_input_change(e=None):
             if configuration_change_blocked():
                 language_input.value = " ".join(selected_languages["languages"])
@@ -1494,12 +1509,15 @@ def create_add_audio_page(*, delete_existing: bool = True):
                 )
             failed_language_count = sum(
                 len(actions)
-                for actions in (video_source_state.get("failed_targets") or {}).values()
-                if isinstance(actions, list)
+                for actions in _select_terminal_repair_actions(
+                    video_source_state.get("failed_targets"),
+                    [video["id"] for video in video_source_state.get("failed_videos") or []],
+                    selected_languages["languages"],
+                ).values()
             )
             ui.label(
-                f"Đã tìm thấy {len(video_source_state.get('failed_videos') or [])} video lỗi; "
-                f"{failed_language_count} audio cần sửa; "
+                f"Đã tìm thấy {len(video_source_state.get('failed_videos') or [])} video cần xử lý; "
+                f"{failed_language_count} audio cần sửa hoặc thêm; "
                 f"đọc được {max(0, video_source_state.get('scan_total', 0) - video_source_state.get('scan_skipped', 0))}/"
                 f"{video_source_state.get('scan_total', 0)} video trong phạm vi {scope_label}."
             ).classes("text-xs font-medium text-emerald-700")
@@ -1747,6 +1765,7 @@ def create_add_audio_page(*, delete_existing: bool = True):
                 [video.id for video in videos],
                 channel_id,
                 unreadable_ids,
+                include_missing_audio=True,
             )
             check_stopped()
             failed_ids = set(failed_targets)
@@ -1775,13 +1794,15 @@ def create_add_audio_page(*, delete_existing: bool = True):
                 1 for video in failed_videos if id_to_path.get(video.id)
             )
             failed_language_count = sum(
-                len(actions) for actions in failed_targets.values()
+                len(actions) for actions in _select_terminal_repair_actions(
+                    failed_targets, failed_ids, selected_languages["languages"]
+                ).values()
             )
             refresh_video_source_controls()
             save_right_panel_state()
             if failed_videos:
                 ui.notify(
-                    f"Đã lấy {len(failed_videos)} video / {failed_language_count} audio lỗi; đọc được "
+                    f"Đã lấy {len(failed_videos)} video / {failed_language_count} audio cần sửa hoặc thêm; đọc được "
                     f"{len(videos) - len(unreadable_ids)}/{len(videos)} video từ {scan_label}. "
                     + (
                         f"Đã tự khôi phục file nhạc cho {restored_audio_count} video; "
@@ -1793,14 +1814,15 @@ def create_add_audio_page(*, delete_existing: bool = True):
                 )
             elif unreadable_ids:
                 ui.notify(
-                    f"Không thấy audio lỗi trong {len(videos) - len(unreadable_ids)} video đọc được; "
+                    f"Không thấy audio lỗi hoặc video một ngôn ngữ chưa có audio trong "
+                    f"{len(videos) - len(unreadable_ids)} video đọc được; "
                     f"{len(unreadable_ids)} video không được YouTube trả trạng thái audio.",
                     type="warning",
                 )
             else:
                 ui.notify(
-                    f"Đã quét {len(videos)} video trong {scan_label}, không thấy audio Đang xử lý / "
-                    "Không xử lý được / Không đủ điều kiện / Đã xoá.",
+                    f"Đã quét {len(videos)} video trong {scan_label}, không thấy audio lỗi "
+                    "hoặc video chỉ có một ngôn ngữ với cột Âm thanh trống (–).",
                     type="warning",
                 )
         except TaskStopped:
@@ -2326,7 +2348,7 @@ def create_add_audio_page(*, delete_existing: bool = True):
             )
             if not repair_actions_by_video:
                 ui.notify(
-                    "Không có ngôn ngữ lỗi kết thúc nào trùng với danh sách ngôn ngữ đã chọn. "
+                    "Không có audio lỗi hoặc audio còn thiếu phù hợp với ngôn ngữ đã chọn. "
                     "Audio đã xuất bản hoặc đang xử lý sẽ không được add lại.",
                     type="warning",
                 )
@@ -2761,6 +2783,7 @@ def create_add_audio_page(*, delete_existing: bool = True):
                         [vid],
                         channel_id,
                         unreadable_now,
+                        include_missing_audio=True,
                     )
                     check_stopped()
                     if unreadable_now:
@@ -2835,6 +2858,8 @@ def create_add_audio_page(*, delete_existing: bool = True):
 
                     def delete_old_audio():
                         if selective_repair:
+                            if not failed_track_ids:
+                                return 200
                             return update_audio_module.delete_track_ids(
                                 vid,
                                 channel_id,
@@ -3335,6 +3360,10 @@ def create_add_audio_page(*, delete_existing: bool = True):
                     on_click=handle_failed_video_scan,
                 ).props("outline disable")
                 ui_refs["failed_video_scan_button"] = failed_video_scan_button
+                failed_video_scan_button.tooltip(
+                    "Lấy video có audio lỗi và video chỉ có một ngôn ngữ "
+                    "với cột Âm thanh trống (–)."
+                )
             with ui.row().classes("w-full items-end gap-3 flex-wrap"):
                 with ui.column().classes("gap-1"):
                     ui.label("Phạm vi quét trên kênh").classes(
@@ -3355,7 +3384,7 @@ def create_add_audio_page(*, delete_existing: bool = True):
                     on_change=on_recent_limit_change,
                 ).props("outlined disable").classes("w-44")
                 recent_limit_input.tooltip(
-                    "Áp dụng cho Bản nháp và Đăng gần nhất. Số video có audio lỗi có thể ít hơn số video đã quét."
+                    "Áp dụng cho Bản nháp và Đăng gần nhất. Số video cần xử lý audio có thể ít hơn số video đã quét."
                 )
                 ui_refs["recent_limit_input"] = recent_limit_input
                 ui_refs["scan_start_date_input"] = create_scan_date_input(

@@ -783,12 +783,16 @@ class UpdateAudioModule(IModule):
         cls,
         payload: dict,
         requested_order: list[str],
+        *,
+        include_missing_audio: bool = False,
     ) -> tuple[dict[str, list[dict]], set[str]]:
         """Extract language-level creator-dub failures from one Studio response.
 
-        The returned mapping contains only terminal failures. READY/PUBLISHED
+        By default the mapping contains only terminal failures. READY/PUBLISHED
         and PROCESSING/PENDING rows are deliberately absent. The second return
         value contains requested video IDs which the response did not describe.
+        Manual scans can also request a language-neutral ``missing`` action
+        for a single language row whose Audio column is empty.
         """
         requested = set(requested_order)
         readable_ids: set[str] = set()
@@ -813,6 +817,7 @@ class UpdateAudioModule(IModule):
 
         translations_by_video: dict[str, list[dict]] = {}
         translation_by_track_id: dict[tuple[str, str], dict] = {}
+        missing_audio_candidates: set[str] = set()
         for video_id, group in group_pairs:
             readable_ids.add(video_id)
             translations = group.get("translations") or []
@@ -820,6 +825,14 @@ class UpdateAudioModule(IModule):
                 continue
             clean_items = [item for item in translations if isinstance(item, dict)]
             translations_by_video[video_id] = clean_items
+            if (
+                include_missing_audio
+                and len(translations) == 1
+                and len(clean_items) == 1
+                and cls._translation_has_no_audio(clean_items[0])
+                and cls._translation_language(clean_items[0])
+            ):
+                missing_audio_candidates.add(video_id)
             for item in clean_items:
                 audio = item.get("audioTranslation") or {}
                 if not isinstance(audio, dict):
@@ -918,15 +931,50 @@ class UpdateAudioModule(IModule):
             for video_id in requested_order
             if target_maps.get(video_id)
         }
+        for video_id in requested_order:
+            if (
+                video_id in missing_audio_candidates
+                and isinstance(tracks, list)
+                and all(isinstance(track, dict) for track in tracks)
+                and not creator_tracks_by_video.get(video_id)
+                and video_id not in targets
+            ):
+                # An empty language means the user may add any configured
+                # languages. Resolve it after scanning so changing the language
+                # selection does not require another channel scan.
+                targets[video_id] = [
+                    {"language": "", "track_ids": [], "reason": "missing"}
+                ]
         return targets, requested - readable_ids
+
+    @staticmethod
+    def _translation_has_no_audio(item: dict) -> bool:
+        """Recognize an empty Audio column, including Studio's dash label."""
+        for key, value in item.items():
+            normalized = "".join(ch for ch in str(key).upper() if ch.isalnum())
+            if not any(marker in normalized for marker in ("AUDIO", "DUBBING", "ALOUD")):
+                continue
+            if value is None or value == {}:
+                continue
+            if (
+                key == "audioTranslation"
+                and isinstance(value, dict)
+                and set(value) <= {"videoId", "statusLabel"}
+                and str(value.get("statusLabel") or "").strip() in {"-", "–", "—"}
+            ):
+                continue
+            return False
+        return True
 
     def get_terminal_audio_repair_targets(
         self,
         video_ids: list[str],
         channel_id: str,
         unreadable_ids: list[str] | None = None,
+        *,
+        include_missing_audio: bool = False,
     ) -> dict[str, list[dict]]:
-        """Return exact failed languages/track IDs which are safe to replace."""
+        """Return failed languages and, optionally, single-language videos with no audio."""
         unique_ids = list(dict.fromkeys(video_id for video_id in video_ids if video_id))
         skipped = unreadable_ids if unreadable_ids is not None else []
         targets: dict[str, list[dict]] = {}
@@ -943,6 +991,12 @@ class UpdateAudioModule(IModule):
                 }
                 for action in actions:
                     language = str(action.get("language") or "").strip()
+                    if not language and action.get("reason") == "missing":
+                        if "" not in by_language:
+                            copied = {"language": "", "track_ids": [], "reason": "missing"}
+                            targets[video_id].append(copied)
+                            by_language[""] = copied
+                        continue
                     if not language:
                         continue
                     key = language.casefold()
@@ -979,7 +1033,9 @@ class UpdateAudioModule(IModule):
                 )
                 return
 
-            found, missing = self._terminal_repair_targets_from_payload(payload, chunk)
+            found, missing = self._terminal_repair_targets_from_payload(
+                payload, chunk, include_missing_audio=include_missing_audio
+            )
             merge_targets(found)
             if not missing:
                 return
