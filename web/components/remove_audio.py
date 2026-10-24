@@ -118,8 +118,8 @@ def create_remove_audio_page():
     selected_remove_channel = {"id": None}
     ids_state = {"ids": []}
     video_processing_status = {}
-    # Kept separately from the display status.  It is set *before* a
-    # destructive request so a restart can verify what YouTube received.
+    # Save the exact failed track IDs before deleting, so a resumed job can
+    # recheck those failures without falling back to deleting every track.
     delete_requested = {}
     performance_settings = {"max_concurrency": DEFAULT_REMOVE_AUDIO_CONCURRENCY}
     scan_settings = {
@@ -293,7 +293,7 @@ def create_remove_audio_page():
                     scope_label = f"{scan_state['last_scan_limit']} {scope_label}"
                 ui.label(
                     f"Đã bắt {scan_state.get('matched', 0)}/{scan_state.get('total', 0)} "
-                    f"video trong phạm vi {scope_label} có audio Đang xử lý / Không xử lý được / "
+                    f"video trong phạm vi {scope_label} có audio Không xử lý được / "
                     "Không đủ điều kiện / Đã xoá."
                 ).classes("text-xs font-medium text-emerald-700")
                 date_label = scan_date_label(
@@ -308,8 +308,8 @@ def create_remove_audio_page():
                     ).classes("text-xs text-orange-600")
             else:
                 ui.label(
-                    "Quét tự động 4 trạng thái: Đang xử lý, Không xử lý được, "
-                    "Không đủ điều kiện và Đã xoá."
+                    "Quét video có audio Không xử lý được, Không đủ điều kiện hoặc Đã xoá. "
+                    "Bỏ qua video chỉ có audio đang xử lý, đã xuất bản hoặc chưa có audio."
                 ).classes("text-xs text-gray-600")
 
     def refresh_right_panel():
@@ -338,6 +338,8 @@ def create_remove_audio_page():
                     status_icon, status_color = "error", "text-red-600"
                 elif status == "processing":
                     status_icon, status_color = "autorenew", "text-blue-600"
+                elif status == "skipped":
+                    status_icon, status_color = "skip_next", "text-gray-600"
                 else:
                     status_icon, status_color = "schedule", "text-yellow-600"
 
@@ -351,7 +353,7 @@ def create_remove_audio_page():
                     with ui.column().classes("w-3/12 text-center p-2"):
                         with ui.row().classes("items-center justify-center gap-1"):
                             ui.icon(status_icon).classes(f"text-sm {status_color}")
-                            ui.label(status.title()).classes(
+                            ui.label("Bỏ qua: không có track lỗi cần xóa" if status == "skipped" else status.title()).classes(
                                 f"text-xs font-medium {status_color}"
                             )
 
@@ -506,13 +508,13 @@ def create_remove_audio_page():
                 start_date=start_date, date_type=date_type,
             )
             unreadable_ids: list[str] = []
-            matched_ids = await asyncio.to_thread(
-                update_audio_module.get_audio_attention_video_ids,
+            failed_targets = await asyncio.to_thread(
+                update_audio_module.get_terminal_audio_repair_targets,
                 [video.id for video in videos],
                 channel_id,
                 unreadable_ids,
             )
-            ordered_ids = [video.id for video in videos if video.id in matched_ids]
+            ordered_ids = [video.id for video in videos if video.id in failed_targets]
 
             ids_state["ids"] = ordered_ids
             video_processing_status.clear()
@@ -615,6 +617,7 @@ def create_remove_audio_page():
             return
         total_tasks = max(1, len(video_ids_to_process))
         completed_tasks = 0
+        skipped_tasks = 0
         overall_errors = []
         max_concurrency = _clamp_remove_concurrency(
             performance_settings.get("max_concurrency")
@@ -622,52 +625,63 @@ def create_remove_audio_page():
         semaphore = asyncio.Semaphore(max_concurrency)
 
         async def run_delete(vid: str):
-            nonlocal completed_tasks
+            nonlocal completed_tasks, skipped_tasks
             async with semaphore:
                 try:
-                    if delete_requested.get(vid):
-                        # A power loss can occur after the DELETE request is
-                        # accepted but before its result is saved.  If no
-                        # translated tracks remain, treat that request as
-                        # completed instead of issuing a duplicate one.
-                        remaining_tracks = await asyncio.to_thread(
-                            update_audio_module._get_all_audio_track_ids,
-                            vid,
-                            channel_id,
+                    unreadable_ids: list[str] = []
+                    current_targets = await asyncio.to_thread(
+                        update_audio_module.get_terminal_audio_repair_targets,
+                        [vid],
+                        channel_id,
+                        unreadable_ids,
+                    )
+                    if unreadable_ids:
+                        raise RuntimeError(
+                            "YouTube không trả trạng thái audio mới nhất; chưa xóa audio của video này."
                         )
-                        if not remaining_tracks:
-                            video_processing_status[vid] = "successful"
-                            delete_requested.pop(vid, None)
-                            if save_remove_state() is False:
-                                delete_requested[vid] = True
-                                video_processing_status[vid] = "pending"
-                                raise RuntimeError(
-                                    "Không thể lưu checkpoint xác nhận xóa audio"
-                                )
-                            return
+                    failed_track_ids = list(dict.fromkeys(
+                        str(track_id).strip()
+                        for action in current_targets.get(vid, [])
+                        for track_id in action.get("track_ids") or []
+                        if track_id and str(track_id).strip()
+                    ))
+                    if not failed_track_ids:
+                        # Older checkpoints stored True. They must also pass
+                        # this fresh failure check; never resume a full delete.
+                        previous_intent = delete_requested.get(vid)
+                        already_deleted = isinstance(previous_intent, list) and bool(previous_intent)
+                        video_processing_status[vid] = "successful" if already_deleted else "skipped"
+                        delete_requested.pop(vid, None)
+                        skipped_tasks += int(not already_deleted)
+                        if save_remove_state() is False:
+                            if previous_intent:
+                                delete_requested[vid] = previous_intent
+                            raise RuntimeError("Không thể lưu trạng thái video không còn track lỗi cần xóa")
+                        return
 
                     video_processing_status[vid] = "processing"
-                    delete_requested[vid] = True
+                    delete_requested[vid] = failed_track_ids
                     if save_remove_state() is False:
                         raise RuntimeError("Không thể lưu checkpoint trước khi xóa audio")
                     best_effort_ui(
                         "render pending remove-audio video",
                         lambda: (
                             refresh_right_panel(),
-                            status_label.set_text(f"{vid} - Đang xóa..."),
+                            status_label.set_text(f"{vid} - Đang xóa {len(failed_track_ids)} track audio lỗi..."),
                         ),
                     )
                     await asyncio.to_thread(
-                        update_audio_module.delete,
-                        id_video=vid,
-                        channel_id=channel_id,
+                        update_audio_module.delete_track_ids,
+                        vid,
+                        channel_id,
+                        failed_track_ids,
                     )
                     video_processing_status[vid] = "successful"
                     delete_requested.pop(vid, None)
                     if save_remove_state() is False:
                         # Leave the intent in the next successful checkpoint;
                         # a restart will verify the remote result first.
-                        delete_requested[vid] = True
+                        delete_requested[vid] = failed_track_ids
                         video_processing_status[vid] = "pending"
                         raise RuntimeError(
                             "Không thể lưu checkpoint sau khi xóa audio"
@@ -719,6 +733,15 @@ def create_remove_audio_page():
                 lambda: ui.notify(
                     "Quá trình hoàn tất với một số lỗi. Kiểm tra trạng thái từng video bên dưới.",
                     type="warning",
+                ),
+            )
+        elif skipped_tasks:
+            best_effort_ui(
+                "notify skipped remove-audio videos",
+                lambda: ui.notify(
+                    f"Đã xử lý {len(video_ids_to_process) - skipped_tasks} video; "
+                    f"bỏ qua {skipped_tasks} video không có track audio lỗi cần xóa.",
+                    type="info",
                 ),
             )
         else:
@@ -781,7 +804,7 @@ def create_remove_audio_page():
     with page_shell():
         with page_header(
             "Xóa audio",
-            "Xóa audio track đã thêm khỏi danh sách video trên kênh được chọn.",
+            "Chỉ xóa track audio bị lỗi theo từng ngôn ngữ; giữ audio tốt và audio đang xử lý.",
             eyebrow="Tác vụ",
         ):
             ui.button(
@@ -808,7 +831,7 @@ def create_remove_audio_page():
         with app_card():
             with section_header(
                 "Quét trạng thái audio trên kênh",
-                "Tự động lấy video có audio đang xử lý hoặc thuộc một trong ba trạng thái lỗi.",
+                "Lọc video có ngôn ngữ audio lỗi như chức năng Xóa & thêm audio.",
             ):
                 pass
             with ui.row().classes("w-full items-end gap-3 flex-wrap"):

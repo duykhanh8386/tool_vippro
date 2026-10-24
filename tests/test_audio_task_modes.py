@@ -177,9 +177,13 @@ class AudioTaskModeTests(unittest.IsolatedAsyncioTestCase):
         self.state.states["audio_add"] = {"keep": "combined"}
         self.state.states["audio_add_only"] = {"keep": "add only"}
         client = self.render(remove_only=True)
-        with client:
+        with patch.object(remove_audio.update_audio_module, "get_terminal_audio_repair_targets", return_value={
+            "video": [{"language": "en", "track_ids": ["failed-en"]}],
+        }), client:
             await self.button_callback(client, "Bắt đầu xóa")()
-        self.assertEqual(self.events, ["delete"])
+        self.assertEqual(self.events, ["delete_tracks"])
+        self.delete_tracks.assert_called_once_with("video", self.channel.id, ["failed-en"])
+        self.delete.assert_not_called()
         self.add.assert_not_called()
         self.assertEqual(self.state.states["audio_remove"]["video_processing_status"]["video"], "successful")
         self.assertEqual(self.state.states["audio_add"], {"keep": "combined"})
@@ -343,6 +347,212 @@ class AudioTaskModeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.state.states["audio_add"], {"keep": "combined"})
         self.assertEqual(self.state.states["audio_remove"], {"keep": "remove"})
 
+    async def test_remove_scan_matches_combined_failure_filter_and_skips_videos_without_audio(self):
+        rows = [
+            ("mixed", [
+                {"languageCode": "en", "audioTranslation": {
+                    "audioTrackId": "failed-en", "status": "AUDIO_TRACK_STATUS_FAILED",
+                }},
+                {"languageCode": "vi", "audioTranslation": {
+                    "audioTrackId": "ready-vi", "status": "AUDIO_TRACK_STATUS_READY",
+                }},
+            ]),
+            ("processing", [{"languageCode": "en", "audioTranslation": {
+                "audioTrackId": "processing-en", "status": "AUDIO_TRACK_STATUS_PROCESSING",
+            }}]),
+            ("published", [{"languageCode": "en", "audioTranslation": {
+                "audioTrackId": "published-en", "publishStatus": "PUBLISHED",
+            }}]),
+            ("source-ineligible", [{"languageCode": "es", "audioTranslation": {
+                "status": "AUDIO_TRACK_STATUS_INELIGIBLE",
+            }}]),
+            ("no-audio", [{"languageCode": "es", "audioTranslation": {"statusLabel": "–"}}]),
+        ]
+        videos = [Video(id=video_id, channel_id=self.channel.id, title="", description="",
+                        thumbnail="", duration_ms=60000) for video_id, _translations in rows]
+        payload = {"videoTranslations": [
+            {"videoId": video_id, "translations": translations} for video_id, translations in rows
+        ], "audioTracks": []}
+        for remove_only, state_key in ((False, "audio_add"), (True, "audio_remove")):
+            with self.subTest(remove_only=remove_only):
+                if remove_only:
+                    self.state.states[state_key] = {"selected_channel": self.channel.id}
+                else:
+                    saved = self.saved_add_state()
+                    saved["video_source_state"]["mode"] = "failed"
+                    self.state.states[state_key] = saved
+                client = self.render(remove_only=remove_only)
+                module = remove_audio if remove_only else audio
+                with (
+                    patch.object(module, "_fetch_channel_videos", return_value=videos),
+                    patch.object(module.update_audio_module, "_get_video_translation_payload", return_value=payload),
+                    client,
+                ):
+                    await self.button_callback(
+                        client, "Quét video cần xử lý" if remove_only else "Quét ID audio cần xử lý",
+                    )()
+                self.assertEqual(self.state.states[state_key]["ids" if remove_only else "video_ids"],
+                                 ["mixed"] if remove_only else ["mixed", "no-audio"])
+        self.delete.assert_not_called()
+        self.delete_tracks.assert_not_called()
+
+    async def test_remove_scanned_video_deletes_only_failed_track_and_preserves_other_audio(self):
+        self.state.states["audio_remove"] = {"selected_channel": self.channel.id}
+        client = self.render(remove_only=True)
+        payload = {"videoTranslations": [{"videoId": "video", "translations": [
+            {"languageCode": "en", "audioTranslation": {
+                "audioTrackId": "failed-en", "status": "AUDIO_TRACK_STATUS_FAILED",
+            }},
+            {"languageCode": "vi", "audioTranslation": {
+                "audioTrackId": "ready-vi", "status": "AUDIO_TRACK_STATUS_READY",
+            }},
+            {"languageCode": "fr", "audioTranslation": {
+                "audioTrackId": "processing-fr", "status": "AUDIO_TRACK_STATUS_PROCESSING",
+            }},
+        ]}], "audioTracks": []}
+        with (
+            patch.object(remove_audio, "_fetch_channel_videos", return_value=[SimpleNamespace(id="video")]),
+            patch.object(remove_audio.update_audio_module, "_get_video_translation_payload", return_value=payload) as fetch,
+        ):
+            with client:
+                await self.button_callback(client, "Quét video cần xử lý")()
+            # Reopening the page must still recheck the current audio state.
+            client = self.render(remove_only=True)
+            with client:
+                await self.button_callback(client, "Bắt đầu xóa")()
+        self.assertEqual(fetch.call_count, 2)
+        self.delete.assert_not_called()
+        self.delete_tracks.assert_called_once_with("video", self.channel.id, ["failed-en"])
+        self.add.assert_not_called()
+        self.assertEqual(self.state.states["audio_remove"]["video_processing_status"]["video"], "successful")
+
+    async def test_remove_recheck_skips_videos_without_deletable_failed_tracks(self):
+        for audio_translation in (
+            {"audioTrackId": "ready-en", "status": "AUDIO_TRACK_STATUS_READY"},
+            {"audioTrackId": "processing-en", "status": "AUDIO_TRACK_STATUS_PROCESSING"},
+            {"statusLabel": "–"},
+            {"status": "AUDIO_TRACK_STATUS_FAILED"},
+        ):
+            with self.subTest(audio_translation=audio_translation):
+                self.state.states["audio_remove"] = {
+                    "selected_channel": self.channel.id, "ids": ["video"],
+                }
+                client = self.render(remove_only=True)
+                payload = {"videoTranslations": [{"videoId": "video", "translations": [
+                    {"languageCode": "en", "audioTranslation": audio_translation},
+                ]}], "audioTracks": []}
+                with patch.object(remove_audio.update_audio_module, "_get_video_translation_payload", return_value=payload), client:
+                    await self.button_callback(client, "Bắt đầu xóa")()
+                saved = self.state.states["audio_remove"]
+                self.assertEqual(saved["video_processing_status"]["video"], "skipped")
+                self.assertEqual(saved["delete_requested"], {})
+                self.delete.assert_not_called()
+                self.delete_tracks.assert_not_called()
+
+    async def test_remove_recheck_omitted_video_is_an_error_and_is_not_deleted(self):
+        self.state.states["audio_remove"] = {"selected_channel": self.channel.id, "ids": ["video"]}
+        client = self.render(remove_only=True)
+        with patch.object(remove_audio.update_audio_module, "_get_video_translation_payload", return_value={
+            "videoTranslations": [], "audioTracks": [],
+        }), client:
+            await self.button_callback(client, "Bắt đầu xóa")()
+        self.assertEqual(self.state.states["audio_remove"]["video_processing_status"]["video"], "unsuccessful")
+        self.delete.assert_not_called()
+        self.delete_tracks.assert_not_called()
+
+    async def test_remove_resume_preserves_remaining_healthy_audio(self):
+        self.state.states["audio_remove"] = {
+            "selected_channel": self.channel.id, "ids": ["video"],
+            "delete_requested": {"video": True}, "video_processing_status": {"video": "processing"},
+        }
+        client = self.render(remove_only=True)
+        with (
+            patch.object(remove_audio.update_audio_module, "_get_all_audio_track_ids") as discover,
+            patch.object(remove_audio.update_audio_module, "get_terminal_audio_repair_targets", return_value={}),
+            client,
+        ):
+            await self.button_callback(client, "Bắt đầu xóa")()
+        self.assertEqual(self.state.states["audio_remove"]["video_processing_status"]["video"], "skipped")
+        discover.assert_not_called()
+        self.delete.assert_not_called()
+        self.delete_tracks.assert_not_called()
+
+    async def test_remove_recheck_excludes_track_that_became_ready_since_scan(self):
+        self.state.states["audio_remove"] = {"selected_channel": self.channel.id}
+        client = self.render(remove_only=True)
+
+        def payload(en_status):
+            return {"videoTranslations": [{"videoId": "video", "translations": [
+                {"languageCode": "en", "audioTranslation": {
+                    "audioTrackId": "track-en", "status": f"AUDIO_TRACK_STATUS_{en_status}",
+                }},
+                {"languageCode": "vi", "audioTranslation": {
+                    "audioTrackId": "failed-vi", "status": "AUDIO_TRACK_STATUS_FAILED",
+                }},
+            ]}], "audioTracks": []}
+
+        with (
+            patch.object(remove_audio, "_fetch_channel_videos", return_value=[SimpleNamespace(id="video")]),
+            patch.object(remove_audio.update_audio_module, "_get_video_translation_payload",
+                         side_effect=[payload("FAILED"), payload("READY")]),
+            client,
+        ):
+            await self.button_callback(client, "Quét video cần xử lý")()
+            await self.button_callback(client, "Bắt đầu xóa")()
+        self.delete_tracks.assert_called_once_with("video", self.channel.id, ["failed-vi"])
+        self.delete.assert_not_called()
+
+    async def test_remove_retry_rechecks_remaining_failed_tracks_after_uncertain_delete(self):
+        self.state.states["audio_remove"] = {"selected_channel": self.channel.id, "ids": ["video"]}
+        client = self.render(remove_only=True)
+
+        def payload(en_status):
+            return {"videoTranslations": [{"videoId": "video", "translations": [
+                {"languageCode": "en", "audioTranslation": {
+                    "audioTrackId": "track-en", "status": f"AUDIO_TRACK_STATUS_{en_status}",
+                }},
+                {"languageCode": "vi", "audioTranslation": {
+                    "audioTrackId": "failed-vi", "status": "AUDIO_TRACK_STATUS_FAILED",
+                }},
+            ]}], "audioTracks": []}
+
+        with (
+            patch.object(remove_audio.update_audio_module, "_get_video_translation_payload",
+                         side_effect=[payload("FAILED"), payload("READY")]),
+            patch.object(remove_audio.update_audio_module, "delete_track_ids", side_effect=[
+                TimeoutError("response lost after partial deletion"), 200,
+            ]) as delete_tracks,
+        ):
+            with client:
+                await self.button_callback(client, "Bắt đầu xóa")()
+            saved = self.state.states["audio_remove"]
+            self.assertEqual(saved["video_processing_status"]["video"], "unsuccessful")
+            self.assertEqual(saved["delete_requested"]["video"], ["track-en", "failed-vi"])
+            client = self.render(remove_only=True)
+            with client:
+                await self.button_callback(client, "Bắt đầu xóa")()
+        self.assertEqual([call.args for call in delete_tracks.call_args_list], [
+            ("video", self.channel.id, ["track-en", "failed-vi"]),
+            ("video", self.channel.id, ["failed-vi"]),
+        ])
+        self.assertEqual(self.state.states["audio_remove"]["video_processing_status"]["video"], "successful")
+        self.assertEqual(self.state.states["audio_remove"]["delete_requested"], {})
+        self.delete.assert_not_called()
+
+    async def test_remove_resume_completes_exact_delete_when_only_healthy_tracks_remain(self):
+        self.state.states["audio_remove"] = {
+            "selected_channel": self.channel.id, "ids": ["video"],
+            "delete_requested": {"video": ["removed-en"]},
+            "video_processing_status": {"video": "processing"},
+        }
+        client = self.render(remove_only=True)
+        with patch.object(remove_audio.update_audio_module, "get_terminal_audio_repair_targets", return_value={}), client:
+            await self.button_callback(client, "Bắt đầu xóa")()
+        self.assertEqual(self.state.states["audio_remove"]["video_processing_status"]["video"], "successful")
+        self.assertEqual(self.state.states["audio_remove"]["delete_requested"], {})
+        self.delete.assert_not_called()
+        self.delete_tracks.assert_not_called()
+
     async def test_remove_scan_caps_drafts_before_reading_audio_and_saves_actual_result_scope(self):
         self.state.states["audio_remove"] = {
             "selected_channel": self.channel.id,
@@ -355,15 +565,18 @@ class AudioTaskModeTests(unittest.IsolatedAsyncioTestCase):
         with client:
             number.value = 3
 
-        def find_attention(video_ids, channel_id, unreadable):
+        def find_failures(video_ids, channel_id, unreadable):
             unreadable.append("draft-1")
-            return {"draft-0", "draft-2"}
+            return {
+                video_id: [{"language": "en", "track_ids": ["failed-" + video_id]}]
+                for video_id in ("draft-0", "draft-2")
+            }
 
         with (
             patch.object(remove_audio.list_videos_module, "list_all_videos", return_value=(
                 [SimpleNamespace(id=f"draft-{i}") for i in range(5)], "unused"),
             ) as fetch,
-            patch.object(remove_audio.update_audio_module, "get_audio_attention_video_ids", side_effect=find_attention) as scan,
+            patch.object(remove_audio.update_audio_module, "get_terminal_audio_repair_targets", side_effect=find_failures) as scan,
             client,
         ):
             await self.button_callback(client, "Quét video cần xử lý")()
@@ -410,7 +623,10 @@ class AudioTaskModeTests(unittest.IsolatedAsyncioTestCase):
                     patch.object(remove_audio.list_videos_module, "list_all_videos", return_value=(
                         [videos[2]] if scope == "draft" else videos, None,
                     )) as fetch,
-                    patch.object(remove_audio.update_audio_module, "get_audio_attention_video_ids", return_value=set(expected)) as scan,
+                    patch.object(remove_audio.update_audio_module, "get_terminal_audio_repair_targets", return_value={
+                        video_id: [{"language": "en", "track_ids": ["failed-" + video_id]}]
+                        for video_id in expected
+                    }) as scan,
                     client,
                 ):
                     await self.button_callback(client, "Quét video cần xử lý")()
@@ -474,7 +690,7 @@ class AudioTaskModeTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch.object(remove_audio.asyncio, "to_thread", new=AsyncMock(side_effect=dispatch)),
-            patch.object(remove_audio.update_audio_module, "get_audio_attention_video_ids", return_value=set()),
+            patch.object(remove_audio.update_audio_module, "get_terminal_audio_repair_targets", return_value={}),
             client,
         ):
             task = asyncio.create_task(self.button_callback(client, "Quét video cần xử lý")())
@@ -550,8 +766,8 @@ class AudioTaskModeTests(unittest.IsolatedAsyncioTestCase):
                                 if isinstance(element, ui.input) and element._props.get("label") == "Quét từ ngày")
                 self.assertEqual(calendar.value, "2026-10-21")
                 module = remove_audio if remove_only else audio
-                method = "get_audio_attention_video_ids" if remove_only else "get_terminal_audio_repair_targets"
-                targets = {"eligible"} if remove_only else {"eligible": [{"language": "en", "track_ids": ["failed"]}]}
+                method = "get_terminal_audio_repair_targets"
+                targets = {"eligible": [{"language": "en", "track_ids": ["failed"]}]}
                 with (
                     patch("src.video_scan_dates.scan_today", return_value=today),
                     patch.object(module, "scan_today", return_value=today),
@@ -603,12 +819,12 @@ class AudioTaskModeTests(unittest.IsolatedAsyncioTestCase):
                              if isinstance(element, ui.select) and element._props.get("label") == "Tính theo ngày")
                 self.assertEqual(basis.value, "auto")
                 module = remove_audio if remove_only else audio
-                method = "get_audio_attention_video_ids" if remove_only else "get_terminal_audio_repair_targets"
+                method = "get_terminal_audio_repair_targets"
                 for date_type, expected in (("auto", ["publication", "schedule"]), ("uploaded", ["upload"]),
                                             ("published", ["publication"]), ("scheduled", ["schedule"])):
                     with client:
                         basis.value = date_type
-                    targets = set(expected) if remove_only else {
+                    targets = {
                         video_id: [{"language": "en", "track_ids": ["failed"]}] for video_id in expected
                     }
                     with (
