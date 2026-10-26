@@ -193,8 +193,13 @@ def _with_upload_progress(snapshot: dict) -> dict:
         total = max(0, int(upload.get("total") or 0))
     except (TypeError, ValueError):
         total = 0
+    try:
+        confirmed = max(0, min(total, int(upload.get("confirmed") or 0)))
+    except (TypeError, ValueError):
+        confirmed = 0
     snapshot["upload_sent"] = sent
     snapshot["upload_total"] = total
+    snapshot["upload_confirmed"] = confirmed
     snapshot["upload_status"] = str(upload.get("status") or "")
     snapshot["upload_fraction"] = min(1.0, sent / total) if total else 0.0
     output_path = snapshot.pop("_preparation_output_path", None)
@@ -2472,7 +2477,7 @@ async def run_audio_recovery_cycle(
                                     upload_progress = {
                                         "sent": 0,
                                         "total": temp_audio_path.stat().st_size,
-                                        "status": "starting",
+                                        "status": "deleting" if action["track_ids"] else "starting",
                                     }
                                     _update_runtime_status(
                                         phase="uploading",

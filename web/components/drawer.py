@@ -67,6 +67,30 @@ def _recovery_channel_summary(status: dict) -> str:
     return summary
 
 
+def _recovery_transfer_text(job: dict) -> str:
+    if job.get("phase") == "preparing":
+        return (
+            f"Đã tạo {_format_transfer_size(job.get('preparation_bytes', 0))} · "
+            f"{job.get('preparation_elapsed_seconds', 0)} giây"
+        )
+    if job.get("phase") != "uploading":
+        return "—"
+    stage = {
+        "deleting": "Đang xóa track lỗi",
+        "authenticating": "Đang xác thực",
+        "starting": "Đang mở phiên tải",
+        "registering": "Đang đăng ký audio",
+        "finalizing": "Chờ YouTube xác nhận",
+        "retrying": "Đang thử tải lại",
+        "complete": "Đã gửi file",
+        "error": "Tải file lỗi",
+    }.get(job.get("upload_status"), "Đang gửi file")
+    sent = int(job.get("upload_sent") or 0)
+    total = int(job.get("upload_total") or 0)
+    fraction = float(job.get("upload_fraction") or 0)
+    return f"{stage} · {fraction:.0%} · {_format_transfer_size(sent)} / {_format_transfer_size(total)}"
+
+
 def _navigate(route: str) -> None:
     target_path = route.split("?", 1)[0]
     try:
@@ -281,11 +305,22 @@ def create_drawer():
                         {"name": "language", "label": "Ngôn ngữ", "field": "language"},
                         {"name": "pass_index", "label": "Lượt quét", "field": "pass_index"},
                         {"name": "message", "label": "Tiến độ / Kết quả", "field": "message", "classes": "whitespace-normal", "style": "min-width: 200px; max-width: 350px"},
-                        {"name": "transfer", "label": "Tiến độ file", "field": "transfer"},
+                        {"name": "transfer", "label": "Tiến độ file", "field": "transfer", "style": "min-width: 240px"},
                     ],
                     rows=[], row_key="channel_id",
                 ).props("dense flat").classes("w-full")
-                recovery_detail_progress = ui.linear_progress(value=0).props(
+                recovery_channel_table.add_slot("body-cell-transfer", '''
+                    <q-td :props="props">
+                        <div v-if="props.row.phase === 'uploading'" class="column q-gutter-xs">
+                            <q-linear-progress rounded color="blue" size="8px"
+                                :value="props.row.upload_fraction || 0"
+                                :indeterminate="['deleting', 'authenticating', 'starting', 'registering'].includes(props.row.upload_status)" />
+                            <span>{{ props.row.transfer }}</span>
+                        </div>
+                        <span v-else>{{ props.row.transfer }}</span>
+                    </q-td>
+                ''')
+                recovery_detail_progress = ui.linear_progress(value=0, show_value=False, size="12px").props(
                     "rounded color=blue"
                 ).classes("w-full")
                 recovery_detail_transfer = ui.label().classes(
@@ -343,20 +378,13 @@ def create_drawer():
                 recovery_detail_summary.set_text(_recovery_channel_summary(status))
                 recovery_detail_capacity.set_text(
                     f"Tối đa {status.get('channel_concurrency', 3)} kênh cùng lúc. "
-                    "Bảng giữ lại kết quả từng kênh, gồm lỗi và lý do tạm hoãn."
+                    "Mỗi kênh có tiến độ file riêng; kết quả giữ lại cả lỗi và lý do tạm hoãn."
                 )
                 recovery_channel_table.update_rows([
                     {
                         **job,
                         "name": get_recovery_channel_name(job["channel_id"]),
-                        "transfer": (
-                            f"{_format_transfer_size(job.get('upload_sent', 0))} / "
-                            f"{_format_transfer_size(job.get('upload_total', 0))}"
-                            if job.get("phase") == "uploading" else
-                            f"Đã tạo {_format_transfer_size(job.get('preparation_bytes', 0))} · "
-                            f"{job.get('preparation_elapsed_seconds', 0)} giây"
-                            if job.get("phase") == "preparing" else "—"
-                        ),
+                        "transfer": _recovery_transfer_text(job),
                     }
                     for job in status.get("channels", []) if active
                 ] + [
@@ -385,14 +413,12 @@ def create_drawer():
                 recovery_detail_progress.props(remove="indeterminate")
                 if phase == "uploading" and active:
                     fraction = float(status.get("upload_fraction") or 0)
-                    sent = int(status.get("upload_sent") or 0)
-                    total = int(status.get("upload_total") or 0)
                     repair_index = int(status.get("repair_index") or 0)
                     repair_total = int(status.get("repair_total") or 0)
                     recovery_detail_progress.set_value(fraction)
                     recovery_detail_transfer.set_text(
-                        f"Audio {repair_index}/{repair_total} · "
-                        f"{_format_transfer_size(sent)} / {_format_transfer_size(total)}"
+                        f"{get_recovery_channel_name(channel_id)} · Audio {repair_index}/{repair_total} · "
+                        f"{_recovery_transfer_text(status)}"
                     )
                 elif phase == "preparing" and active:
                     recovery_detail_progress.props("indeterminate")
@@ -450,14 +476,12 @@ def create_drawer():
                                 "text-[11px] text-blue-800"
                             )
                             if phase == "uploading":
-                                sent = int(status.get("upload_sent") or 0)
-                                total = int(status.get("upload_total") or 0)
                                 fraction = float(status.get("upload_fraction") or 0)
-                                ui.linear_progress(value=fraction).props(
+                                ui.linear_progress(value=fraction, show_value=False).props(
                                     "rounded color=blue"
                                 ).classes("w-full mt-1")
                                 ui.label(
-                                    f"{_format_transfer_size(sent)} / {_format_transfer_size(total)}"
+                                    _recovery_transfer_text(status)
                                 ).classes("text-[11px] text-blue-800")
                                 ui.label(
                                     f"Video: {status.get('video_id') or '—'} · "
@@ -467,7 +491,7 @@ def create_drawer():
                                 current = int(status.get("completed_channel_count") or 0)
                                 total = int(status.get("channel_total") or 0)
                                 fraction = current / total if total else 0
-                                ui.linear_progress(value=fraction).props(
+                                ui.linear_progress(value=fraction, show_value=False).props(
                                     "rounded color=blue"
                                 ).classes("w-full mt-1")
                                 ui.label(
@@ -476,7 +500,7 @@ def create_drawer():
                                     f"Đã hoàn tất {current}/{total} kênh" if total else "Đang đọc danh sách theo dõi..."
                                 ).classes("text-[11px] text-blue-800")
                             else:
-                                ui.linear_progress(value=0).props(
+                                ui.linear_progress(value=0, show_value=False).props(
                                     "indeterminate rounded color=blue"
                                 ).classes("w-full mt-1")
                                 if phase == "preparing":

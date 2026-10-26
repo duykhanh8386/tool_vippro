@@ -2072,7 +2072,7 @@ class AudioRecoveryCycleTests(unittest.IsolatedAsyncioTestCase):
             progress = call.kwargs["progress"]
             self.assertEqual(progress["sent"], 0)
             self.assertGreater(progress["total"], 0)
-            self.assertEqual(progress["status"], "starting")
+            self.assertEqual(progress["status"], "starting" if call.kwargs["language"] == "fr" else "deleting")
 
         runtime_status = get_audio_recovery_runtime_status()
         self.assertFalse(runtime_status["active"])

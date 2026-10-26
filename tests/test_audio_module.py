@@ -1,5 +1,6 @@
 import unittest
 import tempfile
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
@@ -30,13 +31,18 @@ class AudioUploadTests(unittest.TestCase):
         module._CHUNK_SIZE = 4
         progress = {}
         session = Mock()
+        chunks = []
+
+        def accept_chunk(_url, **kwargs):
+            chunks.append(kwargs["data"].read())
+            return Response(200)
 
         with tempfile.TemporaryDirectory() as temp_dir:
             audio_path = Path(temp_dir) / "audio.mp3"
             audio_path.write_bytes(b"abcdefghij")
             with patch(
                 "src.module.audio_module.post_with_stop",
-                return_value=Response(200),
+                side_effect=accept_chunk,
             ) as post:
                 result = module._next_upload_http(
                     "https://session",
@@ -50,7 +56,7 @@ class AudioUploadTests(unittest.TestCase):
 
         self.assertEqual(result, "final")
         self.assertEqual(
-            [call.kwargs["data"] for call in post.call_args_list],
+            chunks,
             [b"abcd", b"efgh", b"ij"],
         )
         self.assertTrue(
@@ -58,6 +64,89 @@ class AudioUploadTests(unittest.TestCase):
         )
         self.assertEqual(progress["sent"], 10)
         self.assertEqual(progress["total"], 10)
+        self.assertEqual(progress["status"], "complete")
+        self.assertEqual(progress["confirmed"], 10)
+
+    def test_three_uploads_report_independent_progress_before_any_response_completes(self):
+        module = UpdateAudioModule()
+        data = b"x" * (128 * 1024)
+        progress = [{} for _ in range(3)]
+        all_read_first_block = threading.Barrier(4)
+        advance = [threading.Event() for _ in range(3)]
+        advanced = [threading.Event() for _ in range(3)]
+        finish = threading.Event()
+
+        def send(request, **_kwargs):
+            channel = int(request.url.rsplit("/", 1)[1])
+            self.assertEqual(request.headers["Content-Length"], str(len(data)))
+            self.assertNotIn("Transfer-Encoding", request.headers)
+            self.assertEqual(request.body.read(32 * 1024), data[:32 * 1024])
+            all_read_first_block.wait(timeout=5)
+            if not advance[channel].wait(timeout=5):
+                raise AssertionError("Test did not release the upload")
+            self.assertEqual(len(request.body.read(32 * 1024)), 32 * 1024)
+            advanced[channel].set()
+            if not finish.wait(timeout=5):
+                raise AssertionError("Test did not finish the upload")
+            self.assertEqual(len(request.body.read()), 64 * 1024)
+            self.assertEqual(progress[channel]["sent"], len(data))
+            self.assertEqual(progress[channel]["confirmed"], 0)
+            self.assertEqual(progress[channel]["status"], "finalizing")
+            return Response(200)
+
+        with patch("requests.sessions.Session.send", side_effect=send), ThreadPoolExecutor(max_workers=3) as pool:
+            futures = [pool.submit(
+                module._next_upload_http, f"https://upload.test/{index}", "audio.mp3", "cookie",
+                data, progress=progress[index],
+            ) for index in range(3)]
+            try:
+                all_read_first_block.wait(timeout=5)
+                self.assertEqual([item["sent"] for item in progress], [32 * 1024] * 3)
+                self.assertEqual([item["confirmed"] for item in progress], [0] * 3)
+                self.assertTrue(all(not future.done() for future in futures))
+                advance[1].set()
+                self.assertTrue(advanced[1].wait(timeout=5))
+                self.assertEqual([item["sent"] for item in progress], [32 * 1024, 64 * 1024, 32 * 1024])
+                self.assertTrue(all(not future.done() for future in futures))
+            finally:
+                for event in advance:
+                    event.set()
+                finish.set()
+            self.assertEqual([future.result(timeout=5) for future in futures], ["final"] * 3)
+        self.assertTrue(all(item["confirmed"] == len(data) for item in progress))
+        self.assertTrue(all(item["status"] == "complete" for item in progress))
+
+    def test_progress_resumes_from_server_offset_after_partially_sent_chunk_times_out(self):
+        module = UpdateAudioModule()
+        module._CHUNK_SIZE = 6
+        progress = {}
+        received = []
+        first = True
+
+        def post(_url, **kwargs):
+            nonlocal first
+            if kwargs["headers"]["X-Goog-Upload-Command"] == "query":
+                self.assertEqual(progress["sent"], 3)
+                self.assertEqual(progress["confirmed"], 0)
+                return Response(headers={"X-Goog-Upload-Size-Received": "2"})
+            if first:
+                first = False
+                self.assertEqual(kwargs["data"].read(3), b"abc")
+                raise requests.exceptions.Timeout("write interrupted")
+            received.append((kwargs["headers"]["X-Goog-Upload-Offset"], kwargs["data"].read()))
+            return Response(200)
+
+        with (
+            patch("src.module.audio_module.post_with_stop", side_effect=post),
+            patch("src.module.audio_module.wait_interruptibly"),
+        ):
+            result = module._next_upload_http(
+                "https://same-session", "audio.mp3", "cookie", b"abcdefghij", progress=progress,
+            )
+        self.assertEqual(result, "final")
+        self.assertEqual(received, [("2", b"cdefgh"), ("8", b"ij")])
+        self.assertEqual(progress["sent"], 10)
+        self.assertEqual(progress["confirmed"], 10)
         self.assertEqual(progress["status"], "complete")
 
     def test_add_reuses_one_http_session_for_start_register_and_upload(self):

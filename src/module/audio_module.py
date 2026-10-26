@@ -2,6 +2,7 @@
 import os
 import time
 import unicodedata
+from io import BytesIO
 from urllib.parse import quote
 import requests
 from loguru import logger
@@ -19,6 +20,31 @@ class AudioUpdateError(Exception):
         super().__init__(message)
         self.status_code = status_code
         self.retryable = retryable
+
+
+class _AudioUploadBody(BytesIO):
+    """Report bytes handed to HTTP without waiting for a whole chunk's reply."""
+
+    def __init__(self, data: bytes, offset: int, progress: dict | None):
+        super().__init__(data)
+        self._size = len(data)
+        self._offset = offset
+        self._progress = progress
+
+    def __len__(self) -> int:
+        return self._size
+
+    def read(self, size: int = -1) -> bytes:
+        check_stopped()
+        block = super().read(size)
+        if block and self._progress is not None:
+            sent = self._offset + self.tell()
+            self._progress.update(
+                sent=sent,
+                updated_at=time.monotonic(),
+                status="finalizing" if sent >= self._progress["total"] else "uploading",
+            )
+        return block
 
 
 def _youtube_error_message(response: requests.Response, action: str) -> str:
@@ -61,11 +87,15 @@ class UpdateAudioModule(IModule):
         upload_path: str | None = None,
     ):
         check_stopped()
+        if progress is not None:
+            progress["status"] = "authenticating"
         channel_info = get_channels_info(channel_id)
         cookie_string = "; ".join([f"{cookie['name']}={cookie['value']}" for cookie in channel_info.cookies])
         session_token = self._get_session_token(channel_info)
         fname_header = quote(os.path.basename(file_name), safe="")
         with requests.Session() as session:
+            if progress is not None:
+                progress["status"] = "starting"
             upload_url, scotty_resource_id = self._upload_http(
                 fname_header=fname_header,
                 cookie_string=cookie_string,
@@ -74,6 +104,8 @@ class UpdateAudioModule(IModule):
             # YouTube's audio-track flow first registers the pending Scotty resource
             # with the video, then uploads/finalizes the resource bytes.  Keep the
             # upload synchronous so callers only see success after it has completed.
+            if progress is not None:
+                progress["status"] = "registering"
             res = self._update(
                 video_id=id_video,
                 scotty_resource_id=scotty_resource_id,
@@ -176,6 +208,7 @@ class UpdateAudioModule(IModule):
         if progress is not None:
             progress.update(
                 sent=0,
+                confirmed=0,
                 total=total,
                 started_at=started_at,
                 updated_at=started_at,
@@ -199,13 +232,14 @@ class UpdateAudioModule(IModule):
                 headers["X-Goog-Upload-Offset"] = str(offset)
                 headers["X-Goog-Upload-Command"] = "upload, finalize" if end == total else "upload"
                 try:
-                    response = post_with_stop(
-                        next_url,
-                        headers=headers,
-                        data=chunk,
-                        timeout=self._UPLOAD_TIMEOUT,
-                        session=session,
-                    )
+                    with _AudioUploadBody(chunk, offset, progress) as body:
+                        response = post_with_stop(
+                            next_url,
+                            headers=headers,
+                            data=body,
+                            timeout=self._UPLOAD_TIMEOUT,
+                            session=session,
+                        )
                     if response.status_code != 200:
                         retryable = response.status_code == 429 or response.status_code >= 500
                         raise AudioUpdateError(
@@ -217,15 +251,20 @@ class UpdateAudioModule(IModule):
                     retries = 0
                     if progress is not None:
                         progress["sent"] = offset
+                        progress["confirmed"] = offset
                         progress["updated_at"] = time.monotonic()
                         progress["status"] = "complete" if offset >= total else "uploading"
                 except TaskStopped:
                     raise
                 except Exception as exc:
                     if isinstance(exc, AudioUpdateError) and not exc.retryable:
+                        if progress is not None:
+                            progress["status"] = "error"
                         raise
                     retries += 1
                     if retries > self._MAX_UPLOAD_RETRIES:
+                        if progress is not None:
+                            progress["status"] = "error"
                         raise AudioUpdateError(
                             f"Tải audio bị gián đoạn tại {offset}/{total} byte sau "
                             f"{self._MAX_UPLOAD_RETRIES} lần thử: {exc}",
@@ -240,6 +279,7 @@ class UpdateAudioModule(IModule):
                         offset = server_offset
                     if progress is not None:
                         progress["sent"] = offset
+                        progress["confirmed"] = offset
                         progress["updated_at"] = time.monotonic()
                         progress["status"] = "retrying"
                     logger.warning(

@@ -7,6 +7,9 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import requests
+
+from src.module.audio_module import UpdateAudioModule
 from src.audio_recovery import (
     clear_audio_recovery_registry,
     get_audio_mutation_guard,
@@ -188,6 +191,78 @@ class AudioRecoveryConcurrencyTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(busy_task, timeout=3)
             result = await asyncio.wait_for(task, timeout=4)
         self.assertEqual(result["repaired"], 10)
+
+    async def test_transport_progress_for_three_registry_channels_advances_before_any_response(self):
+        self.channels = self.channels[:3]
+        state = get_audio_recovery_state()
+        state["entries"] = {channel: state["entries"][channel] for channel in self.channels}
+        for videos in state["entries"].values():
+            for entry in videos.values():
+                entry["languages"] = ["en"]
+        self.manager.save_state("audio_recovery", state)
+        module = UpdateAudioModule()
+        self.mocks["update_audio_module.add"].side_effect = module.add
+        loop = asyncio.get_running_loop()
+        all_started = asyncio.Event()
+        advanced = asyncio.Event()
+        gates = {channel: threading.Event() for channel in self.channels}
+        finish = threading.Event()
+        started = set()
+
+        def send(request, **_kwargs):
+            channel = request.url.rsplit("/", 1)[1]
+            self.assertTrue(get_audio_mutation_guard(channel).locked())
+            self.assertEqual(request.headers["Content-Length"], "200")
+            self.assertEqual(len(request.body.read(40)), 40)
+            with self.lock:
+                started.add(channel)
+                if len(started) == 3:
+                    loop.call_soon_threadsafe(all_started.set)
+            if not gates[channel].wait(timeout=5):
+                raise AssertionError("Test did not advance the upload")
+            self.assertEqual(len(request.body.read(40)), 40)
+            if channel == self.channels[1]:
+                loop.call_soon_threadsafe(advanced.set)
+            if not finish.wait(timeout=5):
+                raise AssertionError("Test did not release the HTTP response")
+            self.assertEqual(len(request.body.read()), 120)
+            response = requests.Response()
+            response.status_code = 200
+            response._content = b""
+            return response
+
+        with (
+            patch("src.module.audio_module.get_channels_info", side_effect=lambda channel: SimpleNamespace(
+                cookies=[{"name": "test", "value": channel}],
+            )),
+            patch.object(module, "_get_session_token", return_value="test-token"),
+            patch.object(module, "_upload_http", side_effect=lambda **kwargs: (
+                f"https://upload.test/{kwargs['cookie_string'].split('=')[1]}", "resource",
+            )),
+            patch.object(module, "_update", return_value=200),
+            patch("requests.sessions.Session.send", side_effect=send),
+        ):
+            task = asyncio.create_task(run_audio_recovery_cycle(now=2000))
+            try:
+                await asyncio.wait_for(all_started.wait(), timeout=3)
+                jobs = {job["channel_id"]: job for job in get_audio_recovery_runtime_status()["channels"]}
+                self.assertEqual(set(jobs), set(self.channels))
+                self.assertTrue(all(job["upload_sent"] == 40 for job in jobs.values()))
+                self.assertTrue(all(job["upload_confirmed"] == 0 for job in jobs.values()))
+                gates[self.channels[1]].set()
+                await asyncio.wait_for(advanced.wait(), timeout=3)
+                jobs = {job["channel_id"]: job for job in get_audio_recovery_runtime_status()["channels"]}
+                self.assertEqual([jobs[channel]["upload_sent"] for channel in self.channels], [40, 80, 40])
+                self.assertEqual([jobs[channel]["upload_fraction"] for channel in self.channels], [0.2, 0.4, 0.2])
+                self.assertTrue(all(job["upload_status"] == "uploading" for job in jobs.values()))
+                self.assertFalse(task.done())
+            finally:
+                for gate in gates.values():
+                    gate.set()
+                finish.set()
+                result = await asyncio.wait_for(task, timeout=4)
+        self.assertEqual(result["repaired"], 3)
+        self.assertEqual(result["failed"], 0)
 
     async def test_upload_failure_does_not_stop_other_channels_or_lose_saved_attempts(self):
         self.fail_channel = self.channels[0]
