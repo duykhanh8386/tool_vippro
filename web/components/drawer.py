@@ -55,8 +55,13 @@ def _recovery_channel_summary(status: dict) -> str:
     active = int(status.get("active_channel_count") or 0)
     finished = int(status.get("completed_channel_count") or 0)
     total = int(status.get("channel_total") or 0)
-    waiting = max(0, total - active - finished)
-    summary = f"Đang xử lý {active} kênh · Đã kết thúc lượt {finished}/{total} kênh"
+    if status.get("continuous"):
+        waiting = int(status.get("waiting_channel_count") or 0)
+        passes = int(status.get("completed_pass_count") or 0)
+        summary = f"Tổng {total} kênh · Đang xử lý {active} · Đã kết thúc {passes} lượt"
+    else:
+        waiting = max(0, total - active - finished)
+        summary = f"Đang xử lý {active} kênh · Đã kết thúc lượt {finished}/{total} kênh"
     if waiting:
         summary += f" · Còn chờ {waiting} kênh"
     return summary
@@ -274,6 +279,7 @@ def create_drawer():
                         {"name": "channel_id", "label": "Channel ID", "field": "channel_id", "classes": "font-mono select-text"},
                         {"name": "video_id", "label": "Video ID", "field": "video_id", "classes": "font-mono select-text"},
                         {"name": "language", "label": "Ngôn ngữ", "field": "language"},
+                        {"name": "pass_index", "label": "Lượt quét", "field": "pass_index"},
                         {"name": "message", "label": "Tiến độ / Kết quả", "field": "message", "classes": "whitespace-normal", "style": "min-width: 200px; max-width: 350px"},
                         {"name": "transfer", "label": "Tiến độ file", "field": "transfer"},
                     ],
@@ -356,6 +362,7 @@ def create_drawer():
                 ] + [
                     {
                         **result,
+                        "pass_index": result.get("pass_count", 1),
                         "name": get_recovery_channel_name(result["channel_id"]),
                         "video_id": "—", "language": "—", "transfer": "—",
                     }
@@ -406,6 +413,7 @@ def create_drawer():
                         current / total if phase == "scanning" and total else 0
                     )
                     recovery_detail_transfer.set_text(
+                        _recovery_channel_summary(status) if status.get("continuous") else
                         f"Đã hoàn tất {current}/{total} kênh"
                         if phase == "scanning" and total
                         else "Đang chuẩn bị audio để add lại"
@@ -463,6 +471,8 @@ def create_drawer():
                                     "rounded color=blue"
                                 ).classes("w-full mt-1")
                                 ui.label(
+                                    f"Đang đọc lại trạng thái audio · {status.get('completed_pass_count', 0)} lượt đã xong"
+                                    if status.get("continuous") else
                                     f"Đã hoàn tất {current}/{total} kênh" if total else "Đang đọc danh sách theo dõi..."
                                 ).classes("text-[11px] text-blue-800")
                             else:

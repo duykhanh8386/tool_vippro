@@ -16,6 +16,7 @@ import re
 import tempfile
 import threading
 import time
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from contextvars import ContextVar, copy_context
 from functools import partial
@@ -108,6 +109,10 @@ _RUNTIME_STATUS = {
     "channel_total": 0,
     "channel_concurrency": MAX_CONCURRENT_RECOVERY_CHANNELS,
     "completed_channel_count": 0,
+    "completed_pass_count": 0,
+    "waiting_channel_count": 0,
+    "continuous": False,
+    "_channel_passes": {},
     "_channel_jobs": {},
     "_channel_results": {},
     "channel_id": "",
@@ -150,7 +155,12 @@ def _update_runtime_status(**changes) -> None:
         cycle_id, channel_id = context
         if _RUNTIME_STATUS.get("cycle_id") != cycle_id:
             return
-        _RUNTIME_STATUS["_channel_jobs"].setdefault(channel_id, {}).update(changes)
+        jobs = _RUNTIME_STATUS["_channel_jobs"]
+        if channel_id not in jobs:
+            _RUNTIME_STATUS["_channel_results"].pop(channel_id, None)
+            _RUNTIME_STATUS["completed_channel_count"] = len(_RUNTIME_STATUS["_channel_results"])
+            jobs[channel_id] = {"pass_index": _RUNTIME_STATUS["_channel_passes"].get(channel_id, 0) + 1}
+        jobs[channel_id].update(changes)
         for key in (
             "repaired", "failed", "processing_warning_count", "captions_repaired",
             "captions_failed", "caption_quota_message",
@@ -163,8 +173,12 @@ def _finish_channel_runtime_status(cycle_id: int, channel_id: str, result: dict)
     with _RUNTIME_STATUS_LOCK:
         if _RUNTIME_STATUS.get("cycle_id") == cycle_id:
             _RUNTIME_STATUS["_channel_jobs"].pop(channel_id, None)
+            pass_count = _RUNTIME_STATUS["_channel_passes"].get(channel_id, 0) + 1
+            _RUNTIME_STATUS["_channel_passes"][channel_id] = pass_count
+            result["pass_count"] = pass_count
             _RUNTIME_STATUS["_channel_results"][channel_id] = dict(result)
-            _RUNTIME_STATUS["completed_channel_count"] += 1
+            _RUNTIME_STATUS["completed_channel_count"] = len(_RUNTIME_STATUS["_channel_results"])
+            _RUNTIME_STATUS["completed_pass_count"] += 1
 
 
 def _with_upload_progress(snapshot: dict) -> dict:
@@ -204,6 +218,7 @@ def get_audio_recovery_runtime_status() -> dict:
     """Return UI-safe live scan/upload progress for the global drawer."""
     with _RUNTIME_STATUS_LOCK:
         snapshot = dict(_RUNTIME_STATUS)
+        snapshot.pop("_channel_passes", None)
         jobs = [dict(job) for job in snapshot.pop("_channel_jobs", {}).values()]
         results = snapshot.pop("_channel_results", {})
         snapshot["channel_results"] = [dict(result) for result in results.values()]
@@ -216,7 +231,7 @@ def get_audio_recovery_runtime_status() -> dict:
         snapshot.update({
             key: value for key, value in focus.items()
             if key not in {"repaired", "failed", "captions_repaired", "captions_failed",
-                           "processing_warning_count", "caption_quota_message"}
+                           "processing_warning_count", "caption_quota_message", "channel_total"}
         })
         return snapshot
     return _with_upload_progress(snapshot)
@@ -824,7 +839,8 @@ def is_audio_recovery_channel_enabled(channel_id: str) -> bool:
     if not clean_channel_id:
         return False
     with _STATE_LOCK:
-        return _channel_is_in_recovery_scope(_load_state(), clean_channel_id)
+        state = _load_state()
+        return bool(state.get("enabled", True)) and _channel_is_in_recovery_scope(state, clean_channel_id)
 
 
 def is_audio_recovery_video_enabled(channel_id: str, video_id: str) -> bool:
@@ -1823,8 +1839,110 @@ def _summarize_channel_result(result: dict) -> None:
     result["message"] = " · ".join(parts) or "Đã kết thúc lượt; không có audio cần gửi lại"
 
 
-async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
-    """Scan the persistent registry once and selectively repair audio tracks."""
+async def _schedule_recovery_channels(
+    process_channel: Callable,
+    initial_entries: dict,
+    channel_results: dict,
+    *,
+    stop_event: asyncio.Event,
+    should_stop: Callable[[], bool],
+    on_complete: Callable[[], None],
+) -> None:
+    """Reuse idle slots unless a queue requires finishing the entire round."""
+    pending = deque(initial_entries)
+    repeats: deque[str] = deque()
+    started: set[str] = set()
+    running: dict[asyncio.Task, str] = {}
+    retry_at: dict[str, float] = {}
+    queued_round = len(pending) > MAX_CONCURRENT_RECOVERY_CHANNELS
+    try:
+        while not should_stop():
+            latest = get_audio_recovery_state()
+            eligible = {
+                channel_id: entries
+                for channel_id, entries in (latest.get("entries") or {}).items()
+                if latest.get("enabled", True) and isinstance(entries, dict)
+                and _channel_is_in_recovery_scope(latest, channel_id)
+            }
+            active_ids = set(running.values())
+            started.intersection_update(set(eligible) | active_ids)
+            pending = deque(channel for channel in pending if channel in eligible and channel not in active_ids)
+            repeats = deque(channel for channel in repeats if channel in eligible and channel not in active_ids)
+            known = started | active_ids | set(pending)
+            newcomers = [channel for channel in eligible if channel not in known]
+            pending.extend(newcomers)
+            if (newcomers and started) or (pending and repeats):
+                queued_round = True
+            if queued_round:
+                repeats.clear()
+
+            def launch(channel_id: str) -> None:
+                index = list(eligible).index(channel_id) + 1
+                task = asyncio.create_task(process_channel(
+                    index, channel_id, eligible[channel_id], current_state=latest,
+                    current_total=len(eligible),
+                ))
+                running[task] = channel_id
+                started.add(channel_id)
+
+            while pending and len(running) < MAX_CONCURRENT_RECOVERY_CHANNELS:
+                launch(pending.popleft())
+            if pending:
+                queued_round = True
+                repeats.clear()
+            if not queued_round:
+                for _ in range(len(repeats)):
+                    channel_id = repeats.popleft()
+                    if len(running) < MAX_CONCURRENT_RECOVERY_CHANNELS and time.monotonic() >= retry_at.get(channel_id, 0):
+                        launch(channel_id)
+                    else:
+                        repeats.append(channel_id)
+
+            preferences = _scan_preferences_from_state(latest)
+            _update_runtime_status(
+                channel_total=len(set(eligible) | set(running.values())),
+                waiting_channel_count=len(pending),
+                scan_mode=preferences["scan_mode"],
+                video_scan_scope=preferences["video_scan_scope"],
+                selected_channel_ids=preferences["selected_channel_ids"],
+            )
+            if not running:
+                if queued_round or not eligible:
+                    return
+                try:
+                    await asyncio.wait_for(stop_event.wait(), timeout=MONITOR_IDLE_POLL_SECONDS)
+                except asyncio.TimeoutError:
+                    pass
+                continue
+
+            done, _ = await asyncio.wait(
+                running, timeout=MONITOR_IDLE_POLL_SECONDS,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for task in done:
+                channel_id = running.pop(task)
+                task.result()
+                report = channel_results.get(channel_id) or {}
+                if not queued_round:
+                    repeats.append(channel_id)
+                    retry_at[channel_id] = time.monotonic() + (
+                        MONITOR_IDLE_POLL_SECONDS
+                        if report.get("errors") or not report.get("scan_performed") else 0
+                    )
+                on_complete()
+            if queued_round and not pending and not running:
+                return
+            await asyncio.sleep(0)
+    finally:
+        # Current uploads own their locks/files until their threads return.
+        if running:
+            await asyncio.gather(*running)
+
+
+async def run_audio_recovery_cycle(
+    *, now: float | None = None, stop_event: asyncio.Event | None = None,
+) -> dict:
+    """Scan once, or reuse free channel slots until a queued round finishes."""
     cycle_time = float(now if now is not None else time.time())
     with _RUNTIME_STATUS_LOCK:
         cycle_id = int(_RUNTIME_STATUS.get("cycle_id") or 0) + 1
@@ -1834,9 +1952,10 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
     captions_repaired = 0
     captions_failed = 0
     caption_quota_message = ""
-    unreadable: list[str] = []
+    caption_quota_by_channel: dict[str, str] = {}
+    unreadable_by_channel: dict[str, set[str]] = {}
     scanned_channels = 0
-    processing_warnings: list[dict] = []
+    warnings_by_channel: dict[str, list[dict]] = {}
     channel_results: dict[str, dict] = {}
     deferred_busy = 0
     deferred_initial_grace = 0
@@ -1855,6 +1974,10 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
         channel_total=0,
         channel_concurrency=MAX_CONCURRENT_RECOVERY_CHANNELS,
         completed_channel_count=0,
+        completed_pass_count=0,
+        waiting_channel_count=0,
+        continuous=stop_event is not None,
+        _channel_passes={},
         _channel_jobs={},
         _channel_results={},
         channel_id="",
@@ -1898,7 +2021,6 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
             video_scan_scope=scan_preferences["video_scan_scope"],
             selected_channel_ids=sorted(selected_channel_ids),
         )
-        refresh_alerts = state.get("channel_refresh_alerts") or {}
         try:
             stale_processing_seconds = max(
                 0.0,
@@ -1938,23 +2060,38 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
         cycle_cancelled = False
 
         def should_stop() -> bool:
-            return cycle_cancelled or _recovery_was_cleared(cycle_generation)
+            nonlocal cancelled_by_clear
+            cancelled_by_clear = cancelled_by_clear or _recovery_was_cleared(cycle_generation)
+            return (
+                cycle_cancelled or cancelled_by_clear
+                or (stop_event is not None and stop_event.is_set())
+            )
 
-        async def process_channel(channel_index: int, channel_id: str, video_entries: dict) -> None:
+        async def process_channel(
+            channel_index: int, channel_id: str, video_entries: dict,
+            *, current_state: dict | None = None, current_total: int | None = None,
+        ) -> None:
             nonlocal repaired, failed, captions_repaired, captions_failed
             nonlocal caption_quota_message, scanned_channels, deferred_busy
             nonlocal deferred_video_scope, deferred_visibility_unknown
-            nonlocal cancelled_by_clear
             async with semaphore:
                 if should_stop():
                     return
                 context_token = _RUNTIME_CHANNEL_CONTEXT.set((cycle_id, channel_id))
                 pool_token = _RECOVERY_WORKER_POOL.set(worker_pool)
+                cycle_time = float(now if now is not None else time.time())
+                channel_total = current_total if current_total is not None else len(entries_by_channel)
+                pass_state = current_state if current_state is not None else state
+                scan_preferences = _scan_preferences_from_state(pass_state)
+                refresh_alerts = pass_state.get("channel_refresh_alerts") or {}
+                unreadable = unreadable_by_channel[channel_id] = set()
+                processing_warnings = warnings_by_channel[channel_id] = []
                 owned_mutation_guard: threading.Lock | None = None
                 channel_result = {
                     "channel_id": channel_id, "scanned_videos": 0,
                     "submitted": 0, "errors": 0, "healthy_skipped": 0,
                     "cooldown_tracks": 0, "processing_tracks": 0,
+                    "scan_performed": False,
                 }
                 try:
                     _update_runtime_status(
@@ -1970,7 +2107,6 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
                         _upload_progress=None,
                     )
                     if should_stop():
-                        cancelled_by_clear = True
                         channel_result["reason"] = "Lượt quét đã bị dừng"
                         return
                     if not is_audio_recovery_channel_enabled(channel_id):
@@ -2038,7 +2174,7 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
                         channel_result["errors"] += len(video_ids)
                         channel_result["last_error"] = _recovery_channel_error(exc)
                         failed += len(video_ids)
-                        unreadable.extend(video_ids)
+                        unreadable.update(video_ids)
                         if _requires_channel_refresh(exc):
                             mark_channel_refresh_required(channel_id, exc, now=cycle_time)
                             channel_requires_refresh = True
@@ -2051,6 +2187,7 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
                         )
                         return
 
+                    channel_result["scan_performed"] = True
                     matching_video_ids = _enabled_recovery_video_ids(channel_id, [
                         video_id
                         for video_id in video_ids
@@ -2094,28 +2231,28 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
                     # explicit YouTube ``failed`` status is updated. Missing tracks are
                     # never inserted here. This runs after the visibility filter so a
                     # draft or unscheduled private video cannot consume caption quota.
-                    if not caption_quota_message:
-                        caption_result = await _monitor_failed_caption_tracks(
-                            channel_id=channel_id,
-                            entries=eligible_entries,
-                            cycle_time=cycle_time,
-                            continue_allowed=lambda channel_id=channel_id: (
-                                not should_stop() and is_audio_recovery_channel_enabled(channel_id)
-                            ),
-                            video_continue_allowed=lambda video_id, channel_id=channel_id: (
-                                is_audio_recovery_video_enabled(channel_id, video_id)
-                            ),
-                        )
-                        captions_repaired += int(caption_result.get("repaired") or 0)
-                        captions_failed += int(caption_result.get("failed") or 0)
-                        caption_quota_message = caption_quota_message or str(
-                            caption_result.get("quota_message") or ""
-                        )
-                        _update_runtime_status(
-                            captions_repaired=captions_repaired,
-                            captions_failed=captions_failed,
-                            caption_quota_message=caption_quota_message,
-                        )
+                    caption_result = await _monitor_failed_caption_tracks(
+                        channel_id=channel_id,
+                        entries=eligible_entries,
+                        cycle_time=cycle_time,
+                        continue_allowed=lambda channel_id=channel_id: (
+                            not should_stop() and is_audio_recovery_channel_enabled(channel_id)
+                        ),
+                        video_continue_allowed=lambda video_id, channel_id=channel_id: (
+                            is_audio_recovery_video_enabled(channel_id, video_id)
+                        ),
+                    )
+                    captions_repaired += int(caption_result.get("repaired") or 0)
+                    captions_failed += int(caption_result.get("failed") or 0)
+                    caption_quota_by_channel[channel_id] = str(caption_result.get("quota_message") or "")
+                    caption_quota_message = next(
+                        (message for message in caption_quota_by_channel.values() if message), ""
+                    )
+                    _update_runtime_status(
+                        captions_repaired=captions_repaired,
+                        captions_failed=captions_failed,
+                        caption_quota_message=caption_quota_message,
+                    )
 
                     _update_runtime_status(
                         phase="scanning",
@@ -2128,7 +2265,6 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
                     channel_actions: list[dict] = []
                     for start in range(0, len(video_ids), batch_size):
                         if should_stop():
-                            cancelled_by_clear = True
                             break
                         if not is_audio_recovery_channel_enabled(channel_id):
                             scope_skipped_channel_ids.add(channel_id)
@@ -2148,7 +2284,7 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
                             channel_result["errors"] += len(chunk)
                             channel_result["last_error"] = _recovery_channel_error(exc)
                             failed += len(chunk)
-                            unreadable.extend(chunk)
+                            unreadable.update(chunk)
                             if _requires_channel_refresh(exc):
                                 mark_channel_refresh_required(channel_id, exc, now=cycle_time)
                                 channel_requires_refresh = True
@@ -2193,11 +2329,13 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
                                 stale_after_seconds=stale_processing_seconds,
                             )
                         )
-                        _update_runtime_status(processing_warning_count=len(processing_warnings))
+                        _update_runtime_status(
+                            processing_warning_count=sum(len(warnings) for warnings in warnings_by_channel.values())
+                        )
                         channel_actions.extend(actions)
-                        unreadable.extend(sorted(unreadable_chunk))
+                        unreadable.update(unreadable_chunk)
 
-                    if cancelled_by_clear:
+                    if should_stop():
                         return
                     if channel_requires_refresh:
                         return
@@ -2208,7 +2346,6 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
 
                     for video_id, actions in actions_by_video.items():
                         if should_stop():
-                            cancelled_by_clear = True
                             break
                         if not is_audio_recovery_channel_enabled(channel_id):
                             scope_skipped_channel_ids.add(channel_id)
@@ -2309,7 +2446,6 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
 
                             for action_index, action in enumerate(actions):
                                 if should_stop():
-                                    cancelled_by_clear = True
                                     break
                                 if not is_audio_recovery_channel_enabled(channel_id):
                                     scope_skipped_channel_ids.add(channel_id)
@@ -2462,32 +2598,73 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
                                     logger.warning("Could not remove recovery temp file {}: {}", temp_audio_path, exc)
                         if channel_requires_refresh:
                             break
-                        if cancelled_by_clear:
+                        if should_stop():
                             break
 
-                    if cancelled_by_clear:
+                    if should_stop():
                         return
                 except Exception as exc:
                     affected_videos = list(video_entries) if isinstance(video_entries, dict) else []
                     channel_result["errors"] += max(1, len(affected_videos))
                     channel_result["last_error"] = _recovery_channel_error(exc)
                     failed += max(1, len(affected_videos))
-                    unreadable.extend(affected_videos)
+                    unreadable.update(affected_videos)
                     logger.exception("Audio auto-recovery channel failed: channel={} error={}", channel_id, exc)
                 finally:
                     if owned_mutation_guard is not None:
                         owned_mutation_guard.release()
+                    if should_stop():
+                        channel_result["reason"] = "Đã dừng lượt quét"
                     _summarize_channel_result(channel_result)
                     channel_results[channel_id] = channel_result
                     _finish_channel_runtime_status(cycle_id, channel_id, channel_result)
                     _RECOVERY_WORKER_POOL.reset(pool_token)
                     _RUNTIME_CHANNEL_CONTEXT.reset(context_token)
 
-        channel_tasks = [
-            asyncio.create_task(process_channel(index, channel_id, video_entries))
-            for index, (channel_id, video_entries) in enumerate(entries_by_channel.items(), 1)
-        ]
-        channel_group = asyncio.gather(*channel_tasks)
+        def save_cycle_result() -> dict:
+            with _STATE_LOCK:
+                latest = _load_state()
+                preferences = _scan_preferences_from_state(latest)
+                result = {
+                    "repaired": repaired,
+                    "failed": failed,
+                    "processing_warnings": [
+                        warning for warnings in warnings_by_channel.values() for warning in warnings
+                    ],
+                    "captions_repaired": captions_repaired,
+                    "captions_failed": captions_failed,
+                    "caption_quota_message": caption_quota_message,
+                    "unreadable": sorted(set().union(*unreadable_by_channel.values())),
+                    "scanned_channels": scanned_channels,
+                    "channel_results": list(channel_results.values()),
+                    "reauth_required": sorted(get_channel_refresh_alerts()),
+                    "deferred_busy": deferred_busy,
+                    "deferred_initial_grace": deferred_initial_grace,
+                    "deferred_video_scope": deferred_video_scope,
+                    "deferred_visibility_unknown": deferred_visibility_unknown,
+                    "cancelled_by_clear": cancelled_by_clear,
+                    "scan_mode": preferences["scan_mode"],
+                    "video_scan_scope": preferences["video_scan_scope"],
+                    "scan_start_date": preferences["scan_start_date"],
+                    "scan_date_type": preferences["scan_date_type"],
+                    "scope_skipped_channel_ids": sorted(scope_skipped_channel_ids),
+                }
+                latest["last_cycle_at"] = float(now if now is not None else time.time())
+                latest["last_cycle_result"] = result
+                state_manager.save_state(RECOVERY_STATE_NAME, latest)
+                return result
+
+        if stop_event is None:
+            channel_group = asyncio.gather(*[
+                asyncio.create_task(process_channel(index, channel_id, video_entries))
+                for index, (channel_id, video_entries) in enumerate(entries_by_channel.items(), 1)
+            ])
+        else:
+            channel_group = asyncio.create_task(_schedule_recovery_channels(
+                process_channel, entries_by_channel, channel_results,
+                stop_event=stop_event, should_stop=should_stop,
+                on_complete=save_cycle_result,
+            ))
         try:
             await asyncio.shield(channel_group)
         except asyncio.CancelledError:
@@ -2496,35 +2673,10 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
             # queued channels or subsequent tracks from starting.
             cycle_cancelled = True
             await channel_group
+            save_cycle_result()
             raise
 
-        result = {
-            "repaired": repaired,
-            "failed": failed,
-            "processing_warnings": processing_warnings,
-            "captions_repaired": captions_repaired,
-            "captions_failed": captions_failed,
-            "caption_quota_message": caption_quota_message,
-            "unreadable": list(dict.fromkeys(unreadable)),
-            "scanned_channels": scanned_channels,
-            "channel_results": [channel_results[channel_id] for channel_id in entries_by_channel if channel_id in channel_results],
-            "reauth_required": sorted(get_channel_refresh_alerts()),
-            "deferred_busy": deferred_busy,
-            "deferred_initial_grace": deferred_initial_grace,
-            "deferred_video_scope": deferred_video_scope,
-            "deferred_visibility_unknown": deferred_visibility_unknown,
-            "cancelled_by_clear": cancelled_by_clear,
-            "scan_mode": scan_preferences["scan_mode"],
-            "video_scan_scope": scan_preferences["video_scan_scope"],
-            "scan_start_date": scan_preferences["scan_start_date"],
-            "scan_date_type": scan_preferences["scan_date_type"],
-            "scope_skipped_channel_ids": sorted(scope_skipped_channel_ids),
-        }
-        with _STATE_LOCK:
-            latest = _load_state()
-            latest["last_cycle_at"] = cycle_time
-            latest["last_cycle_result"] = result
-            state_manager.save_state(RECOVERY_STATE_NAME, latest)
+        result = save_cycle_result()
         logger.info(
             "Auto-recovery scan finished: audio_repaired={} audio_failed={} "
             "captions_repaired={} captions_failed={} unreadable={} processing_warnings={}.",
@@ -2533,7 +2685,7 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
             captions_repaired,
             captions_failed,
             len(result["unreadable"]),
-            len(processing_warnings),
+            len(result["processing_warnings"]),
         )
         final_message = (
             f"Quét xong: đã gửi lại {repaired}, hoãn "
@@ -2541,7 +2693,7 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
             f"{deferred_visibility_unknown} video chưa đọc được trạng thái, "
             f"lỗi {failed}; phụ đề failed đã sửa "
             f"{captions_repaired}, lỗi {captions_failed}; "
-            f"{len(processing_warnings)} audio xử lý lâu được giữ nguyên"
+            f"{len(result['processing_warnings'])} audio xử lý lâu được giữ nguyên"
         )
         return result
     except asyncio.CancelledError:
@@ -2567,7 +2719,7 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
                     repair_total=0,
                     repaired=repaired,
                     failed=failed,
-                    processing_warning_count=len(processing_warnings),
+                    processing_warning_count=sum(len(warnings) for warnings in warnings_by_channel.values()),
                     captions_repaired=captions_repaired,
                     captions_failed=captions_failed,
                     caption_quota_message=caption_quota_message,
@@ -2584,7 +2736,7 @@ async def _monitor_loop(stop_event: asyncio.Event) -> None:
     while not stop_event.is_set():
         idle_wait = MONITOR_IDLE_POLL_SECONDS
         try:
-            result = await run_audio_recovery_cycle()
+            result = await run_audio_recovery_cycle(stop_event=stop_event)
             if result.get("scanned_channels") and not result.get("unreadable"):
                 idle_wait = 0
         except asyncio.CancelledError:

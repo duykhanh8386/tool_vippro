@@ -1427,7 +1427,7 @@ class AudioRecoveryCycleTests(unittest.IsolatedAsyncioTestCase):
             "last_cycle_result": {},
         }
 
-        async def run_once():
+        async def run_once(**_kwargs):
             stop_event.set()
             return {"repaired": 0, "failed": 0}
 
@@ -1438,7 +1438,7 @@ class AudioRecoveryCycleTests(unittest.IsolatedAsyncioTestCase):
         ):
             await asyncio.wait_for(_monitor_loop(stop_event), timeout=0.2)
 
-        cycle.assert_awaited_once_with()
+        cycle.assert_awaited_once_with(stop_event=stop_event)
 
     async def test_monitor_repeats_as_soon_as_previous_scan_finishes_without_overlap(self):
         for deferred_busy in (0, 1):
@@ -1448,7 +1448,7 @@ class AudioRecoveryCycleTests(unittest.IsolatedAsyncioTestCase):
                 finish_first = asyncio.Event()
                 calls = 0
 
-                async def scan():
+                async def scan(**_kwargs):
                     nonlocal calls
                     calls += 1
                     if calls == 1:
@@ -1500,7 +1500,7 @@ class AudioRecoveryCycleTests(unittest.IsolatedAsyncioTestCase):
                     patch("src.audio_recovery.asyncio.wait_for", new=AsyncMock(side_effect=stop_when_idle)) as wait,
                 ):
                     await _monitor_loop(stop_event)
-                cycle.assert_awaited_once_with()
+                cycle.assert_awaited_once_with(stop_event=stop_event)
                 self.assertEqual(wait.await_args.kwargs["timeout"], MONITOR_IDLE_POLL_SECONDS)
 
     async def test_monitor_waits_after_unexpected_error_and_stops_during_idle_wait(self):
@@ -1518,16 +1518,17 @@ class AudioRecoveryCycleTests(unittest.IsolatedAsyncioTestCase):
                     task.cancel()
                     with self.assertRaises(asyncio.CancelledError):
                         await task
-        cycle.assert_awaited_once_with()
+        cycle.assert_awaited_once_with(stop_event=stop_event)
 
     async def test_monitor_propagates_cancellation_without_starting_another_scan(self):
+        stop_event = asyncio.Event()
         with (
             patch("src.audio_recovery.run_audio_recovery_cycle", new=AsyncMock(side_effect=asyncio.CancelledError)) as cycle,
             patch("src.audio_recovery.asyncio.wait_for", new=AsyncMock()) as wait,
         ):
             with self.assertRaises(asyncio.CancelledError):
-                await _monitor_loop(asyncio.Event())
-        cycle.assert_awaited_once_with()
+                await _monitor_loop(stop_event)
+        cycle.assert_awaited_once_with(stop_event=stop_event)
         wait.assert_not_awaited()
 
     async def test_non_public_video_stays_registered_until_it_becomes_public(self):

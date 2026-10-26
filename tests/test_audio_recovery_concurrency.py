@@ -339,6 +339,87 @@ class AudioRecoveryConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         saved_failure = next(item for item in saved_results if item["channel_id"] == failed_channel)
         self.assertEqual(saved_failure["outcome"], "error")
 
+    async def test_finished_channel_is_rescanned_and_repaired_while_other_upload_is_running(self):
+        self.channels = self.channels[:2]
+        fast, slow = self.channels
+        state = get_audio_recovery_state()
+        state["entries"] = {channel: state["entries"][channel] for channel in self.channels}
+        self.manager.save_state("audio_recovery", state)
+        loop = asyncio.get_running_loop()
+        stop = asyncio.Event()
+        release_slow = threading.Event()
+        third_read_started = asyncio.Event()
+        release_third_read = threading.Event()
+        payload = self.mocks["update_audio_module._get_video_translation_payload"].side_effect
+        upload = self.mocks["update_audio_module.add"].side_effect
+        reads = {channel: 0 for channel in self.channels}
+
+        def fresh_payload(video_ids, channel_id):
+            reads[channel_id] += 1
+            response = payload(video_ids, channel_id)
+            if channel_id == fast and reads[channel_id] >= 2:
+                status = "DELETED" if reads[channel_id] == 2 else "PROCESSING"
+                for track in response["audioTracks"]:
+                    track["status"] = f"AUDIO_TRACK_STATUS_{status}"
+                if reads[channel_id] == 3:
+                    loop.call_soon_threadsafe(third_read_started.set)
+                    if not release_third_read.wait(timeout=5):
+                        raise AssertionError("Test did not release the third scan")
+            return response
+
+        def slow_upload(**kwargs):
+            if kwargs["channel_id"] == slow and kwargs["language"] == "en":
+                if not release_slow.wait(timeout=5):
+                    raise AssertionError("Test did not release the slow upload")
+            return upload(**kwargs)
+
+        async def wait_for_processing_report():
+            while True:
+                result = get_audio_recovery_state().get("last_cycle_result") or {}
+                report = next((r for r in result.get("channel_results", []) if r["channel_id"] == fast), {})
+                if report.get("processing_tracks") == 2:
+                    return report
+                await asyncio.sleep(0.005)
+
+        self.mocks["update_audio_module._get_video_translation_payload"].side_effect = fresh_payload
+        self.mocks["update_audio_module.add"].side_effect = slow_upload
+        task = asyncio.create_task(run_audio_recovery_cycle(now=2000, stop_event=stop))
+        try:
+            await asyncio.wait_for(third_read_started.wait(), timeout=3)
+            self.assertFalse(release_slow.is_set())
+            self.assertTrue(get_audio_mutation_guard(slow).locked())
+            self.assertEqual(reads[slow], 1)
+            self.assertEqual([event for event in self.events[fast] if event[0] == "add"], [
+                ("add", "en"), ("add", "es"), ("add", "en"), ("add", "es"),
+            ])
+            # Results survive before the slow channel or the monitoring session ends.
+            saved = get_audio_recovery_state()["last_cycle_result"]["channel_results"]
+            report = next(r for r in saved if r["channel_id"] == fast)
+            self.assertEqual(report["pass_count"], 2)
+            self.assertEqual(report["submitted"], 2)
+            status = get_audio_recovery_runtime_status()
+            self.assertEqual(status["channel_total"], 2)
+            self.assertEqual(status["active_channel_count"], 2)
+            self.assertEqual(status["completed_pass_count"], 2)
+            self.assertEqual(status["channel_results"], [])
+            self.assertNotIn("_channel_passes", status)
+            job = next(job for job in status["channels"] if job["channel_id"] == fast)
+            self.assertEqual(job["pass_index"], 3)
+            release_third_read.set()
+            report = await asyncio.wait_for(wait_for_processing_report(), timeout=3)
+            self.assertEqual(report["submitted"], 0)
+            self.assertGreaterEqual(report["pass_count"], 3)
+            self.assertEqual(len([e for e in self.events[fast] if e[0] == "add"]), 4)
+        finally:
+            stop.set()
+            release_third_read.set()
+            release_slow.set()
+            result = await asyncio.wait_for(task, timeout=4)
+        self.assertFalse(result["cancelled_by_clear"])
+        self.assertFalse(get_audio_mutation_guard(fast).locked())
+        self.assertFalse(get_audio_mutation_guard(slow).locked())
+        self.assertTrue(all(not Path(path).exists() for path in self.temp_files))
+
     async def test_two_failed_channels_repair_immediately_despite_legacy_grace_or_recent_attempt(self):
         self.channels = self.channels[:2]
         upload = self.mocks["update_audio_module.add"].side_effect
@@ -455,6 +536,26 @@ class AudioRecoveryConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(not self.events[channel] for channel in self.channels[3:]))
         self.assertTrue(all(not Path(path).exists() for path in self.temp_files))
         self.assertFalse(get_audio_recovery_runtime_status()["active"])
+
+    async def test_continuous_monitor_cancellation_drains_uploads_before_releasing_guards(self):
+        self.release_uploads.clear()
+        task = asyncio.create_task(run_audio_recovery_cycle(now=2000, stop_event=asyncio.Event()))
+        try:
+            await self.wait_for_three_uploads()
+            task.cancel()
+            await asyncio.sleep(0)
+            self.assertFalse(task.done())
+            for channel_id in self.channels[:3]:
+                self.assertTrue(get_audio_mutation_guard(channel_id).locked())
+        finally:
+            with self.assertRaises(asyncio.CancelledError):
+                await self.finish_cycle(task)
+        self.assertEqual(self.mocks["update_audio_module.add"].call_count, 3)
+        self.assertTrue(all(not get_audio_mutation_guard(channel).locked() for channel in self.channels))
+        self.assertTrue(all(not Path(path).exists() for path in self.temp_files))
+        saved = get_audio_recovery_state()["last_cycle_result"]
+        self.assertEqual(saved["repaired"], 3)
+        self.assertFalse(saved["cancelled_by_clear"])
 
 
 if __name__ == "__main__":
