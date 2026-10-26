@@ -1860,6 +1860,7 @@ async def _schedule_recovery_channels(
     running: dict[asyncio.Task, str] = {}
     retry_at: dict[str, float] = {}
     queued_round = len(pending) > MAX_CONCURRENT_RECOVERY_CHANNELS
+    last_slot_snapshot: tuple[tuple[str, ...], tuple[str, ...]] | None = None
     try:
         while not should_stop():
             latest = get_audio_recovery_state()
@@ -1903,6 +1904,16 @@ async def _schedule_recovery_channels(
                     else:
                         repeats.append(channel_id)
 
+            slot_snapshot = (tuple(sorted(running.values())), tuple(pending))
+            if slot_snapshot != last_slot_snapshot:
+                logger.info(
+                    "Audio auto-recovery slots: active={}/{} channels={} waiting={} waiting_channels={}",
+                    len(running), MAX_CONCURRENT_RECOVERY_CHANNELS,
+                    ",".join(slot_snapshot[0]) or "none", len(pending),
+                    ",".join(pending) or "none",
+                )
+                last_slot_snapshot = slot_snapshot
+
             preferences = _scan_preferences_from_state(latest)
             _update_runtime_status(
                 channel_total=len(set(eligible) | set(running.values())),
@@ -1928,6 +1939,11 @@ async def _schedule_recovery_channels(
                 channel_id = running.pop(task)
                 task.result()
                 report = channel_results.get(channel_id) or {}
+                if report.get("submitted") or report.get("errors") or report.get("reason"):
+                    logger.info(
+                        "Audio auto-recovery channel pass finished: channel={} submitted={} errors={} active_other_channels={}",
+                        channel_id, report.get("submitted", 0), report.get("errors", 0), len(running),
+                    )
                 if not queued_round:
                     repeats.append(channel_id)
                     retry_at[channel_id] = time.monotonic() + (
