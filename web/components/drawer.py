@@ -230,14 +230,14 @@ def create_drawer():
 
             recovery_activity_container = ui.column().classes("w-full gap-1")
             recovery_activity_state = {
-                "notified_cycle": None,
+                "notified_start": False,
                 "was_active": False,
                 "quota_signature": None,
             }
             recovery_channel_names: dict[str, str] = {}
 
             with ui.dialog() as recovery_detail_dialog, ui.card().classes(
-                "w-[min(560px,calc(100vw-32px))] gap-3"
+                "w-[min(800px,calc(100vw-32px))] gap-3"
             ):
                 with ui.row().classes("w-full items-center justify-between no-wrap"):
                     with ui.row().classes("items-center gap-2 no-wrap"):
@@ -252,6 +252,18 @@ def create_drawer():
                 recovery_detail_status = ui.label().classes(
                     "text-sm font-medium text-blue-800"
                 )
+                recovery_detail_summary = ui.label().classes("text-xs text-gray-600")
+                recovery_channel_table = ui.table(
+                    columns=[
+                        {"name": "name", "label": "Kênh", "field": "name"},
+                        {"name": "channel_id", "label": "Channel ID", "field": "channel_id", "classes": "font-mono select-text"},
+                        {"name": "video_id", "label": "Video ID", "field": "video_id", "classes": "font-mono select-text"},
+                        {"name": "language", "label": "Ngôn ngữ", "field": "language"},
+                        {"name": "message", "label": "Tiến độ", "field": "message"},
+                        {"name": "transfer", "label": "Đã tải", "field": "transfer"},
+                    ],
+                    rows=[], row_key="channel_id",
+                ).props("dense flat").classes("w-full")
                 recovery_detail_progress = ui.linear_progress(value=0).props(
                     "rounded color=blue"
                 ).classes("w-full")
@@ -307,6 +319,24 @@ def create_drawer():
             def refresh_recovery_details(status: dict) -> None:
                 active = bool(status.get("active"))
                 phase = str(status.get("phase") or "idle")
+                recovery_detail_summary.set_text(
+                    f"Đang chạy {status.get('active_channel_count', 0)}/"
+                    f"{status.get('channel_concurrency', 3)} kênh cùng lúc · "
+                    f"Hoàn tất {status.get('completed_channel_count', 0)}/"
+                    f"{status.get('channel_total', 0)} kênh"
+                )
+                recovery_channel_table.update_rows([
+                    {
+                        **job,
+                        "name": get_recovery_channel_name(job["channel_id"]),
+                        "transfer": (
+                            f"{_format_transfer_size(job.get('upload_sent', 0))} / "
+                            f"{_format_transfer_size(job.get('upload_total', 0))}"
+                            if job.get("phase") == "uploading" else "—"
+                        ),
+                    }
+                    for job in status.get("channels", []) if active
+                ])
                 channel_id = str(status.get("channel_id") or "") if active else ""
                 video_id = str(status.get("video_id") or "") if active else ""
                 language = str(status.get("language") or "") if active else ""
@@ -338,13 +368,13 @@ def create_drawer():
                         "Đang kiểm tra và add lại phụ đề có trạng thái failed"
                     )
                 elif active:
-                    current = int(status.get("channel_index") or 0)
+                    current = int(status.get("completed_channel_count") or 0)
                     total = int(status.get("channel_total") or 0)
                     recovery_detail_progress.set_value(
                         current / total if phase == "scanning" and total else 0
                     )
                     recovery_detail_transfer.set_text(
-                        f"Đang quét kênh {current}/{total}"
+                        f"Đã hoàn tất {current}/{total} kênh"
                         if phase == "scanning" and total
                         else "Đang chuẩn bị audio để add lại"
                     )
@@ -362,7 +392,7 @@ def create_drawer():
                 status = get_audio_recovery_runtime_status()
                 active = bool(status.get("active"))
                 phase = str(status.get("phase") or "idle")
-                cycle_id = status.get("cycle_id")
+                processing_warning_count = int(status.get("processing_warning_count") or 0)
 
                 recovery_activity_container.clear()
                 with recovery_activity_container:
@@ -376,6 +406,12 @@ def create_drawer():
                                 ui.label(str(status.get("message") or "Đang tự động quét audio")) \
                                     .classes("text-xs font-semibold text-blue-900")
 
+                            ui.label(
+                                f"Đang chạy {status.get('active_channel_count', 0)}/"
+                                f"{status.get('channel_concurrency', 3)} kênh · "
+                                f"Hoàn tất {status.get('completed_channel_count', 0)}/"
+                                f"{status.get('channel_total', 0)}"
+                            ).classes("text-[11px] text-blue-800")
                             if phase == "uploading":
                                 sent = int(status.get("upload_sent") or 0)
                                 total = int(status.get("upload_total") or 0)
@@ -391,14 +427,14 @@ def create_drawer():
                                     f"Ngôn ngữ: {status.get('language') or '—'}"
                                 ).classes("text-[10px] text-blue-700 break-all")
                             elif phase == "scanning":
-                                current = int(status.get("channel_index") or 0)
+                                current = int(status.get("completed_channel_count") or 0)
                                 total = int(status.get("channel_total") or 0)
                                 fraction = current / total if total else 0
                                 ui.linear_progress(value=fraction).props(
                                     "rounded color=blue"
                                 ).classes("w-full mt-1")
                                 ui.label(
-                                    f"Kênh {current}/{total}" if total else "Đang đọc danh sách theo dõi..."
+                                    f"Đã hoàn tất {current}/{total} kênh" if total else "Đang đọc danh sách theo dõi..."
                                 ).classes("text-[11px] text-blue-800")
                             else:
                                 ui.linear_progress(value=0).props(
@@ -418,7 +454,7 @@ def create_drawer():
                         ).on("click", open_recovery_details):
                             with ui.row().classes("w-full items-center gap-2 no-wrap"):
                                 ui.icon("verified").classes("text-emerald-700")
-                                ui.label("Auto audio đang hoạt động").classes(
+                                ui.label("Auto audio đang quét liên tục").classes(
                                     "text-xs font-semibold text-emerald-900"
                                 )
                             finished_at = status.get("last_cycle_finished_at")
@@ -456,26 +492,34 @@ def create_drawer():
                                 "text-[11px] text-orange-900"
                             )
 
+                    if processing_warning_count:
+                        ui.label(
+                            f"{processing_warning_count} audio xử lý lâu: giữ nguyên track. "
+                            "Xem cảnh báo trong Auto Registry."
+                        ).classes("text-[11px] text-amber-800")
+
                 refresh_recovery_details(status)
 
-                if active and recovery_activity_state["notified_cycle"] != cycle_id:
+                if not status.get("monitor_running") and not active:
+                    recovery_activity_state["notified_start"] = False
+                if active and not recovery_activity_state["notified_start"]:
                     ui.notify(
-                        "Đang tự động quét audio và kiểm tra phụ đề vừa đăng...",
+                        "Đang quét audio liên tục và kiểm tra phụ đề vừa đăng...",
                         type="info",
                         timeout=3000,
                     )
-                    recovery_activity_state["notified_cycle"] = cycle_id
+                    recovery_activity_state["notified_start"] = True
                 elif recovery_activity_state["was_active"] and not active:
                     repaired = int(status.get("repaired") or 0)
                     failed = int(status.get("failed") or 0)
                     captions_repaired = int(status.get("captions_repaired") or 0)
                     captions_failed = int(status.get("captions_failed") or 0)
-                    if repaired or failed or captions_repaired or captions_failed:
+                    if repaired or failed or captions_repaired or captions_failed or processing_warning_count:
                         ui.notify(
                             str(status.get("message") or "Đã hoàn tất tự động khôi phục audio"),
                             type=(
                                 "positive"
-                                if failed == 0 and captions_failed == 0
+                                if failed == 0 and captions_failed == 0 and processing_warning_count == 0
                                 else "warning"
                             ),
                             timeout=5000,

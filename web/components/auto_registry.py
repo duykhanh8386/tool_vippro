@@ -69,6 +69,12 @@ def create_auto_registry_content(*, on_change: Callable[[], None] | None = None)
                     else "Kênh chưa được phép tự động quét" if not item["channel_enabled"]
                     else "Auto Registry đang tắt"
                 ),
+                "processing_warning": (
+                    "Đang xử lý lâu: "
+                    + ", ".join(warning["language"] for warning in item.get("processing_warnings") or [])
+                    + " · Giữ nguyên audio"
+                    if item.get("processing_warnings") else ""
+                ),
             }
             for item in video_items
         ]
@@ -85,6 +91,7 @@ def create_auto_registry_content(*, on_change: Callable[[], None] | None = None)
             f"{len(video_rows)} video · "
             f'{sum(item["enabled"] for item in video_items)} video được phép tự động quét'
             f' · {RECOVERY_VIDEO_SCOPE_LABELS[preferences["video_scan_scope"]]}'
+            f' · {sum(item.get("processing_warning_count", 0) for item in channel_items)} cảnh báo audio xử lý lâu'
             + (f' · {scan_date_label(preferences["scan_start_date"], date_type=preferences["scan_date_type"])}'
                if preferences["scan_start_date"] else "")
         )
@@ -331,6 +338,10 @@ def create_auto_registry_content(*, on_change: Callable[[], None] | None = None)
                 "flat round dense"
             ).tooltip("Làm mới Auto Registry")
         summary = ui.label("").classes("text-xs text-gray-500")
+        ui.label(
+            "Quét liên tục tối đa 3 kênh cùng lúc, tự xóa track lỗi và thêm lại audio. "
+            "Vòng tiếp theo bắt đầu ngay khi vòng trước hoàn tất."
+        ).classes("text-xs text-gray-500")
         ui.label("Loại video tự động quét").classes("text-sm font-medium")
         video_scope = ui.toggle(
             RECOVERY_VIDEO_SCOPE_LABELS,
@@ -350,6 +361,10 @@ def create_auto_registry_content(*, on_change: Callable[[], None] | None = None)
             "theo danh sách đã đăng ký, kể cả video toàn dấu “-”."
         ).classes("text-xs text-gray-500")
         ui.label(
+            "Audio đang xử lý lâu chỉ được cảnh báo và giữ nguyên track. "
+            "Thời gian xử lý lâu không làm tool tự xóa hoặc tải lại audio."
+        ).classes("text-xs text-amber-700")
+        ui.label(
             "Mặc định tự động quét tất cả các kênh Active. Kênh Deactive vẫn ở trong "
             "danh sách và có thể Active lại bằng nút; toàn bộ video của kênh Deactive "
             "được bỏ qua. Deactive video chỉ áp dụng cho ID đó. Trạng thái được lưu "
@@ -365,6 +380,7 @@ def create_auto_registry_content(*, on_change: Callable[[], None] | None = None)
                     {"name": "channel_id", "label": "Channel ID", "field": "channel_id", "classes": "font-mono select-text"},
                     {"name": "video_count", "label": "Tổng video", "field": "video_count"},
                     {"name": "active_video_count", "label": "Video được quét", "field": "active_video_count"},
+                    {"name": "processing_warning_count", "label": "Audio xử lý lâu", "field": "processing_warning_count"},
                     {"name": "status", "label": "Trạng thái", "field": "status"},
                     {"name": "actions", "label": "Thao tác", "field": "id", "sortable": False},
                 ])
@@ -374,6 +390,7 @@ def create_auto_registry_content(*, on_change: Callable[[], None] | None = None)
                     {"name": "channel_id", "label": "Channel ID", "field": "channel_id", "classes": "font-mono select-text"},
                     {"name": "name", "label": "Kênh", "field": "name"},
                     {"name": "languages", "label": "Ngôn ngữ audio", "field": "languages"},
+                    {"name": "processing_warning", "label": "Cảnh báo", "field": "processing_warning", "classes": "whitespace-normal text-amber-700"},
                     {"name": "status", "label": "Trạng thái", "field": "status"},
                     {"name": "actions", "label": "Thao tác", "field": "id", "sortable": False},
                 ])

@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 from src.audio_recovery import (
+    PROCESSING_WARNING_REASON,
     RECOVERY_SCAN_MODE_ALL,
     RECOVERY_SCAN_MODE_SELECTED,
     RECOVERY_VIDEO_SCOPE_BOTH,
@@ -63,6 +64,39 @@ class RegistryStorage:
 
 
 class AutoRegistryPersistenceTests(RegistryStorage, unittest.TestCase):
+    def test_legacy_scan_interval_migrates_to_continuous_without_changing_entries(self):
+        for interval in (15 * 60, 6 * 60 * 60):
+            with self.subTest(interval=interval):
+                self.manager.save_state("audio_recovery", {
+                    "entries": self.original_entries, "interval_seconds": interval,
+                })
+                state = get_audio_recovery_state()
+                self.assertEqual(state["interval_seconds"], 0)
+                self.assertEqual(state["entries"], self.original_entries)
+
+    def test_processing_warning_survives_restart_and_is_available_in_registry(self):
+        state = get_audio_recovery_state()
+        tracker = {
+            "language": "en", "track_ids": ["processing-en"],
+            "first_seen_at": 1000, "last_seen_at": 22600, "scan_count": 2,
+            "warning_reason": PROCESSING_WARNING_REASON, "warned_at": 22600,
+        }
+        state["entries"]["channel-a"]["video-shared"]["processing_observations"] = {"en": tracker}
+        self.assertTrue(self.manager.save_state("audio_recovery", state))
+        self.manager._conn.close()
+        self.manager._conn = None
+
+        channels, videos = get_audio_recovery_registry_items()
+        channel = next(item for item in channels if item["channel_id"] == "channel-a")
+        video = next(item for item in videos if item["channel_id"] == "channel-a"
+                     and item["video_id"] == "video-shared")
+        self.assertEqual(channel["processing_warning_count"], 1)
+        self.assertEqual(video["processing_warnings"], [{
+            "language": "en", "track_ids": ["processing-en"],
+            "reason": PROCESSING_WARNING_REASON,
+            "first_seen_at": 1000, "last_seen_at": 22600, "warned_at": 22600,
+        }])
+
     def test_video_scope_survives_restart_without_changing_channel_preferences(self):
         set_audio_recovery_scan_preferences(
             scan_mode=RECOVERY_SCAN_MODE_SELECTED, selected_channel_ids=["channel-a"]
@@ -506,6 +540,30 @@ class AutoRegistryCycleTests(RegistryStorage, unittest.IsolatedAsyncioTestCase):
 
 
 class AutoRegistryUiTests(RegistryStorage, unittest.TestCase):
+    def test_processing_warning_is_displayed_and_clears_when_resolved(self):
+        state = get_audio_recovery_state()
+        entry = state["entries"]["channel-a"]["video-shared"]
+        entry["processing_observations"] = {"en": {
+            "language": "en", "track_ids": ["processing-en"],
+            "warning_reason": PROCESSING_WARNING_REASON,
+        }}
+        self.manager.save_state("audio_recovery", state)
+        with self.client:
+            self.refresh()
+        channels, videos = self.tables
+        channel = next(item for item in channels.rows if item["channel_id"] == "channel-a")
+        video = next(item for item in videos.rows if item["channel_id"] == "channel-a"
+                     and item["video_id"] == "video-shared")
+        self.assertEqual(channel["processing_warning_count"], 1)
+        self.assertEqual(video["processing_warning"], "Đang xử lý lâu: en · Giữ nguyên audio")
+
+        entry.pop("processing_observations")
+        self.manager.save_state("audio_recovery", state)
+        with self.client:
+            self.refresh()
+        self.assertTrue(all(item["processing_warning_count"] == 0 for item in channels.rows))
+        self.assertTrue(all(item["processing_warning"] == "" for item in videos.rows))
+
     def setUp(self):
         super().setUp()
         from nicegui import Client, ui

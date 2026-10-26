@@ -10,6 +10,8 @@ from src.audio_recovery import (
     DEFAULT_RECOVERY_INTERVAL_SECONDS,
     DEFAULT_RECOVERY_RETRY_COOLDOWN_SECONDS,
     DEFAULT_STALE_PROCESSING_SECONDS,
+    MONITOR_IDLE_POLL_SECONDS,
+    PROCESSING_WARNING_REASON,
     RECOVERY_SCAN_MODE_ALL,
     RECOVERY_SCAN_MODE_SELECTED,
     RECOVERY_VIDEO_SCOPE_BOTH,
@@ -36,8 +38,8 @@ from src.audio_recovery import (
 
 
 class AudioRecoveryPlanTests(unittest.TestCase):
-    def test_default_monitor_checks_and_retries_every_fifteen_minutes(self):
-        self.assertEqual(DEFAULT_RECOVERY_INTERVAL_SECONDS, 15 * 60)
+    def test_default_monitor_is_continuous_with_separate_track_retry_delay(self):
+        self.assertEqual(DEFAULT_RECOVERY_INTERVAL_SECONDS, 0)
         self.assertEqual(DEFAULT_RECOVERY_RETRY_COOLDOWN_SECONDS, 15 * 60)
         self.assertEqual(DEFAULT_INITIAL_RECOVERY_GRACE_SECONDS, 15 * 60)
         self.assertEqual(DEFAULT_STALE_PROCESSING_SECONDS, 6 * 60 * 60)
@@ -342,7 +344,7 @@ class AudioRecoveryPlanTests(unittest.TestCase):
         self.assertEqual(stale_actions, [])
         self.assertNotIn("processing_observations", entries["video"])
 
-    def test_same_processing_track_becomes_stale_only_after_timeout(self):
+    def test_same_processing_track_only_warns_after_timeout(self):
         entries = {"video": {"languages": ["it"]}}
         payload = {
             "videoTranslations": [
@@ -387,6 +389,7 @@ class AudioRecoveryPlanTests(unittest.TestCase):
                 "src.audio_recovery.state_manager.save_state",
                 return_value=True,
             ) as save,
+            patch("src.audio_recovery.logger.warning") as warn,
         ):
             first = _record_processing_observations(
                 channel_id="channel",
@@ -394,22 +397,30 @@ class AudioRecoveryPlanTests(unittest.TestCase):
                 observations=observations,
                 observed_at=1000,
             )
-            stale = _record_processing_observations(
+            warning = _record_processing_observations(
                 channel_id="channel",
                 requested_entries=entries,
                 observations=observations,
                 observed_at=1000 + DEFAULT_STALE_PROCESSING_SECONDS,
             )
+            repeated = _record_processing_observations(
+                channel_id="channel",
+                requested_entries=entries,
+                observations=observations,
+                observed_at=1000 + 2 * DEFAULT_STALE_PROCESSING_SECONDS,
+            )
 
         self.assertEqual(first, [])
         self.assertEqual(
-            stale,
+            warning,
             [
                 {
+                    "channel_id": "channel",
                     "video_id": "video",
                     "language": "it",
                     "track_ids": ["processing-it"],
-                    "reason": "stale_processing",
+                    "reason": PROCESSING_WARNING_REASON,
+                    "age_seconds": DEFAULT_STALE_PROCESSING_SECONDS,
                 }
             ],
         )
@@ -417,8 +428,13 @@ class AudioRecoveryPlanTests(unittest.TestCase):
             "processing_observations"
         ]["it"]
         self.assertEqual(tracker["first_seen_at"], 1000)
-        self.assertEqual(tracker["scan_count"], 2)
-        self.assertEqual(save.call_count, 2)
+        self.assertEqual(tracker["scan_count"], 3)
+        self.assertEqual(tracker["warning_reason"], PROCESSING_WARNING_REASON)
+        self.assertEqual(tracker["warned_at"], 1000 + DEFAULT_STALE_PROCESSING_SECONDS)
+        self.assertEqual(repeated[0]["reason"], PROCESSING_WARNING_REASON)
+        self.assertEqual(repeated[0]["age_seconds"], 2 * DEFAULT_STALE_PROCESSING_SECONDS)
+        self.assertEqual(save.call_count, 3)
+        warn.assert_called_once()
 
     def test_changed_processing_track_restarts_stale_clock(self):
         entries = {"video": {"languages": ["it"]}}
@@ -434,6 +450,8 @@ class AudioRecoveryPlanTests(unittest.TestCase):
                                 "first_seen_at": 1000,
                                 "last_seen_at": 1000,
                                 "scan_count": 10,
+                                "warning_reason": PROCESSING_WARNING_REASON,
+                                "warned_at": 1000,
                             }
                         },
                     }
@@ -470,6 +488,8 @@ class AudioRecoveryPlanTests(unittest.TestCase):
         self.assertEqual(tracker["track_ids"], ["new-track"])
         self.assertEqual(tracker["first_seen_at"], 1000 + DEFAULT_STALE_PROCESSING_SECONDS)
         self.assertEqual(tracker["scan_count"], 1)
+        self.assertNotIn("warning_reason", tracker)
+        self.assertNotIn("warned_at", tracker)
 
 
 class AudioRecoveryRegistryTests(unittest.TestCase):
@@ -1095,7 +1115,7 @@ class AudioRecoveryCycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(added.call_args.kwargs["language"], "en")
         self.assertEqual(result["scope_skipped_channel_ids"], ["channel"])
 
-    async def test_cycle_replaces_only_same_track_stuck_past_timeout(self):
+    async def test_cycle_warns_without_replacing_long_processing_track(self):
         with tempfile.TemporaryDirectory() as folder:
             source = Path(folder) / "source.mp3"
             source.write_bytes(b"source")
@@ -1166,7 +1186,7 @@ class AudioRecoveryCycleTests(unittest.IsolatedAsyncioTestCase):
                     ).update_audio_module,
                     "_get_video_info",
                     return_value=SimpleNamespace(duration_ms=60_000),
-                ),
+                ) as info,
                 patch.object(
                     __import__(
                         "src.audio_recovery", fromlist=["update_audio_module"]
@@ -1184,27 +1204,54 @@ class AudioRecoveryCycleTests(unittest.IsolatedAsyncioTestCase):
                 patch(
                     "src.audio_recovery.multiply_audio",
                     side_effect=render_audio,
-                ),
+                ) as render,
                 patch(
                     "src.audio_recovery.call_audio_update_with_retry",
                     new=AsyncMock(side_effect=run_retry),
                 ),
             ):
                 first = await run_audio_recovery_cycle(now=1000)
-                stale = await run_audio_recovery_cycle(now=1060)
+                self.assertEqual(first["scanned_channels"], 1)
+                warning = await run_audio_recovery_cycle(now=1060)
+                repeated = await run_audio_recovery_cycle(now=2000)
+                entry = state["entries"]["channel"]["video"]
+                tracker = entry["processing_observations"]["it"]
+                self.assertEqual(tracker["warned_at"], 1060)
+                self.assertEqual(tracker["warning_reason"], PROCESSING_WARNING_REASON)
+                self.assertEqual(tracker["track_ids"], ["processing-it"])
+                self.assertEqual(entry["attempts"], {})
+                self.assertEqual(
+                    state["last_cycle_result"]["processing_warnings"],
+                    repeated["processing_warnings"],
+                )
+                self.assertEqual(get_audio_recovery_runtime_status()["processing_warning_count"], 1)
+
+                # Old installations already have aged trackers without warning metadata.
+                tracker.pop("warning_reason")
+                tracker.pop("warned_at")
+                legacy = await run_audio_recovery_cycle(now=100000)
+                self.assertEqual(entry["processing_observations"]["it"]["warned_at"], 100000)
+
+                # A completed track clears the warning on the next scan.
+                payload["videoTranslations"][0]["translations"][0]["audioTranslation"] = {
+                    "audioTrackId": "processing-it", "publishStatus": "PUBLISHED",
+                }
+                healthy = await run_audio_recovery_cycle(now=100060)
 
         self.assertEqual(first["repaired"], 0)
-        self.assertEqual(stale["repaired"], 1)
-        deleted.assert_called_once_with(
-            "video",
-            "channel",
-            ["processing-it"],
-        )
-        self.assertEqual(added.call_args.kwargs["language"], "it")
-        self.assertNotIn(
-            "processing_observations",
-            state["entries"]["channel"]["video"],
-        )
+        self.assertEqual(first["processing_warnings"], [])
+        for result in (warning, repeated, legacy):
+            self.assertEqual(result["repaired"], 0)
+            self.assertEqual(result["failed"], 0)
+            self.assertEqual(len(result["processing_warnings"]), 1)
+            self.assertEqual(result["processing_warnings"][0]["reason"], PROCESSING_WARNING_REASON)
+        deleted.assert_not_called()
+        added.assert_not_called()
+        info.assert_not_called()
+        render.assert_not_called()
+        self.assertEqual(healthy["processing_warnings"], [])
+        self.assertNotIn("processing_observations", entry)
+        self.assertEqual(get_audio_recovery_runtime_status()["processing_warning_count"], 0)
 
     async def test_caption_monitor_repairs_only_explicit_failed_tracks(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -1392,6 +1439,96 @@ class AudioRecoveryCycleTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(_monitor_loop(stop_event), timeout=0.2)
 
         cycle.assert_awaited_once_with()
+
+    async def test_monitor_repeats_as_soon_as_previous_scan_finishes_without_overlap(self):
+        for deferred_busy in (0, 1):
+            with self.subTest(deferred_busy=deferred_busy):
+                stop_event = asyncio.Event()
+                first_started = asyncio.Event()
+                finish_first = asyncio.Event()
+                calls = 0
+
+                async def scan():
+                    nonlocal calls
+                    calls += 1
+                    if calls == 1:
+                        first_started.set()
+                        await finish_first.wait()
+                    else:
+                        stop_event.set()
+                    return {"scanned_channels": 1, "deferred_busy": deferred_busy}
+
+                cycle = AsyncMock(side_effect=scan)
+                with (
+                    patch("src.audio_recovery.run_audio_recovery_cycle", cycle),
+                    patch("src.audio_recovery.get_audio_recovery_state", return_value={
+                        "interval_seconds": 15 * 60,
+                    }),
+                ):
+                    task = asyncio.create_task(_monitor_loop(stop_event))
+                    try:
+                        await asyncio.wait_for(first_started.wait(), timeout=0.5)
+                        await asyncio.sleep(0)
+                        self.assertEqual(cycle.await_count, 1)
+                        finish_first.set()
+                        await asyncio.wait_for(task, timeout=0.5)
+                    finally:
+                        if not task.done():
+                            task.cancel()
+                            with self.assertRaises(asyncio.CancelledError):
+                                await task
+                self.assertEqual(cycle.await_count, 2)
+
+    async def test_monitor_waits_briefly_when_no_scan_can_run_or_response_is_unreadable(self):
+        results = [
+            {"skipped": "disabled"}, {"skipped": "empty"},
+            {"skipped": "no_selected_channels"},
+            {"scanned_channels": 0, "deferred_busy": 1},
+            {"scanned_channels": 0, "reauth_required": ["channel"]},
+            {"scanned_channels": 1, "unreadable": ["video"]},
+        ]
+        for result in results:
+            with self.subTest(result=result):
+                stop_event = asyncio.Event()
+
+                async def stop_when_idle(awaitable, *, timeout):
+                    stop_event.set()
+                    return await awaitable
+
+                with (
+                    patch("src.audio_recovery.run_audio_recovery_cycle", new=AsyncMock(return_value=result)) as cycle,
+                    patch("src.audio_recovery.asyncio.wait_for", new=AsyncMock(side_effect=stop_when_idle)) as wait,
+                ):
+                    await _monitor_loop(stop_event)
+                cycle.assert_awaited_once_with()
+                self.assertEqual(wait.await_args.kwargs["timeout"], MONITOR_IDLE_POLL_SECONDS)
+
+    async def test_monitor_waits_after_unexpected_error_and_stops_during_idle_wait(self):
+        stop_event = asyncio.Event()
+        wait_for = asyncio.wait_for
+        with patch("src.audio_recovery.run_audio_recovery_cycle", new=AsyncMock(side_effect=RuntimeError("offline"))) as cycle:
+            task = asyncio.create_task(_monitor_loop(stop_event))
+            try:
+                await asyncio.sleep(0)
+                self.assertEqual(cycle.await_count, 1)
+                stop_event.set()
+                await wait_for(task, timeout=0.5)
+            finally:
+                if not task.done():
+                    task.cancel()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await task
+        cycle.assert_awaited_once_with()
+
+    async def test_monitor_propagates_cancellation_without_starting_another_scan(self):
+        with (
+            patch("src.audio_recovery.run_audio_recovery_cycle", new=AsyncMock(side_effect=asyncio.CancelledError)) as cycle,
+            patch("src.audio_recovery.asyncio.wait_for", new=AsyncMock()) as wait,
+        ):
+            with self.assertRaises(asyncio.CancelledError):
+                await _monitor_loop(asyncio.Event())
+        cycle.assert_awaited_once_with()
+        wait.assert_not_awaited()
 
     async def test_non_public_video_stays_registered_until_it_becomes_public(self):
         state = {
