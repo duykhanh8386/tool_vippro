@@ -275,7 +275,7 @@ def create_drawer():
                         {"name": "video_id", "label": "Video ID", "field": "video_id", "classes": "font-mono select-text"},
                         {"name": "language", "label": "Ngôn ngữ", "field": "language"},
                         {"name": "message", "label": "Tiến độ / Kết quả", "field": "message", "classes": "whitespace-normal", "style": "min-width: 200px; max-width: 350px"},
-                        {"name": "transfer", "label": "Đã tải", "field": "transfer"},
+                        {"name": "transfer", "label": "Tiến độ file", "field": "transfer"},
                     ],
                     rows=[], row_key="channel_id",
                 ).props("dense flat").classes("w-full")
@@ -346,7 +346,10 @@ def create_drawer():
                         "transfer": (
                             f"{_format_transfer_size(job.get('upload_sent', 0))} / "
                             f"{_format_transfer_size(job.get('upload_total', 0))}"
-                            if job.get("phase") == "uploading" else "—"
+                            if job.get("phase") == "uploading" else
+                            f"Đã tạo {_format_transfer_size(job.get('preparation_bytes', 0))} · "
+                            f"{job.get('preparation_elapsed_seconds', 0)} giây"
+                            if job.get("phase") == "preparing" else "—"
                         ),
                     }
                     for job in status.get("channels", []) if active
@@ -372,6 +375,7 @@ def create_drawer():
                 recovery_detail_video_id.set_text(video_id or "—")
                 recovery_detail_language.set_text(language or "—")
 
+                recovery_detail_progress.props(remove="indeterminate")
                 if phase == "uploading" and active:
                     fraction = float(status.get("upload_fraction") or 0)
                     sent = int(status.get("upload_sent") or 0)
@@ -382,6 +386,13 @@ def create_drawer():
                     recovery_detail_transfer.set_text(
                         f"Audio {repair_index}/{repair_total} · "
                         f"{_format_transfer_size(sent)} / {_format_transfer_size(total)}"
+                    )
+                elif phase == "preparing" and active:
+                    recovery_detail_progress.props("indeterminate")
+                    recovery_detail_transfer.set_text(
+                        f"{status.get('message', '')} · "
+                        f"Đã tạo {_format_transfer_size(status.get('preparation_bytes', 0))} · "
+                        f"{status.get('preparation_elapsed_seconds', 0)} giây"
                     )
                 elif phase == "captioning" and active:
                     recovery_detail_progress.set_value(0)
@@ -458,6 +469,11 @@ def create_drawer():
                                 ui.linear_progress(value=0).props(
                                     "indeterminate rounded color=blue"
                                 ).classes("w-full mt-1")
+                                if phase == "preparing":
+                                    ui.label(
+                                        f"Đã tạo {_format_transfer_size(status.get('preparation_bytes', 0))} · "
+                                        f"{status.get('preparation_elapsed_seconds', 0)} giây"
+                                    ).classes("text-[11px] text-blue-800")
                                 if status.get("video_id"):
                                     ui.label(
                                         f"Video: {status['video_id']}"

@@ -60,6 +60,7 @@ async def call_audio_update_with_retry(
     base_delay: float = 2.0,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     on_retry: Callable[[int, float, BaseException], None] | None = None,
+    run_blocking: Callable[[Callable[[], int]], Awaitable[int]] | None = None,
 ) -> int:
     """Run one blocking audio update with exponential backoff.
 
@@ -70,7 +71,7 @@ async def call_audio_update_with_retry(
     """
     for attempt in range(max_retries + 1):
         try:
-            status = await asyncio.to_thread(operation)
+            status = await (run_blocking or asyncio.to_thread)(operation)
             if status in (200, 409):
                 return status
             error = RuntimeError(f"YouTube returned HTTP {status}")

@@ -2,6 +2,7 @@ import asyncio
 import tempfile
 import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -158,6 +159,36 @@ class AudioRecoveryConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status["active_channel_count"], 0)
         self.assertEqual(status["channels"], [])
 
+    async def test_busy_application_thread_pool_does_not_block_recovery_channels(self):
+        loop = asyncio.get_running_loop()
+        loop.set_default_executor(ThreadPoolExecutor(max_workers=1))
+        default_worker_started = asyncio.Event()
+        release_default_worker = threading.Event()
+
+        def occupy_application_worker():
+            loop.call_soon_threadsafe(default_worker_started.set)
+            if not release_default_worker.wait(timeout=5):
+                raise AssertionError("Test did not release application worker")
+
+        async def wait_for_recovery_uploads():
+            while not self.first_three_uploads.is_set():
+                await asyncio.sleep(0.01)
+
+        busy_task = asyncio.create_task(asyncio.to_thread(occupy_application_worker))
+        await asyncio.wait_for(default_worker_started.wait(), timeout=1)
+        self.release_uploads.clear()
+        task = asyncio.create_task(run_audio_recovery_cycle(now=2000))
+        try:
+            await asyncio.wait_for(wait_for_recovery_uploads(), timeout=1)
+            self.assertFalse(busy_task.done())
+            self.assertEqual(get_audio_recovery_runtime_status()["active_channel_count"], 3)
+        finally:
+            release_default_worker.set()
+            self.release_uploads.set()
+            await asyncio.wait_for(busy_task, timeout=3)
+            result = await asyncio.wait_for(task, timeout=4)
+        self.assertEqual(result["repaired"], 10)
+
     async def test_upload_failure_does_not_stop_other_channels_or_lose_saved_attempts(self):
         self.fail_channel = self.channels[0]
         result = await run_audio_recovery_cycle(now=2000)
@@ -169,6 +200,67 @@ class AudioRecoveryConcurrencyTests(unittest.IsolatedAsyncioTestCase):
             attempts = entries[channel_id][f"{channel_id}-video"]["attempts"]
             self.assertEqual(attempts["en"]["succeeded"], channel_id != self.fail_channel)
             self.assertTrue(attempts["es"]["succeeded"])
+
+    async def test_channel_can_prepare_and_upload_while_another_upload_is_blocked(self):
+        self.channels = self.channels[:2]
+        loop = asyncio.get_running_loop()
+        loop.set_default_executor(ThreadPoolExecutor(max_workers=1))
+        other_source = Path(self.folder.name) / "source-b.mp3"
+        other_source.write_bytes(b"source")
+        state = get_audio_recovery_state()
+        state["entries"] = {channel: state["entries"][channel] for channel in self.channels}
+        state["entries"][self.channels[1]][f"{self.channels[1]}-video"]["audio_path"] = str(other_source)
+        self.manager.save_state("audio_recovery", state)
+
+        upload_started = asyncio.Event()
+        other_render_started = asyncio.Event()
+        other_upload_started = asyncio.Event()
+        release_upload = threading.Event()
+        release_render = threading.Event()
+        render = self.mocks["multiply_audio"].side_effect
+        upload = self.mocks["update_audio_module.add"].side_effect
+
+        def controlled_render(**kwargs):
+            render(**kwargs)
+            if Path(kwargs["input_file"]).name == other_source.name:
+                loop.call_soon_threadsafe(other_render_started.set)
+                if not release_render.wait(timeout=5):
+                    raise AssertionError("Test did not release rendering")
+
+        def controlled_upload(**kwargs):
+            if kwargs["channel_id"] == self.channels[0] and kwargs["language"] == "en":
+                loop.call_soon_threadsafe(upload_started.set)
+                if not release_upload.wait(timeout=5):
+                    raise AssertionError("Test did not release upload")
+            if kwargs["channel_id"] == self.channels[1]:
+                loop.call_soon_threadsafe(other_upload_started.set)
+            return upload(**kwargs)
+
+        self.mocks["multiply_audio"].side_effect = controlled_render
+        self.mocks["update_audio_module.add"].side_effect = controlled_upload
+        task = asyncio.create_task(run_audio_recovery_cycle(now=2000))
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(upload_started.wait(), other_render_started.wait()), timeout=3,
+            )
+            status = get_audio_recovery_runtime_status()
+            jobs = {job["channel_id"]: job for job in status["channels"]}
+            self.assertEqual(jobs[self.channels[0]]["phase"], "uploading")
+            preparing = jobs[self.channels[1]]
+            self.assertEqual(preparing["phase"], "preparing")
+            self.assertEqual(preparing["preparation_stage"], "rendering")
+            self.assertEqual(preparing["preparation_bytes"], 200)
+            self.assertGreaterEqual(preparing["preparation_elapsed_seconds"], 0)
+            self.assertNotIn("_preparation_output_path", preparing)
+            release_render.set()
+            await asyncio.wait_for(other_upload_started.wait(), timeout=3)
+            self.assertFalse(release_upload.is_set())
+            self.assertTrue(get_audio_mutation_guard(self.channels[0]).locked())
+        finally:
+            release_render.set()
+            release_upload.set()
+            result = await self.finish_cycle(task)
+        self.assertEqual(result["repaired"], 4)
 
     async def test_two_channels_can_show_one_finished_while_other_is_still_uploading(self):
         self.channels = self.channels[:2]

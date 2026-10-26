@@ -16,7 +16,9 @@ import re
 import tempfile
 import threading
 import time
-from contextvars import ContextVar
+from concurrent.futures import ThreadPoolExecutor
+from contextvars import ContextVar, copy_context
+from functools import partial
 from pathlib import Path
 from typing import Callable, Iterable, Mapping
 
@@ -91,6 +93,9 @@ _RUNTIME_STATUS_LOCK = threading.RLock()
 _RUNTIME_CHANNEL_CONTEXT: ContextVar[tuple[int, str] | None] = ContextVar(
     "audio_recovery_channel", default=None
 )
+_RECOVERY_WORKER_POOL: ContextVar[ThreadPoolExecutor | None] = ContextVar(
+    "audio_recovery_worker_pool", default=None
+)
 _RUNTIME_STATUS = {
     "monitor_running": False,
     "active": False,
@@ -123,6 +128,17 @@ _RUNTIME_STATUS = {
     "selected_channel_ids": [],
     "_upload_progress": None,
 }
+
+
+async def _run_recovery_blocking(operation, *args, **kwargs):
+    """Reserve worker capacity for registry channels, including their uploads."""
+    pool = _RECOVERY_WORKER_POOL.get()
+    if pool is None:
+        return await asyncio.to_thread(operation, *args, **kwargs)
+    context = copy_context()
+    return await asyncio.get_running_loop().run_in_executor(
+        pool, context.run, partial(operation, *args, **kwargs)
+    )
 
 
 def _update_runtime_status(**changes) -> None:
@@ -167,6 +183,20 @@ def _with_upload_progress(snapshot: dict) -> dict:
     snapshot["upload_total"] = total
     snapshot["upload_status"] = str(upload.get("status") or "")
     snapshot["upload_fraction"] = min(1.0, sent / total) if total else 0.0
+    output_path = snapshot.pop("_preparation_output_path", None)
+    snapshot["preparation_elapsed_seconds"] = 0
+    snapshot["preparation_bytes"] = 0
+    if snapshot.get("phase") == "preparing":
+        try:
+            started_at = float(snapshot.get("preparation_started_at") or time.time())
+            snapshot["preparation_elapsed_seconds"] = max(0, int(time.time() - started_at))
+        except (ValueError, TypeError):
+            pass
+        if output_path:
+            try:
+                snapshot["preparation_bytes"] = Path(output_path).stat().st_size
+            except OSError:
+                pass
     return snapshot
 
 
@@ -1632,7 +1662,7 @@ async def _monitor_failed_caption_tracks(
                 language="",
             )
             client = YouTubeCaptionClient(channel_id)
-            tracks = await asyncio.to_thread(client.list_tracks, video_id)
+            tracks = await _run_recovery_blocking(client.list_tracks, video_id)
             tracks_by_language = {
                 client.track_language(track).casefold(): track
                 for track in tracks
@@ -1669,7 +1699,7 @@ async def _monitor_failed_caption_tracks(
                         break
                     if not video_can_continue(video_id):
                         continue
-                    await asyncio.to_thread(
+                    await _run_recovery_blocking(
                         client.upsert_track,
                         video_id=video_id,
                         language=source_language,
@@ -1694,14 +1724,14 @@ async def _monitor_failed_caption_tracks(
                     if source_status != "serving":
                         continue
                     _update_runtime_status(language=language)
-                    translated = await asyncio.to_thread(
+                    translated = await _run_recovery_blocking(
                         client.download_translation,
                         str(source_track.get("id") or ""),
                         language,
                     )
                     if not can_continue() or not video_can_continue(video_id):
                         break
-                    await asyncio.to_thread(
+                    await _run_recovery_blocking(
                         client.upsert_track,
                         video_id=video_id,
                         language=language,
@@ -1814,6 +1844,7 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
     deferred_visibility_unknown = 0
     scope_skipped_channel_ids: set[str] = set()
     cancelled_by_clear = False
+    worker_pool: ThreadPoolExecutor | None = None
     _update_runtime_status(
         active=True,
         phase="scanning",
@@ -1899,6 +1930,10 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
             message=f"Đang tự động quét {channel_total} kênh...",
         )
         logger.info("Audio auto-recovery scan started for {} channel(s).", len(entries_by_channel))
+        worker_pool = ThreadPoolExecutor(
+            max_workers=MAX_CONCURRENT_RECOVERY_CHANNELS,
+            thread_name_prefix="audio-recovery",
+        )
         semaphore = asyncio.Semaphore(MAX_CONCURRENT_RECOVERY_CHANNELS)
         cycle_cancelled = False
 
@@ -1914,6 +1949,7 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
                 if should_stop():
                     return
                 context_token = _RUNTIME_CHANNEL_CONTEXT.set((cycle_id, channel_id))
+                pool_token = _RECOVERY_WORKER_POOL.set(worker_pool)
                 owned_mutation_guard: threading.Lock | None = None
                 channel_result = {
                     "channel_id": channel_id, "scanned_videos": 0,
@@ -1988,7 +2024,7 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
                         (
                             matches_by_video_id,
                             unresolved_video_ids,
-                        ) = await asyncio.to_thread(
+                        ) = await _run_recovery_blocking(
                             _get_registered_video_scan_statuses,
                             channel_id,
                             video_ids,
@@ -2103,7 +2139,7 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
                         if not chunk:
                             continue
                         try:
-                            payload = await asyncio.to_thread(
+                            payload = await _run_recovery_blocking(
                                 update_audio_module._get_video_translation_payload,
                                 chunk,
                                 channel_id,
@@ -2215,10 +2251,15 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
                             continue
 
                         temp_audio_path: Path | None = None
+                        preparation_stage = "metadata"
+                        preparation_started = time.monotonic()
                         try:
                             _update_runtime_status(
                                 phase="preparing",
-                                message="Đang chuẩn bị file audio để tự động add lại",
+                                message="Đang đọc thời lượng video từ YouTube",
+                                preparation_stage=preparation_stage,
+                                preparation_started_at=time.time(),
+                                _preparation_output_path=None,
                                 channel_id=channel_id,
                                 video_id=video_id,
                                 language="",
@@ -2226,7 +2267,11 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
                                 repair_total=len(actions),
                                 _upload_progress=None,
                             )
-                            video_info = await asyncio.to_thread(
+                            logger.info(
+                                "Audio auto-recovery preparation started: channel={} video={} stage=metadata",
+                                channel_id, video_id,
+                            )
+                            video_info = await _run_recovery_blocking(
                                 update_audio_module._get_video_info,
                                 video_id=video_id,
                                 channel_id=channel_id,
@@ -2238,13 +2283,28 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
                             )
                             with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as temp_file:
                                 temp_audio_path = Path(temp_file.name)
-                            await asyncio.to_thread(
+                            preparation_stage = "rendering"
+                            _update_runtime_status(
+                                message="Đang tạo file MP3 cho video",
+                                preparation_stage=preparation_stage,
+                                _preparation_output_path=str(temp_audio_path),
+                            )
+                            logger.info(
+                                "Audio auto-recovery preparation stage: channel={} video={} stage=rendering "
+                                "metadata_seconds={:.1f}",
+                                channel_id, video_id, time.monotonic() - preparation_started,
+                            )
+                            await _run_recovery_blocking(
                                 multiply_audio,
                                 input_file=normalize_path(str(audio_path)),
                                 output_file=str(temp_audio_path),
                                 times=max(1, int(entry.get("repeat_times") or 1)),
                                 extra_minutes=max(0.0, float(entry.get("extra_minutes") or 0)),
                                 video_duration_seconds=duration_seconds,
+                            )
+                            logger.info(
+                                "Audio auto-recovery preparation finished: channel={} video={} elapsed_seconds={:.1f}",
+                                channel_id, video_id, time.monotonic() - preparation_started,
                             )
 
                             for action_index, action in enumerate(actions):
@@ -2308,7 +2368,8 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
                                                 video_id,
                                                 channel_id,
                                                 action["track_ids"],
-                                            )
+                                            ),
+                                            run_blocking=_run_recovery_blocking,
                                         )
                                     await call_audio_update_with_retry(
                                         lambda language=language: update_audio_module.add(
@@ -2318,7 +2379,8 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
                                             language=language,
                                             data=None,
                                             progress=upload_progress,
-                                        )
+                                        ),
+                                        run_blocking=_run_recovery_blocking,
                                     )
                                     repaired += 1
                                     channel_result["submitted"] += 1
@@ -2376,9 +2438,10 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
                                 mark_channel_refresh_required(channel_id, exc, now=cycle_time)
                                 channel_requires_refresh = True
                             logger.error(
-                                "Audio auto-recovery preparation failed: channel={} video={} error={}",
+                                "Audio auto-recovery preparation failed: channel={} video={} stage={} error={}",
                                 channel_id,
                                 video_id,
+                                preparation_stage,
                                 exc,
                             )
                             for action in actions:
@@ -2417,6 +2480,7 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
                     _summarize_channel_result(channel_result)
                     channel_results[channel_id] = channel_result
                     _finish_channel_runtime_status(cycle_id, channel_id, channel_result)
+                    _RECOVERY_WORKER_POOL.reset(pool_token)
                     _RUNTIME_CHANNEL_CONTEXT.reset(context_token)
 
         channel_tasks = [
@@ -2487,6 +2551,8 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
         final_message = "Vòng quét tự động gặp lỗi"
         raise
     finally:
+        if worker_pool is not None:
+            worker_pool.shutdown(wait=False, cancel_futures=True)
         with _RUNTIME_STATUS_LOCK:
             if _RUNTIME_STATUS.get("cycle_id") == cycle_id:
                 _RUNTIME_STATUS.update(
