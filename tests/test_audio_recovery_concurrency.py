@@ -170,6 +170,154 @@ class AudioRecoveryConcurrencyTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(attempts["en"]["succeeded"], channel_id != self.fail_channel)
             self.assertTrue(attempts["es"]["succeeded"])
 
+    async def test_two_channels_can_show_one_finished_while_other_is_still_uploading(self):
+        self.channels = self.channels[:2]
+        state = get_audio_recovery_state()
+        state["entries"] = {channel: state["entries"][channel] for channel in self.channels}
+        self.manager.save_state("audio_recovery", state)
+        release_slow_channel = threading.Event()
+        upload = self.mocks["update_audio_module.add"].side_effect
+
+        def upload_with_slow_channel(**kwargs):
+            if kwargs["channel_id"] == self.channels[1] and kwargs["language"] == "en":
+                if not release_slow_channel.wait(timeout=5):
+                    raise AssertionError("Test did not release slow channel")
+            return upload(**kwargs)
+
+        async def wait_for_first_channel_to_finish():
+            while True:
+                status = get_audio_recovery_runtime_status()
+                if status["completed_channel_count"] == 1 and status["active_channel_count"] == 1:
+                    return status
+                await asyncio.sleep(0.01)
+
+        self.mocks["update_audio_module.add"].side_effect = upload_with_slow_channel
+        task = asyncio.create_task(run_audio_recovery_cycle(now=2000))
+        try:
+            status = await asyncio.wait_for(wait_for_first_channel_to_finish(), timeout=3)
+            self.assertEqual(status["channel_total"], 2)
+            self.assertEqual(status["channel_concurrency"], 3)
+            self.assertEqual(len(status["channels"]), 1)
+            self.assertEqual(status["channels"][0]["channel_id"], self.channels[1])
+            self.assertEqual(len(status["channel_results"]), 1)
+            finished = status["channel_results"][0]
+            self.assertEqual(finished["channel_id"], self.channels[0])
+            self.assertEqual(finished["submitted"], 2)
+            self.assertEqual(finished["outcome"], "submitted")
+            self.assertIn("chờ YouTube xử lý", finished["message"])
+            self.assertEqual(self.mocks["_get_registered_video_scan_statuses"].call_count, 2)
+            self.assertEqual(self.events[self.channels[0]], [
+                ("delete", "en"), ("add", "en"), ("delete", "es"), ("add", "es"),
+            ])
+        finally:
+            release_slow_channel.set()
+            result = await self.finish_cycle(task)
+        self.assertEqual(result["repaired"], 4)
+        self.assertEqual(result["scanned_channels"], 2)
+
+    async def test_dns_failure_remains_visible_after_channel_finishes_and_is_saved(self):
+        failed_channel = self.channels[0]
+        visibility = self.mocks["_get_registered_video_scan_statuses"].side_effect
+
+        def visibility_with_dns_error(channel_id, video_ids, **kwargs):
+            if channel_id == failed_channel:
+                raise RuntimeError("NameResolutionError: Failed to resolve 'studio.youtube.com' (getaddrinfo failed)")
+            return visibility(channel_id, video_ids, **kwargs)
+
+        self.mocks["_get_registered_video_scan_statuses"].side_effect = visibility_with_dns_error
+        self.release_uploads.clear()
+        task = asyncio.create_task(run_audio_recovery_cycle(now=2000))
+        try:
+            await self.wait_for_three_uploads()
+            status = get_audio_recovery_runtime_status()
+            self.assertEqual(status["completed_channel_count"], 1)
+            self.assertEqual(status["active_channel_count"], 3)
+            report = next(item for item in status["channel_results"] if item["channel_id"] == failed_channel)
+            self.assertEqual(report["outcome"], "error")
+            self.assertEqual(report["scanned_videos"], 0)
+            self.assertEqual(report["submitted"], 0)
+            self.assertIn("Lỗi DNS", report["message"])
+        finally:
+            result = await self.finish_cycle(task)
+        self.assertEqual(result["failed"], 1)
+        self.assertEqual(result["repaired"], 8)
+        self.assertEqual(self.events[failed_channel], [])
+        saved_results = get_audio_recovery_state()["last_cycle_result"]["channel_results"]
+        self.assertEqual(saved_results, result["channel_results"])
+        saved_failure = next(item for item in saved_results if item["channel_id"] == failed_channel)
+        self.assertEqual(saved_failure["outcome"], "error")
+
+    async def test_two_failed_channels_repair_immediately_despite_legacy_grace_or_recent_attempt(self):
+        self.channels = self.channels[:2]
+        upload = self.mocks["update_audio_module.add"].side_effect
+        for legacy_delay in ("initial_grace", "retry_after_success", "retry_after_failure"):
+            with self.subTest(legacy_delay=legacy_delay):
+                for channel_id in self.channels:
+                    self.events[channel_id].clear()
+                state = get_audio_recovery_state()
+                state["initial_grace_seconds"] = 15 * 60
+                state["retry_cooldown_seconds"] = 15 * 60
+                state["entries"] = {
+                    channel: {f"{channel}-video": {
+                        "audio_path": str(self.source), "languages": ["en", "es"],
+                    }} for channel in self.channels
+                }
+                recent_entry = state["entries"][self.channels[0]][f"{self.channels[0]}-video"]
+                if legacy_delay == "initial_grace":
+                    recent_entry["registered_at"] = 2000
+                else:
+                    recent_entry["attempts"] = {
+                        language: {"attempted_at": 1999, "succeeded": legacy_delay == "retry_after_success"}
+                        for language in ("en", "es")
+                    }
+                self.manager.save_state("audio_recovery", state)
+                release_slow_channel = threading.Event()
+
+                def slow_upload(**kwargs):
+                    if kwargs["channel_id"] == self.channels[1] and kwargs["language"] == "en":
+                        if not release_slow_channel.wait(timeout=5):
+                            raise AssertionError("Test did not release slow channel")
+                    return upload(**kwargs)
+
+                async def wait_for_repaired_channel_to_finish():
+                    while True:
+                        status = get_audio_recovery_runtime_status()
+                        if status["completed_channel_count"] == 1 and status["active_channel_count"] == 1:
+                            return status
+                        await asyncio.sleep(0.01)
+
+                self.mocks["update_audio_module.add"].side_effect = slow_upload
+                task = asyncio.create_task(run_audio_recovery_cycle(now=2000))
+                try:
+                    status = await asyncio.wait_for(wait_for_repaired_channel_to_finish(), timeout=3)
+                    self.assertEqual(status["channel_total"], 2)
+                    report = status["channel_results"][0]
+                    self.assertEqual(report["channel_id"], self.channels[0])
+                    self.assertEqual(report["submitted"], 2)
+                    self.assertEqual(report["outcome"], "submitted")
+                    self.assertEqual(report["scanned_videos"], 1)
+                    self.assertEqual(report["cooldown_tracks"], 0)
+                    self.assertEqual(self.events[self.channels[0]], [
+                        ("delete", "en"), ("add", "en"), ("delete", "es"), ("add", "es"),
+                    ])
+                finally:
+                    release_slow_channel.set()
+                    result = await self.finish_cycle(task)
+                self.assertEqual(result["repaired"], 4)
+
+    async def test_failed_tracks_retry_on_next_scan_immediately_after_submission(self):
+        await run_audio_recovery_cycle(now=2000)
+        add = self.mocks["update_audio_module.add"]
+        add.reset_mock()
+        result = await run_audio_recovery_cycle(now=2000)
+        self.assertEqual(add.call_count, 10)
+        self.assertEqual(result["repaired"], 10)
+        self.assertEqual(len(result["channel_results"]), 5)
+        for report in result["channel_results"]:
+            self.assertEqual(report["outcome"], "submitted")
+            self.assertEqual(report["submitted"], 2)
+            self.assertEqual(report["cooldown_tracks"], 0)
+
     async def test_deactivating_queued_channel_prevents_its_scan_and_mutations(self):
         self.release_uploads.clear()
         task = asyncio.create_task(run_audio_recovery_cycle(now=2000))

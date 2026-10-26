@@ -38,10 +38,10 @@ from src.audio_recovery import (
 
 
 class AudioRecoveryPlanTests(unittest.TestCase):
-    def test_default_monitor_is_continuous_with_separate_track_retry_delay(self):
+    def test_default_monitor_scans_and_repairs_without_time_delays(self):
         self.assertEqual(DEFAULT_RECOVERY_INTERVAL_SECONDS, 0)
-        self.assertEqual(DEFAULT_RECOVERY_RETRY_COOLDOWN_SECONDS, 15 * 60)
-        self.assertEqual(DEFAULT_INITIAL_RECOVERY_GRACE_SECONDS, 15 * 60)
+        self.assertEqual(DEFAULT_RECOVERY_RETRY_COOLDOWN_SECONDS, 0)
+        self.assertEqual(DEFAULT_INITIAL_RECOVERY_GRACE_SECONDS, 0)
         self.assertEqual(DEFAULT_STALE_PROCESSING_SECONDS, 6 * 60 * 60)
 
     def test_plan_skips_entire_video_with_any_healthy_dub(self):
@@ -1584,7 +1584,7 @@ class AudioRecoveryCycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("video", state["entries"]["channel"])
 
 
-    async def test_new_registration_first_scans_when_initial_grace_elapses(self):
+    async def test_new_registration_scans_immediately_despite_legacy_grace_setting(self):
         state = {
             "enabled": True,
             "retry_cooldown_seconds": 0,
@@ -1625,11 +1625,12 @@ class AudioRecoveryCycleTests(unittest.IsolatedAsyncioTestCase):
                 fetch,
             ),
         ):
-            result = await run_audio_recovery_cycle(now=1000 + 14 * 60)
-            due_result = await run_audio_recovery_cycle(now=1000 + 15 * 60)
+            result = await run_audio_recovery_cycle(now=1000)
+            due_result = await run_audio_recovery_cycle(now=1001)
 
-        fetch.assert_called_once_with(["video"], "channel")
-        self.assertEqual(result["deferred_initial_grace"], 1)
+        self.assertEqual(fetch.call_count, 2)
+        self.assertTrue(all(call.args == (["video"], "channel") for call in fetch.call_args_list))
+        self.assertEqual(result["deferred_initial_grace"], 0)
         self.assertEqual(result["repaired"], 0)
         self.assertEqual(due_result["deferred_initial_grace"], 0)
         self.assertEqual(due_result["repaired"], 0)
@@ -2126,7 +2127,7 @@ class AudioRecoveryCycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state["entries"]["channel"]["video"]["languages"], ["es", "it"])
         self.assertNotIn("processing_observations", state["entries"]["channel"]["video"])
 
-    async def test_cycle_adds_missing_registered_audio_and_observes_retry_cooldown(self):
+    async def test_cycle_immediately_retries_missing_or_deleted_audio_but_preserves_processing(self):
         from src.audio_recovery import update_audio_module
 
         for failed_es in (False, True):
@@ -2135,7 +2136,7 @@ class AudioRecoveryCycleTests(unittest.IsolatedAsyncioTestCase):
                 source.write_bytes(b"source")
                 state = {
                     "enabled": True, "initial_grace_seconds": 0,
-                    "retry_cooldown_seconds": DEFAULT_RECOVERY_RETRY_COOLDOWN_SECONDS,
+                    "retry_cooldown_seconds": 15 * 60,
                     "entries": {"channel": {"video": {
                         "audio_path": str(source), "languages": ["en", "es"],
                         "repeat_times": 1, "attempts": {},
@@ -2175,20 +2176,30 @@ class AudioRecoveryCycleTests(unittest.IsolatedAsyncioTestCase):
                     patch("src.audio_recovery.call_audio_update_with_retry", new=AsyncMock(side_effect=run_retry)),
                 ):
                     result = await run_audio_recovery_cycle(now=2000)
-                    # Studio can still show dashes immediately after an upload.
-                    # The saved attempt must prevent re-uploading every cycle.
-                    repeated = await run_audio_recovery_cycle(now=2060)
+                    # Re-read Studio on each cycle; missing/deleted audio can
+                    # be repaired immediately even after a recent submission.
+                    repeated = await run_audio_recovery_cycle(now=2000)
+                    for item in payload["videoTranslations"][0]["translations"]:
+                        if item["languageCode"] in ("en", "es"):
+                            item["audioTranslation"] = {
+                                "audioTrackId": f"processing-{item['languageCode']}",
+                                "status": "AUDIO_TRACK_STATUS_PROCESSING",
+                            }
+                    processing = await run_audio_recovery_cycle(now=2001)
 
                 self.assertEqual(result["repaired"], 2)
                 self.assertEqual(result["failed"], 0)
                 self.assertEqual(result["unreadable"], [])
-                self.assertEqual(repeated["repaired"], 0)
+                self.assertEqual(repeated["repaired"], 2)
                 self.assertEqual(repeated["failed"], 0)
-                self.assertEqual([call.kwargs["language"] for call in add.call_args_list], ["en", "es"])
-                info.assert_called_once()
-                render.assert_called_once()
+                self.assertEqual(processing["repaired"], 0)
+                self.assertEqual(processing["failed"], 0)
+                self.assertEqual([call.kwargs["language"] for call in add.call_args_list], ["en", "es", "en", "es"])
+                self.assertEqual(info.call_count, 2)
+                self.assertEqual(render.call_count, 2)
                 if failed_es:
-                    delete.assert_called_once_with("video", "channel", ["deleted-es"])
+                    self.assertEqual(delete.call_count, 2)
+                    self.assertTrue(all(call.args == ("video", "channel", ["deleted-es"]) for call in delete.call_args_list))
                 else:
                     delete.assert_not_called()
                 attempts = state["entries"]["channel"]["video"]["attempts"]

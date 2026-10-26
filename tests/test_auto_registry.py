@@ -64,14 +64,17 @@ class RegistryStorage:
 
 
 class AutoRegistryPersistenceTests(RegistryStorage, unittest.TestCase):
-    def test_legacy_scan_interval_migrates_to_continuous_without_changing_entries(self):
+    def test_legacy_scan_and_repair_delays_are_removed_without_changing_entries(self):
         for interval in (15 * 60, 6 * 60 * 60):
             with self.subTest(interval=interval):
                 self.manager.save_state("audio_recovery", {
                     "entries": self.original_entries, "interval_seconds": interval,
+                    "initial_grace_seconds": interval, "retry_cooldown_seconds": interval,
                 })
                 state = get_audio_recovery_state()
                 self.assertEqual(state["interval_seconds"], 0)
+                self.assertEqual(state["initial_grace_seconds"], 0)
+                self.assertEqual(state["retry_cooldown_seconds"], 0)
                 self.assertEqual(state["entries"], self.original_entries)
 
     def test_processing_warning_survives_restart_and_is_available_in_registry(self):

@@ -51,6 +51,17 @@ def _format_transfer_size(value: int) -> str:
     return f"{size:.1f} GB"
 
 
+def _recovery_channel_summary(status: dict) -> str:
+    active = int(status.get("active_channel_count") or 0)
+    finished = int(status.get("completed_channel_count") or 0)
+    total = int(status.get("channel_total") or 0)
+    waiting = max(0, total - active - finished)
+    summary = f"Đang xử lý {active} kênh · Đã kết thúc lượt {finished}/{total} kênh"
+    if waiting:
+        summary += f" · Còn chờ {waiting} kênh"
+    return summary
+
+
 def _navigate(route: str) -> None:
     target_path = route.split("?", 1)[0]
     try:
@@ -237,7 +248,9 @@ def create_drawer():
             recovery_channel_names: dict[str, str] = {}
 
             with ui.dialog() as recovery_detail_dialog, ui.card().classes(
-                "w-[min(800px,calc(100vw-32px))] gap-3"
+                "gap-3"
+            ).style(
+                "width: min(1000px, calc(100vw - 32px)); max-width: calc(100vw - 32px)"
             ):
                 with ui.row().classes("w-full items-center justify-between no-wrap"):
                     with ui.row().classes("items-center gap-2 no-wrap"):
@@ -253,13 +266,15 @@ def create_drawer():
                     "text-sm font-medium text-blue-800"
                 )
                 recovery_detail_summary = ui.label().classes("text-xs text-gray-600")
+                recovery_detail_capacity = ui.label().classes("text-xs text-gray-500")
+                ui.label("Kênh trong lượt quét").classes("text-xs font-medium text-gray-700")
                 recovery_channel_table = ui.table(
                     columns=[
-                        {"name": "name", "label": "Kênh", "field": "name"},
+                        {"name": "name", "label": "Kênh", "field": "name", "classes": "whitespace-normal"},
                         {"name": "channel_id", "label": "Channel ID", "field": "channel_id", "classes": "font-mono select-text"},
                         {"name": "video_id", "label": "Video ID", "field": "video_id", "classes": "font-mono select-text"},
                         {"name": "language", "label": "Ngôn ngữ", "field": "language"},
-                        {"name": "message", "label": "Tiến độ", "field": "message"},
+                        {"name": "message", "label": "Tiến độ / Kết quả", "field": "message", "classes": "whitespace-normal", "style": "min-width: 200px; max-width: 350px"},
                         {"name": "transfer", "label": "Đã tải", "field": "transfer"},
                     ],
                     rows=[], row_key="channel_id",
@@ -319,11 +334,10 @@ def create_drawer():
             def refresh_recovery_details(status: dict) -> None:
                 active = bool(status.get("active"))
                 phase = str(status.get("phase") or "idle")
-                recovery_detail_summary.set_text(
-                    f"Đang chạy {status.get('active_channel_count', 0)}/"
-                    f"{status.get('channel_concurrency', 3)} kênh cùng lúc · "
-                    f"Hoàn tất {status.get('completed_channel_count', 0)}/"
-                    f"{status.get('channel_total', 0)} kênh"
+                recovery_detail_summary.set_text(_recovery_channel_summary(status))
+                recovery_detail_capacity.set_text(
+                    f"Tối đa {status.get('channel_concurrency', 3)} kênh cùng lúc. "
+                    "Bảng giữ lại kết quả từng kênh, gồm lỗi và lý do tạm hoãn."
                 )
                 recovery_channel_table.update_rows([
                     {
@@ -336,6 +350,13 @@ def create_drawer():
                         ),
                     }
                     for job in status.get("channels", []) if active
+                ] + [
+                    {
+                        **result,
+                        "name": get_recovery_channel_name(result["channel_id"]),
+                        "video_id": "—", "language": "—", "transfer": "—",
+                    }
+                    for result in status.get("channel_results", [])
                 ])
                 channel_id = str(status.get("channel_id") or "") if active else ""
                 video_id = str(status.get("video_id") or "") if active else ""
@@ -406,12 +427,9 @@ def create_drawer():
                                 ui.label(str(status.get("message") or "Đang tự động quét audio")) \
                                     .classes("text-xs font-semibold text-blue-900")
 
-                            ui.label(
-                                f"Đang chạy {status.get('active_channel_count', 0)}/"
-                                f"{status.get('channel_concurrency', 3)} kênh · "
-                                f"Hoàn tất {status.get('completed_channel_count', 0)}/"
-                                f"{status.get('channel_total', 0)}"
-                            ).classes("text-[11px] text-blue-800")
+                            ui.label(_recovery_channel_summary(status)).classes(
+                                "text-[11px] text-blue-800"
+                            )
                             if phase == "uploading":
                                 sent = int(status.get("upload_sent") or 0)
                                 total = int(status.get("upload_total") or 0)
@@ -497,6 +515,15 @@ def create_drawer():
                             f"{processing_warning_count} audio xử lý lâu: giữ nguyên track. "
                             "Xem cảnh báo trong Auto Registry."
                         ).classes("text-[11px] text-amber-800")
+                    channel_errors = sum(
+                        result.get("outcome") == "error"
+                        for result in status.get("channel_results", [])
+                    )
+                    if channel_errors:
+                        ui.label(
+                            f"{channel_errors} kênh có lỗi trong lượt quét. "
+                            "Mở chi tiết Auto audio để xem nguyên nhân."
+                        ).classes("text-[11px] text-red-700")
 
                 refresh_recovery_details(status)
 

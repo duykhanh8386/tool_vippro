@@ -58,8 +58,8 @@ RECOVERY_VIDEO_SCOPE_LABELS = {
 DEFAULT_RECOVERY_INTERVAL_SECONDS = 0
 MONITOR_IDLE_POLL_SECONDS = 1.0
 MAX_CONCURRENT_RECOVERY_CHANNELS = 3
-DEFAULT_RECOVERY_RETRY_COOLDOWN_SECONDS = 15 * 60
-DEFAULT_INITIAL_RECOVERY_GRACE_SECONDS = 15 * 60
+DEFAULT_RECOVERY_RETRY_COOLDOWN_SECONDS = 0
+DEFAULT_INITIAL_RECOVERY_GRACE_SECONDS = 0
 DEFAULT_STALE_PROCESSING_SECONDS = 6 * 60 * 60
 MIN_STALE_PROCESSING_SCANS = 2
 PROCESSING_WARNING_REASON = "processing_timeout"
@@ -104,6 +104,7 @@ _RUNTIME_STATUS = {
     "channel_concurrency": MAX_CONCURRENT_RECOVERY_CHANNELS,
     "completed_channel_count": 0,
     "_channel_jobs": {},
+    "_channel_results": {},
     "channel_id": "",
     "video_id": "",
     "language": "",
@@ -142,10 +143,11 @@ def _update_runtime_status(**changes) -> None:
                 _RUNTIME_STATUS[key] = changes[key]
 
 
-def _finish_channel_runtime_status(cycle_id: int, channel_id: str) -> None:
+def _finish_channel_runtime_status(cycle_id: int, channel_id: str, result: dict) -> None:
     with _RUNTIME_STATUS_LOCK:
         if _RUNTIME_STATUS.get("cycle_id") == cycle_id:
             _RUNTIME_STATUS["_channel_jobs"].pop(channel_id, None)
+            _RUNTIME_STATUS["_channel_results"][channel_id] = dict(result)
             _RUNTIME_STATUS["completed_channel_count"] += 1
 
 
@@ -173,6 +175,8 @@ def get_audio_recovery_runtime_status() -> dict:
     with _RUNTIME_STATUS_LOCK:
         snapshot = dict(_RUNTIME_STATUS)
         jobs = [dict(job) for job in snapshot.pop("_channel_jobs", {}).values()]
+        results = snapshot.pop("_channel_results", {})
+        snapshot["channel_results"] = [dict(result) for result in results.values()]
     snapshot["channels"] = [_with_upload_progress(job) for job in jobs]
     snapshot["active_channel_count"] = len(jobs)
     if jobs:
@@ -354,8 +358,8 @@ def _load_state() -> dict:
             if isinstance(alert, dict)
             and alert.get("reason") == REAUTH_ALERT_REASON
         }
-    # Completed scans repeat immediately, including on older installations
-    # with a persisted interval. Track retry and initial grace remain separate.
+    # Remove legacy delays for both scanning and audio repair. Every cycle
+    # decides from fresh YouTube status, including just-registered tracks.
     state["interval_seconds"] = DEFAULT_RECOVERY_INTERVAL_SECONDS
     state["retry_cooldown_seconds"] = DEFAULT_RECOVERY_RETRY_COOLDOWN_SECONDS
     state["initial_grace_seconds"] = DEFAULT_INITIAL_RECOVERY_GRACE_SECONDS
@@ -584,7 +588,7 @@ def register_caption_monitor(
                 "source_srt_path": str(source_srt_path or "").strip(),
                 "source_language": str(source_language or "").strip(),
                 "languages": clean_languages,
-                "next_check_at": timestamp + DEFAULT_INITIAL_RECOVERY_GRACE_SECONDS,
+                "next_check_at": timestamp + CAPTION_REPAIR_VERIFY_SECONDS,
                 "last_error": "",
             }
         else:
@@ -1748,35 +1752,45 @@ async def _monitor_failed_caption_tracks(
     }
 
 
-def _cooldown_elapsed(entry: dict, language: str, now: float, cooldown: float) -> bool:
-    attempt = (entry.get("attempts") or {}).get(language.casefold()) or {}
-    try:
-        attempted_at = float(attempt.get("attempted_at") or 0)
-    except (TypeError, ValueError):
-        attempted_at = 0
-    return now - attempted_at >= cooldown
-
-
-def _initial_grace_elapsed(entry: dict, now: float, grace: float) -> bool:
-    """Delay the first verification long enough for Studio to settle a new track.
-
-    Legacy entries do not have ``registered_at`` and remain immediately eligible.
-    New entries become eligible as soon as their initial grace has elapsed;
-    subsequent registry scans run continuously.
-    """
-    try:
-        registered_at = float(entry.get("registered_at") or 0)
-    except (TypeError, ValueError):
-        registered_at = 0
-    return registered_at <= 0 or now - registered_at >= grace
-
-
 def _registered_language_count(video_entries: dict[str, dict]) -> int:
     return sum(
         len(entry.get("languages") or [])
         for entry in video_entries.values()
         if isinstance(entry, dict)
     )
+
+
+def _recovery_channel_error(error: BaseException) -> str:
+    message = str(error)
+    if any(marker in message.casefold() for marker in (
+        "nameresolutionerror", "getaddrinfo failed", "failed to resolve",
+    )):
+        return "Lỗi DNS: không phân giải được địa chỉ YouTube; chưa kiểm tra được video"
+    if _requires_channel_refresh(error):
+        return "YouTube không cấp token xác thực; cần đăng nhập và tải lại đúng kênh"
+    return _REFRESH_ALERT_SECRET_RE.sub("[redacted]", message)[:400]
+
+
+def _summarize_channel_result(result: dict) -> None:
+    parts = []
+    if result["scanned_videos"]:
+        parts.append(f"Đã đọc audio {result['scanned_videos']} video")
+    if result["submitted"]:
+        parts.append(f"Đã gửi {result['submitted']} audio, chờ YouTube xử lý")
+    if result["healthy_skipped"]:
+        parts.append(f"Bỏ qua {result['healthy_skipped']} video còn audio tốt")
+    if result["processing_tracks"]:
+        parts.append(f"Giữ nguyên {result['processing_tracks']} track đang xử lý")
+    if result.get("reason"):
+        parts.append(result["reason"])
+    if result.get("last_error"):
+        parts.append(result["last_error"])
+    result["outcome"] = (
+        "error" if result["errors"] else
+        "deferred" if result.get("reason") else
+        "submitted" if result["submitted"] else "scanned"
+    )
+    result["message"] = " · ".join(parts) or "Đã kết thúc lượt; không có audio cần gửi lại"
 
 
 async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
@@ -1793,6 +1807,7 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
     unreadable: list[str] = []
     scanned_channels = 0
     processing_warnings: list[dict] = []
+    channel_results: dict[str, dict] = {}
     deferred_busy = 0
     deferred_initial_grace = 0
     deferred_video_scope = 0
@@ -1810,6 +1825,7 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
         channel_concurrency=MAX_CONCURRENT_RECOVERY_CHANNELS,
         completed_channel_count=0,
         _channel_jobs={},
+        _channel_results={},
         channel_id="",
         video_id="",
         language="",
@@ -1853,23 +1869,6 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
         )
         refresh_alerts = state.get("channel_refresh_alerts") or {}
         try:
-            cooldown = max(0.0, float(state.get("retry_cooldown_seconds") or 0))
-        except (TypeError, ValueError):
-            cooldown = DEFAULT_RECOVERY_RETRY_COOLDOWN_SECONDS
-        try:
-            raw_initial_grace = state.get(
-                "initial_grace_seconds",
-                DEFAULT_INITIAL_RECOVERY_GRACE_SECONDS,
-            )
-            if raw_initial_grace is None:
-                raw_initial_grace = DEFAULT_INITIAL_RECOVERY_GRACE_SECONDS
-            initial_grace = max(
-                0.0,
-                float(raw_initial_grace),
-            )
-        except (TypeError, ValueError):
-            initial_grace = DEFAULT_INITIAL_RECOVERY_GRACE_SECONDS
-        try:
             stale_processing_seconds = max(
                 0.0,
                 float(
@@ -1909,13 +1908,18 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
         async def process_channel(channel_index: int, channel_id: str, video_entries: dict) -> None:
             nonlocal repaired, failed, captions_repaired, captions_failed
             nonlocal caption_quota_message, scanned_channels, deferred_busy
-            nonlocal deferred_initial_grace, deferred_video_scope, deferred_visibility_unknown
+            nonlocal deferred_video_scope, deferred_visibility_unknown
             nonlocal cancelled_by_clear
             async with semaphore:
                 if should_stop():
                     return
                 context_token = _RUNTIME_CHANNEL_CONTEXT.set((cycle_id, channel_id))
                 owned_mutation_guard: threading.Lock | None = None
+                channel_result = {
+                    "channel_id": channel_id, "scanned_videos": 0,
+                    "submitted": 0, "errors": 0, "healthy_skipped": 0,
+                    "cooldown_tracks": 0, "processing_tracks": 0,
+                }
                 try:
                     _update_runtime_status(
                         phase="scanning",
@@ -1931,8 +1935,10 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
                     )
                     if should_stop():
                         cancelled_by_clear = True
+                        channel_result["reason"] = "Lượt quét đã bị dừng"
                         return
                     if not is_audio_recovery_channel_enabled(channel_id):
+                        channel_result["reason"] = "Kênh đã Deactive hoặc nằm ngoài phạm vi quét"
                         scope_skipped_channel_ids.add(channel_id)
                         logger.info(
                             "Audio auto-recovery skipped deselected channel={}",
@@ -1940,8 +1946,10 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
                         )
                         return
                     if not isinstance(video_entries, dict):
+                        channel_result["reason"] = "Danh sách video đăng ký không hợp lệ"
                         return
                     if channel_id in refresh_alerts:
+                        channel_result["reason"] = "Tạm dừng: cần đăng nhập và tải lại thông tin kênh"
                         logger.info(
                             "Audio auto-recovery paused for channel={}: waiting for full channel refresh.",
                             channel_id,
@@ -1955,10 +1963,9 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
                         video_id: entry
                         for video_id, entry in active_entries.items()
                         if isinstance(entry, dict)
-                        and _initial_grace_elapsed(entry, cycle_time, initial_grace)
                     }
-                    deferred_initial_grace += len(active_entries) - len(eligible_entries)
                     if not eligible_entries:
+                        channel_result["reason"] = "Không có video Active để quét"
                         return
 
                     # The normal/manual flow owns this guard for its entire channel
@@ -1966,6 +1973,7 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
                     # channel to keep recovery traffic and state decisions isolated.
                     channel_mutation_guard = get_audio_mutation_guard(channel_id)
                     if channel_mutation_guard.locked():
+                        channel_result["reason"] = "Tạm hoãn: kênh đang chạy tác vụ audio khác"
                         deferred_busy += _registered_language_count(eligible_entries)
                         logger.info(
                             "Audio auto-recovery deferred for channel={}: "
@@ -1991,6 +1999,8 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
                         )
                         scanned_channels += 1
                     except Exception as exc:
+                        channel_result["errors"] += len(video_ids)
+                        channel_result["last_error"] = _recovery_channel_error(exc)
                         failed += len(video_ids)
                         unreadable.extend(video_ids)
                         if _requires_channel_refresh(exc):
@@ -2026,6 +2036,11 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
                             len(unresolved_video_ids),
                         )
                     if not matching_video_ids:
+                        channel_result["reason"] = (
+                            "Chưa đọc được trạng thái công khai/lên lịch"
+                            if unresolved_video_ids else
+                            "Không có video đăng ký phù hợp loại video/ngày quét đã chọn"
+                        )
                         return
 
                     if not is_audio_recovery_channel_enabled(channel_id):
@@ -2094,6 +2109,8 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
                                 channel_id,
                             )
                         except Exception as exc:
+                            channel_result["errors"] += len(chunk)
+                            channel_result["last_error"] = _recovery_channel_error(exc)
                             failed += len(chunk)
                             unreadable.extend(chunk)
                             if _requires_channel_refresh(exc):
@@ -2118,6 +2135,19 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
                             chunk,
                             observation_sink=processing_observations,
                         )
+                        channel_result["scanned_videos"] += len(chunk) - len(unreadable_chunk)
+                        if unreadable_chunk:
+                            channel_result["errors"] += len(unreadable_chunk)
+                            channel_result["last_error"] = "YouTube chưa trả đủ dữ liệu audio để kiểm tra video"
+                        channel_result["healthy_skipped"] += sum(
+                            any("healthy" in observed.get("states", []) for observed in languages.values())
+                            for languages in processing_observations.values()
+                        )
+                        channel_result["processing_tracks"] += sum(
+                            "inflight" in observed.get("states", [])
+                            for languages in processing_observations.values()
+                            for observed in languages.values()
+                        )
                         processing_warnings.extend(
                             _record_processing_observations(
                                 channel_id=channel_id,
@@ -2138,9 +2168,7 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
 
                     actions_by_video: dict[str, list[dict]] = {}
                     for action in channel_actions:
-                        entry = eligible_entries.get(action["video_id"]) or {}
-                        if _cooldown_elapsed(entry, action["language"], cycle_time, cooldown):
-                            actions_by_video.setdefault(action["video_id"], []).append(action)
+                        actions_by_video.setdefault(action["video_id"], []).append(action)
 
                     for video_id, actions in actions_by_video.items():
                         if should_stop():
@@ -2154,6 +2182,7 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
                         entry = eligible_entries.get(video_id) or {}
                         channel_mutation_guard = get_audio_mutation_guard(channel_id)
                         if channel_mutation_guard.locked():
+                            channel_result["reason"] = "Tạm hoãn: kênh đang chạy tác vụ audio khác"
                             deferred_busy += len(actions)
                             logger.info(
                                 "Audio auto-recovery deferred for channel={} video={}: "
@@ -2164,6 +2193,8 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
                             continue
                         audio_path = Path(str(entry.get("audio_path") or ""))
                         if not audio_path.is_file():
+                            channel_result["errors"] += len(actions)
+                            channel_result["last_error"] = "Không tìm thấy file audio nguồn để tải lại"
                             message = f"Không còn file audio: {audio_path}"
                             logger.error(
                                 "Audio auto-recovery skipped channel={} video={}: {}",
@@ -2232,6 +2263,7 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
                                     break
                                 language = action["language"]
                                 if not channel_mutation_guard.acquire(blocking=False):
+                                    channel_result["reason"] = "Tạm hoãn: kênh đang chạy tác vụ audio khác"
                                     deferred_busy += len(actions) - action_index
                                     logger.info(
                                         "Audio auto-recovery deferred for channel={}: "
@@ -2289,6 +2321,7 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
                                         )
                                     )
                                     repaired += 1
+                                    channel_result["submitted"] += 1
                                     _update_runtime_status(repaired=repaired)
                                     _record_recovery_attempt(
                                         channel_id,
@@ -2307,6 +2340,8 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
                                         action["reason"],
                                     )
                                 except Exception as exc:
+                                    channel_result["errors"] += 1
+                                    channel_result["last_error"] = _recovery_channel_error(exc)
                                     failed += 1
                                     _update_runtime_status(failed=failed)
                                     if _requires_channel_refresh(exc):
@@ -2335,6 +2370,8 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
                                     channel_mutation_guard.release()
                                     owned_mutation_guard = None
                         except Exception as exc:
+                            channel_result["errors"] += len(actions)
+                            channel_result["last_error"] = _recovery_channel_error(exc)
                             if _requires_channel_refresh(exc):
                                 mark_channel_refresh_required(channel_id, exc, now=cycle_time)
                                 channel_requires_refresh = True
@@ -2369,13 +2406,17 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
                         return
                 except Exception as exc:
                     affected_videos = list(video_entries) if isinstance(video_entries, dict) else []
+                    channel_result["errors"] += max(1, len(affected_videos))
+                    channel_result["last_error"] = _recovery_channel_error(exc)
                     failed += max(1, len(affected_videos))
                     unreadable.extend(affected_videos)
                     logger.exception("Audio auto-recovery channel failed: channel={} error={}", channel_id, exc)
                 finally:
                     if owned_mutation_guard is not None:
                         owned_mutation_guard.release()
-                    _finish_channel_runtime_status(cycle_id, channel_id)
+                    _summarize_channel_result(channel_result)
+                    channel_results[channel_id] = channel_result
+                    _finish_channel_runtime_status(cycle_id, channel_id, channel_result)
                     _RUNTIME_CHANNEL_CONTEXT.reset(context_token)
 
         channel_tasks = [
@@ -2402,6 +2443,7 @@ async def run_audio_recovery_cycle(*, now: float | None = None) -> dict:
             "caption_quota_message": caption_quota_message,
             "unreadable": list(dict.fromkeys(unreadable)),
             "scanned_channels": scanned_channels,
+            "channel_results": [channel_results[channel_id] for channel_id in entries_by_channel if channel_id in channel_results],
             "reauth_required": sorted(get_channel_refresh_alerts()),
             "deferred_busy": deferred_busy,
             "deferred_initial_grace": deferred_initial_grace,
@@ -2517,10 +2559,7 @@ def start_audio_recovery_monitor() -> None:
         phase="idle",
         message="Tự động khôi phục audio đang hoạt động",
     )
-    logger.info(
-        "Audio auto-recovery monitor is running (continuous scans, initial_grace={}m).",
-        DEFAULT_INITIAL_RECOVERY_GRACE_SECONDS / 60,
-    )
+    logger.info("Audio auto-recovery monitor is running (continuous scans, no audio repair delay).")
 
 
 def stop_audio_recovery_monitor() -> None:

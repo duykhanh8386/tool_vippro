@@ -340,7 +340,8 @@ def create_auto_registry_content(*, on_change: Callable[[], None] | None = None)
         summary = ui.label("").classes("text-xs text-gray-500")
         ui.label(
             "Quét liên tục tối đa 3 kênh cùng lúc, tự xóa track lỗi và thêm lại audio. "
-            "Vòng tiếp theo bắt đầu ngay khi vòng trước hoàn tất."
+            "Vòng tiếp theo bắt đầu ngay khi vòng trước hoàn tất; audio lỗi/đã xóa "
+            "được xử lý ngay, không chờ sau đăng ký hoặc giữa các lượt thử lại."
         ).classes("text-xs text-gray-500")
         ui.label("Loại video tự động quét").classes("text-sm font-medium")
         video_scope = ui.toggle(
