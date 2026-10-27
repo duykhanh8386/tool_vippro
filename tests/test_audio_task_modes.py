@@ -206,6 +206,44 @@ class AudioTaskModeTests(unittest.IsolatedAsyncioTestCase):
         self.delete.assert_not_called()
         self.delete_tracks.assert_called_once_with("video", self.channel.id, ["failed-track"])
 
+    async def test_combined_scan_rechecks_then_replaces_processing_and_keeps_published_language(self):
+        for fresh_status in ("PROCESSING", "READY"):
+            with self.subTest(fresh_status=fresh_status):
+                self.events.clear()
+                self.delete_tracks.reset_mock()
+                saved = self.saved_add_state()
+                saved["video_source_state"]["mode"] = "failed"
+                self.state.states["audio_add"] = saved
+                client = self.render()
+
+                def payload(status):
+                    return {"videoTranslations": [{"videoId": "video", "translations": [
+                        {"languageCode": "en", "audioTranslation": {
+                            "audioTrackId": "processing-en", "status": "AUDIO_TRACK_STATUS_" + status}},
+                        {"languageCode": "vi", "audioTranslation": {
+                            "audioTrackId": "published-vi", "publishStatus": "PUBLISHED"}},
+                    ]}], "audioTracks": []}
+
+                with (
+                    patch.object(audio, "_fetch_channel_videos", return_value=[Video(
+                        id="video", channel_id=self.channel.id, title="Test", description="",
+                        thumbnail="", duration_ms=60000,
+                    )]),
+                    patch.object(audio.update_audio_module, "_get_video_translation_payload",
+                                 side_effect=[payload("PROCESSING"), payload(fresh_status)]),
+                    client,
+                ):
+                    await self.button_callback(client, "Quét ID audio cần xử lý")()
+                    self.assertEqual(self.state.states["audio_add"]["video_ids"], ["video"])
+                    await self.button_callback(client, "Bắt đầu xóa & thêm audio")()
+                if fresh_status == "PROCESSING":
+                    self.delete_tracks.assert_called_once_with("video", self.channel.id, ["processing-en"])
+                    self.assertEqual(self.events, ["delete_tracks", "add:en"])
+                else:
+                    self.delete_tracks.assert_not_called()
+                    self.assertEqual(self.events, [])
+                self.delete.assert_not_called()
+
     async def test_single_language_dash_audio_scan_can_add_selected_languages_after_reload(self):
         for delete_existing, state_key in ((True, "audio_add"), (False, "audio_add_only")):
             with self.subTest(delete_existing=delete_existing):
@@ -392,11 +430,11 @@ class AudioTaskModeTests(unittest.IsolatedAsyncioTestCase):
                         client, "Quét video cần xử lý" if remove_only else "Quét ID audio cần xử lý",
                     )()
                 self.assertEqual(self.state.states[state_key]["ids" if remove_only else "video_ids"],
-                                 ["mixed"] if remove_only else ["mixed", "no-audio"])
+                                 ["mixed", "processing"] if remove_only else ["mixed", "processing", "no-audio"])
         self.delete.assert_not_called()
         self.delete_tracks.assert_not_called()
 
-    async def test_remove_scanned_video_deletes_only_failed_track_and_preserves_other_audio(self):
+    async def test_remove_scanned_video_deletes_failed_and_processing_tracks_and_preserves_good_audio(self):
         self.state.states["audio_remove"] = {"selected_channel": self.channel.id}
         client = self.render(remove_only=True)
         payload = {"videoTranslations": [{"videoId": "video", "translations": [
@@ -422,14 +460,14 @@ class AudioTaskModeTests(unittest.IsolatedAsyncioTestCase):
                 await self.button_callback(client, "Bắt đầu xóa")()
         self.assertEqual(fetch.call_count, 2)
         self.delete.assert_not_called()
-        self.delete_tracks.assert_called_once_with("video", self.channel.id, ["failed-en"])
+        self.delete_tracks.assert_called_once_with("video", self.channel.id, ["failed-en", "processing-fr"])
         self.add.assert_not_called()
         self.assertEqual(self.state.states["audio_remove"]["video_processing_status"]["video"], "successful")
 
     async def test_remove_recheck_skips_videos_without_deletable_failed_tracks(self):
         for audio_translation in (
             {"audioTrackId": "ready-en", "status": "AUDIO_TRACK_STATUS_READY"},
-            {"audioTrackId": "processing-en", "status": "AUDIO_TRACK_STATUS_PROCESSING"},
+            {"status": "AUDIO_TRACK_STATUS_PROCESSING"},
             {"statusLabel": "–"},
             {"status": "AUDIO_TRACK_STATUS_FAILED"},
         ):
@@ -565,7 +603,8 @@ class AudioTaskModeTests(unittest.IsolatedAsyncioTestCase):
         with client:
             number.value = 3
 
-        def find_failures(video_ids, channel_id, unreadable):
+        def find_failures(video_ids, channel_id, unreadable, *, include_processing=False):
+            self.assertTrue(include_processing)
             unreadable.append("draft-1")
             return {
                 video_id: [{"language": "en", "track_ids": ["failed-" + video_id]}]

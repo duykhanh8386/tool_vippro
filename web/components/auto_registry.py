@@ -72,7 +72,7 @@ def create_auto_registry_content(*, on_change: Callable[[], None] | None = None)
                 "processing_warning": (
                     "Đang xử lý lâu: "
                     + ", ".join(warning["language"] for warning in item.get("processing_warnings") or [])
-                    + " · Giữ nguyên audio"
+                    + " · Chờ xóa và add lại"
                     if item.get("processing_warnings") else ""
                 ),
             }
@@ -91,7 +91,7 @@ def create_auto_registry_content(*, on_change: Callable[[], None] | None = None)
             f"{len(video_rows)} video · "
             f'{sum(item["enabled"] for item in video_items)} video được phép tự động quét'
             f' · {RECOVERY_VIDEO_SCOPE_LABELS[preferences["video_scan_scope"]]}'
-            f' · {sum(item.get("processing_warning_count", 0) for item in channel_items)} cảnh báo audio xử lý lâu'
+            f' · {sum(item.get("processing_warning_count", 0) for item in channel_items)} audio quá 2 giờ chờ thay lại'
             + (f' · {scan_date_label(preferences["scan_start_date"], date_type=preferences["scan_date_type"])}'
                if preferences["scan_start_date"] else "")
         )
@@ -357,13 +357,14 @@ def create_auto_registry_content(*, on_change: Callable[[], None] | None = None)
             "Lựa chọn áp dụng từ vòng quét tiếp theo và được lưu khi mở lại ứng dụng."
         ).classes("text-xs text-gray-500")
         ui.label(
-            "Video còn ít nhất một ngôn ngữ audio đã xuất bản dùng được sẽ được bỏ qua. "
+            "Video còn ngôn ngữ audio dùng được sẽ được giữ lại, ngoại trừ track đang xử lý quá 2 giờ. "
             "Khi không còn bản audio tốt, tool sửa audio lỗi và thêm các ngôn ngữ còn thiếu "
             "theo danh sách đã đăng ký, kể cả video toàn dấu “-”."
         ).classes("text-xs text-gray-500")
         ui.label(
-            "Audio đang xử lý lâu chỉ được cảnh báo và giữ nguyên track. "
-            "Thời gian xử lý lâu không làm tool tự xóa hoặc tải lại audio."
+            "Audio ở trạng thái Đang xử lý từ 2 giờ trở lên sẽ tự xóa đúng track rồi add lại. "
+            "Thời gian tính từ lần tool ghi nhận cùng Track ID và được lưu qua lần mở lại; "
+            "track chưa đủ 2 giờ và audio tốt được giữ nguyên."
         ).classes("text-xs text-amber-700")
         ui.label(
             "Mặc định tự động quét tất cả các kênh Active. Kênh Deactive vẫn ở trong "

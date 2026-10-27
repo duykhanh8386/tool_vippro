@@ -70,11 +70,13 @@ class AutoRegistryPersistenceTests(RegistryStorage, unittest.TestCase):
                 self.manager.save_state("audio_recovery", {
                     "entries": self.original_entries, "interval_seconds": interval,
                     "initial_grace_seconds": interval, "retry_cooldown_seconds": interval,
+                    "stale_processing_seconds": 6 * 60 * 60,
                 })
                 state = get_audio_recovery_state()
                 self.assertEqual(state["interval_seconds"], 0)
                 self.assertEqual(state["initial_grace_seconds"], 0)
                 self.assertEqual(state["retry_cooldown_seconds"], 0)
+                self.assertEqual(state["stale_processing_seconds"], 2 * 60 * 60)
                 self.assertEqual(state["entries"], self.original_entries)
 
     def test_processing_warning_survives_restart_and_is_available_in_registry(self):
@@ -558,7 +560,7 @@ class AutoRegistryUiTests(RegistryStorage, unittest.TestCase):
         video = next(item for item in videos.rows if item["channel_id"] == "channel-a"
                      and item["video_id"] == "video-shared")
         self.assertEqual(channel["processing_warning_count"], 1)
-        self.assertEqual(video["processing_warning"], "Đang xử lý lâu: en · Giữ nguyên audio")
+        self.assertEqual(video["processing_warning"], "Đang xử lý lâu: en · Chờ xóa và add lại")
 
         entry.pop("processing_observations")
         self.manager.save_state("audio_recovery", state)

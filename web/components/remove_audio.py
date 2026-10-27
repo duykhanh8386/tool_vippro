@@ -293,7 +293,7 @@ def create_remove_audio_page():
                     scope_label = f"{scan_state['last_scan_limit']} {scope_label}"
                 ui.label(
                     f"Đã bắt {scan_state.get('matched', 0)}/{scan_state.get('total', 0)} "
-                    f"video trong phạm vi {scope_label} có audio Không xử lý được / "
+                    f"video trong phạm vi {scope_label} có audio Đang xử lý / Không xử lý được / "
                     "Không đủ điều kiện / Đã xoá."
                 ).classes("text-xs font-medium text-emerald-700")
                 date_label = scan_date_label(
@@ -308,8 +308,8 @@ def create_remove_audio_page():
                     ).classes("text-xs text-orange-600")
             else:
                 ui.label(
-                    "Quét video có audio Không xử lý được, Không đủ điều kiện hoặc Đã xoá. "
-                    "Bỏ qua video chỉ có audio đang xử lý, đã xuất bản hoặc chưa có audio."
+                    "Quét video có audio Đang xử lý, Không xử lý được, Không đủ điều kiện hoặc Đã xoá. "
+                    "Giữ audio đã xuất bản và bỏ qua video chưa có audio."
                 ).classes("text-xs text-gray-600")
 
     def refresh_right_panel():
@@ -513,6 +513,7 @@ def create_remove_audio_page():
                 [video.id for video in videos],
                 channel_id,
                 unreadable_ids,
+                include_processing=True,
             )
             ordered_ids = [video.id for video in videos if video.id in failed_targets]
 
@@ -634,6 +635,7 @@ def create_remove_audio_page():
                         [vid],
                         channel_id,
                         unreadable_ids,
+                        include_processing=True,
                     )
                     if unreadable_ids:
                         raise RuntimeError(
@@ -804,7 +806,7 @@ def create_remove_audio_page():
     with page_shell():
         with page_header(
             "Xóa audio",
-            "Chỉ xóa track audio bị lỗi theo từng ngôn ngữ; giữ audio tốt và audio đang xử lý.",
+            "Chỉ xóa track audio lỗi hoặc đang xử lý theo từng ngôn ngữ; giữ audio tốt.",
             eyebrow="Tác vụ",
         ):
             ui.button(

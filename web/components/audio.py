@@ -518,7 +518,7 @@ def _select_terminal_repair_actions(
                             if str(track_id or "").strip()
                         )
                     ),
-                    "reason": "terminal",
+                    "reason": action.get("reason") or "terminal",
                 }
             )
         if actions:
@@ -1766,6 +1766,7 @@ def create_add_audio_page(*, delete_existing: bool = True):
                 channel_id,
                 unreadable_ids,
                 include_missing_audio=True,
+                include_processing=delete_existing,
             )
             check_stopped()
             failed_ids = set(failed_targets)
@@ -2349,7 +2350,7 @@ def create_add_audio_page(*, delete_existing: bool = True):
             if not repair_actions_by_video:
                 ui.notify(
                     "Không có audio lỗi hoặc audio còn thiếu phù hợp với ngôn ngữ đã chọn. "
-                    "Audio đã xuất bản hoặc đang xử lý sẽ không được add lại.",
+                    "Audio đã xuất bản sẽ được giữ nguyên.",
                     type="warning",
                 )
                 return None
@@ -2784,6 +2785,7 @@ def create_add_audio_page(*, delete_existing: bool = True):
                         channel_id,
                         unreadable_now,
                         include_missing_audio=True,
+                        include_processing=delete_existing,
                     )
                     check_stopped()
                     if unreadable_now:
@@ -3361,7 +3363,8 @@ def create_add_audio_page(*, delete_existing: bool = True):
                 ).props("outline disable")
                 ui_refs["failed_video_scan_button"] = failed_video_scan_button
                 failed_video_scan_button.tooltip(
-                    "Lấy video có audio lỗi và video chỉ có một ngôn ngữ "
+                    ("Lấy video có audio lỗi hoặc đang xử lý, và video chỉ có một ngôn ngữ "
+                     if delete_existing else "Lấy video có audio lỗi và video chỉ có một ngôn ngữ ") +
                     "với cột Âm thanh trống (–)."
                 )
             with ui.row().classes("w-full items-end gap-3 flex-wrap"):

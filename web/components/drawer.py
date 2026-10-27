@@ -76,7 +76,7 @@ def _recovery_transfer_text(job: dict) -> str:
     if job.get("phase") != "uploading":
         return "—"
     stage = {
-        "deleting": "Đang xóa track lỗi",
+        "deleting": "Đang xóa track cần thay lại",
         "authenticating": "Đang xác thực",
         "starting": "Đang mở phiên tải",
         "registering": "Đang đăng ký audio",
@@ -562,8 +562,8 @@ def create_drawer():
 
                     if processing_warning_count:
                         ui.label(
-                            f"{processing_warning_count} audio xử lý lâu: giữ nguyên track. "
-                            "Xem cảnh báo trong Auto Registry."
+                            f"{processing_warning_count} audio xử lý quá 2 giờ: xóa và add lại. "
+                            "Xem chi tiết trong Auto Registry."
                         ).classes("text-[11px] text-amber-800")
                     channel_errors = sum(
                         result.get("outcome") == "error"

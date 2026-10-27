@@ -825,14 +825,15 @@ class UpdateAudioModule(IModule):
         requested_order: list[str],
         *,
         include_missing_audio: bool = False,
+        include_processing: bool = False,
     ) -> tuple[dict[str, list[dict]], set[str]]:
         """Extract language-level creator-dub failures from one Studio response.
 
         By default the mapping contains only terminal failures. READY/PUBLISHED
         and PROCESSING/PENDING rows are deliberately absent. The second return
         value contains requested video IDs which the response did not describe.
-        Manual scans can also request a language-neutral ``missing`` action
-        for a single language row whose Audio column is empty.
+        Manual scans may opt into PROCESSING/PENDING tracks, or request a
+        language-neutral ``missing`` action for a single empty Audio column.
         """
         requested = set(requested_order)
         readable_ids: set[str] = set()
@@ -901,7 +902,7 @@ class UpdateAudioModule(IModule):
 
         target_maps: dict[str, dict[str, dict]] = {}
 
-        def add_target(video_id: str, language: str, track_id: str = "") -> None:
+        def add_target(video_id: str, language: str, track_id: str = "", *, reason: str = "terminal") -> None:
             clean_language = str(language or "").strip()
             if not clean_language:
                 return
@@ -911,11 +912,13 @@ class UpdateAudioModule(IModule):
                 {
                     "language": clean_language,
                     "track_ids": [],
-                    "reason": "terminal",
+                    "reason": reason,
                 },
             )
             if track_id and track_id not in target["track_ids"]:
                 target["track_ids"].append(track_id)
+            if reason == "terminal":
+                target["reason"] = reason
 
         for video_id in requested_order:
             creator_track_ids: set[str] = set()
@@ -923,9 +926,11 @@ class UpdateAudioModule(IModule):
                 track_id = str(track.get("audioTrackId") or "").strip()
                 if track_id:
                     creator_track_ids.add(track_id)
-                if not cls._audio_payload_has_terminal_failure(
-                    track, assume_audio=True
-                ):
+                if cls._audio_payload_has_terminal_failure(track, assume_audio=True):
+                    reason = "terminal"
+                elif include_processing and track_id and cls._audio_payload_needs_attention(track, assume_audio=True):
+                    reason = "processing"
+                else:
                     continue
                 translation = translation_by_track_id.get((video_id, track_id), {})
                 language = cls._translation_language(track) or cls._translation_language(
@@ -939,7 +944,7 @@ class UpdateAudioModule(IModule):
                         track_id or "none",
                     )
                     continue
-                add_target(video_id, language, track_id)
+                add_target(video_id, language, track_id, reason=reason)
 
             # Some Studio variants put the terminal status only in the
             # translation row. Root audioTracks remains authoritative whenever
@@ -953,7 +958,11 @@ class UpdateAudioModule(IModule):
                     continue
                 if track_id and track_id in creator_track_ids:
                     continue
-                if not cls._audio_translation_has_terminal_failure(item):
+                if cls._audio_translation_has_terminal_failure(item):
+                    reason = "terminal"
+                elif include_processing and track_id and cls._audio_payload_needs_attention(item):
+                    reason = "processing"
+                else:
                     continue
                 language = cls._translation_language(item)
                 if not language:
@@ -964,7 +973,7 @@ class UpdateAudioModule(IModule):
                         track_id or "none",
                     )
                     continue
-                add_target(video_id, language, track_id)
+                add_target(video_id, language, track_id, reason=reason)
 
         targets = {
             video_id: list(target_maps.get(video_id, {}).values())
@@ -1013,8 +1022,9 @@ class UpdateAudioModule(IModule):
         unreadable_ids: list[str] | None = None,
         *,
         include_missing_audio: bool = False,
+        include_processing: bool = False,
     ) -> dict[str, list[dict]]:
-        """Return failed languages and, optionally, single-language videos with no audio."""
+        """Return exact failed tracks; manual callers can include processing/missing audio."""
         unique_ids = list(dict.fromkeys(video_id for video_id in video_ids if video_id))
         skipped = unreadable_ids if unreadable_ids is not None else []
         targets: dict[str, list[dict]] = {}
@@ -1045,11 +1055,13 @@ class UpdateAudioModule(IModule):
                         copied = {
                             "language": language,
                             "track_ids": list(action.get("track_ids") or []),
-                            "reason": "terminal",
+                            "reason": action.get("reason") or "terminal",
                         }
                         targets[video_id].append(copied)
                         by_language[key] = copied
                     else:
+                        if action.get("reason") == "terminal":
+                            existing["reason"] = "terminal"
                         for track_id in action.get("track_ids") or []:
                             if track_id not in existing["track_ids"]:
                                 existing["track_ids"].append(track_id)
@@ -1074,7 +1086,8 @@ class UpdateAudioModule(IModule):
                 return
 
             found, missing = self._terminal_repair_targets_from_payload(
-                payload, chunk, include_missing_audio=include_missing_audio
+                payload, chunk, include_missing_audio=include_missing_audio,
+                include_processing=include_processing,
             )
             merge_targets(found)
             if not missing:

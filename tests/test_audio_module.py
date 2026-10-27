@@ -1011,6 +1011,9 @@ class AudioUploadTests(unittest.TestCase):
             targets = module.get_terminal_audio_repair_targets(
                 ["video"], "channel"
             )
+            manual_targets = module.get_terminal_audio_repair_targets(
+                ["video"], "channel", include_processing=True,
+            )
 
         self.assertEqual(
             targets,
@@ -1024,6 +1027,10 @@ class AudioUploadTests(unittest.TestCase):
                 ]
             },
         )
+        self.assertEqual(manual_targets["video"], [
+            {"language": "es", "track_ids": ["failed-es"], "reason": "terminal"},
+            {"language": "de", "track_ids": ["processing-de"], "reason": "processing"},
+        ])
 
     def test_manual_scan_includes_single_language_with_dash_audio_and_published_captions(self):
         module = UpdateAudioModule()

@@ -2,11 +2,11 @@
 
 The registry lives in the app SQLite database, so it survives browser/NiceGUI
 disconnects and process restarts on the same machine or VM. Videos with any
-healthy creator dub are skipped. Otherwise the monitor replaces failed tracks
+healthy creator dub skip normal failure/missing repairs. Otherwise the monitor replaces failed tracks
 and adds missing registered languages, without touching the source/original
 audio or treating an unreadable response as an empty video.
-Long-running processing tracks are only reported as warnings and are never
-deleted or reuploaded because of their age.
+Processing tracks observed for at least two hours are replaced by exact Track
+ID, after a fresh status check. Younger tracks are left to finish.
 """
 
 from __future__ import annotations
@@ -63,7 +63,7 @@ MONITOR_IDLE_POLL_SECONDS = 1.0
 MAX_CONCURRENT_RECOVERY_CHANNELS = 3
 DEFAULT_RECOVERY_RETRY_COOLDOWN_SECONDS = 0
 DEFAULT_INITIAL_RECOVERY_GRACE_SECONDS = 0
-DEFAULT_STALE_PROCESSING_SECONDS = 6 * 60 * 60
+DEFAULT_STALE_PROCESSING_SECONDS = 2 * 60 * 60
 MIN_STALE_PROCESSING_SCANS = 2
 PROCESSING_WARNING_REASON = "processing_timeout"
 CAPTION_STATUS_CHECK_INTERVAL_SECONDS = 6 * 60 * 60
@@ -1340,8 +1340,8 @@ def build_audio_recovery_plan(
             continue
         if any("healthy" in states for states in observations.get(video_id, {}).values()):
             logger.info(
-                "Audio auto-recovery skipped video={}: at least one dubbed audio "
-                "language is still healthy.",
+                "Audio auto-recovery preserving healthy dubs for video={}; "
+                "only timed-out processing tracks may need replacement.",
                 video_id,
             )
             continue
@@ -1399,11 +1399,11 @@ def _record_processing_observations(
     observed_at: float,
     stale_after_seconds: float = DEFAULT_STALE_PROCESSING_SECONDS,
 ) -> list[dict]:
-    """Persist in-flight track ages and return warnings without repair actions.
+    """Persist in-flight ages and return exact tracks eligible for replacement.
 
-    A warning is raised only when the same exact Audio Track ID remains in
+    Replacement is allowed only when the same exact Audio Track ID remains in
     PROCESSING across multiple scans for the full stale window. A healthy dub
-    protects the whole video and clears all its timers. Otherwise terminal
+    protects its own language and clears that language's timer. Terminal
     evidence or a changed/missing Track ID clears the language's timer.
     This makes the decision survive app restarts without treating one delayed
     Studio response as a failure.
@@ -1424,14 +1424,6 @@ def _record_processing_observations(
             if not isinstance(entry, dict) or not isinstance(requested_entry, dict):
                 continue
             video_observations = observations.get(video_id) or {}
-            if any(
-                "healthy" in (observed.get("states") or [])
-                for observed in video_observations.values()
-            ):
-                if "processing_observations" in entry:
-                    entry.pop("processing_observations", None)
-                    changed = True
-                continue
             registered_languages = {
                 str(language).strip().casefold(): str(language).strip()
                 for language in requested_entry.get("languages") or []
@@ -1518,7 +1510,7 @@ def _record_processing_observations(
                     )
                     if not already_warned:
                         logger.warning(
-                            "Audio processing warning; preserving track without delete/reupload: "
+                            "Audio processing timeout; scheduling exact tracks for delete/reupload: "
                             "channel={} video={} language={} track_ids={} reason={} age_seconds={:.0f}",
                             channel_id,
                             video_id,
@@ -1831,7 +1823,7 @@ def _summarize_channel_result(result: dict) -> None:
     if result["healthy_skipped"]:
         parts.append(f"Bỏ qua {result['healthy_skipped']} video còn audio tốt")
     if result["processing_tracks"]:
-        parts.append(f"Giữ nguyên {result['processing_tracks']} track đang xử lý")
+        parts.append(f"Còn {result['processing_tracks']} track đang xử lý, chưa thay lại")
     if result.get("reason"):
         parts.append(result["reason"])
     if result.get("last_error"):
@@ -2332,23 +2324,29 @@ async def run_audio_recovery_cycle(
                         if unreadable_chunk:
                             channel_result["errors"] += len(unreadable_chunk)
                             channel_result["last_error"] = "YouTube chưa trả đủ dữ liệu audio để kiểm tra video"
-                        channel_result["healthy_skipped"] += sum(
-                            any("healthy" in observed.get("states", []) for observed in languages.values())
-                            for languages in processing_observations.values()
-                        )
                         channel_result["processing_tracks"] += sum(
                             "inflight" in observed.get("states", [])
                             for languages in processing_observations.values()
                             for observed in languages.values()
                         )
-                        processing_warnings.extend(
-                            _record_processing_observations(
-                                channel_id=channel_id,
-                                requested_entries=chunk_entries,
-                                observations=processing_observations,
-                                observed_at=cycle_time,
-                                stale_after_seconds=stale_processing_seconds,
-                            )
+                        stale_actions = _record_processing_observations(
+                            channel_id=channel_id,
+                            requested_entries=chunk_entries,
+                            observations={
+                                video_id: languages
+                                for video_id, languages in processing_observations.items()
+                                if video_id not in unreadable_chunk
+                            },
+                            observed_at=float(now if now is not None else time.time()),
+                            stale_after_seconds=stale_processing_seconds,
+                        )
+                        processing_warnings.extend(stale_actions)
+                        actions.extend(stale_actions)
+                        action_video_ids = {action["video_id"] for action in actions}
+                        channel_result["healthy_skipped"] += sum(
+                            any("healthy" in observed.get("states", []) for observed in languages.values())
+                            for video_id, languages in processing_observations.items()
+                            if video_id not in action_video_ids
                         )
                         _update_runtime_status(
                             processing_warning_count=sum(len(warnings) for warnings in warnings_by_channel.values())
@@ -2490,6 +2488,45 @@ async def run_audio_recovery_cycle(
                                     break
                                 owned_mutation_guard = channel_mutation_guard
                                 try:
+                                    if action["reason"] == PROCESSING_WARNING_REASON:
+                                        # MP3 preparation can take minutes. Re-read under
+                                        # the channel guard before deleting a timed-out track.
+                                        fresh_payload = await _run_recovery_blocking(
+                                            update_audio_module._get_video_translation_payload,
+                                            [video_id], channel_id,
+                                        )
+                                        fresh_observations: dict = {}
+                                        _, fresh_unreadable = build_audio_recovery_plan(
+                                            fresh_payload, {video_id: entry}, [video_id],
+                                            observation_sink=fresh_observations,
+                                        )
+                                        if video_id in fresh_unreadable:
+                                            _record_processing_observations(
+                                                channel_id=channel_id,
+                                                requested_entries={video_id: entry}, observations={},
+                                                observed_at=float(now if now is not None else time.time()),
+                                                stale_after_seconds=stale_processing_seconds,
+                                            )
+                                            raise RuntimeError("Chưa đọc được trạng thái audio trước khi xóa track quá 2 giờ")
+                                        fresh_language = fresh_observations.get(video_id, {}).get(language.casefold(), {})
+                                        current_ids = set(fresh_language.get("inflight_track_ids") or [])
+                                        if (
+                                            "healthy" in (fresh_language.get("states") or [])
+                                            or current_ids != set(action["track_ids"])
+                                        ):
+                                            _record_processing_observations(
+                                                channel_id=channel_id,
+                                                requested_entries={video_id: entry}, observations=fresh_observations,
+                                                observed_at=float(now if now is not None else time.time()),
+                                                stale_after_seconds=stale_processing_seconds,
+                                            )
+                                            logger.info(
+                                                "Audio timeout repair skipped after fresh check: channel={} video={} language={}",
+                                                channel_id, video_id, language,
+                                            )
+                                            continue
+                                    if should_stop() or not is_audio_recovery_video_enabled(channel_id, video_id):
+                                        break
                                     upload_progress = {
                                         "sent": 0,
                                         "total": temp_audio_path.stat().st_size,
@@ -2541,6 +2578,8 @@ async def run_audio_recovery_cycle(
                                     )
                                     repaired += 1
                                     channel_result["submitted"] += 1
+                                    if action["reason"] == PROCESSING_WARNING_REASON:
+                                        channel_result["processing_tracks"] = max(0, channel_result["processing_tracks"] - 1)
                                     _update_runtime_status(repaired=repaired)
                                     _record_recovery_attempt(
                                         channel_id,
@@ -2714,7 +2753,7 @@ async def run_audio_recovery_cycle(
             f"{deferred_visibility_unknown} video chưa đọc được trạng thái, "
             f"lỗi {failed}; phụ đề failed đã sửa "
             f"{captions_repaired}, lỗi {captions_failed}; "
-            f"{len(result['processing_warnings'])} audio xử lý lâu được giữ nguyên"
+            f"{len(result['processing_warnings'])} audio xử lý quá 2 giờ được phát hiện để thay lại"
         )
         return result
     except asyncio.CancelledError:
