@@ -858,7 +858,7 @@ def create_delete_back_flow_page():
         video_id = await asyncio.to_thread(
             upload_video_module.create_video,
             channel_id=channel_id,
-            title=Path(item["name"]).stem,
+            title=Path(item.get("output_path") or item.get("music") or item["name"]).stem,
             frontend_upload_id=item["frontend_upload_id"],
             scotty_resource_id=item["scotty_resource_id"],
         )
