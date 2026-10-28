@@ -141,6 +141,8 @@ def create_video_titles_page():
                 button.set_enabled(not busy)
             buttons["stop"].set_enabled(busy)
             buttons["scan"].set_enabled(not busy and bool(config["channel_id"]))
+            buttons["scan_part"].set_enabled(not busy and bool(config["channel_id"]))
+            buttons["scan_manual"].set_enabled(not busy and bool(config["channel_id"]) and bool(config["manual_ids"].strip()))
             buttons["match"].set_enabled(not busy and bool(data["rows"]) and bool(config["folder"]))
             eligible = [row for row in data["rows"] if row.get("new_title") and row["status"] in ELIGIBLE]
             chosen = sum(bool(row.get("selected")) for row in eligible)
@@ -172,6 +174,7 @@ def create_video_titles_page():
         with app_card():
             with section_header("Quét video", "Quét mọi video trong phạm vi; không lọc theo trạng thái audio."):
                 buttons["scan"] = ui.button("Quét video", icon="manage_search", on_click=lambda: start("scan"))
+                buttons["scan_part"] = ui.button('Quét video có chữ “part”', icon="filter_alt", on_click=lambda: start("scan_part")).props("outline")
             with ui.row().classes("w-full items-end gap-3 flex-wrap"):
                 fields["mode"] = ui.select({"count": "Theo số lượng", "dates": "Theo khoảng ngày"}, label="Cách quét", value=settings["mode"],
                                            on_change=lambda e: change("mode", e.value)).props("outlined").classes("w-52")
@@ -184,6 +187,14 @@ def create_video_titles_page():
                 fields["date_type"] = ui.select(SCAN_DATE_TYPE_OPTIONS, label="Tính theo ngày", value=settings["date_type"],
                                                 on_change=lambda e: change("date_type", e.value)).props("outlined").classes("w-64")
             ui.label("Khoảng ngày tính theo giờ Việt Nam, gồm cả ngày kết thúc. Chế độ số lượng lấy video mới nhất sau khi lọc phạm vi.").classes("text-xs text-gray-500")
+            ui.label('Nút quét “part” chỉ lấy tiêu đề chứa chữ part, không phân biệt hoa thường (ví dụ: _part40, PART 2). Số lượng tính sau khi lọc tiêu đề.').classes("text-xs text-gray-500")
+            ui.separator()
+            fields["manual_ids"] = ui.textarea("Video ID thủ công", value=settings["manual_ids"],
+                                               placeholder="Mỗi dòng một Video ID hoặc link YouTube / Studio",
+                                               on_change=lambda e: change("manual_ids", e.value or "")).props("outlined autogrow").classes("w-full")
+            with ui.row().classes("w-full items-center gap-3"):
+                buttons["scan_manual"] = ui.button("Đọc Video ID thủ công", icon="playlist_add", on_click=lambda: start("scan_manual")).props("outline")
+                ui.label("Đọc đúng danh sách đã nhập và thay thế bảng bên dưới; bỏ qua bộ lọc ngày, số lượng và phạm vi. Video phải thuộc kênh đã chọn.").classes("text-xs text-gray-500 flex-1 min-w-0")
         with app_card():
             with section_header("Ghép tên bài nhạc theo thời lượng", "Tên file nhạc bỏ phần mở rộng sẽ trở thành tiêu đề video trên YouTube."):
                 buttons["match"] = ui.button("Ghép theo thời lượng", icon="timer", on_click=lambda: start("match")).props("outline")

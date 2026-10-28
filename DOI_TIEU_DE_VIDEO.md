@@ -10,6 +10,13 @@ Trong mục **Tác vụ** ở thanh bên, mở **Ghép & đổi tiêu đề**.
 6. Khi nhiều bài khớp, ưu tiên bài gần thời lượng nhất. Nếu nhiều tên khớp ngang nhau và tiêu đề cũ không xác định được một bài duy nhất, dòng báo **Cần chọn file**. Bấm biểu tượng thư mục ở cuối dòng để chọn một trong các bài khớp. Các dòng khớp được chọn sẵn; bỏ chọn dòng chưa muốn đổi.
 7. Bấm **Đổi tiêu đề đã chọn** để cập nhật trực tiếp tiêu đề trên YouTube bằng phiên kênh Tuất. Chỉ những dòng đã chọn và có tiêu đề đề xuất mới được xử lý.
 
+Hai cách lấy danh sách bổ sung trong khung **Quét video**:
+
+- **Quét video có chữ “part”**: giữ phạm vi kênh và khoảng ngày/số lượng đã chọn, chỉ lấy video có tiêu đề chứa `part`, không phân biệt hoa thường; nhận cả `_part40`, `Part 2`, `PART03`. Chế độ số lượng lấy N video khớp mới nhất, tiếp tục qua các trang nếu cần để tìm đủ. Chế độ khoảng ngày lấy tất cả video khớp trong khoảng đó.
+- **Video ID thủ công**: dán mỗi dòng một ID hoặc link YouTube/Studio rồi bấm **Đọc Video ID thủ công**. Có thể ngăn cách bằng dấu phẩy, chấm phẩy hoặc khoảng trắng. Tool bỏ ID trùng, đọc tiêu đề và thời lượng trực tiếp theo thứ tự đã nhập, tối đa 10.000 ID. Danh sách này bỏ qua bộ lọc ngày/số lượng/phạm vi, nhưng mọi video phải thuộc kênh đã chọn. ID không hợp lệ hoặc không đọc được sẽ báo lỗi; không thay bảng hiện tại bằng một danh sách đọc dở.
+
+Cả ba nút lấy danh sách đều thay thế bảng xem trước sau khi đọc xong; bước ghép theo thời lượng và đổi tiêu đề vẫn dùng chung. Nhập/sửa ô ID chưa tự đổi tiêu đề trên YouTube.
+
 Tool đọc lại đúng Video ID, kênh, thời lượng và tiêu đề trước khi gửi. Nếu tiêu đề đã bị sửa thủ công sau lúc quét hoặc thời lượng không còn khớp, dòng báo lỗi để quét lại. Yêu cầu cập nhật chỉ chứa thay đổi tiêu đề. **Thành công** chỉ hiện sau khi đọc lại thấy đúng tiêu đề mới trên YouTube.
 
 Một file nhạc có thể ghép cho nhiều video. Thao tác này đổi tiêu đề trên YouTube, giữ nguyên các file video/nhạc trên máy. **Xuất kết quả CSV** lưu tiêu đề cũ, tiêu đề mới và trạng thái để đối chiếu.

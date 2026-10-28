@@ -8,7 +8,7 @@ from src.module.base import YouTubeRequestError
 from src.module.video_title_module import video_title_module
 from src.state_manager import state_manager
 from src.task_runtime import TaskStopped, bind_run_context, create_run_context
-from src.video_title_matching import build_title_matches, default_title_settings, scan_title_videos
+from src.video_title_matching import build_title_matches, default_title_settings, parse_manual_title_ids, scan_title_videos
 
 STATE_KEY = "video_titles"
 ELIGIBLE = {"ready", "error", "stopped"}
@@ -52,7 +52,7 @@ class VideoTitleController:
             if set(changes) & {"channel_id", "mode", "scope", "limit", "start_date", "end_date", "date_type"}:
                 self.rows = []
                 self.message = "Phạm vi đã đổi. Quét lại video để tạo danh sách mới."
-            else:
+            elif set(changes) & {"folder", "recursive", "tolerance"}:
                 for row in self.rows:
                     if row["status"] == "successful":
                         row["old_title"] = row["new_title"]
@@ -88,13 +88,15 @@ class VideoTitleController:
             self._save()
 
     def start(self, action):
-        if action not in {"scan", "match", "update"}:
+        if action not in {"scan", "scan_part", "scan_manual", "match", "update"}:
             raise ValueError("Tác vụ tiêu đề không hợp lệ.")
         with self.lock:
             if self.busy:
                 raise ValueError("Tác vụ đang chạy. Chờ hoàn tất hoặc bấm Dừng.")
             if not self.settings["channel_id"]:
                 raise ValueError("Chọn một kênh YouTube trước.")
+            if action == "scan_manual":
+                parse_manual_title_ids(self.settings["manual_ids"])
             if action in {"match", "update"} and not self.rows:
                 raise ValueError("Quét video trước khi ghép và đổi tiêu đề.")
             if action == "match" and not self.settings["folder"]:
@@ -103,7 +105,9 @@ class VideoTitleController:
                 raise ValueError("Chọn ít nhất một video đã ghép để đổi tiêu đề.")
             self.busy, self.phase = True, action
             self.revision += 1
-            self.message = {"scan": "Đang quét video trên kênh…", "match": "Đang đọc thời lượng nhạc…", "update": "Đang kiểm tra và đổi tiêu đề…"}[action]
+            self.message = {"scan": "Đang quét video trên kênh…", "scan_part": "Đang quét video có chữ “part” trong tiêu đề…",
+                            "scan_manual": "Đang đọc các Video ID nhập thủ công…",
+                            "match": "Đang đọc thời lượng nhạc…", "update": "Đang kiểm tra và đổi tiêu đề…"}[action]
             self.run = create_run_context("video_titles")
             self.thread = threading.Thread(target=self._worker, args=(action, self.run), daemon=True, name="video-titles")
             self.thread.start()
@@ -128,16 +132,30 @@ class VideoTitleController:
         try:
             with bind_run_context(run):
                 settings = dict(self.settings)
-                if action == "scan":
-                    videos = scan_title_videos(settings["channel_id"], mode=settings["mode"], scope=settings["scope"],
-                                               limit=settings["limit"], start_date=settings["start_date"], end_date=settings["end_date"],
-                                               date_type=settings["date_type"], progress=self._progress)
+                if action in {"scan", "scan_part", "scan_manual"}:
+                    if action == "scan_manual":
+                        identifiers = parse_manual_title_ids(settings["manual_ids"])
+                        videos = []
+                        for index, identifier in enumerate(identifiers, 1):
+                            run.checkpoint()
+                            self._progress(f"Đọc Video ID {index}/{len(identifiers)} · {identifier}")
+                            try:
+                                videos.append(self.module.read_video(settings["channel_id"], identifier))
+                            except (ValueError, YouTubeRequestError) as exc:
+                                raise ValueError(f"Video {identifier}: {self._error(exc)}") from None
+                    else:
+                        videos = scan_title_videos(settings["channel_id"], mode=settings["mode"], scope=settings["scope"],
+                                                   limit=settings["limit"], start_date=settings["start_date"], end_date=settings["end_date"],
+                                                   date_type=settings["date_type"], title_contains="part" if action == "scan_part" else "",
+                                                   progress=self._progress)
                     run.checkpoint()
                     with self.lock:
                         self.rows = [dict(video_id=v.id, channel_id=v.channel_id, old_title=v.title,
                                           duration_seconds=float(v.duration_ms or 0) / 1000, status="scanned",
                                           audio_path="", new_title="", selected=False, detail="Chưa ghép nhạc.") for v in videos]
-                        self.message = f"Đã quét {len(self.rows)} video. Chọn thư mục nhạc rồi bấm Ghép theo thời lượng."
+                        source = {"scan": "Đã quét", "scan_part": "Đã quét", "scan_manual": "Đã đọc"}[action]
+                        criterion = " có chữ “part” trong tiêu đề" if action == "scan_part" else " nhập thủ công" if action == "scan_manual" else ""
+                        self.message = f"{source} {len(self.rows)} video{criterion}. Chọn thư mục nhạc rồi bấm Ghép theo thời lượng."
                         self.revision += 1
                         self._save()
                 elif action == "match":

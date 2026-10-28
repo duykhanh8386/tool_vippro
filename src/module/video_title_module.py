@@ -16,6 +16,11 @@ from src.youtube_auth import studio_authorization_header
 
 
 class VideoTitleModule(IModule):
+    def read_video(self, channel_id, video_id):
+        if not re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id or ""):
+            raise ValueError("Video ID không hợp lệ.")
+        return self._read_owned(video_id, channel_id)
+
     def _read_owned(self, video_id, channel_id):
         check_stopped()
         video = self._get_video_info(video_id, channel_id)
@@ -24,10 +29,8 @@ class VideoTitleModule(IModule):
         return video
 
     def update_title(self, channel_id, video_id, title, *, expected_title, audio_duration=None, tolerance=2.0):
-        if not re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id or ""):
-            raise ValueError("Video ID không hợp lệ.")
         title = clean_video_title(title)
-        before = self._read_owned(video_id, channel_id)
+        before = self.read_video(channel_id, video_id)
         if audio_duration is not None:
             current_duration = float(before.duration_ms or 0) / 1000
             if not math.isfinite(current_duration) or current_duration <= 0 or abs(current_duration - audio_duration) > tolerance + 1e-6:

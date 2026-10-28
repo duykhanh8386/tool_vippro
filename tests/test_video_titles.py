@@ -16,7 +16,7 @@ from src.module.base import YouTubeRequestError
 from src.module.model import Video
 from src.module.video_title_module import VideoTitleModule
 from src.task_runtime import TaskStopped, bind_run_context, create_run_context
-from src.video_title_matching import build_title_matches, clean_video_title, scan_title_videos
+from src.video_title_matching import build_title_matches, clean_video_title, parse_manual_title_ids, scan_title_videos
 from src.video_title_tasks import STATE_KEY, VideoTitleController
 
 CHANNEL = "UC" + "a" * 22
@@ -54,6 +54,27 @@ class MemoryState:
 
 
 class TitleScanTests(unittest.TestCase):
+    def test_part_scan_counts_matching_titles_across_pages_and_ignores_case(self):
+        pages = [([video(title="Song without the keyword"), video(OTHER, title="1026(1)_PART40")], "next"),
+                 ([video(OTHER, title="Repeated part"), video("Ghi123_-XYZ", title="Mix Part 2"),
+                   video("Jkl123_-XYZ", title="Part 3")], None)]
+        with patch("src.video_title_matching.list_videos_module.list_all_videos", side_effect=pages) as listing:
+            result = scan_title_videos(CHANNEL, limit=2, title_contains="part")
+        self.assertEqual([item.id for item in result], [OTHER, "Ghi123_-XYZ"])
+        self.assertEqual(listing.call_count, 2)
+        self.assertEqual(listing.call_args.kwargs["limit"], 50)
+
+    def test_part_scan_keeps_date_and_scope_filters(self):
+        stamp = lambda day: datetime(2026, 10, day, 12, tzinfo=timezone.utc).timestamp()
+        pages = [([video(title="Part 1", privacy="PRIVATE", time_created_seconds=stamp(28)),
+                   video(OTHER, title="Part 2", time_created_seconds=stamp(27))], "next"),
+                 ([video("Ghi123_-XYZ", title="A part30", time_created_seconds=stamp(28)),
+                   video("Jkl123_-XYZ", title="Normal title", time_created_seconds=stamp(28))], None)]
+        with patch("src.video_title_matching.list_videos_module.list_all_videos", side_effect=pages):
+            result = scan_title_videos(CHANNEL, mode="dates", scope="public", title_contains="part", limit=1,
+                                       start_date="2026-10-28", end_date="2026-10-28", date_type="uploaded")
+        self.assertEqual([item.id for item in result], ["Ghi123_-XYZ"])
+
     def test_count_filters_scope_before_counting_and_deduplicates_pages(self):
         pages = [([video(privacy="PRIVATE"), video(OTHER)], "next"), ([video(OTHER), video("Ghi123_-XYZ")], None)]
         with patch("src.video_title_matching.list_videos_module.list_all_videos", side_effect=pages) as listing:
@@ -94,6 +115,21 @@ class TitleScanTests(unittest.TestCase):
         with patch("src.video_title_matching.list_videos_module.list_all_videos", return_value=([video(channel_id="foreign")], None)):
             with self.assertRaisesRegex(ValueError, "không thuộc"):
                 scan_title_videos(CHANNEL)
+
+
+class ManualTitleIdsTests(unittest.TestCase):
+    def test_ids_and_youtube_links_are_deduplicated_in_input_order(self):
+        text = (f"{VIDEO}\nhttps://youtu.be/{OTHER}?t=20; https://www.youtube.com/watch?v={VIDEO}&list=fixture\n"
+                f"https://studio.youtube.com/video/Ghi123_-XYZ/edit, youtube.com/shorts/Jkl123_-XYZ\n"
+                f"https://www.youtube.com/live/{OTHER}\nhttps://www.youtube.com/embed/{VIDEO}")
+        self.assertEqual(parse_manual_title_ids(text), [VIDEO, OTHER, "Ghi123_-XYZ", "Jkl123_-XYZ"])
+
+    def test_invalid_entries_are_not_silently_ignored_or_extracted_from_other_sites(self):
+        for text in ("", "   ", VIDEO + "\nwrong", "https://example.com/watch?v=" + VIDEO,
+                     "https://youtube.com.evil.test/watch?v=" + VIDEO, "https://youtube.com/@channel",
+                     "ftp://youtube.com/watch?v=" + VIDEO, "http://[", VIDEO + "extra"):
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                parse_manual_title_ids(text)
 
 
 class TitleMatchTests(unittest.TestCase):
@@ -164,6 +200,17 @@ class TitleModuleTests(unittest.TestCase):
     def call(self):
         return self.module.update_title(CHANNEL, VIDEO, "Tên bài nhạc", expected_title="1026(1)_part40", audio_duration=60, tolerance=2)
 
+    def test_manual_read_checks_exact_video_and_channel_without_mutation(self):
+        with patch.object(self.module, "_get_video_info", return_value=video()) as read, \
+             patch("src.module.video_title_module.post_with_stop") as post:
+            self.assertEqual(self.module.read_video(CHANNEL, VIDEO).title, "1026(1)_part40")
+            read.assert_called_once_with(VIDEO, CHANNEL)
+            post.assert_not_called()
+        for current in (video(channel_id="foreign"), video(OTHER)):
+            with self.subTest(current=current), patch.object(self.module, "_get_video_info", return_value=current):
+                with self.assertRaises(ValueError):
+                    self.module.read_video(CHANNEL, VIDEO)
+
     def test_mutation_contains_only_title_and_success_requires_readback(self):
         with patch.object(self.module, "_get_video_info", side_effect=[video(), video(title="Tên bài nhạc")]), \
              patch("src.module.video_title_module.post_with_stop", return_value=Mock(status_code=200, json=lambda: {})) as post:
@@ -228,6 +275,65 @@ class TitleControllerTests(unittest.TestCase):
         self.controller.start("update")
         self.controller.thread.join(timeout=5)
         self.assertFalse(self.controller.thread.is_alive())
+
+    def test_manual_scan_reads_only_explicit_ids_and_does_not_apply_channel_scan_filters(self):
+        self.controller.change_settings(manual_ids=f"{OTHER}\n{VIDEO}\n{OTHER}", mode="dates", scope="draft",
+                                        start_date="invalid", end_date="invalid", limit=1)
+        self.module.read_video.side_effect = [video(OTHER, title="Chosen song", duration_ms=80000), video()]
+        with patch("src.video_title_tasks.scan_title_videos") as scan:
+            self.controller.start("scan_manual")
+            self.controller.thread.join(5)
+        self.assertFalse(self.controller.busy)
+        scan.assert_not_called()
+        self.assertEqual([call.args for call in self.module.read_video.call_args_list], [(CHANNEL, OTHER), (CHANNEL, VIDEO)])
+        self.assertEqual([item["video_id"] for item in self.controller.rows], [OTHER, VIDEO])
+        self.assertEqual(self.controller.rows[0]["duration_seconds"], 80)
+        self.assertEqual(self.controller.rows[0]["old_title"], "Chosen song")
+        self.assertTrue(all(item["status"] == "scanned" for item in self.controller.rows))
+        self.module.update_title.assert_not_called()
+        restored = VideoTitleController(storage=self.state, module=self.module)
+        self.assertEqual(restored.settings["manual_ids"], f"{OTHER}\n{VIDEO}\n{OTHER}")
+        self.assertEqual(restored.rows, self.controller.rows)
+
+    def test_manual_input_is_draft_and_failed_or_stopped_reads_keep_existing_preview(self):
+        original = copy.deepcopy(self.controller.rows)
+        self.controller.change_settings(manual_ids=f"{VIDEO}\n{OTHER}")
+        self.assertEqual(self.controller.rows, original)
+        self.module.read_video.side_effect = [video(), ValueError("Không thuộc kênh đã chọn")]
+        self.controller.start("scan_manual")
+        self.controller.thread.join(5)
+        self.assertEqual(self.controller.rows, original)
+        self.assertIn(OTHER, self.controller.message)
+        self.module.update_title.assert_not_called()
+
+        def read(*args):
+            self.controller.stop()
+            return video()
+
+        self.module.read_video.reset_mock(side_effect=True)
+        self.module.read_video.side_effect = read
+        self.controller.start("scan_manual")
+        self.controller.thread.join(5)
+        self.module.read_video.assert_called_once()
+        self.assertEqual(self.controller.rows, original)
+
+    def test_invalid_manual_input_does_not_start_background_job(self):
+        self.controller.change_settings(manual_ids=VIDEO + "\ninvalid")
+        with self.assertRaises(ValueError):
+            self.controller.start("scan_manual")
+        self.assertFalse(self.controller.busy)
+        self.module.read_video.assert_not_called()
+
+    def test_part_button_starts_filtered_scan_and_normal_scan_stays_unfiltered(self):
+        for action, criterion in (("scan_part", "part"), ("scan", "")):
+            with self.subTest(action=action), patch("src.video_title_tasks.scan_title_videos", return_value=[video()]) as scan:
+                self.controller.start(action)
+                self.controller.thread.join(5)
+                self.assertFalse(self.controller.busy)
+                self.assertEqual(scan.call_args.kwargs["title_contains"], criterion)
+                self.assertEqual(scan.call_args.args, (CHANNEL,))
+                self.assertEqual(self.controller.rows[0]["old_title"], "1026(1)_part40")
+        self.module.update_title.assert_not_called()
 
     def test_confirmed_changes_are_saved_and_reload_does_not_select_successes(self):
         self.run_update()

@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import math
+import re
 from datetime import date
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 from src.audio_batch_matcher import normalize_title, scan_audio_files
 from src.audio_recovery import _is_currently_public_video, _is_currently_scheduled_video
@@ -22,8 +24,44 @@ def clean_video_title(value: str) -> str:
     return title
 
 
+def parse_manual_title_ids(text: str) -> list[str]:
+    """Accept explicit IDs or YouTube links, preserving order without duplicates."""
+    identifiers = []
+    seen = set()
+    for index, value in enumerate(re.split(r"[\s,;]+", str(text or "").strip()), 1):
+        if not value:
+            continue
+        identifier = value
+        if not re.fullmatch(r"[A-Za-z0-9_-]{11}", identifier):
+            try:
+                url = urlparse(value if "://" in value else "https://" + value)
+            except ValueError:
+                raise ValueError(f"Mục {index} không phải Video ID hoặc link YouTube hợp lệ.") from None
+            host = (url.hostname or "").lower()
+            parts = url.path.strip("/").split("/")
+            identifier = ""
+            if url.scheme in {"http", "https"}:
+                if host in {"youtu.be", "www.youtu.be"} and len(parts) == 1:
+                    identifier = parts[0]
+                elif host in {"youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com", "studio.youtube.com"}:
+                    if parts == ["watch"]:
+                        identifier = parse_qs(url.query).get("v", [""])[0]
+                    elif len(parts) >= 2 and parts[0] in {"video", "shorts", "live", "embed"}:
+                        identifier = parts[1]
+            if not re.fullmatch(r"[A-Za-z0-9_-]{11}", identifier):
+                raise ValueError(f"Mục {index} không phải Video ID hoặc link YouTube hợp lệ. Mỗi Video ID có 11 ký tự.")
+        if identifier not in seen:
+            seen.add(identifier)
+            identifiers.append(identifier)
+        if len(identifiers) > 10_000:
+            raise ValueError("Mỗi lượt chỉ đọc tối đa 10.000 Video ID.")
+    if not identifiers:
+        raise ValueError("Nhập ít nhất một Video ID hoặc link YouTube.")
+    return identifiers
+
+
 def scan_title_videos(channel_id: str, *, mode="count", scope="all", limit=50,
-                      start_date="", end_date="", date_type="auto", progress=lambda message: None):
+                      start_date="", end_date="", date_type="auto", title_contains="", progress=lambda message: None):
     if mode not in {"count", "dates"} or scope not in {"all", "public", "scheduled", "draft"}:
         raise ValueError("Chọn phạm vi quét video hợp lệ.")
     try:
@@ -42,10 +80,11 @@ def scan_title_videos(channel_id: str, *, mode="count", scope="all", limit=50,
         except (ValueError, TypeError):
             raise ValueError("Khoảng ngày không hợp lệ; ngày kết thúc phải từ ngày bắt đầu trở đi.") from None
     videos, seen, tokens = [], set(), set()
+    title_filter = str(title_contains or "").casefold()
     token = None
     while True:
         check_stopped()
-        size = min(50, limit - len(videos)) if mode == "count" else 50
+        size = min(50, limit - len(videos)) if mode == "count" and not title_filter else 50
         kwargs = {"limit": size, "page_token": token, "include_all_origins": True}
         if scope == "draft":
             kwargs["draft_only"] = True
@@ -63,10 +102,13 @@ def scan_title_videos(channel_id: str, *, mode="count", scope="all", limit=50,
                 continue
             if not video_matches_scan_dates(video, bounds, date_type=normalize_scan_date_type(date_type)):
                 continue
+            if title_filter and title_filter not in str(video.title or "").casefold():
+                continue
             videos.append(video)
             if mode == "count" and len(videos) == limit:
                 break
-        progress(f"Đã đọc {len(seen)} video · {len(videos)} video trong phạm vi đã chọn.")
+        criterion = f' có chữ “{title_contains}”' if title_filter else ""
+        progress(f"Đã đọc {len(seen)} video · {len(videos)} video{criterion} trong phạm vi đã chọn.")
         if not next_token or (mode == "count" and len(videos) >= limit):
             return videos
         if next_token in tokens:
@@ -136,4 +178,4 @@ def build_title_matches(rows, folder, *, recursive=True, tolerance=2.0,
 def default_title_settings():
     return {"channel_id": "", "mode": "count", "scope": "all", "limit": 50,
             "start_date": scan_today().isoformat(), "end_date": scan_today().isoformat(),
-            "date_type": "auto", "folder": "", "recursive": True, "tolerance": 2.0}
+            "date_type": "auto", "folder": "", "recursive": True, "tolerance": 2.0, "manual_ids": ""}
