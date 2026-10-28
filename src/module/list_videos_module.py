@@ -27,7 +27,7 @@ class ListVideosModule(IModule):
     pass
     pass
 
-    def list_all_videos(self, channel_id: str, limit: int=50, page_token: str | None=None, *, draft_only: bool=False) -> tuple[list[Video], str | None]:
+    def list_all_videos(self, channel_id: str, limit: int=50, page_token: str | None=None, *, draft_only: bool=False, include_all_origins: bool=False) -> tuple[list[Video], str | None]:
         """
         Fetch all uploaded videos for a channel regardless of privacy type.
 
@@ -40,6 +40,8 @@ class ListVideosModule(IModule):
             page_token:  Continuation token from a previous call for pagination.
             draft_only:  Ask Studio for draft rows explicitly. Draft uploads are
                          not consistently included in the unfiltered listing.
+            include_all_origins: Include livestream archives as well as uploads.
+                                 Existing audio scans keep their current default.
 
         Returns:
             (videos, next_page_token) — next_page_token is None on the last page.
@@ -61,6 +63,9 @@ class ListVideosModule(IModule):
     "publicShorts": {"all": True}, "podcastRssMetadata": {"all": True}, "videoLinkageShortsAttribution": {"all": True}, "alteredContentSettings": {"all": True}, "superfansOnly": {"all": True}, "tvfilmMetadata": {"all": True}, "videoCreatorExperiment": {"all": True}, "responseStatus": {"all": True}, "statusDetails": {"all": True}, "description": True, "titleFormattedString": {"all": True}, "descriptionDetails": {"all": True}, "descriptionFormattedString": {"all": True}, "titleDetails": {"all": True},
     "videoDurationMs": True, "publicMetrics": {"all": True}, "audienceRestriction": {"all": True}, "releaseInfo": {"all": True}, "privateMetrics": {"dislikeCount": True}, "monetization": {"all": True}, "selfCertification": {"all": True}, "allRestrictions": {"all": True}, "mfkSettings": {"all": True}, "inlineEditProcessingStatus": True, "videoPrechecks": {"all": True}, "videoStreamUrl": True, "thumbnailEditorState": {"all": True}, "videoResolutions": {"all": True},
     "shorts": {"all": True}, "scheduledPublishingDetails": {"all": True}, "visibility": {"all": True}, "privateShare": {"all": True}, "sponsorsOnly": {"all": True}, "unlistedExpired": True, "videoTrailers": {"all": True}, "remix": {"isSource": True}, "isPaygated": True}, "context": {"client": {"clientName": 62, "clientVersion": "1.20260520.00.00", "hl": "vi", "gl": "VN", "experimentsToken": "", "utcOffsetMinutes": 420, "userInterfaceTheme": "USER_INTERFACE_THEME_DARK", "screenWidthPoints": 1920, "screenHeightPoints": 150, "screenPixelDensity": 1, "screenDensityFloat": 1}, "request": {"returnLogEntry": True, "internalExperimentFlags": [], "eats": self.EATS, "sessionInfo": {"token": session_token}, "consistencyTokenJars": []}, "user": {"onBehalfOfUser": channel_info.delegated_session_id, "delegationContext": {"externalChannelId": channel_info.id, "roleType": {"channelRoleType": channel_info.role}}, "serializedDelegationContext": ""}, "clickTracking": {"visualElement": {"veType": 31_402}}, "clientScreenNonce": self.CLIENT_SCREEN_NONCE}}
+        if include_all_origins:
+            operands = payload["filter"]["and"]["operands"]
+            operands[:] = [operand for operand in operands if "videoOriginIs" not in operand]
         if draft_only:
             payload["filter"]["and"]["operands"].insert(1, {"isDraft": {}})
         headers = {"origin": "https://studio.youtube.com", "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36", "cookie": cookie_string, "content-type": "application/json", "authorization": studio_authorization_header(channel_info.cookies)}

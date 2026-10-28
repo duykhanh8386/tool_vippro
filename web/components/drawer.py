@@ -635,6 +635,8 @@ def create_drawer():
                     pass
                 with nav_item("/audio/add-only", "Thêm audio", "o_add_circle_outline"):
                     pass
+                with nav_item("/videos/titles", "Ghép & đổi tiêu đề", "o_drive_file_rename_outline"):
+                    pass
                 with nav_item("/reup/delete-video", "Xóa - Back", "o_delete_sweep"):
                     pass
 
