@@ -1059,6 +1059,31 @@ class AudioUploadTests(unittest.TestCase):
                     })
                     self.assertEqual(unreadable, [])
 
+    def test_manual_scan_excludes_completely_empty_translations_table(self):
+        module = UpdateAudioModule()
+        cases = [
+            [],
+            [{"languageCode": "sdp"}],
+            [{"languageCode": "sdp", "audioTranslation": {}}],
+            [{"languageCode": "sdp", "audioTranslation": {"statusLabel": "-"}}],
+            [{"languageCode": "sdp", "audioTranslation": {"statusLabel": "–"}}],
+            [{"languageCode": "sdp", "captionsTranslations": []}],
+            [{"languageCode": "sdp", "metadataTranslations": []}],
+        ]
+        for translations in cases:
+            with self.subTest(translations=translations):
+                payload = {
+                    "videoTranslations": [{"videoId": "video", "translations": translations}],
+                    "audioTracks": [],
+                }
+                unreadable = []
+                with patch.object(module, "_get_video_translation_payload", return_value=payload):
+                    targets = module.get_terminal_audio_repair_targets(
+                        ["video"], "channel", unreadable, include_missing_audio=True,
+                    )
+                self.assertEqual(targets, {})
+                self.assertEqual(unreadable, [])
+
     def test_manual_missing_audio_scan_excludes_existing_audio_and_invalid_rows(self):
         module = UpdateAudioModule()
         empty_row = {"languageCode": "es", "audioTranslation": {}}
@@ -1103,7 +1128,9 @@ class AudioUploadTests(unittest.TestCase):
                 raise AudioUpdateError("Precondition check failed", status_code=400)
             video_id = "first" if len(video_ids) > 1 else video_ids[0]
             return {"videoTranslations": [{"videoId": video_id, "translations": [
-                {"languageCode": "es", "audioTranslation": {"statusLabel": "–"}},
+                {"languageCode": "es", "audioTranslation": {
+                    "audioTrackId": "failed-es", "status": "AUDIO_TRACK_STATUS_FAILED",
+                }},
             ]}], "audioTracks": []}
 
         unreadable = []

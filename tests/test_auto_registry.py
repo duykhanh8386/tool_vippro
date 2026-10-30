@@ -7,7 +7,10 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 from src.audio_recovery import (
+    DEFAULT_RECOVERY_CONCURRENCY_MODE,
     PROCESSING_WARNING_REASON,
+    RECOVERY_CONCURRENCY_MODE_CHANNELS,
+    RECOVERY_CONCURRENCY_MODE_VIDEOS,
     RECOVERY_SCAN_MODE_ALL,
     RECOVERY_SCAN_MODE_SELECTED,
     RECOVERY_VIDEO_SCOPE_BOTH,
@@ -610,6 +613,14 @@ class AutoRegistryUiTests(RegistryStorage, unittest.TestCase):
         return next(
             element for element in self.client.elements.values()
             if isinstance(element, self.ui.toggle)
+            and RECOVERY_VIDEO_SCOPE_PUBLIC in element._props.get("options", {})
+        )
+
+    def concurrency_mode_control(self):
+        return next(
+            element for element in self.client.elements.values()
+            if isinstance(element, self.ui.toggle)
+            and RECOVERY_CONCURRENCY_MODE_CHANNELS in element._props.get("options", {})
         )
 
     def test_calendar_saves_reloads_and_clears_without_changing_registered_videos(self):
@@ -687,6 +698,32 @@ class AutoRegistryUiTests(RegistryStorage, unittest.TestCase):
         with patch("web.components.auto_registry.set_audio_recovery_scan_preferences") as save, self.client:
             self.refresh()
         self.assertEqual(self.video_scope_control().value, RECOVERY_VIDEO_SCOPE_BOTH)
+        save.assert_not_called()
+
+    def test_concurrency_mode_control_saves_all_choices(self):
+        control = self.concurrency_mode_control()
+        self.assertEqual(control.value, DEFAULT_RECOVERY_CONCURRENCY_MODE)
+        for mode in (RECOVERY_CONCURRENCY_MODE_VIDEOS, RECOVERY_CONCURRENCY_MODE_CHANNELS):
+            with self.subTest(mode=mode), self.client:
+                control.set_value(mode)
+                self.assertEqual(get_audio_recovery_scan_preferences()["concurrency_mode"], mode)
+                self.assertEqual(get_audio_recovery_state()["entries"], self.original_entries)
+
+    def test_concurrency_mode_control_restores_selection_when_save_fails(self):
+        control = self.concurrency_mode_control()
+        with patch("web.components.auto_registry.set_audio_recovery_scan_preferences", return_value=False), self.client:
+            control.set_value(RECOVERY_CONCURRENCY_MODE_VIDEOS)
+        self.assertEqual(control.value, DEFAULT_RECOVERY_CONCURRENCY_MODE)
+        self.assertEqual(
+            get_audio_recovery_scan_preferences()["concurrency_mode"], DEFAULT_RECOVERY_CONCURRENCY_MODE
+        )
+        self.notify.assert_called_with("Không thể lưu chế độ luồng tự động quét.", type="negative")
+
+    def test_refresh_syncs_concurrency_mode_without_saving_again(self):
+        set_audio_recovery_scan_preferences(concurrency_mode=RECOVERY_CONCURRENCY_MODE_VIDEOS)
+        with patch("web.components.auto_registry.set_audio_recovery_scan_preferences") as save, self.client:
+            self.refresh()
+        self.assertEqual(self.concurrency_mode_control().value, RECOVERY_CONCURRENCY_MODE_VIDEOS)
         save.assert_not_called()
 
     def test_channel_action_updates_both_lists_and_preserves_unlisted_channels(self):

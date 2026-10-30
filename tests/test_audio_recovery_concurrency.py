@@ -11,6 +11,7 @@ import requests
 
 from src.module.audio_module import UpdateAudioModule
 from src.audio_recovery import (
+    RECOVERY_CONCURRENCY_MODE_VIDEOS,
     clear_audio_recovery_registry,
     get_audio_mutation_guard,
     get_audio_recovery_runtime_status,
@@ -631,6 +632,94 @@ class AudioRecoveryConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         saved = get_audio_recovery_state()["last_cycle_result"]
         self.assertEqual(saved["repaired"], 3)
         self.assertFalse(saved["cancelled_by_clear"])
+
+    async def test_video_concurrency_mode_runs_one_channel_with_three_videos_at_once(self):
+        channel_entries = {
+            "chan-A": {
+                f"chan-A-vid-{idx}": {
+                    "audio_path": str(self.source), "languages": ["en"],
+                } for idx in range(3)
+            },
+            "chan-B": {
+                "chan-B-vid-0": {
+                    "audio_path": str(self.source), "languages": ["en"],
+                }
+            },
+        }
+        self.manager.save_state("audio_recovery", {
+            "entries": channel_entries,
+            "concurrency_mode": RECOVERY_CONCURRENCY_MODE_VIDEOS,
+        })
+        active_channel_counts = {}
+        active_videos = set()
+        max_active_channels = 0
+        max_active_videos = 0
+        three_videos_started = threading.Event()
+        release_mode2_uploads = threading.Event()
+
+        def visibility_mock(channel_id, video_ids, **_kwargs):
+            return dict.fromkeys(video_ids, True), set()
+
+        def payload_mock(video_ids, channel_id):
+            return {
+                "videoTranslations": [{"videoId": vid, "translations": []} for vid in video_ids],
+                "audioTracks": [{
+                    "videoId": vid, "audioTrackId": f"{vid}-en",
+                    "language": "en", "source": "AUDIO_TRACK_SOURCE_CREATOR",
+                    "audioContentTypeString": "dubbed", "status": "AUDIO_TRACK_STATUS_FAILED",
+                } for vid in video_ids],
+            }
+
+        def delete_mock(video_id, channel_id, track_ids):
+            self.assertTrue(get_audio_mutation_guard(channel_id).locked())
+            return 200
+
+        def upload_mock(*, id_video, channel_id, file_name, language, progress, **_kwargs):
+            nonlocal max_active_channels, max_active_videos
+            self.assertTrue(get_audio_mutation_guard(channel_id).locked())
+            with self.lock:
+                active_channel_counts[channel_id] = active_channel_counts.get(channel_id, 0) + 1
+                active_videos.add(id_video)
+                active_chs = {ch for ch, cnt in active_channel_counts.items() if cnt > 0}
+                max_active_channels = max(max_active_channels, len(active_chs))
+                max_active_videos = max(max_active_videos, len(active_videos))
+                if len(active_videos) == 3:
+                    three_videos_started.set()
+            try:
+                if not release_mode2_uploads.wait(timeout=5):
+                    raise AssertionError("Test did not release mode 2 uploads")
+                return 200
+            finally:
+                with self.lock:
+                    active_channel_counts[channel_id] -= 1
+                    active_videos.discard(id_video)
+
+        with patch("src.audio_recovery._get_registered_video_scan_statuses", side_effect=visibility_mock), \
+             patch("src.audio_recovery.update_audio_module._get_video_translation_payload", side_effect=payload_mock), \
+             patch("src.audio_recovery.update_audio_module.delete_track_ids", side_effect=delete_mock), \
+             patch("src.audio_recovery.update_audio_module.add", side_effect=upload_mock):
+            task = asyncio.create_task(run_audio_recovery_cycle(now=2000))
+            try:
+                ready = await asyncio.wait_for(
+                    asyncio.to_thread(three_videos_started.wait, 3), timeout=4,
+                )
+                self.assertTrue(ready, "Three videos on channel chan-A did not start together")
+                status = get_audio_recovery_runtime_status()
+                self.assertEqual(status["concurrency_mode"], RECOVERY_CONCURRENCY_MODE_VIDEOS)
+                self.assertEqual(status["channel_concurrency"], 1)
+                self.assertEqual(status["video_concurrency"], 3)
+                self.assertEqual(status["active_channel_count"], 1)
+                self.assertEqual(len(status["channels"]), 3)
+                for job in status["channels"]:
+                    self.assertEqual(job["channel_id"], "chan-A")
+            finally:
+                release_mode2_uploads.set()
+                result = await asyncio.wait_for(task, timeout=4)
+
+        self.assertEqual(max_active_channels, 1, "Only 1 channel should run at a time in videos mode")
+        self.assertEqual(max_active_videos, 3, "Up to 3 videos should run concurrently in videos mode")
+        self.assertEqual(result["repaired"], 4)
+        self.assertEqual(result["concurrency_mode"], RECOVERY_CONCURRENCY_MODE_VIDEOS)
 
 
 if __name__ == "__main__":

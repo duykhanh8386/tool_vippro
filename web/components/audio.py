@@ -1815,7 +1815,7 @@ def create_add_audio_page(*, delete_existing: bool = True):
                 )
             elif unreadable_ids:
                 ui.notify(
-                    f"Không thấy audio lỗi hoặc video một ngôn ngữ chưa có audio trong "
+                    f"Không thấy audio lỗi hoặc video có ngôn ngữ chưa có audio trong "
                     f"{len(videos) - len(unreadable_ids)} video đọc được; "
                     f"{len(unreadable_ids)} video không được YouTube trả trạng thái audio.",
                     type="warning",
@@ -1823,7 +1823,7 @@ def create_add_audio_page(*, delete_existing: bool = True):
             else:
                 ui.notify(
                     f"Đã quét {len(videos)} video trong {scan_label}, không thấy audio lỗi "
-                    "hoặc video chỉ có một ngôn ngữ với cột Âm thanh trống (–).",
+                    "hoặc video có ngôn ngữ với cột Âm thanh trống (–).",
                     type="warning",
                 )
         except TaskStopped:
@@ -3363,8 +3363,8 @@ def create_add_audio_page(*, delete_existing: bool = True):
                 ).props("outline disable")
                 ui_refs["failed_video_scan_button"] = failed_video_scan_button
                 failed_video_scan_button.tooltip(
-                    ("Lấy video có audio lỗi hoặc đang xử lý, và video chỉ có một ngôn ngữ "
-                     if delete_existing else "Lấy video có audio lỗi và video chỉ có một ngôn ngữ ") +
+                    ("Lấy video có audio lỗi hoặc đang xử lý, và video có ngôn ngữ "
+                     if delete_existing else "Lấy video có audio lỗi và video có ngôn ngữ ") +
                     "với cột Âm thanh trống (–)."
                 )
             with ui.row().classes("w-full items-end gap-3 flex-wrap"):

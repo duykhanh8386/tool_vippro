@@ -6,6 +6,10 @@ from loguru import logger
 from nicegui import ui
 
 from src.audio_recovery import (
+    DEFAULT_RECOVERY_CONCURRENCY_MODE,
+    RECOVERY_CONCURRENCY_MODE_CHANNELS,
+    RECOVERY_CONCURRENCY_MODE_LABELS,
+    RECOVERY_CONCURRENCY_MODE_VIDEOS,
     RECOVERY_VIDEO_SCOPE_LABELS,
     RECOVERY_VIDEO_SCOPE_PUBLIC,
     get_audio_recovery_registry_items,
@@ -38,6 +42,10 @@ def create_auto_registry_content(*, on_change: Callable[[], None] | None = None)
 
         preference_sync["active"] = True
         try:
+            if concurrency_mode_toggle.value != preferences.get("concurrency_mode"):
+                concurrency_mode_toggle.set_value(
+                    preferences.get("concurrency_mode", DEFAULT_RECOVERY_CONCURRENCY_MODE)
+                )
             if video_scope.value != preferences["video_scan_scope"]:
                 video_scope.set_value(preferences["video_scan_scope"])
             if scan_date_input.value != preferences["scan_start_date"]:
@@ -85,15 +93,35 @@ def create_auto_registry_content(*, on_change: Callable[[], None] | None = None)
                 table.selected = [row for row in rows if row["id"] in selected_ids]
                 table.update_rows(rows, clear_selection=False)
         active_channels = sum(item["enabled"] for item in channel_items)
+        concurrency_label = RECOVERY_CONCURRENCY_MODE_LABELS.get(
+            preferences.get("concurrency_mode"),
+            RECOVERY_CONCURRENCY_MODE_LABELS[DEFAULT_RECOVERY_CONCURRENCY_MODE],
+        )
         summary.set_text(
             f"{len(channel_rows)} kênh "
             f"({active_channels} Active · {len(channel_rows) - active_channels} Deactive) · "
             f"{len(video_rows)} video · "
             f'{sum(item["enabled"] for item in video_items)} video được phép tự động quét'
+            f' · {concurrency_label}'
             f' · {RECOVERY_VIDEO_SCOPE_LABELS[preferences["video_scan_scope"]]}'
             f' · {sum(item.get("processing_warning_count", 0) for item in channel_items)} audio quá 2 giờ chờ thay lại'
             + (f' · {scan_date_label(preferences["scan_start_date"], date_type=preferences["scan_date_type"])}'
                if preferences["scan_start_date"] else "")
+        )
+
+    def change_concurrency_mode(event) -> None:
+        if preference_sync["active"]:
+            return
+        if not set_audio_recovery_scan_preferences(concurrency_mode=event.value):
+            refresh()
+            ui.notify("Không thể lưu chế độ luồng tự động quét.", type="negative")
+            return
+        refresh()
+        if on_change is not None:
+            on_change()
+        ui.notify(
+            "Đã lưu chế độ luồng tự động quét; áp dụng từ vòng quét tiếp theo.",
+            type="positive",
         )
 
     def change_video_scope(event) -> None:
@@ -339,9 +367,19 @@ def create_auto_registry_content(*, on_change: Callable[[], None] | None = None)
             ).tooltip("Làm mới Auto Registry")
         summary = ui.label("").classes("text-xs text-gray-500")
         ui.label(
-            "Quét liên tục tối đa 3 kênh cùng lúc, tự xóa track lỗi và thêm lại audio. "
+            "Quét liên tục theo chế độ được chọn, tự xóa track lỗi và thêm lại audio. "
             "Ưu tiên kênh đang chờ; không còn hàng chờ thì quét lại kênh vừa xong ngay. "
             "Khi có hàng chờ, hết lượt tất cả kênh sẽ lấy lại danh sách cho vòng mới."
+        ).classes("text-xs text-gray-500")
+        ui.label("Chế độ quét song song").classes("text-sm font-medium")
+        concurrency_mode_toggle = ui.toggle(
+            RECOVERY_CONCURRENCY_MODE_LABELS,
+            value=DEFAULT_RECOVERY_CONCURRENCY_MODE,
+            on_change=change_concurrency_mode,
+        ).props("no-caps").classes("w-full")
+        ui.label(
+            "Chọn quét từng video trên 3 kênh cùng lúc (mặc định) hoặc quét 3 video trên 1 kênh cùng lúc. "
+            "Lựa chọn áp dụng từ vòng quét tiếp theo và được lưu khi mở lại ứng dụng."
         ).classes("text-xs text-gray-500")
         ui.label("Loại video tự động quét").classes("text-sm font-medium")
         video_scope = ui.toggle(

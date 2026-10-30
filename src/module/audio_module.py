@@ -872,6 +872,7 @@ class UpdateAudioModule(IModule):
                 and len(clean_items) == 1
                 and cls._translation_has_no_audio(clean_items[0])
                 and cls._translation_language(clean_items[0])
+                and cls._translation_row_has_table_content(clean_items[0])
             ):
                 missing_audio_candidates.add(video_id)
             for item in clean_items:
@@ -988,13 +989,49 @@ class UpdateAudioModule(IModule):
                 and not creator_tracks_by_video.get(video_id)
                 and video_id not in targets
             ):
-                # An empty language means the user may add any configured
-                # languages. Resolve it after scanning so changing the language
-                # selection does not require another channel scan.
                 targets[video_id] = [
                     {"language": "", "track_ids": [], "reason": "missing"}
                 ]
         return targets, requested - readable_ids
+
+    @classmethod
+    def _translation_row_has_table_content(cls, item: dict) -> bool:
+        """Return True if ``item`` represents an actual row in Studio's Subtitles/Bản dịch table.
+
+        When a video only has its default video language configured in details without
+        any published/draft captions or translated metadata, Studio displays an entirely
+        empty table ('trống hoàn toàn'). A row only appears in the table when there are
+        captions, translated metadata, or audio tracks.
+        """
+        if not isinstance(item, dict):
+            return False
+        captions = item.get("captionsTranslations")
+        if isinstance(captions, list) and captions:
+            for cap in captions:
+                if isinstance(cap, dict) and (
+                    cap.get("captionTrackId")
+                    or str(cap.get("publishStatus") or "").strip().upper() in {"PUBLISHED", "DRAFT"}
+                    or str(cap.get("statusLabel") or "").strip()
+                ):
+                    return True
+        caption = item.get("captionTranslation")
+        if isinstance(caption, dict) and caption:
+            if (
+                caption.get("captionTrackId")
+                or str(caption.get("publishStatus") or "").strip().upper() in {"PUBLISHED", "DRAFT"}
+                or str(caption.get("statusLabel") or "").strip()
+            ):
+                return True
+        for meta_key in ("metadataTranslations", "metadataTranslation", "titleTranslation", "descriptionTranslation"):
+            meta = item.get(meta_key)
+            if isinstance(meta, dict) and meta:
+                return True
+            if isinstance(meta, list) and meta:
+                return True
+        audio = item.get("audioTranslation")
+        if isinstance(audio, dict) and audio.get("audioTrackId"):
+            return True
+        return False
 
     @staticmethod
     def _translation_has_no_audio(item: dict) -> bool:
