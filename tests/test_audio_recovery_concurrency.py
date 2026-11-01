@@ -37,7 +37,7 @@ class AudioRecoveryConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         self.source = Path(self.folder.name) / "source.mp3"
         self.source.write_bytes(b"source")
         self.channels = [f"parallel-{index}" for index in range(5)]
-        self.manager.save_state("audio_recovery", {"entries": {
+        self.manager.save_state("audio_recovery", {"audio_content_types": ["descriptive"], "entries": {
             channel: {f"{channel}-video": {
                 "audio_path": str(self.source), "languages": ["en", "es"],
             }} for channel in self.channels
@@ -570,6 +570,7 @@ class AudioRecoveryConcurrencyTests(unittest.IsolatedAsyncioTestCase):
             },
         }
         self.manager.save_state("audio_recovery", {
+            "audio_content_types": ["descriptive"],
             "entries": channel_entries,
             "concurrency_mode": RECOVERY_CONCURRENCY_MODE_VIDEOS,
         })

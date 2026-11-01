@@ -19,7 +19,9 @@ from src.audio_recovery import (
     set_audio_recovery_items_enabled,
     set_audio_recovery_scan_preferences,
     set_audio_recovery_enabled,
+    set_audio_recovery_audio_types,
 )
+from src.audio_description_recovery import enabled_audio_types
 from src.utils import get_channels_info
 from src.video_scan_dates import scan_date_label, validate_scan_start_date
 from web.components.common import create_scan_date_input, create_scan_date_type_select
@@ -34,7 +36,9 @@ def create_auto_registry_content(*, on_change: Callable[[], None] | None = None)
         try:
             channel_items, video_items = get_audio_recovery_registry_items()
             preferences = get_audio_recovery_scan_preferences()
-            enabled = bool(get_audio_recovery_state().get("enabled", True))
+            state = get_audio_recovery_state()
+            enabled = bool(state.get("enabled", True))
+            audio_types = enabled_audio_types(state)
             names = {
                 channel.id: channel.name for channel in (get_channels_info() or [])
             }
@@ -51,6 +55,8 @@ def create_auto_registry_content(*, on_change: Callable[[], None] | None = None)
         global_status.set_text("Auto Registry đang bật" if enabled else "Auto Registry đã tắt")
         preference_sync["active"] = True
         try:
+            dubbed_switch.set_value("dubbed" in audio_types)
+            description_switch.set_value("descriptive" in audio_types)
             if concurrency_mode_toggle.value != preferences.get("concurrency_mode"):
                 concurrency_mode_toggle.set_value(
                     preferences.get("concurrency_mode", DEFAULT_RECOVERY_CONCURRENCY_MODE)
@@ -81,10 +87,17 @@ def create_auto_registry_content(*, on_change: Callable[[], None] | None = None)
                 "name": names.get(item["channel_id"], item["channel_id"]),
                 "languages": ", ".join(item["languages"]),
                 "description_status": (
-                    "Hoàn tất — bỏ qua các lượt quét âm thanh tiếp theo"
+                    "Tắt" if "descriptive" not in audio_types else
+                    "Hoàn tất"
                     if item.get("description_complete") else
                     f'{item.get("description_completed_count", 0)}/{item.get("description_total", len(item["languages"]))} ngôn ngữ · '
                     + (item.get("description_last_error") or "Đang chờ bổ sung/xác nhận mô tả")
+                ),
+                "dubbed_status": (
+                    "Tắt" if "dubbed" not in audio_types else "Hoàn tất"
+                    if item.get("dubbed_complete") else
+                    f'{item.get("dubbed_completed_count", 0)}/{len(item["languages"])} ngôn ngữ · '
+                    + (item.get("dubbed_last_error") or "Đang chờ bổ sung/xác nhận audio ngôn ngữ")
                 ),
                 "status": "Active" if item["enabled"] else "Deactive",
                 "inactive_reason": (
@@ -97,7 +110,7 @@ def create_auto_registry_content(*, on_change: Callable[[], None] | None = None)
                 "processing_warning": (
                     "Đang xử lý lâu: "
                     + ", ".join(warning["language"] for warning in item.get("processing_warnings") or [])
-                    + " · Chờ thêm lại mô tả"
+                    + (" · Chờ thêm lại audio" if "dubbed" in audio_types else " · Chờ thêm lại mô tả")
                     if item.get("processing_warnings") else ""
                 ),
             }
@@ -118,8 +131,8 @@ def create_auto_registry_content(*, on_change: Callable[[], None] | None = None)
             f"{len(channel_rows)} kênh "
             f"({active_channels} Active · {len(channel_rows) - active_channels} Deactive) · "
             f"{len(video_rows)} video · "
-            f'{sum(item["enabled"] and not item.get("description_complete") for item in video_items)} video chờ mô tả'
-            f' · {sum(bool(item.get("description_complete")) for item in video_items)} video hoàn tất'
+            f'{sum(item["enabled"] and not item.get("audio_complete") and bool(audio_types) for item in video_items)} video chờ audio đã chọn'
+            f' · {sum(bool(item.get("audio_complete")) for item in video_items)} video hoàn tất'
             f' · {concurrency_label}'
             f' · {RECOVERY_VIDEO_SCOPE_LABELS[preferences["video_scan_scope"]]}'
             f' · {sum(item.get("processing_warning_count", 0) for item in channel_items)} audio quá 2 giờ chờ thay lại'
@@ -141,6 +154,18 @@ def create_auto_registry_content(*, on_change: Callable[[], None] | None = None)
             "Đã tắt Auto Registry. Thao tác đang chạy sẽ kết thúc trước khi dừng.",
             type="positive",
         )
+
+    def change_audio_types(_event) -> None:
+        if preference_sync["active"]:
+            return
+        selected = [kind for kind, active in (
+            ("dubbed", dubbed_switch.value), ("descriptive", description_switch.value),
+        ) if active]
+        if not set_audio_recovery_audio_types(selected):
+            ui.notify("Không thể lưu lựa chọn loại âm thanh.", type="negative")
+        refresh()
+        if on_change is not None:
+            on_change()
 
     def change_concurrency_mode(event) -> None:
         if preference_sync["active"]:
@@ -409,9 +434,13 @@ def create_auto_registry_content(*, on_change: Callable[[], None] | None = None)
             "được giữ khi mở lại ứng dụng."
         ).classes("text-xs text-gray-500")
         summary = ui.label("").classes("text-xs text-gray-500")
+        with ui.row().classes("w-full gap-4 flex-wrap"):
+            dubbed_switch = ui.switch("Audio ngôn ngữ", value=True, on_change=change_audio_types)
+            description_switch = ui.switch("Âm thanh mô tả", value=True, on_change=change_audio_types)
         ui.label(
-            "Tự tìm file nhạc đã ghép với video và thêm âm thanh mô tả đầy đủ cho các ngôn ngữ đăng ký. "
-            "Video đã đủ mô tả dùng được được lưu hoàn tất và bỏ qua các lượt quét âm thanh tiếp theo."
+            "Bật một công tắc để xử lý riêng loại đó; bật cả hai để xử lý audio ngôn ngữ trước rồi đến mô tả. "
+            "Tắt cả hai để ngừng xử lý audio. Lựa chọn được lưu khi mở lại ứng dụng. "
+            "Tool tự tìm file nhạc đầy đủ đã ghép đúng video; video đã đủ các loại audio đang bật sẽ được bỏ qua."
         ).classes("text-xs text-gray-500")
         ui.label("Chế độ quét song song").classes("text-sm font-medium")
         concurrency_mode_toggle = ui.toggle(
@@ -437,12 +466,12 @@ def create_auto_registry_content(*, on_change: Callable[[], None] | None = None)
             "Lựa chọn áp dụng từ vòng quét tiếp theo và được lưu khi mở lại ứng dụng."
         ).classes("text-xs text-gray-500")
         ui.label(
-            "Trạng thái audio ngôn ngữ không quyết định việc bổ sung mô tả. "
-            "Các video trong Auto Registry từ trước cũng được xử lý tự động khi chưa đủ mô tả."
+            "Khi bật cả hai, mô tả thiếu hoặc lỗi sẽ được xử lý sau khi audio ngôn ngữ tương ứng đã được thay thế và xử lý xong. "
+            "Các video đăng ký từ trước cũng áp dụng lựa chọn hiện tại."
         ).classes("text-xs text-gray-500")
         ui.label(
-            "Mô tả bị lỗi sẽ được xóa đúng track lỗi rồi tải lại file nhạc đầy đủ. "
-            "Mô tả thiếu hoặc xử lý quá 2 giờ sẽ được thử thêm lại. "
+            "Track bị lỗi sẽ được xóa đúng loại và ngôn ngữ rồi tải lại file nhạc đầy đủ. "
+            "Audio thiếu hoặc xử lý quá 2 giờ sẽ được thử thêm lại. "
             "Sau mỗi lượt gửi, tool chờ ít nhất 30 giây trước lượt xác nhận hoặc thử lại tiếp theo."
         ).classes("text-xs text-amber-700")
         ui.label(
@@ -461,7 +490,7 @@ def create_auto_registry_content(*, on_change: Callable[[], None] | None = None)
                     {"name": "channel_id", "label": "Channel ID", "field": "channel_id", "classes": "font-mono select-text"},
                     {"name": "video_count", "label": "Tổng video", "field": "video_count"},
                     {"name": "active_video_count", "label": "Video được quét", "field": "active_video_count"},
-                    {"name": "completed_video_count", "label": "Đã đủ mô tả", "field": "completed_video_count"},
+                    {"name": "completed_video_count", "label": "Đã đủ audio đã chọn", "field": "completed_video_count"},
                     {"name": "processing_warning_count", "label": "Audio xử lý lâu", "field": "processing_warning_count"},
                     {"name": "status", "label": "Trạng thái", "field": "status"},
                     {"name": "actions", "label": "Thao tác", "field": "id", "sortable": False},
@@ -472,6 +501,7 @@ def create_auto_registry_content(*, on_change: Callable[[], None] | None = None)
                     {"name": "channel_id", "label": "Channel ID", "field": "channel_id", "classes": "font-mono select-text"},
                     {"name": "name", "label": "Kênh", "field": "name"},
                     {"name": "languages", "label": "Ngôn ngữ audio", "field": "languages"},
+                    {"name": "dubbed_status", "label": "Audio ngôn ngữ", "field": "dubbed_status", "classes": "whitespace-normal"},
                     {"name": "description_status", "label": "Âm thanh mô tả", "field": "description_status", "classes": "whitespace-normal"},
                     {"name": "processing_warning", "label": "Cảnh báo", "field": "processing_warning", "classes": "whitespace-normal text-amber-700"},
                     {"name": "status", "label": "Trạng thái", "field": "status"},

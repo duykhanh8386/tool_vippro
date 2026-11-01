@@ -100,6 +100,7 @@ class AudioRecoverySchedulerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls, dict.fromkeys("abcde", 1))
 
     async def test_completed_description_channel_is_not_repeated_while_another_is_working(self):
+        self.state["audio_content_types"] = ["descriptive"]
         self.add_channels("a", "b")
         release_slow = asyncio.Event()
         finished_fast = asyncio.Event()

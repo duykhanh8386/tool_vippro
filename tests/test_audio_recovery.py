@@ -939,7 +939,7 @@ class AudioRecoveryCycleTests(unittest.IsolatedAsyncioTestCase):
                 (RECOVERY_VIDEO_SCOPE_BOTH, ["public", "scheduled"]),
             ):
                 state = {
-                    "enabled": True, "video_scan_scope": scope, "initial_grace_seconds": 0,
+                    "enabled": True, "audio_content_types": ["descriptive"], "video_scan_scope": scope, "initial_grace_seconds": 0,
                     "retry_cooldown_seconds": 0, "disabled_video_ids": {"channel": ["disabled-scheduled"]},
                     "entries": {"channel": {
                         vid: {"audio_path": str(source), "languages": ["en"], "repeat_times": 1}

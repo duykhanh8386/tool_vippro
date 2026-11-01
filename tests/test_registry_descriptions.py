@@ -28,7 +28,7 @@ def response(tracks=(), video_id="video"):
     return {"videoTranslations": [{"videoId": video_id, "translations": []}], "audioTracks": list(tracks)}
 
 
-class RegistryDescriptionTests(unittest.IsolatedAsyncioTestCase):
+class RegistryAudioFixture:
     def setUp(self):
         self.stack = ExitStack()
         self.addCleanup(self.stack.close)
@@ -76,11 +76,12 @@ class RegistryDescriptionTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(self.delete.assert_not_called)
 
     def reset_registry(self):
-        self.manager.save_state("audio_recovery", {"entries": {"channel": {"video": copy.deepcopy(self.entry)}}})
+        self.manager.save_state("audio_recovery", {"audio_content_types": ["descriptive"], "entries": {"channel": {"video": copy.deepcopy(self.entry)}}})
 
     def saved_entry(self):
         return recovery.get_audio_recovery_state()["entries"]["channel"]["video"]
 
+class RegistryDescriptionTests(RegistryAudioFixture, unittest.IsolatedAsyncioTestCase):
     async def test_legacy_entries_receive_full_descriptions_regardless_of_dub_status(self):
         for status in ("READY", "PROCESSING", "FAILED", "DELETED"):
             with self.subTest(status=status):

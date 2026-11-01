@@ -1,4 +1,4 @@
-"""Description-only registry decisions and deterministic source-file lookup."""
+"""Registry track decisions, completion checkpoints and source-file lookup."""
 
 from pathlib import Path
 
@@ -10,6 +10,18 @@ from src.utils import normalize_path
 
 DESCRIPTION_VERIFY_SECONDS = 30
 DESCRIPTION_RETRY_SECONDS = 30
+AUDIO_CONTENT_TYPES = ("dubbed", "descriptive")
+
+
+def enabled_audio_types(state: dict) -> tuple[str, ...]:
+    selected = state.get("audio_content_types", AUDIO_CONTENT_TYPES)
+    if not isinstance(selected, (list, tuple)):
+        selected = AUDIO_CONTENT_TYPES
+    return tuple(kind for kind in AUDIO_CONTENT_TYPES if kind in selected)
+
+
+def track_state_prefix(audio_content_type: str) -> str:
+    return "dubbed" if audio_content_type == "dubbed" else "description"
 
 
 def description_languages(entry: dict) -> list[str]:
@@ -20,24 +32,36 @@ def description_languages(entry: dict) -> list[str]:
 
 
 def description_entry_complete(entry: dict) -> bool:
+    return audio_entry_complete(entry, "descriptive")
+
+
+def audio_entry_complete(entry: dict, audio_content_type: str) -> bool:
     languages = description_languages(entry)
-    completed = {str(language).casefold() for language in entry.get("description_completed_languages") or []}
+    completed = {str(language).casefold() for language in entry.get(track_state_prefix(audio_content_type) + "_completed_languages") or []}
     return bool(languages) and all(language.casefold() in completed for language in languages)
 
 
+def registry_entry_complete(entry: dict, audio_types) -> bool:
+    return bool(audio_types) and all(audio_entry_complete(entry, kind) for kind in audio_types)
+
+
 def description_work_due(entry: dict, now: float) -> bool:
-    if description_entry_complete(entry) or not description_languages(entry):
+    return audio_work_due(entry, now, "descriptive")
+
+
+def audio_work_due(entry: dict, now: float, audio_content_type: str) -> bool:
+    if audio_entry_complete(entry, audio_content_type) or not description_languages(entry):
         return False
     try:
-        return float(entry.get("description_next_check_at") or 0) <= now
+        return float(entry.get(track_state_prefix(audio_content_type) + "_next_check_at") or 0) <= now
     except (ValueError, TypeError):
         return True
 
 
-def registry_work_due(entry: dict, now: float) -> bool:
-    if description_entry_complete(entry):
+def registry_work_due(entry: dict, now: float, audio_types=("descriptive",)) -> bool:
+    if audio_types and registry_entry_complete(entry, audio_types):
         return False
-    if description_work_due(entry, now):
+    if any(audio_work_due(entry, now, kind) for kind in audio_types):
         return True
     monitor = entry.get("caption_monitor") or {}
     if not isinstance(monitor, dict) or not monitor.get("languages"):
@@ -56,7 +80,13 @@ def _confirmed_description(track: dict) -> bool:
     return str(track.get("statusLabel") or "").casefold() in {"published", "đã xuất bản"}
 
 
-def build_description_recovery_plan(payload: dict, entries: dict, video_ids) -> tuple[list[dict], set[str], dict]:
+def _original_audio_track(track: dict) -> bool:
+    kind = str(track.get("audioContentTypeString") or track.get("audioContentType") or "").casefold()
+    source = str(track.get("source") or track.get("audioTrackSource") or "").upper()
+    return kind == "original" or (kind in {"", "dubbed"} and source == "AUDIO_TRACK_SOURCE_UPLOAD")
+
+
+def build_description_recovery_plan(payload: dict, entries: dict, video_ids, audio_content_type="descriptive") -> tuple[list[dict], set[str], dict]:
     requested = list(dict.fromkeys(str(video_id) for video_id in video_ids))
     readable = UpdateAudioModule._readable_translation_video_ids(payload, requested)
     unreadable = set(requested) - readable
@@ -66,19 +96,25 @@ def build_description_recovery_plan(payload: dict, entries: dict, video_ids) -> 
         if video_id not in readable:
             continue
         entry = entries.get(video_id) or {}
-        completed = {str(lang).casefold() for lang in entry.get("description_completed_languages") or []}
+        completed = {str(lang).casefold() for lang in entry.get(track_state_prefix(audio_content_type) + "_completed_languages") or []}
         tracks = [track for track in UpdateAudioModule._video_audio_tracks(payload, video_id)
-                  if str(track.get("audioContentTypeString") or track.get("audioContentType") or "").casefold() == "descriptive"]
+                  if ((_original_audio_track(track) or UpdateAudioModule._is_creator_dubbed_track(track))
+                      if audio_content_type == "dubbed" else
+                      str(track.get("audioContentTypeString") or track.get("audioContentType") or "").casefold() == "descriptive")]
         video_observations = observations[video_id] = {}
         for language in description_languages(entry):
             key = language.casefold()
             if key in completed:
                 continue
             states = {}
+            original = False
             for track in tracks:
                 if (UpdateAudioModule._translation_language(track) or "").casefold() != key:
                     continue
-                if UpdateAudioModule._audio_payload_has_terminal_failure(track, assume_audio=True):
+                if audio_content_type == "dubbed" and _original_audio_track(track):
+                    state = "healthy"
+                    original = True
+                elif UpdateAudioModule._audio_payload_has_terminal_failure(track, assume_audio=True):
                     state = "terminal"
                 elif UpdateAudioModule._audio_payload_needs_attention(track, assume_audio=True):
                     state = "processing"
@@ -89,10 +125,54 @@ def build_description_recovery_plan(payload: dict, entries: dict, video_ids) -> 
                 states.setdefault(state, []).append(str(track["audioTrackId"]))
             state = next((value for value in ("healthy", "processing", "terminal") if value in states), "missing")
             track_ids = sorted(set(states.get(state, [])))
+            if audio_content_type == "dubbed" and state == "healthy" and not original:
+                track_ids = sorted({track_id for ids in states.values() for track_id in ids})
             video_observations[key] = {"language": language, "state": state, "track_ids": track_ids}
+            if original:
+                video_observations[key]["original"] = True
             if state in {"missing", "terminal"}:
                 actions.append({"video_id": video_id, "language": language, "track_ids": track_ids,
-                                "reason": "missing_description" if state == "missing" else "terminal"})
+                                "reason": ("missing_description" if audio_content_type == "descriptive" else "missing_audio") if state == "missing" else "terminal",
+                                "audio_content_type": audio_content_type})
+    return actions, unreadable, observations
+
+
+def build_registry_recovery_plan(payload: dict, entries: dict, video_ids, audio_types, now: float):
+    actions, unreadable, observations = [], set(), {}
+    for kind in audio_types:
+        selected = {}
+        for video_id in video_ids:
+            entry = entries[video_id]
+            if audio_work_due(entry, now, kind) or (kind == "dubbed" and "descriptive" in audio_types
+                                                   and description_work_due(entry, now)):
+                selected[video_id] = dict(entry)
+                if kind == "dubbed" and "descriptive" in audio_types:
+                    selected[video_id]["dubbed_completed_languages"] = []
+        planned, missing, observed = build_description_recovery_plan(payload, selected, list(selected), kind)
+        actions.extend(planned)
+        unreadable.update(missing)
+        observations[kind] = observed
+    if set(audio_types) == set(AUDIO_CONTENT_TYPES):
+        deferred_descriptions = set()
+        normal_actions = {(action["video_id"], action["language"].casefold()): action
+                          for action in actions if action["audio_content_type"] == "dubbed"}
+        for action in list(actions):
+            if action["audio_content_type"] != "descriptive":
+                continue
+            video_id, key = action["video_id"], action["language"].casefold()
+            normal = observations.get("dubbed", {}).get(video_id, {}).get(key, {})
+            if normal.get("state") == "processing" and (video_id, key) not in normal_actions:
+                deferred_descriptions.add((video_id, key))
+            if (video_id, key) in normal_actions:
+                normal_actions[video_id, key]["description_pair"] = True
+            elif (normal.get("state") == "healthy" and not normal.get("original")
+                  and key not in {str(lang).casefold() for lang in entries[video_id].get("dubbed_prepared_for_description") or []}):
+                actions.append({"video_id": video_id, "language": action["language"],
+                                "audio_content_type": "dubbed", "reason": "paired_description",
+                                "track_ids": normal["track_ids"], "description_pair": True})
+        actions = [action for action in actions if action["audio_content_type"] != "descriptive"
+                   or (action["video_id"], action["language"].casefold()) not in deferred_descriptions]
+    actions.sort(key=lambda action: AUDIO_CONTENT_TYPES.index(action["audio_content_type"]))
     return actions, unreadable, observations
 
 

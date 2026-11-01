@@ -31,6 +31,7 @@ from src.audio_recovery import (
     set_audio_recovery_items_enabled,
     set_audio_recovery_scan_preferences,
     set_audio_recovery_enabled,
+    set_audio_recovery_audio_types,
 )
 from src.state_manager import StateManager
 
@@ -64,6 +65,7 @@ class RegistryStorage:
             },
         }
         self.manager.save_state("audio_recovery", {
+            "audio_content_types": ["descriptive"],
             "entries": copy.deepcopy(self.original_entries),
             "last_cycle_result": {"repaired": 3},
         })
@@ -140,6 +142,7 @@ class AutoRegistryPersistenceTests(RegistryStorage, unittest.TestCase):
                      and item["video_id"] == "video-shared")
         self.assertEqual(channel["processing_warning_count"], 1)
         self.assertEqual(video["processing_warnings"], [{
+            "audio_content_type": "descriptive",
             "language": "en", "track_ids": ["processing-en"],
             "reason": PROCESSING_WARNING_REASON,
             "first_seen_at": 1000, "last_seen_at": 22600, "warned_at": 22600,
@@ -740,6 +743,60 @@ class AutoRegistryUiTests(RegistryStorage, unittest.TestCase):
             if isinstance(element, self.ui.toggle)
             and RECOVERY_CONCURRENCY_MODE_CHANNELS in element.options
         )
+
+    def audio_switch(self, label):
+        return next(element for element in self.client.elements.values()
+                    if isinstance(element, self.ui.switch) and element.text == label)
+
+    def test_independent_audio_switches_select_each_type_both_or_neither(self):
+        normal, descriptive = self.audio_switch("Audio ngôn ngữ"), self.audio_switch("Âm thanh mô tả")
+        self.assertFalse(normal.value)
+        self.assertTrue(descriptive.value)
+        with self.client:
+            normal.value = True
+        self.assertEqual(get_audio_recovery_state()["audio_content_types"], ["dubbed", "descriptive"])
+        with self.client:
+            descriptive.value = False
+        self.assertEqual(get_audio_recovery_state()["audio_content_types"], ["dubbed"])
+        self.click_action("Tắt Auto Registry")
+        with self.client:
+            normal.value = False
+            descriptive.value = True
+        self.assertEqual(get_audio_recovery_state()["audio_content_types"], ["descriptive"])
+        self.assertFalse(is_audio_recovery_enabled())
+        with self.client:
+            descriptive.value = False
+        self.assertEqual(get_audio_recovery_state()["audio_content_types"], [])
+        self.assertEqual(get_audio_recovery_state()["entries"], self.original_entries)
+
+    def test_audio_switch_reverts_on_save_failure_and_refresh_does_not_save(self):
+        normal = self.audio_switch("Audio ngôn ngữ")
+        with patch("web.components.auto_registry.set_audio_recovery_audio_types", return_value=False) as save, self.client:
+            normal.value = True
+            self.refresh()
+        save.assert_called_once_with(["dubbed", "descriptive"])
+        self.assertFalse(normal.value)
+        self.assertEqual(self.notify.call_args.kwargs["type"], "negative")
+
+    def test_audio_columns_and_completion_follow_the_selected_types(self):
+        set_audio_recovery_audio_types(["dubbed", "descriptive"])
+        state = get_audio_recovery_state()
+        entry = state["entries"]["channel-a"]["video-shared"]
+        entry["description_completed_languages"] = ["en", "es"]
+        self.manager.save_state("audio_recovery", state)
+        with self.client:
+            self.refresh()
+        channels, videos = self.tables
+        row = next(row for row in videos.rows if row["id"] == "channel-a:video-shared")
+        self.assertEqual(row["description_status"], "Hoàn tất")
+        self.assertIn("0/2", row["dubbed_status"])
+        self.assertFalse(row["audio_complete"])
+        set_audio_recovery_audio_types(["descriptive"])
+        with self.client:
+            self.refresh()
+        row = next(row for row in videos.rows if row["id"] == "channel-a:video-shared")
+        self.assertEqual(row["dubbed_status"], "Tắt")
+        self.assertTrue(row["audio_complete"])
 
     def test_master_button_toggles_and_refresh_restores_the_saved_choice(self):
         self.click_action("Tắt Auto Registry")
