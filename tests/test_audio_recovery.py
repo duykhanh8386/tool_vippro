@@ -1645,10 +1645,11 @@ class AudioRecoveryCycleTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 busy_guard.release()
 
-        self.assertEqual(result["repaired"], 1)
+        self.assertEqual(result["repaired"], 2)
         self.assertEqual(result["deferred_busy"], 1)
         self.assertEqual(set(scanned_channels), {"channel-a"})
-        self.assertEqual(added.call_args.kwargs["id_video"], "video-a")
+        self.assertEqual([(call.kwargs["id_video"], call.kwargs["audio_content_type"])
+                          for call in added.call_args_list], [("video-a", "dubbed"), ("video-a", "descriptive")])
 
     async def test_clearing_registry_cancels_running_recovery_snapshot(self):
         stored = {

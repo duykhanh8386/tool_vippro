@@ -23,6 +23,7 @@ from src.audio_description_recovery import (
     description_languages, description_work_due, registry_work_due,
     AUDIO_CONTENT_TYPES, audio_entry_complete, audio_work_due, enabled_audio_types,
     build_registry_recovery_plan, registry_entry_complete, track_state_prefix,
+    dubbed_upload_submitted, sort_registry_actions,
     resolve_description_audio_path,
 )
 from src.channel_store import channel_store
@@ -1834,6 +1835,11 @@ def _record_description_attempt(
                 if str(done).casefold() != language.casefold()
             ]
             entry.pop(prefix + "_completed_at", None)
+            if audio_content_type == "dubbed":
+                entry["dubbed_prepared_for_description"] = [
+                    prepared for prepared in entry.get("dubbed_prepared_for_description") or []
+                    if str(prepared).casefold() != language.casefold()
+                ]
         if succeeded and description_pair and audio_content_type == "dubbed":
             entry["dubbed_prepared_for_description"] = list(dict.fromkeys(
                 [*(entry.get("dubbed_prepared_for_description") or []), language.casefold()]
@@ -2691,7 +2697,7 @@ async def run_audio_recovery_cycle(
                             )
                             processing_warnings.extend(stale_actions)
                             actions.extend(stale_actions)
-                        actions.sort(key=lambda action: AUDIO_CONTENT_TYPES.index(action["audio_content_type"]))
+                        sort_registry_actions(actions, chunk_entries, chunk)
                         confirmed_entries = (get_audio_recovery_state().get("entries") or {}).get(channel_id, {})
                         channel_result["healthy_skipped"] += sum(
                             registry_entry_complete(confirmed_entries.get(video_id) or {}, audio_types)
@@ -2778,6 +2784,8 @@ async def run_audio_recovery_cycle(
                                     str(getattr(video_info, "title", "") or ""),
                                 )
                                 fresh_observations = {}
+                                submitted_dubbed_languages = set()
+                                failed_dubbed_languages = set()
                                 with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as temp_file:
                                     temp_audio_path = Path(temp_file.name)
                                 preparation_stage = "rendering"
@@ -2865,12 +2873,19 @@ async def run_audio_recovery_cycle(
                                             if description_now.get(video_id, {}).get(language.casefold(), {}).get("state") in {"healthy", "processing"}:
                                                 continue
                                         if audio_content_type == "descriptive" and "dubbed" in current_types:
+                                            if language.casefold() in failed_dubbed_languages:
+                                                continue
                                             _, _, normal_now = build_description_recovery_plan(
                                                 fresh_payload, {video_id: {**entry, "dubbed_completed_languages": []}}, [video_id], "dubbed",
                                             )
-                                            if normal_now.get(video_id, {}).get(language.casefold(), {}).get("state") != "healthy":
-                                                # Wait for the language track to finish processing before
-                                                # submitting its description; an upload response is not READY.
+                                            normal_state = normal_now.get(video_id, {}).get(language.casefold(), {}).get("state")
+                                            live_entry = (get_audio_recovery_state().get("entries") or {}).get(channel_id, {}).get(video_id, {})
+                                            submitted = (language.casefold() in submitted_dubbed_languages
+                                                         or (dubbed_upload_submitted(live_entry, language)
+                                                             and normal_state in {"processing", "terminal"}))
+                                            if normal_state != "healthy" and not submitted:
+                                                # The normal file must be uploaded, but its server-side
+                                                # processing does not have to finish before its description.
                                                 continue
                                         if observed.get("state") == "healthy" and (action["reason"] != "paired_description" or observed.get("original")):
                                             continue
@@ -2955,6 +2970,8 @@ async def run_audio_recovery_cycle(
                                             run_blocking=_run_recovery_blocking,
                                         )
                                         repaired += 1
+                                        if audio_content_type == "dubbed":
+                                            submitted_dubbed_languages.add(language.casefold())
                                         channel_result["submitted"] += 1
                                         if action["reason"] == PROCESSING_WARNING_REASON:
                                             channel_result["processing_tracks"] = max(0, channel_result["processing_tracks"] - 1)
@@ -2979,6 +2996,8 @@ async def run_audio_recovery_cycle(
                                             action["reason"],
                                         )
                                     except Exception as exc:
+                                        if audio_content_type == "dubbed":
+                                            failed_dubbed_languages.add(language.casefold())
                                         channel_result["errors"] += 1
                                         channel_result["last_error"] = _recovery_channel_error(exc)
                                         failed += 1

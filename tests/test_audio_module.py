@@ -23,6 +23,112 @@ class Response:
 
 
 class AudioUploadTests(unittest.TestCase):
+    def test_start_declares_the_real_audio_size_and_type(self):
+        module = UpdateAudioModule()
+        headers = {"X-Goog-Upload-Status": "active", "X-Goog-Upload-URL": "https://session",
+                   "X-Goog-Upload-Header-Scotty-Resource-Id": "resource"}
+        with patch("src.module.audio_module.post_with_stop", return_value=Response(headers=headers)) as post:
+            self.assertEqual(module._upload_http("song.mp3", "cookie", file_size=123, content_type="audio/mpeg"),
+                             ("https://session", "resource"))
+        self.assertEqual(post.call_args.kwargs["headers"]["X-Goog-Upload-Header-Content-Length"], "123")
+        self.assertEqual(post.call_args.kwargs["headers"]["X-Goog-Upload-Header-Content-Type"], "audio/mpeg")
+
+    def test_empty_audio_is_rejected_before_registering_a_track(self):
+        module = UpdateAudioModule()
+        with patch("src.module.audio_module.get_channels_info") as auth:
+            with self.assertRaises(AudioUpdateError):
+                module.add("video", "channel", "song.mp3", "en", data=b"")
+        auth.assert_not_called()
+
+    def test_active_final_response_is_finalized_before_reporting_complete(self):
+        module = UpdateAudioModule()
+        progress, chunks = {}, []
+
+        def post(_url, **kwargs):
+            chunks.append(kwargs["data"].read())
+            if len(chunks) == 1:
+                return Response(headers={"X-Goog-Upload-Status": "active"})
+            self.assertEqual(progress["status"], "finalizing")
+            self.assertEqual(kwargs["headers"]["X-Goog-Upload-Offset"], "3")
+            return Response(headers={"X-Goog-Upload-Status": "final"})
+
+        with patch("src.module.audio_module.post_with_stop", side_effect=post), patch("src.module.audio_module.wait_interruptibly"):
+            self.assertEqual(module._next_upload_http("https://session", "song.mp3", "cookie", b"abc", progress=progress), "final")
+        self.assertEqual(chunks, [b"abc", b""])
+        self.assertEqual(progress["status"], "complete")
+
+    def test_timeout_after_all_bytes_still_finalizes_an_active_session(self):
+        module = UpdateAudioModule()
+        progress, chunks = {}, []
+
+        def post(_url, **kwargs):
+            if kwargs["headers"]["X-Goog-Upload-Command"] == "query":
+                return Response(headers={"X-Goog-Upload-Size-Received": "3", "X-Goog-Upload-Status": "active"})
+            chunks.append(kwargs["data"].read())
+            if len(chunks) == 1:
+                raise requests.exceptions.Timeout("response lost after receiving all bytes")
+            return Response(headers={"X-Goog-Upload-Status": "final"})
+
+        with patch("src.module.audio_module.post_with_stop", side_effect=post), patch("src.module.audio_module.wait_interruptibly"):
+            self.assertEqual(module._next_upload_http("https://session", "song.mp3", "cookie", b"abc", progress=progress), "final")
+        self.assertEqual(chunks, [b"abc", b""])
+        self.assertEqual(progress["status"], "complete")
+
+    def test_timeout_with_verified_final_session_does_not_upload_again(self):
+        module = UpdateAudioModule()
+        progress = {}
+        with (
+            patch("src.module.audio_module.post_with_stop", side_effect=[
+                requests.exceptions.Timeout("lost final response"),
+                Response(headers={"X-Goog-Upload-Size-Received": "3", "X-Goog-Upload-Status": "final"}),
+            ]) as post,
+            patch("src.module.audio_module.wait_interruptibly"),
+        ):
+            self.assertEqual(module._next_upload_http("https://session", "song.mp3", "cookie", b"abc", progress=progress), "final")
+        self.assertEqual(post.call_count, 2)
+        self.assertEqual(progress["status"], "complete")
+
+    def test_a_session_which_never_finalizes_is_not_reported_as_success(self):
+        module = UpdateAudioModule()
+        progress = {}
+        with (
+            patch("src.module.audio_module.post_with_stop", return_value=Response(headers={"X-Goog-Upload-Status": "active"})) as post,
+            patch("src.module.audio_module.wait_interruptibly"),
+        ):
+            with self.assertRaises(AudioUpdateError):
+                module._next_upload_http("https://session", "song.mp3", "cookie", b"abc", progress=progress)
+        self.assertEqual(post.call_count, module._MAX_UPLOAD_RETRIES + 1)
+        self.assertEqual(progress["status"], "error")
+
+    def test_final_query_without_size_header_still_confirms_the_completed_upload(self):
+        module = UpdateAudioModule()
+        progress = {}
+        with (
+            patch("src.module.audio_module.post_with_stop", side_effect=[
+                requests.exceptions.Timeout("lost response"),
+                Response(headers={"X-Goog-Upload-Status": "final"}),
+            ]) as post,
+            patch("src.module.audio_module.wait_interruptibly"),
+        ):
+            self.assertEqual(module._next_upload_http("https://session", "song.mp3", "cookie", b"abc", progress=progress), "final")
+        self.assertEqual(post.call_count, 2)
+        self.assertEqual(progress["confirmed"], 3)
+        self.assertEqual(progress["status"], "complete")
+
+    def test_processed_tracks_are_verified_without_treating_unknown_failure_reasons_as_errors(self):
+        module = UpdateAudioModule()
+        payload = {"videoTranslations": [{"videoId": "video", "translations": []}], "audioTracks": [{
+            "videoId": "video", "audioTrackId": "description", "language": "en",
+            "audioContentTypeString": "descriptive", "source": "AUDIO_TRACK_SOURCE_CREATOR",
+            "status": "AUDIO_TRACK_STATUS_PROCESSED", "failureReason": "AUDIO_TRACK_FAILURE_REASON_UNSPECIFIED",
+        }]}
+        for kind in ("descriptive", "dubbed"):
+            with self.subTest(kind=kind):
+                payload["audioTracks"][0]["audioContentTypeString"] = kind
+                with patch.object(module, "_get_video_translation_payload", return_value=payload) as fetch:
+                    self.assertTrue(module._has_audio_track("video", "channel", "en", kind))
+                fetch.assert_called_once()
+
     def test_audio_upload_uses_sixteen_megabyte_chunks(self):
         self.assertEqual(UpdateAudioModule._CHUNK_SIZE, 16 * 1024 * 1024)
 
@@ -161,6 +267,7 @@ class AudioUploadTests(unittest.TestCase):
             patch("src.module.audio_module.get_channels_info", return_value=channel),
             patch.object(module, "_get_session_token", return_value="token"),
             patch("src.module.audio_module.requests.Session", return_value=session_context),
+            patch("src.module.audio_module.os.path.getsize", return_value=123),
             patch.object(
                 module,
                 "_upload_http",
@@ -182,6 +289,7 @@ class AudioUploadTests(unittest.TestCase):
             )
 
         self.assertIs(start.call_args.kwargs["session"], session)
+        self.assertEqual(start.call_args.kwargs["file_size"], 123)
         self.assertIs(register.call_args.kwargs["session"], session)
         self.assertIs(upload.call_args.kwargs["session"], session)
         self.assertIsNone(upload.call_args.kwargs["data"])

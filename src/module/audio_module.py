@@ -2,6 +2,7 @@
 import os
 import time
 import unicodedata
+import mimetypes
 from io import BytesIO
 from urllib.parse import quote
 import requests
@@ -90,6 +91,10 @@ class UpdateAudioModule(IModule):
         if audio_content_type not in ("dubbed", "descriptive"):
             raise ValueError(f"Unsupported audio content type: {audio_content_type}")
         check_stopped()
+        source_path = (upload_path or file_name) if data is None else None
+        file_size = len(data) if data is not None else os.path.getsize(source_path)
+        if file_size <= 0:
+            raise AudioUpdateError("File audio rỗng, không thể tải lên")
         if progress is not None:
             progress["status"] = "authenticating"
         channel_info = get_channels_info(channel_id)
@@ -103,6 +108,8 @@ class UpdateAudioModule(IModule):
                 fname_header=fname_header,
                 cookie_string=cookie_string,
                 session=session,
+                file_size=file_size,
+                content_type=mimetypes.guess_type(file_name)[0] or "application/octet-stream",
             )
             # YouTube's audio-track flow first registers the pending Scotty resource
             # with the video, then uploads/finalizes the resource bytes.  Keep the
@@ -136,7 +143,7 @@ class UpdateAudioModule(IModule):
                 fname_header=fname_header,
                 cookie_string=cookie_string,
                 data=data,
-                file_path=(upload_path or file_name) if data is None else None,
+                file_path=source_path,
                 progress=progress,
                 session=session,
             )
@@ -146,11 +153,25 @@ class UpdateAudioModule(IModule):
         fname_header: str,
         cookie_string: str,
         session: requests.Session | None = None,
+        file_size: int | None = None,
+        content_type: str = "audio/mpeg",
     ):
-        url = "https://upload.youtube.com/upload/audiotrack?authuser=0"; headers = {"Host": "upload.youtube.com", "Cookie": cookie_string, "Content-Length": "2", "Sec-Ch-Ua-Platform": '"Windows"', "Sec-Ch-Ua": '"Chromium";v="139", "Not;A=Brand";v="99"', "Sec-Ch-Ua-Mobile": "?0", "X-Goog-Upload-Protocol": "resumable", "X-Goog-Upload-File-Name": fname_header, "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8", "Accept-Language": "en-US,en;q=0.9", "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36", "X-Goog-Upload-Command": "start", "Accept": "*/*", "Origin": "https://studio.youtube.com", "Referer": "https://studio.youtube.com/", "Accept-Encoding": "gzip, deflate, br", "Priority": "u=1, i"}; response = post_with_stop(url, headers=headers, data="{}", session=session)
+        url = "https://upload.youtube.com/upload/audiotrack?authuser=0"
+        headers = self._base_upload_headers(fname_header, cookie_string)
+        headers.update({"X-Goog-Upload-Protocol": "resumable", "X-Goog-Upload-Command": "start",
+                        "X-Goog-Upload-Header-Content-Type": content_type})
+        if file_size is not None:
+            headers["X-Goog-Upload-Header-Content-Length"] = str(file_size)
+        response = post_with_stop(url, headers=headers, data="{}", session=session)
         if response.status_code != 200:
             raise AudioUpdateError(_youtube_error_message(response, "khởi tạo tải audio"), status_code=response.status_code, retryable=response.status_code == 429 or response.status_code >= 500)
-        upload_url = response.headers["X-Goog-Upload-URL"]; scotty_id = response.headers["X-Goog-Upload-Header-Scotty-Resource-Id"]
+        status = str(response.headers.get("X-Goog-Upload-Status") or "").lower()
+        if status and status != "active":
+            raise AudioUpdateError(f"YouTube không mở phiên tải audio: {status}")
+        upload_url = response.headers.get("X-Goog-Upload-URL")
+        scotty_id = response.headers.get("X-Goog-Upload-Header-Scotty-Resource-Id")
+        if not upload_url or not scotty_id:
+            raise AudioUpdateError("YouTube không trả đủ thông tin phiên tải audio")
         return (upload_url, scotty_id)
     def _base_upload_headers(self, fname_header: str, cookie_string: str) -> dict:
         return {
@@ -170,6 +191,7 @@ class UpdateAudioModule(IModule):
         next_url: str,
         base_headers: dict,
         session: requests.Session | None = None,
+        upload_state: dict | None = None,
     ) -> int | None:
         try:
             headers = dict(base_headers)
@@ -183,6 +205,8 @@ class UpdateAudioModule(IModule):
             )
             if response.status_code != 200:
                 return None
+            if upload_state is not None:
+                upload_state["status"] = str(response.headers.get("X-Goog-Upload-Status") or "").lower()
             received = response.headers.get("X-Goog-Upload-Size-Received")
             return int(received) if received is not None else None
         except TaskStopped:
@@ -211,6 +235,8 @@ class UpdateAudioModule(IModule):
             raise AudioUpdateError("File audio rỗng, không thể tải lên")
         offset = 0
         retries = 0
+        needs_finalize = False
+        finalize_attempts = 0
         started_at = time.monotonic()
         if progress is not None:
             progress.update(
@@ -223,7 +249,7 @@ class UpdateAudioModule(IModule):
             )
         source_file = open(file_path, "rb") if data is None else None
         try:
-            while offset < total:
+            while offset < total or needs_finalize:
                 check_stopped()
                 end = min(offset + self._CHUNK_SIZE, total)
                 if source_file is not None:
@@ -231,7 +257,7 @@ class UpdateAudioModule(IModule):
                     chunk = source_file.read(end - offset)
                 else:
                     chunk = data[offset:end]
-                if not chunk:
+                if not chunk and not needs_finalize:
                     raise AudioUpdateError(
                         f"Không đọc được audio tại vị trí {offset}/{total} byte"
                     )
@@ -254,13 +280,22 @@ class UpdateAudioModule(IModule):
                             status_code=response.status_code,
                             retryable=retryable,
                         )
+                    server_status = str(response.headers.get("X-Goog-Upload-Status") or "").lower()
+                    if server_status and server_status not in {"active", "final"}:
+                        raise AudioUpdateError(f"YouTube từ chối phiên tải audio: {server_status}")
                     offset += len(chunk)
+                    needs_finalize = offset >= total and server_status == "active"
+                    if needs_finalize:
+                        finalize_attempts += 1
+                        if finalize_attempts > self._MAX_UPLOAD_RETRIES:
+                            raise AudioUpdateError("YouTube chưa xác nhận hoàn tất tải audio; không coi là đã tải xong")
+                        wait_interruptibly(min(finalize_attempts, 3))
                     retries = 0
                     if progress is not None:
                         progress["sent"] = offset
                         progress["confirmed"] = offset
                         progress["updated_at"] = time.monotonic()
-                        progress["status"] = "complete" if offset >= total else "uploading"
+                        progress["status"] = "finalizing" if needs_finalize else "complete" if offset >= total else "uploading"
                 except TaskStopped:
                     raise
                 except Exception as exc:
@@ -277,13 +312,19 @@ class UpdateAudioModule(IModule):
                             f"{self._MAX_UPLOAD_RETRIES} lần thử: {exc}",
                             status_code=getattr(exc, "status_code", None),
                         ) from exc
+                    upload_state = {}
                     server_offset = self._query_upload_offset(
                         next_url,
                         base_headers,
                         session=session,
+                        upload_state=upload_state,
                     )
-                    if server_offset is not None and 0 <= server_offset <= total:
+                    if upload_state.get("status") == "final":
+                        offset = total
+                        needs_finalize = False
+                    elif server_offset is not None and 0 <= server_offset <= total:
                         offset = server_offset
+                        needs_finalize = offset >= total and upload_state.get("status") != "final"
                     if progress is not None:
                         progress["sent"] = offset
                         progress["confirmed"] = offset
@@ -299,6 +340,8 @@ class UpdateAudioModule(IModule):
         finally:
             if source_file is not None:
                 source_file.close()
+        if progress is not None:
+            progress["status"] = "complete"
         return "final"
     def _update(self, video_id: str, scotty_resource_id: str, channel_info: ChannelInfo, cookie_string: str, session_token: str, language: str, session: requests.Session | None = None, audio_content_type: str = "dubbed"):
         url = "https://studio.youtube.com/youtubei/v1/creator/add_audio_track?alt=json"; headers = {"Host": "studio.youtube.com", "Cookie": cookie_string, "Authorization": studio_authorization_header(channel_info.cookies), "Content-Type": "application/json", "Origin": "https://studio.youtube.com", "Referer": f"https://studio.youtube.com/video/{video_id}/translations", "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36", "Accept": "*/*", "Accept-Language": "en-US,en;q=0.9"}; payload = {"videoId": video_id, "resourceId": {"scottyResourceId": {"id": scotty_resource_id}}, "language": language, "audioContentTypeString": audio_content_type, "audioTrackSource": "AUDIO_TRACK_SOURCE_CREATOR", "context": {"client": {"clientName": 62, "clientVersion": "1.20250902.04.00", "hl": "en", "gl": "VN", "utcOffsetMinutes": 420, "userInterfaceTheme": "USER_INTERFACE_THEME_DARK", "screenWidthPoints": 1920, "screenHeightPoints": 945, "screenPixelDensity": 1, "screenDensityFloat": 1}, "request": {"returnLogEntry": True, "internalExperimentFlags": [], "eats": "AWSNWa0l7AGlCHtnt233UutuGGeh33lZ817vfraxpNhL8LY5gqkpaiN73HzUXyRRQ2ApQuCVRfHRtr9rlEQ8rczpjRVn_mm0nP74Qdc4IR95HbzJKhorwIoTVAqfC4o=", "sessionInfo": {"token": session_token}}, "user": {"onBehalfOfUser": channel_info.delegated_session_id, "delegationContext": {"externalChannelId": channel_info.id, "roleType": {"channelRoleType": channel_info.role}}, "serializedDelegationContext": ""}, "clickTracking": {"visualElement": {"veType": 74_618}}, "clientScreenNonce": "UUFKQY_AX3QaOzkG"}}; response = post_with_stop(url, headers=headers, json=payload, session=session)
@@ -452,6 +495,7 @@ class UpdateAudioModule(IModule):
             "NOERROR",
             "OK",
             "READY",
+            "PROCESSED",
             "SUCCESS",
             "SUCCEEDED",
             "COMPLETE",
@@ -463,10 +507,13 @@ class UpdateAudioModule(IModule):
                 "ERRORNONE",
                 "STATUSOK",
                 "STATUSREADY",
+                "STATUSPROCESSED",
+                "STATEPROCESSED",
                 "STATUSSUCCESS",
                 "STATUSSUCCEEDED",
                 "STATUSCOMPLETE",
                 "STATUSCOMPLETED",
+                "REASONUNSPECIFIED",
             )
         ):
             return False
@@ -1441,31 +1488,24 @@ class UpdateAudioModule(IModule):
                 else:
                     states.add("healthy")
 
-        # Descriptive audio is separate from the original/dubbed row. A ready
-        # original track must never turn a descriptive-upload conflict into
-        # success. Studio can expose descriptive tracks only in audioTracks.
-        if audio_content_type == "descriptive":
-            for track in root_tracks.values():
-                actual_type = str(
-                    track.get("audioContentTypeString")
-                    or track.get("audioContentType")
-                    or ""
-                ).casefold()
-                actual_language = cls._translation_language(track)
-                if (
-                    actual_type != "descriptive"
-                    or not actual_language
-                    or actual_language.casefold() != expected
-                ):
-                    continue
-                if cls._audio_payload_has_terminal_failure(track, assume_audio=True):
-                    states.add("terminal")
-                elif cls._audio_payload_needs_attention(track, assume_audio=True):
-                    states.add("inflight")
-                elif str(track.get("status") or "").upper() in (
-                    "AUDIO_TRACK_STATUS_READY", "READY", "PUBLISHED",
-                ) or str(track.get("publishStatus") or "").upper() == "PUBLISHED":
-                    states.add("healthy")
+        # Some responses expose tracks only at the root. Verify the requested
+        # type and language; source audio cannot verify a description conflict.
+        for track in root_tracks.values():
+            actual_type = str(track.get("audioContentTypeString") or track.get("audioContentType") or "").casefold()
+            actual_language = cls._translation_language(track)
+            matches_type = actual_type == audio_content_type or (
+                not actual_type and audio_content_type == "dubbed" and cls._is_creator_dubbed_track(track)
+            )
+            if not matches_type or not actual_language or actual_language.casefold() != expected:
+                continue
+            if cls._audio_payload_has_terminal_failure(track, assume_audio=True):
+                states.add("terminal")
+            elif cls._audio_payload_needs_attention(track, assume_audio=True):
+                states.add("inflight")
+            elif str(track.get("status") or "").upper() in (
+                "AUDIO_TRACK_STATUS_READY", "AUDIO_TRACK_STATUS_PROCESSED", "READY", "PROCESSED", "PUBLISHED",
+            ) or str(track.get("publishStatus") or "").upper() == "PUBLISHED":
+                states.add("healthy")
 
         # A good duplicate always wins. Never replace it because an older copy
         # of the same language is still processing or failed.

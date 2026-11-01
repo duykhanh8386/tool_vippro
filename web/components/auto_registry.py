@@ -438,7 +438,7 @@ def create_auto_registry_content(*, on_change: Callable[[], None] | None = None)
             dubbed_switch = ui.switch("Audio ngôn ngữ", value=True, on_change=change_audio_types)
             description_switch = ui.switch("Âm thanh mô tả", value=True, on_change=change_audio_types)
         ui.label(
-            "Bật một công tắc để xử lý riêng loại đó; bật cả hai để xử lý audio ngôn ngữ trước rồi đến mô tả. "
+            "Bật một công tắc để xử lý riêng loại đó; bật cả hai để thêm audio rồi thêm mô tả ngay cho từng ngôn ngữ trong mỗi video. "
             "Tắt cả hai để ngừng xử lý audio. Lựa chọn được lưu khi mở lại ứng dụng. "
             "Tool tự tìm file nhạc đầy đủ đã ghép đúng video; video đã đủ các loại audio đang bật sẽ được bỏ qua."
         ).classes("text-xs text-gray-500")
@@ -466,7 +466,7 @@ def create_auto_registry_content(*, on_change: Callable[[], None] | None = None)
             "Lựa chọn áp dụng từ vòng quét tiếp theo và được lưu khi mở lại ứng dụng."
         ).classes("text-xs text-gray-500")
         ui.label(
-            "Khi bật cả hai, mô tả thiếu hoặc lỗi sẽ được xử lý sau khi audio ngôn ngữ tương ứng đã được thay thế và xử lý xong. "
+            "Khi bật cả hai, file audio ngôn ngữ tải hoàn tất thì tool thêm mô tả tương ứng ngay, rồi chuyển sang ngôn ngữ tiếp theo. "
             "Các video đăng ký từ trước cũng áp dụng lựa chọn hiện tại."
         ).classes("text-xs text-gray-500")
         ui.label(

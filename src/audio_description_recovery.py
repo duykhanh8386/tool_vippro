@@ -75,7 +75,7 @@ def registry_work_due(entry: dict, now: float, audio_types=("descriptive",)) -> 
 def _confirmed_description(track: dict) -> bool:
     for key in ("status", "publishStatus", "servingStatus"):
         value = str(track.get(key) or "").upper()
-        if value in {"READY", "PUBLISHED", "SERVING", "AUDIO_TRACK_STATUS_READY"} or value.endswith("_PUBLISHED"):
+        if value in {"READY", "PROCESSED", "PUBLISHED", "SERVING", "AUDIO_TRACK_STATUS_READY", "AUDIO_TRACK_STATUS_PROCESSED"} or value.endswith("_PUBLISHED"):
             return True
     return str(track.get("statusLabel") or "").casefold() in {"published", "đã xuất bản"}
 
@@ -137,6 +137,22 @@ def build_description_recovery_plan(payload: dict, entries: dict, video_ids, aud
     return actions, unreadable, observations
 
 
+def dubbed_upload_submitted(entry: dict, language: str) -> bool:
+    attempt = (entry.get("dubbed_attempts") or {}).get(language.casefold()) or {}
+    return attempt.get("succeeded") is True
+
+
+def sort_registry_actions(actions: list[dict], entries: dict, video_ids) -> None:
+    video_order = {video_id: index for index, video_id in enumerate(video_ids)}
+    language_order = {video_id: {lang.casefold(): index for index, lang in enumerate(description_languages(entry))}
+                      for video_id, entry in entries.items()}
+    actions.sort(key=lambda action: (
+        video_order.get(action["video_id"], len(video_order)),
+        language_order.get(action["video_id"], {}).get(action["language"].casefold(), 0),
+        AUDIO_CONTENT_TYPES.index(action["audio_content_type"]),
+    ))
+
+
 def build_registry_recovery_plan(payload: dict, entries: dict, video_ids, audio_types, now: float):
     actions, unreadable, observations = [], set(), {}
     for kind in audio_types:
@@ -161,7 +177,8 @@ def build_registry_recovery_plan(payload: dict, entries: dict, video_ids, audio_
                 continue
             video_id, key = action["video_id"], action["language"].casefold()
             normal = observations.get("dubbed", {}).get(video_id, {}).get(key, {})
-            if normal.get("state") == "processing" and (video_id, key) not in normal_actions:
+            if (normal.get("state") == "processing" and (video_id, key) not in normal_actions
+                    and not dubbed_upload_submitted(entries[video_id], key)):
                 deferred_descriptions.add((video_id, key))
             if (video_id, key) in normal_actions:
                 normal_actions[video_id, key]["description_pair"] = True
@@ -172,7 +189,7 @@ def build_registry_recovery_plan(payload: dict, entries: dict, video_ids, audio_
                                 "track_ids": normal["track_ids"], "description_pair": True})
         actions = [action for action in actions if action["audio_content_type"] != "descriptive"
                    or (action["video_id"], action["language"].casefold()) not in deferred_descriptions]
-    actions.sort(key=lambda action: AUDIO_CONTENT_TYPES.index(action["audio_content_type"]))
+    sort_registry_actions(actions, entries, video_ids)
     return actions, unreadable, observations
 
 
