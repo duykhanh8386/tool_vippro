@@ -94,6 +94,82 @@ async def _acquire_audio_mutation_guard(channel_id: str):
     return guard
 
 
+async def _add_flow_audio_description(item: dict, channel_id: str, push_log) -> str:
+    """Publish the item's full music as descriptive audio in its source language."""
+    video_id = item.get("video_id")
+    if not video_id:
+        raise RuntimeError("Chưa có video ID (upload chưa xong)")
+    audio_path = item.get("music_path")
+    if not audio_path or not Path(audio_path).is_file():
+        raise RuntimeError(f"Không tìm thấy file nhạc gốc: {audio_path}")
+
+    info = await asyncio.to_thread(
+        upload_video_module._get_video_info,
+        video_id=video_id,
+        channel_id=channel_id,
+    )
+    if not info or info.id != video_id:
+        raise RuntimeError(f"Không đọc được thông tin đúng video {video_id}")
+    language = info.audio_language
+    if not language:
+        language = await asyncio.to_thread(
+            update_audio_module.get_original_audio_language, video_id, channel_id,
+        )
+    if not language:
+        raise RuntimeError(
+            f"Video {video_id} chưa có ngôn ngữ gốc. Hãy đặt Ngôn ngữ video "
+            "trong YouTube Studio rồi chạy lại bước Âm thanh mô tả."
+        )
+    if info.duration_ms <= 0:
+        raise RuntimeError(f"Không đọc được thời lượng video {video_id}")
+
+    with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tf:
+        matched_path = tf.name
+    run_context = current_run_context()
+    if run_context is not None:
+        run_context.register_cleanup_path(matched_path)
+    guard = None
+    try:
+        # Always start from music_path, never the intermittent 3s/7s render.
+        await asyncio.to_thread(
+            multiply_audio,
+            input_file=normalize_path(audio_path),
+            output_file=matched_path,
+            times=1,
+            extra_minutes=0,
+            video_duration_seconds=info.duration_ms / 1000.0,
+        )
+        guard = await _acquire_audio_mutation_guard(channel_id)
+        push_log(f"Thêm âm thanh mô tả — ngôn ngữ gốc {language}", "wait", indent=True)
+
+        def upload():
+            return update_audio_module.add(
+                id_video=video_id,
+                channel_id=channel_id,
+                file_name=audio_path,
+                language=language,
+                upload_path=matched_path,
+                audio_content_type="descriptive",
+            )
+
+        await call_audio_update_with_retry(
+            upload,
+            on_retry=lambda attempt, delay, exc: push_log(
+                f"Âm thanh mô tả {language}: thử lại sau {delay:g}s ({attempt}/3)",
+                "wait", indent=True,
+            ),
+        )
+        push_log(f"Đã xuất bản âm thanh mô tả: {language}", "ok", indent=True)
+        return language
+    finally:
+        if guard is not None:
+            guard.release()
+        try:
+            Path(matched_path).unlink(missing_ok=True)
+        except OSError as exc:
+            logger.warning("Không xóa được audio mô tả tạm {}: {}", matched_path, exc)
+
+
 class YouTubeProcessingWaitError(RuntimeError):
     """A classified failure while waiting for YouTube video processing."""
 
@@ -403,7 +479,7 @@ def _fmt_duration(seconds: float | None) -> str:
     return f"{m}:{s:02d}"
 
 def _new_steps() -> dict:
-    return {"merge": "pending", "upload": "pending", "wait": "pending", "add_audio": "pending"}
+    return {"merge": "pending", "upload": "pending", "wait": "pending", "add_audio": "pending", "add_description": "pending"}
 def create_add_audio_flow_page():
     try:
         page_client = context.client
@@ -424,7 +500,7 @@ def create_add_audio_flow_page():
     processing = {"value": False}
     stop_requested = _FLOW_STOP_REQUESTED
     active_run = _ACTIVE_FLOW_RUN
-    PERSIST_FIELDS = ("music", "music_path", "audio_path", "output_path", "video_id", "scotty_resource_id", "frontend_upload_id", "audio_language_results")
+    PERSIST_FIELDS = ("music", "music_path", "audio_path", "output_path", "video_id", "scotty_resource_id", "frontend_upload_id", "audio_language_results", "audio_description_language")
 
     def client_is_alive() -> bool:
         return (
@@ -510,6 +586,8 @@ def create_add_audio_flow_page():
             selected_channel["id"] = state.get("selected_channel")
             _replace_status_snapshot(saved_status_map, state.get("statuses", {}))
             def update_ui():
+                previous_suppression = suppress_autosave["value"]
+                suppress_autosave["value"] = True
                 try:
                     for render in folder_selectors.values():
                         render()
@@ -524,6 +602,8 @@ def create_add_audio_flow_page():
                     load_videos()
                 except Exception as e:
                     logger.error(f"Failed to update UI: {e}")
+                finally:
+                    suppress_autosave["value"] = previous_suppression
             ui.timer(0.5, update_ui, once=True)
         except Exception as e:
             logger.error(f"Failed to load add_audio_flow state: {e}")
@@ -672,19 +752,20 @@ def create_add_audio_flow_page():
 
                 with ui.row().classes("w-full min-h-[42px] items-center font-semibold text-xs text-gray-500 bg-gray-50 border-b border-gray-200 px-3 flex-nowrap"):
                     ui.label("#").classes("w-1/12")
-                    ui.label("Video").classes("w-3/12")
+                    ui.label("Video").classes("w-2/12")
                     ui.label("ID").classes("w-2/12")
                     ui.label("Nhạc").classes("w-2/12")
                     ui.label("Ghép nhạc").classes("w-1/12 text-center")
                     ui.label("Upload").classes("w-1/12 text-center")
                     ui.label("Chờ xử lý").classes("w-1/12 text-center")
                     ui.label("Add audio").classes("w-1/12 text-center")
+                    ui.label("Âm thanh mô tả").classes("w-1/12 text-center")
 
                 for idx, item in enumerate(items, 1):
                     steps = item["steps"]
                     with ui.row().classes("w-full min-h-[54px] items-center bg-white px-3 py-1 border-b border-gray-100 flex-nowrap hover:bg-gray-50"):
                         ui.label(str(idx)).classes("w-1/12 text-xs text-gray-500")
-                        with ui.column().classes("w-3/12 min-w-0 gap-0"):
+                        with ui.column().classes("w-2/12 min-w-0 gap-0"):
                             ui.label(item["name"]).classes("truncate text-sm font-medium text-gray-800").tooltip(item["name"])
                             meta = _human_size(item["size"])
                             if item.get("duration_error"):
@@ -713,6 +794,8 @@ def create_add_audio_flow_page():
                             step_badge(steps["wait"])
                         with ui.element("div").classes("w-1/12 flex justify-center"):
                             step_badge(steps["add_audio"])
+                        with ui.element("div").classes("w-1/12 flex justify-center"):
+                            step_badge(steps["add_description"])
 
         return safe_ui("refresh video list", render)
     async def step_merge(item, output_folder, musics, index, run_config):
@@ -1022,11 +1105,19 @@ def create_add_audio_flow_page():
             except Exception as exc:
                 logger.warning(f"Không xóa được file tạm {matched_path}: {exc}")
 
+    async def step_add_description(item, output_folder, musics, index, run_config):
+        item["audio_description_language"] = await _add_flow_audio_description(
+            item, run_config["channel_id"], push_log,
+        )
+        item["steps"]["add_description"] = "successful"
+        _require_checkpoint(save_state, "audio description")
+
     STEP_SEQUENCE = [
         ("merge", "Ghép nhạc", step_merge),
         ("upload", "Upload", step_upload),
         ("wait", "Chờ xử lý", step_wait_processed),
         ("add_audio", "Add audio", step_add_audio),
+        ("add_description", "Âm thanh mô tả", step_add_description),
     ]
     def set_processing_ui(active: bool, message: str=""):
         """Bật/tắt trạng thái đang xử lý: khóa điều hướng, panel tiến trình, nút."""
@@ -1242,10 +1333,12 @@ def create_add_audio_flow_page():
         errors: list,
     ) -> dict:
         stats = {"finished": 0, "failed": 0}
+        audio_limit = asyncio.Semaphore(MAX_ADD_AUDIO_JOBS)
         step_limits = {
             "merge": asyncio.Semaphore(MAX_FFMPEG_JOBS),
             "upload": asyncio.Semaphore(MAX_UPLOAD_JOBS),
-            "add_audio": asyncio.Semaphore(MAX_ADD_AUDIO_JOBS),
+            "add_audio": audio_limit,
+            "add_description": audio_limit,
         }
 
         async def process_entry(entry) -> None:
@@ -1585,7 +1678,7 @@ def create_add_audio_flow_page():
     with page:
         with page_header(
             "Thêm audio flow",
-            "Chuẩn bị video, ghép nhạc, upload và thêm audio track trong một quy trình.",
+            "Ghép nhạc, upload, thêm audio theo ngôn ngữ và âm thanh mô tả từ nhạc gốc.",
             eyebrow="Quy trình",
         ):
             pass
@@ -1595,6 +1688,7 @@ def create_add_audio_flow_page():
                 {"title": "Upload", "description": "Đăng video lên kênh", "state": "pending"},
                 {"title": "Chờ xử lý", "description": "Đợi YouTube sẵn sàng", "state": "pending"},
                 {"title": "Add audio", "description": "Thêm audio theo ngôn ngữ", "state": "pending"},
+                {"title": "Âm thanh mô tả", "description": "Nhạc đầy đủ ở ngôn ngữ gốc", "state": "pending"},
             ]
         )
         main_container = ui.column().classes("w-full gap-4")
@@ -1710,7 +1804,7 @@ def create_add_audio_flow_page():
                 .classes("w-64")
             )
             ui_refs["lang_input"] = lang_input
-            ui.label("Mã ngôn ngữ của audio track thêm ở Bước 3 (vd: en, vi, ja).").classes("text-xs text-gray-500")
+            ui.label("Mã ngôn ngữ audio ở bước 4 (vd: en, vi, ja). Bước 5 thêm nhạc đầy đủ vào Âm thanh mô tả ở ngôn ngữ gốc của video.").classes("text-xs text-gray-500")
 
         with ui.row().classes("w-full gap-2 mt-3"):
             ui_refs["process_btn"] = ui.button("Xử lý", icon="play_arrow", on_click=handle_process).classes("app-button-primary flex-1")

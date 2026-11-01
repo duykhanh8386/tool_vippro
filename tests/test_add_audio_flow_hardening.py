@@ -263,6 +263,7 @@ class AddAudioFlowHardeningTests(unittest.IsolatedAsyncioTestCase):
             "upload": "unsuccessful",
             "wait": "processing",
             "add_audio": "pending",
+            "add_description": "pending",
         }
 
         detached_live = _restore_steps(saved, reset_processing=False)
@@ -272,6 +273,14 @@ class AddAudioFlowHardeningTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(crashed_run["merge"], "successful")
         self.assertEqual(crashed_run["upload"], "unsuccessful")
         self.assertEqual(crashed_run["wait"], "pending")
+
+    def test_legacy_completed_video_only_needs_the_new_description_step(self):
+        restored = _restore_steps(
+            dict.fromkeys(("merge", "upload", "wait", "add_audio"), "successful"),
+            reset_processing=True,
+        )
+        self.assertEqual(restored["add_audio"], "successful")
+        self.assertEqual(restored["add_description"], "pending")
 
     def test_reattach_refreshes_snapshot_used_by_later_list_rebuild(self):
         snapshot = {

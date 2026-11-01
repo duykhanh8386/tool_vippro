@@ -70,6 +70,7 @@ class Video:
     visibility: object = ""
     time_created_seconds: object = ""
     time_published_seconds: object = ""
+    audio_language: str = ""
 
 
 class AuthSignal(Enum):

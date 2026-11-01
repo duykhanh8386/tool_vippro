@@ -85,7 +85,10 @@ class UpdateAudioModule(IModule):
         data: bytes | None = None,
         progress: dict | None = None,
         upload_path: str | None = None,
+        audio_content_type: str = "dubbed",
     ):
+        if audio_content_type not in ("dubbed", "descriptive"):
+            raise ValueError(f"Unsupported audio content type: {audio_content_type}")
         check_stopped()
         if progress is not None:
             progress["status"] = "authenticating"
@@ -114,9 +117,13 @@ class UpdateAudioModule(IModule):
                 cookie_string=cookie_string,
                 language=language,
                 session=session,
+                audio_content_type=audio_content_type,
             )
             if res == 409:
-                if self._has_audio_track(id_video, channel_id, language):
+                if self._has_audio_track(
+                    id_video, channel_id, language,
+                    audio_content_type=audio_content_type,
+                ):
                     logger.info("Audio track already exists: video={} language={}", id_video, language)
                     return 409
                 raise AudioUpdateError(
@@ -293,8 +300,8 @@ class UpdateAudioModule(IModule):
             if source_file is not None:
                 source_file.close()
         return "final"
-    def _update(self, video_id: str, scotty_resource_id: str, channel_info: ChannelInfo, cookie_string: str, session_token: str, language: str, session: requests.Session | None = None):
-        url = "https://studio.youtube.com/youtubei/v1/creator/add_audio_track?alt=json"; headers = {"Host": "studio.youtube.com", "Cookie": cookie_string, "Authorization": studio_authorization_header(channel_info.cookies), "Content-Type": "application/json", "Origin": "https://studio.youtube.com", "Referer": f"https://studio.youtube.com/video/{video_id}/translations", "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36", "Accept": "*/*", "Accept-Language": "en-US,en;q=0.9"}; payload = {"videoId": video_id, "resourceId": {"scottyResourceId": {"id": scotty_resource_id}}, "language": language, "audioContentTypeString": "dubbed", "audioTrackSource": "AUDIO_TRACK_SOURCE_CREATOR", "context": {"client": {"clientName": 62, "clientVersion": "1.20250902.04.00", "hl": "en", "gl": "VN", "utcOffsetMinutes": 420, "userInterfaceTheme": "USER_INTERFACE_THEME_DARK", "screenWidthPoints": 1920, "screenHeightPoints": 945, "screenPixelDensity": 1, "screenDensityFloat": 1}, "request": {"returnLogEntry": True, "internalExperimentFlags": [], "eats": "AWSNWa0l7AGlCHtnt233UutuGGeh33lZ817vfraxpNhL8LY5gqkpaiN73HzUXyRRQ2ApQuCVRfHRtr9rlEQ8rczpjRVn_mm0nP74Qdc4IR95HbzJKhorwIoTVAqfC4o=", "sessionInfo": {"token": session_token}}, "user": {"onBehalfOfUser": channel_info.delegated_session_id, "delegationContext": {"externalChannelId": channel_info.id, "roleType": {"channelRoleType": channel_info.role}}, "serializedDelegationContext": ""}, "clickTracking": {"visualElement": {"veType": 74_618}}, "clientScreenNonce": "UUFKQY_AX3QaOzkG"}}; response = post_with_stop(url, headers=headers, json=payload, session=session)
+    def _update(self, video_id: str, scotty_resource_id: str, channel_info: ChannelInfo, cookie_string: str, session_token: str, language: str, session: requests.Session | None = None, audio_content_type: str = "dubbed"):
+        url = "https://studio.youtube.com/youtubei/v1/creator/add_audio_track?alt=json"; headers = {"Host": "studio.youtube.com", "Cookie": cookie_string, "Authorization": studio_authorization_header(channel_info.cookies), "Content-Type": "application/json", "Origin": "https://studio.youtube.com", "Referer": f"https://studio.youtube.com/video/{video_id}/translations", "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36", "Accept": "*/*", "Accept-Language": "en-US,en;q=0.9"}; payload = {"videoId": video_id, "resourceId": {"scottyResourceId": {"id": scotty_resource_id}}, "language": language, "audioContentTypeString": audio_content_type, "audioTrackSource": "AUDIO_TRACK_SOURCE_CREATOR", "context": {"client": {"clientName": 62, "clientVersion": "1.20250902.04.00", "hl": "en", "gl": "VN", "utcOffsetMinutes": 420, "userInterfaceTheme": "USER_INTERFACE_THEME_DARK", "screenWidthPoints": 1920, "screenHeightPoints": 945, "screenPixelDensity": 1, "screenDensityFloat": 1}, "request": {"returnLogEntry": True, "internalExperimentFlags": [], "eats": "AWSNWa0l7AGlCHtnt233UutuGGeh33lZ817vfraxpNhL8LY5gqkpaiN73HzUXyRRQ2ApQuCVRfHRtr9rlEQ8rczpjRVn_mm0nP74Qdc4IR95HbzJKhorwIoTVAqfC4o=", "sessionInfo": {"token": session_token}}, "user": {"onBehalfOfUser": channel_info.delegated_session_id, "delegationContext": {"externalChannelId": channel_info.id, "roleType": {"channelRoleType": channel_info.role}}, "serializedDelegationContext": ""}, "clickTracking": {"visualElement": {"veType": 74_618}}, "clientScreenNonce": "UUFKQY_AX3QaOzkG"}}; response = post_with_stop(url, headers=headers, json=payload, session=session)
         if response.status_code not in (200, 409):
             logger.error("YouTube add_audio_track failed: status={} body={}", response.status_code, response.text[:1000])
             raise AudioUpdateError(_youtube_error_message(response, "gắn audio vào video"), status_code=response.status_code, retryable=response.status_code == 429 or response.status_code >= 500)
@@ -1320,6 +1327,18 @@ class UpdateAudioModule(IModule):
                 languages.add(language.casefold())
         return languages
 
+    def get_original_audio_language(self, id_video: str, channel_id: str) -> str:
+        """Read the source track language without guessing from dubbed tracks."""
+        payload = self._get_video_translation_payload([id_video], channel_id)
+        for track in payload.get("audioTracks") or []:
+            if not isinstance(track, dict) or track.get("videoId") != id_video:
+                continue
+            if str(track.get("audioContentTypeString") or "").casefold() == "original":
+                language = self._translation_language(track)
+                if language:
+                    return language
+        return ""
+
     @staticmethod
     def _translation_language(item: dict) -> str | None:
         containers = [item, item.get("audioTranslation") or {}]
@@ -1341,6 +1360,7 @@ class UpdateAudioModule(IModule):
         payload: dict,
         video_id: str,
         language: str,
+        audio_content_type: str = "dubbed",
     ) -> str:
         """Return ``healthy``, ``inflight``, ``terminal``, or ``missing``.
 
@@ -1396,6 +1416,15 @@ class UpdateAudioModule(IModule):
                 if not track_id:
                     continue
                 root_track = root_tracks.get(track_id)
+                actual_type = str(
+                    (root_track or audio).get("audioContentTypeString")
+                    or (root_track or audio).get("audioContentType")
+                    or ""
+                ).casefold()
+                if actual_type != audio_content_type and (
+                    actual_type or audio_content_type != "dubbed"
+                ):
+                    continue
                 status_payload = root_track if root_track is not None else item
                 if cls._audio_payload_has_terminal_failure(
                     status_payload,
@@ -1410,6 +1439,32 @@ class UpdateAudioModule(IModule):
                 else:
                     states.add("healthy")
 
+        # Descriptive audio is separate from the original/dubbed row. A ready
+        # original track must never turn a descriptive-upload conflict into
+        # success. Studio can expose descriptive tracks only in audioTracks.
+        if audio_content_type == "descriptive":
+            for track in root_tracks.values():
+                actual_type = str(
+                    track.get("audioContentTypeString")
+                    or track.get("audioContentType")
+                    or ""
+                ).casefold()
+                actual_language = cls._translation_language(track)
+                if (
+                    actual_type != "descriptive"
+                    or not actual_language
+                    or actual_language.casefold() != expected
+                ):
+                    continue
+                if cls._audio_payload_has_terminal_failure(track, assume_audio=True):
+                    states.add("terminal")
+                elif cls._audio_payload_needs_attention(track, assume_audio=True):
+                    states.add("inflight")
+                elif str(track.get("status") or "").upper() in (
+                    "AUDIO_TRACK_STATUS_READY", "READY", "PUBLISHED",
+                ) or str(track.get("publishStatus") or "").upper() == "PUBLISHED":
+                    states.add("healthy")
+
         # A good duplicate always wins. Never replace it because an older copy
         # of the same language is still processing or failed.
         if "healthy" in states:
@@ -1420,7 +1475,10 @@ class UpdateAudioModule(IModule):
             return "terminal"
         return "missing"
 
-    def _has_audio_track(self, id_video: str, channel_id: str, language: str) -> bool:
+    def _has_audio_track(
+        self, id_video: str, channel_id: str, language: str,
+        audio_content_type: str = "dubbed",
+    ) -> bool:
         """Return true only when the existing language is READY/PUBLISHED."""
         for attempt in range(3):
             payload = self._get_video_translation_payload([id_video], channel_id)
@@ -1428,6 +1486,7 @@ class UpdateAudioModule(IModule):
                 payload,
                 id_video,
                 language,
+                audio_content_type=audio_content_type,
             )
             if state == "healthy":
                 return True

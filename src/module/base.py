@@ -188,6 +188,9 @@ class IModule(ABC):
             )
         video = videos[0]
         thumbnails = video.get("thumbnailDetails", {}).get("thumbnails") or [{}]
+        audio_language = video.get("audioLanguage") or ""
+        if isinstance(audio_language, dict):
+            audio_language = audio_language.get("languageCode") or ""
         return Video(
             id=video.get("videoId", ""),
             title=video.get("title", ""),
@@ -196,6 +199,7 @@ class IModule(ABC):
             duration_ms=video.get("videoDurationMs", 0),
             thumbnail=thumbnails[0].get("url", ""),
             video_status=video.get("status", ""),
+            audio_language=str(audio_language).strip(),
         )
 
         cookie = None
