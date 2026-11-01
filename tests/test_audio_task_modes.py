@@ -98,6 +98,9 @@ class AudioTaskModeTests(unittest.IsolatedAsyncioTestCase):
             },
         ))
         self.recovery = self.patches.enter_context(patch.object(audio, "register_audio_recovery", return_value=True))
+        self.invalidate_description = self.patches.enter_context(patch.object(
+            audio, "invalidate_description_completion", return_value=True,
+        ))
 
     def saved_add_state(self):
         return {
@@ -216,6 +219,133 @@ class AudioTaskModeTests(unittest.IsolatedAsyncioTestCase):
             await self.button_callback(client, "Bắt đầu xóa & thêm audio")()
         self.assertEqual(self.description_events, ["description:vi"])
         self.assertEqual(self.state.states["audio_add"]["video_description_status"]["video"]["en"], "already_added")
+
+    async def test_failed_description_is_deleted_before_reupload_and_healthy_description_is_kept(self):
+        self.state.states["audio_add"] = self.saved_add_state()
+        self.track_states.side_effect = None
+        self.track_states.return_value = {
+            "en": {"descriptive": "terminal", "descriptive_track_ids": ["failed-en-description"]},
+            "vi": {"descriptive": "healthy", "descriptive_track_ids": []},
+        }
+        events = []
+        original_add = self.add.side_effect
+
+        def delete_failed(video_id, channel_id, track_ids):
+            self.assertTrue(get_audio_mutation_guard(self.channel.id).locked())
+            self.assertEqual((video_id, channel_id, track_ids), ("video", self.channel.id, ["failed-en-description"]))
+            self.assertEqual(self.state.states["audio_add"]["video_description_status"]["video"]["en"], "processing")
+            events.append("delete-description")
+            return 200
+
+        def add(**kwargs):
+            if kwargs.get("audio_content_type") == "descriptive":
+                events.append("add-description:" + kwargs["language"])
+            return original_add(**kwargs)
+
+        self.delete_tracks.side_effect = delete_failed
+        self.add.side_effect = add
+        client = self.render()
+        with client:
+            await self.button_callback(client, "Bắt đầu xóa & thêm audio")()
+        self.assertEqual(events, ["delete-description", "add-description:en"])
+        self.invalidate_description.assert_called_once_with(self.channel.id, "video", ["en"])
+        self.assertEqual(self.description_events, ["description:en"])
+        self.assertEqual(self.state.states["audio_add"]["video_description_status"]["video"], {
+            "en": "successful", "vi": "already_added",
+        })
+
+    async def test_successful_checkpoint_is_rechecked_and_failed_description_is_replaced(self):
+        self.state.states["audio_add"] = self.saved_add_state()
+        client = self.render()
+        with client:
+            await self.button_callback(client, "Bắt đầu xóa & thêm audio")()
+        self.description_events.clear()
+        self.track_states.side_effect = None
+        self.track_states.return_value = {
+            "en": {"descriptive": "terminal", "descriptive_track_ids": ["failed-after-upload"]},
+            "vi": {"descriptive": "healthy"},
+        }
+        reopened = self.render()
+        with reopened:
+            await self.button_callback(reopened, "Bắt đầu xóa & thêm audio")()
+        self.delete.assert_called_once()
+        self.assertEqual(self.events, ["delete", "add:en", "add:vi", "delete_tracks"])
+        self.delete_tracks.assert_called_once_with("video", self.channel.id, ["failed-after-upload"])
+        self.assertEqual(self.description_events, ["description:en"])
+
+    async def test_description_delete_failure_does_not_upload_that_language_and_other_languages_continue(self):
+        self.state.states["audio_add"] = self.saved_add_state()
+        self.track_states.side_effect = None
+        self.track_states.return_value = {
+            "en": {"descriptive": "terminal", "descriptive_track_ids": ["failed-en-description"]},
+            "vi": {"descriptive": "missing"},
+        }
+        self.delete_tracks.side_effect = RuntimeError("delete description failed")
+        client = self.render()
+        with client:
+            await self.button_callback(client, "Bắt đầu xóa & thêm audio")()
+        self.assertEqual(self.description_events, ["description:vi"])
+        saved = self.state.states["audio_add"]
+        self.assertEqual(saved["video_description_status"]["video"], {"en": "unsuccessful", "vi": "successful"})
+        self.assertEqual(saved["video_description_errors"]["video"]["en"], "delete description failed")
+
+    async def test_failed_description_is_replaced_even_when_the_dub_upload_fails(self):
+        self.state.states["audio_add"] = self.saved_add_state()
+        self.track_states.side_effect = None
+        self.track_states.return_value = {
+            "en": {"descriptive": "terminal", "descriptive_track_ids": ["failed-en-description"]},
+            "vi": {"descriptive": "inflight"},
+        }
+        original_add = self.add.side_effect
+
+        def add(**kwargs):
+            if kwargs["language"] == "en" and kwargs.get("audio_content_type") != "descriptive":
+                raise RuntimeError("dub upload failed")
+            return original_add(**kwargs)
+
+        self.add.side_effect = add
+        client = self.render()
+        with client:
+            await self.button_callback(client, "Bắt đầu xóa & thêm audio")()
+        self.delete_tracks.assert_called_once_with("video", self.channel.id, ["failed-en-description"])
+        self.assertEqual(self.description_events, ["description:en"])
+        self.assertEqual(self.state.states["audio_add"]["video_description_status"]["video"]["en"], "successful")
+
+    async def test_failed_registry_checkpoint_prevents_description_delete_and_upload(self):
+        self.state.states["audio_add"] = self.saved_add_state()
+        self.track_states.side_effect = None
+        self.track_states.return_value = {
+            "en": {"descriptive": "terminal", "descriptive_track_ids": ["failed-en-description"]},
+            "vi": {"descriptive": "healthy"},
+        }
+        self.invalidate_description.return_value = False
+        client = self.render()
+        with client:
+            await self.button_callback(client, "Bắt đầu xóa & thêm audio")()
+        self.delete_tracks.assert_not_called()
+        self.assertEqual(self.description_events, [])
+        self.assertEqual(self.state.states["audio_add"]["video_description_status"]["video"]["en"], "unsuccessful")
+
+    async def test_failed_description_checkpoint_prevents_delete_and_upload(self):
+        self.state.states["audio_add"] = self.saved_add_state()
+        self.track_states.side_effect = None
+        self.track_states.return_value = {
+            "en": {"descriptive": "terminal", "descriptive_track_ids": ["failed-en-description"]},
+            "vi": {"descriptive": "healthy"},
+        }
+        save = self.state.save_state
+
+        def fail_delete_checkpoint(name, state):
+            if state.get("video_description_status", {}).get("video", {}).get("en") == "processing":
+                return False
+            return save(name, state)
+
+        client = self.render()
+        with patch.object(self.state, "save_state", side_effect=fail_delete_checkpoint), client:
+            await self.button_callback(client, "Bắt đầu xóa & thêm audio")()
+        self.delete_tracks.assert_not_called()
+        self.assertEqual(self.description_events, [])
+        self.assertEqual(self.state.states["audio_add"]["video_description_status"]["video"]["en"], "unsuccessful")
 
     async def test_missing_description_scan_uses_selected_languages_and_preserves_healthy_dubs(self):
         saved = self.saved_add_state()

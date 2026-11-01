@@ -8,6 +8,7 @@ from src.audio_recovery import (
     _is_currently_public_video,
     _is_currently_scheduled_video,
     get_audio_mutation_guard,
+    invalidate_description_completion,
     register_audio_recovery,
     register_caption_monitor,
 )
@@ -91,7 +92,7 @@ MAX_AUDIO_UPLOAD_CONCURRENCY = 5
 _AUDIO_UPLOAD_CONCURRENCY_MODE = "delete_then_add_parallel_v2"
 AUDIO_SCAN_FILTERS = {
     "needs_audio": "Audio lỗi hoặc trống",
-    "missing_description": "Chưa có âm thanh mô tả",
+    "missing_description": "Thiếu hoặc lỗi âm thanh mô tả",
 }
 
 
@@ -2576,27 +2577,55 @@ def create_add_audio_page(*, delete_existing: bool = True):
         async def run_descriptions(vid: str, languages: list[str], temp_audio_path: Path):
             nonlocal completed_tasks
             statuses = video_description_status.setdefault(vid, {})
-            pending = [lang for lang in languages if statuses.get(lang) not in ("successful", "already_added")]
-            states = await asyncio.to_thread(
-                update_audio_module.get_audio_track_states, vid, channel_id, pending,
-            ) if pending else {}
             for lang in languages:
                 check_stopped()
-                if statuses.get(lang) not in ("successful", "already_added"):
+                try:
+                    # Each language may take minutes to upload. Read its current
+                    # state immediately before deleting, including old successful
+                    # checkpoints whose upload subsequently failed in YouTube.
+                    states = await asyncio.to_thread(
+                        update_audio_module.get_audio_track_states, vid, channel_id, [lang],
+                    )
+                    check_stopped()
                     state = states.get(lang, {})
                     if state.get("descriptive") in ("healthy", "inflight"):
                         statuses[lang] = "already_added"
                         video_description_errors.setdefault(vid, {}).pop(lang, None)
-                    elif video_processing_status.get(vid, {}).get(lang) in ("successful", "already_added"):
-                        failed_ids = state.get("descriptive_track_ids") or []
+                    elif state.get("descriptive") == "terminal" or (
+                        statuses.get(lang) not in ("successful", "already_added")
+                        and video_processing_status.get(vid, {}).get(lang) in ("successful", "already_added")
+                    ):
+                        failed_ids = (state.get("descriptive_track_ids") or []) if state.get("descriptive") == "terminal" else []
+                        if state.get("descriptive") == "terminal" and not failed_ids:
+                            raise RuntimeError("Không đọc được ID âm thanh mô tả lỗi để thay thế an toàn")
                         if failed_ids:
+                            statuses[lang] = "processing"
+                            video_description_errors.setdefault(vid, {}).pop(lang, None)
+                            if save_right_panel_state() is False:
+                                raise RuntimeError("Không thể lưu checkpoint trước khi xóa âm thanh mô tả lỗi")
+                            if not await asyncio.to_thread(invalidate_description_completion, channel_id, vid, [lang]):
+                                raise RuntimeError("Không thể lưu trạng thái thử lại âm thanh mô tả trong Auto Registry")
+                            best_effort_ui("render descriptive delete", lambda lang=lang: status_label.set_text(
+                                f"Đang xóa âm thanh mô tả lỗi: {lang}"
+                            ))
                             await call_audio_update_with_retry(
                                 lambda failed_ids=failed_ids: update_audio_module.delete_track_ids(vid, channel_id, failed_ids),
                             )
+                            check_stopped()
                         best_effort_ui("render descriptive upload", lambda lang=lang: status_label.set_text(
                             f"Đang thêm âm thanh mô tả: {lang}"
                         ))
                         await run_upload(vid, lang, temp_audio_path, descriptive=True)
+                except TaskStopped:
+                    raise
+                except Exception as exc:
+                    statuses[lang] = "unsuccessful"
+                    video_description_errors.setdefault(vid, {})[lang] = str(exc)
+                    overall_errors.append(f"{vid}-{lang} (mô tả): {exc}")
+                    if save_right_panel_state() is False:
+                        raise RuntimeError("Không thể lưu lỗi thay thế âm thanh mô tả") from exc
+                    if _is_youtube_auth_error(exc):
+                        raise
                 completed_tasks += 1
                 completed_by_video[vid] += 1
                 if save_right_panel_state() is False:
@@ -3056,6 +3085,17 @@ def create_add_audio_page(*, delete_existing: bool = True):
                         "update skipped-language progress",
                         lambda: setattr(progress_bar, "value", completed_tasks / total_tasks),
                     )
+                if not missing_languages and all(
+                    video_description_status.get(vid, {}).get(lang) in ("successful", "already_added")
+                    for lang in languages_for_video
+                ):
+                    current_descriptions = await asyncio.to_thread(
+                        update_audio_module.get_audio_track_states, vid, channel_id, languages_for_video,
+                    )
+                    check_stopped()
+                    for lang in languages_for_video:
+                        if current_descriptions.get(lang, {}).get("descriptive") == "terminal":
+                            video_description_status[vid].pop(lang, None)
                 if not missing_languages and all(
                     video_description_status.get(vid, {}).get(lang) in ("successful", "already_added")
                     for lang in languages_for_video

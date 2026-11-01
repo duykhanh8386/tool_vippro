@@ -714,6 +714,25 @@ def register_audio_recovery(
     return saved
 
 
+def invalidate_description_completion(channel_id: str, video_id: str, languages: Iterable[str]) -> bool:
+    """Reopen only descriptions a manual task has found failed after completion."""
+    pending = {str(language).casefold() for language in languages}
+    with _STATE_LOCK:
+        state = _load_state()
+        entry = (state.get("entries") or {}).get(channel_id, {}).get(video_id)
+        if not isinstance(entry, dict):
+            return True
+        entry["description_completed_languages"] = [
+            language for language in entry.get("description_completed_languages") or []
+            if str(language).casefold() not in pending
+        ]
+        entry.pop("description_completed_at", None)
+        entry.pop("description_next_check_at", None)
+        for language in pending:
+            entry.get("description_processing_observations", {}).pop(language, None)
+        return state_manager.save_state(RECOVERY_STATE_NAME, state)
+
+
 def register_caption_monitor(
     *,
     channel_id: str,
@@ -2749,7 +2768,7 @@ async def run_audio_recovery_cycle(
                                         break
                                     video_owned_guard = channel_mutation_guard
                                     try:
-                                        if fresh_observations is None:
+                                        if fresh_observations is None or action.get("track_ids"):
                                             fresh_payload = await _run_recovery_blocking(
                                                 update_audio_module._get_video_translation_payload,
                                                 [video_id], channel_id,
@@ -2775,10 +2794,13 @@ async def run_audio_recovery_cycle(
                                             continue
                                         if should_stop() or not is_audio_recovery_video_enabled(channel_id, video_id) or channel_requires_refresh:
                                             break
+                                        failed_description_ids = (
+                                            observed.get("track_ids") or []
+                                        ) if observed.get("state") == "terminal" else []
                                         upload_progress = {
                                             "sent": 0,
                                             "total": temp_audio_path.stat().st_size,
-                                            "status": "deleting" if action["track_ids"] else "starting",
+                                            "status": "deleting" if failed_description_ids else "starting",
                                         }
                                         _update_runtime_status(
                                             phase="uploading",
@@ -2802,13 +2824,31 @@ async def run_audio_recovery_cycle(
                                             video_id,
                                             language,
                                             action["reason"],
-                                            ",".join(action["track_ids"]) or "none",
+                                            ",".join(failed_description_ids) or "none",
                                         )
                                         _record_description_attempt(
                                             channel_id, video_id, language, succeeded=None,
                                             message="Đang tải âm thanh mô tả",
                                             attempted_at=float(now if now is not None else time.time()),
                                         )
+                                        if failed_description_ids:
+                                            _update_runtime_status(message=f"Đang xóa âm thanh mô tả lỗi: {language}")
+                                            await call_audio_update_with_retry(
+                                                lambda: update_audio_module.delete_track_ids(
+                                                    video_id, channel_id, failed_description_ids,
+                                                ),
+                                                run_blocking=_run_recovery_blocking,
+                                            )
+                                            logger.info(
+                                                "Audio auto-recovery deleted failed descriptions: "
+                                                "channel={} video={} language={} track_ids={}",
+                                                channel_id, video_id, language,
+                                                ",".join(failed_description_ids),
+                                            )
+                                        if should_stop() or not is_audio_recovery_channel_enabled(channel_id) or not is_audio_recovery_video_enabled(channel_id, video_id):
+                                            break
+                                        upload_progress["status"] = "starting"
+                                        _update_runtime_status(message=f"Đang thêm âm thanh mô tả: {language}")
                                         await call_audio_update_with_retry(
                                             lambda language=language: update_audio_module.add(
                                                 id_video=video_id,

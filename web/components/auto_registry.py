@@ -441,7 +441,8 @@ def create_auto_registry_content(*, on_change: Callable[[], None] | None = None)
             "Các video trong Auto Registry từ trước cũng được xử lý tự động khi chưa đủ mô tả."
         ).classes("text-xs text-gray-500")
         ui.label(
-            "Mô tả thiếu, bị lỗi hoặc xử lý quá 2 giờ sẽ được thử thêm lại. "
+            "Mô tả bị lỗi sẽ được xóa đúng track lỗi rồi tải lại file nhạc đầy đủ. "
+            "Mô tả thiếu hoặc xử lý quá 2 giờ sẽ được thử thêm lại. "
             "Sau mỗi lượt gửi, tool chờ ít nhất 30 giây trước lượt xác nhận hoặc thử lại tiếp theo."
         ).classes("text-xs text-amber-700")
         ui.label(

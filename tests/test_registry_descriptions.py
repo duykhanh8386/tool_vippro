@@ -72,9 +72,8 @@ class RegistryDescriptionTests(unittest.IsolatedAsyncioTestCase):
 
         self.add = self.stack.enter_context(patch.object(recovery.update_audio_module, "add", side_effect=upload))
         self.delete = self.stack.enter_context(patch.object(recovery.update_audio_module, "delete", side_effect=AssertionError("must never delete")))
-        self.delete_ids = self.stack.enter_context(patch.object(recovery.update_audio_module, "delete_track_ids", side_effect=AssertionError("must never delete")))
+        self.delete_ids = self.stack.enter_context(patch.object(recovery.update_audio_module, "delete_track_ids", side_effect=AssertionError("unexpected track deletion")))
         self.addCleanup(self.delete.assert_not_called)
-        self.addCleanup(self.delete_ids.assert_not_called)
 
     def reset_registry(self):
         self.manager.save_state("audio_recovery", {"entries": {"channel": {"video": copy.deepcopy(self.entry)}}})
@@ -128,25 +127,122 @@ class RegistryDescriptionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(description_entry_complete(self.saved_entry()))
         self.add.assert_called_once()
 
-    async def test_failed_description_retries_without_delete_until_ready(self):
+    async def test_failed_description_is_deleted_before_retry_and_verified_before_completion(self):
         self.entry["languages"] = ["en"]
         self.reset_registry()
-        self.payload = response([audio_track("en", status="FAILED")])
-        self.add.side_effect = AudioUpdateError("conflict; description not ready", status_code=409)
+        self.payload = response([
+            audio_track("en", status="FAILED", track_id="failed-description"),
+            audio_track("en", "dubbed", "FAILED", track_id="failed-dub"),
+            audio_track("en", "original", track_id="original"),
+            audio_track("fr", status="FAILED", track_id="other-language"),
+        ])
+        events = []
+
+        def delete(video_id, channel_id, track_ids):
+            self.assertEqual((video_id, channel_id, track_ids), ("video", "channel", ["failed-description"]))
+            self.assertTrue(recovery.get_audio_mutation_guard("channel").locked())
+            self.assertIsNone(self.saved_entry()["description_attempts"]["en"]["succeeded"])
+            events.append("delete")
+            return 200
+
+        self.delete_ids.side_effect = delete
+
+        def add(**kwargs):
+            self.assertEqual(kwargs["audio_content_type"], "descriptive")
+            events.append("add")
+            raise AudioUpdateError("conflict; description not ready", status_code=409)
+
+        self.add.side_effect = add
         await recovery.run_audio_recovery_cycle(now=2000)
         await recovery.run_audio_recovery_cycle(now=2031)
         self.assertEqual(self.add.call_count, 2)
+        self.assertEqual(events, ["delete", "add", "delete", "add"])
         self.assertFalse(description_entry_complete(self.saved_entry()))
         self.assertFalse(self.saved_entry()["description_attempts"]["en"]["succeeded"])
         self.payload = response([audio_track("en")])
         await recovery.run_audio_recovery_cycle(now=2062)
         self.assertTrue(description_entry_complete(self.saved_entry()))
         self.assertEqual(self.add.call_count, 2)
+        self.assertEqual(self.delete_ids.call_count, 2)
+
+    async def test_delete_failure_prevents_upload_and_retries_in_the_next_cycle(self):
+        self.entry["languages"] = ["es-MX"]
+        self.reset_registry()
+        self.payload = response([audio_track("es-MX", status="FAILED", track_id="failed-description")])
+        self.delete_ids.side_effect = AudioUpdateError("cannot delete", status_code=403)
+        result = await recovery.run_audio_recovery_cycle(now=2000)
+        self.assertEqual(result["failed"], 1)
+        self.add.assert_not_called()
+        self.assertFalse(self.saved_entry()["description_attempts"]["es-mx"]["succeeded"])
+        self.assertIn("cannot delete", self.saved_entry()["description_attempts"]["es-mx"]["message"])
+        self.delete_ids.side_effect = None
+        self.delete_ids.return_value = 200
+        self.payload = response()
+        await recovery.run_audio_recovery_cycle(now=2031)
+        self.add.assert_called_once()
+        self.assertFalse(description_entry_complete(self.saved_entry()))
+        self.payload = response([audio_track("es-MX")])
+        await recovery.run_audio_recovery_cycle(now=2062)
+        self.assertTrue(description_entry_complete(self.saved_entry()))
+
+    async def test_failed_description_is_rechecked_before_each_language_delete(self):
+        self.payload = response([
+            audio_track("en", status="FAILED", track_id="failed-en"),
+            audio_track("vi", status="FAILED", track_id="old-vi"),
+        ])
+        events = []
+
+        def delete(video_id, channel_id, track_ids):
+            events.append(("delete", track_ids))
+            return 200
+
+        def upload(**kwargs):
+            events.append(("add", kwargs["language"]))
+            # The other language finished processing while this upload ran.
+            self.payload = response([audio_track("en", status="PROCESSING"), audio_track("vi")])
+            return 200
+
+        self.delete_ids.side_effect = delete
+        self.add.side_effect = upload
+        await recovery.run_audio_recovery_cycle(now=2000)
+        self.assertEqual(events, [("delete", ["failed-en"]), ("add", "en")])
+        self.assertEqual(self.saved_entry()["description_completed_languages"], ["vi"])
+
+    async def test_changed_failed_description_uses_fresh_track_ids(self):
+        self.entry["languages"] = ["en"]
+        self.reset_registry()
+        self.payload = response([audio_track("en", status="FAILED", track_id="old-track")])
+
+        def render(**kwargs):
+            Path(kwargs["output_file"]).write_bytes(self.source.read_bytes())
+            self.payload = response([audio_track("en", status="FAILED", track_id="new-track")])
+
+        self.render.side_effect = render
+        self.delete_ids.side_effect = None
+        self.delete_ids.return_value = 200
+        await recovery.run_audio_recovery_cycle(now=2000)
+        self.delete_ids.assert_called_once_with("video", "channel", ["new-track"])
+        self.add.assert_called_once()
+
+    async def test_deleted_description_is_added_without_deleting_a_stale_track_id(self):
+        self.entry["languages"] = ["en"]
+        self.reset_registry()
+        self.payload = response([audio_track("en", status="FAILED")])
+
+        def render(**kwargs):
+            Path(kwargs["output_file"]).write_bytes(self.source.read_bytes())
+            self.payload = response()
+
+        self.render.side_effect = render
+        await recovery.run_audio_recovery_cycle(now=2000)
+        self.delete_ids.assert_not_called()
+        self.add.assert_called_once()
 
     async def test_healthy_duplicate_wins_over_a_failed_description(self):
         self.payload = response([audio_track("en"), audio_track("en", status="FAILED", track_id="old-failed"), audio_track("vi")])
         await recovery.run_audio_recovery_cycle(now=2000)
         self.add.assert_not_called()
+        self.delete_ids.assert_not_called()
         self.assertTrue(description_entry_complete(self.saved_entry()))
 
     async def test_processing_description_is_retried_only_after_two_hours_without_delete(self):
@@ -158,6 +254,7 @@ class RegistryDescriptionTests(unittest.IsolatedAsyncioTestCase):
         self.add.assert_not_called()
         await recovery.run_audio_recovery_cycle(now=9201)
         self.add.assert_called_once()
+        self.delete_ids.assert_not_called()
         self.assertFalse(description_entry_complete(self.saved_entry()))
 
     async def test_description_ready_during_render_is_not_uploaded_again(self):
@@ -273,6 +370,65 @@ class RegistryDescriptionTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(asyncio.CancelledError):
                 await task
         self.add.assert_called_once()
+        self.assertFalse(recovery.get_audio_mutation_guard("channel").locked())
+        self.assertTrue(all(not path.exists() for path in self.temp_paths))
+
+    async def test_manual_repair_reopens_only_the_failed_language_of_a_completed_registration(self):
+        self.payload = response([audio_track("en"), audio_track("vi")])
+        await recovery.run_audio_recovery_cycle(now=2000)
+        self.assertTrue(description_entry_complete(self.saved_entry()))
+        self.assertTrue(recovery.invalidate_description_completion("channel", "video", ["EN"]))
+        self.assertEqual(self.saved_entry()["description_completed_languages"], ["vi"])
+        self.assertNotIn("description_completed_at", self.saved_entry())
+        recovery.register_audio_recovery(channel_id="channel", video_id="video", audio_path=str(self.source),
+                                        languages=["en", "vi"], repeat_times=1, extra_minutes=0)
+        self.assertFalse(description_entry_complete(self.saved_entry()))
+        self.payload = response()
+        await recovery.run_audio_recovery_cycle(now=2001)
+        self.add.assert_called_once()
+        self.assertEqual(self.add.call_args.kwargs["language"], "en")
+        self.delete_ids.assert_not_called()
+
+    async def test_failed_checkpoint_prevents_deleting_a_failed_description(self):
+        self.entry["languages"] = ["en"]
+        self.reset_registry()
+        self.payload = response([audio_track("en", status="FAILED")])
+        save = self.manager.save_state
+
+        def fail_attempt_checkpoint(name, state):
+            if (state.get("entries", {}).get("channel", {}).get("video", {}).get("description_attempts", {})
+                    .get("en", {}).get("succeeded", True)) is None:
+                return False
+            return save(name, state)
+
+        with patch.object(self.manager, "save_state", side_effect=fail_attempt_checkpoint):
+            await recovery.run_audio_recovery_cycle(now=2000)
+        self.delete_ids.assert_not_called()
+        self.add.assert_not_called()
+
+    async def test_cancel_drains_description_delete_and_does_not_start_upload(self):
+        self.payload = response([audio_track("en", status="FAILED"), audio_track("vi", status="FAILED")])
+        started, release = threading.Event(), threading.Event()
+
+        def delete(*args):
+            started.set()
+            if not release.wait(3):
+                raise AssertionError("delete not released")
+            return 200
+
+        self.delete_ids.side_effect = delete
+        task = asyncio.create_task(recovery.run_audio_recovery_cycle(now=2000))
+        try:
+            self.assertTrue(await asyncio.to_thread(started.wait, 2))
+            task.cancel()
+            await asyncio.sleep(0)
+            self.assertTrue(recovery.get_audio_mutation_guard("channel").locked())
+        finally:
+            release.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+        self.delete_ids.assert_called_once()
+        self.add.assert_not_called()
         self.assertFalse(recovery.get_audio_mutation_guard("channel").locked())
         self.assertTrue(all(not path.exists() for path in self.temp_paths))
 
