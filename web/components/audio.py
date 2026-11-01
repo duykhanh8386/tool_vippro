@@ -1376,7 +1376,8 @@ def create_add_audio_page(*, delete_existing: bool = True):
 
                 concurrency_input.on("change", update_concurrency)
                 ui.label(
-                    "Chạy đồng thời 3–5 video; mỗi video luôn xóa audio cũ trước rồi mới thêm lần lượt các ngôn ngữ."
+                    "Mỗi lần bấm sẽ xóa và thêm lại audio ngôn ngữ, kể cả khi quét video thiếu hoặc lỗi mô tả. "
+                    "Chạy đồng thời 3–5 video; sau audio ngôn ngữ sẽ thêm hoặc sửa âm thanh mô tả."
                     if delete_existing
                     else "Chạy đồng thời 3–5 video; thêm lần lượt audio theo ngôn ngữ cho từng video."
                 ).classes("app-section-copy flex-1")
@@ -2402,7 +2403,8 @@ def create_add_audio_page(*, delete_existing: bool = True):
                 )
                 return None
         selective_repair = video_source_state.get("mode") == "failed"
-        description_only = selective_repair and video_source_state.get("audio_filter") == "missing_description"
+        description_scan = selective_repair and video_source_state.get("audio_filter") == "missing_description"
+        description_only = description_scan and not delete_existing
         if selective_repair:
             if video_source_state.get("failed_channel") != selected_channel["id"]:
                 ui.notify(
@@ -2415,7 +2417,7 @@ def create_add_audio_page(*, delete_existing: bool = True):
                 video_ids_state["ids"],
                 languages_to_process,
             )
-            if description_only and video_source_state.get("last_scan_languages") != languages_to_process:
+            if description_scan and video_source_state.get("last_scan_languages") != languages_to_process:
                 ui.notify("Danh sách ngôn ngữ đã thay đổi. Hãy quét lại video thiếu âm thanh mô tả.", type="warning")
                 return None
             if not repair_actions_by_video:
@@ -2462,6 +2464,14 @@ def create_add_audio_page(*, delete_existing: bool = True):
         channel_id = selected_channel["id"]
         repeat_times = repeat_settings["times"]
         extra_minutes = repeat_settings["extra_minutes"]
+        if delete_existing:
+            # The combined action always starts a new delete/add cycle. A
+            # successful checkpoint from an earlier click must not turn it
+            # into a description-only retry.
+            for vid in job_video_ids:
+                video_cleanup_status.pop(vid, None)
+                video_processing_status.pop(vid, None)
+                delete_requested.pop(vid, None)
         video_processing_errors.clear()
         if save_right_panel_state() is False:
             _release_audio_run_lock(channel_mutation_guard)
@@ -2909,10 +2919,10 @@ def create_add_audio_page(*, delete_existing: bool = True):
                 repair_actions = planned_actions
                 if (
                     selective_repair
-                    and (description_only or video_cleanup_status.get(vid) != "successful")
+                    and (description_scan or video_cleanup_status.get(vid) != "successful")
                 ):
                     unreadable_now: list[str] = []
-                    if description_only:
+                    if description_scan:
                         current_targets = await asyncio.to_thread(
                             update_audio_module.get_missing_audio_description_targets,
                             [vid], channel_id, languages_for_video, unreadable_now,
@@ -2998,6 +3008,14 @@ def create_add_audio_page(*, delete_existing: bool = True):
                     )
 
                     def delete_old_audio():
+                        if description_scan:
+                            if not repair_actions:
+                                return 200
+                            return update_audio_module.delete(
+                                id_video=vid,
+                                channel_id=channel_id,
+                                languages=[action["language"] for action in repair_actions],
+                            )
                         if selective_repair:
                             if not failed_track_ids:
                                 return 200
@@ -3066,7 +3084,7 @@ def create_add_audio_page(*, delete_existing: bool = True):
                     # It became READY/PUBLISHED or is still PROCESSING between
                     # the scan and this click. Either way it must not be added.
                     existing_status[language] = "already_added"
-                    if description_only:
+                    if description_scan:
                         video_description_status.setdefault(vid, {})[language] = "already_added"
                 if description_only:
                     for action in repair_actions:

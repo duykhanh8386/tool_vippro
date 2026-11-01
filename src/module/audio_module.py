@@ -333,11 +333,13 @@ class UpdateAudioModule(IModule):
                 )
         return 200
 
-    def delete(self, id_video: str, channel_id: str):
+    def delete(self, id_video: str, channel_id: str, languages: list[str] | None = None):
+        """Delete creator dubs, optionally scoped to exact language codes."""
         return self.delete_track_ids(
             id_video,
             channel_id,
-            self._get_all_audio_track_ids(id_video, channel_id),
+            self._get_all_audio_track_ids(id_video, channel_id)
+            if languages is None else self._get_all_audio_track_ids(id_video, channel_id, languages),
         )
     def _get_video_translation_payload(
         self, video_ids: list[str], channel_id: str
@@ -1654,11 +1656,15 @@ class UpdateAudioModule(IModule):
             scan(unique_ids[start:start + self._TRANSLATION_BATCH_SIZE])
         return targets
 
-    def _get_all_audio_track_ids(self, id_video: str, channel_id: str):
+    def _get_all_audio_track_ids(self, id_video: str, channel_id: str, languages: list[str] | None = None):
         payload = self._get_video_translation_payload([id_video], channel_id)
+        selected = None if languages is None else {str(language).casefold() for language in languages}
+        if selected is not None and id_video not in self._readable_translation_video_ids(payload, [id_video]):
+            raise AudioUpdateError("YouTube không trả trạng thái audio của đúng video để xóa theo ngôn ngữ")
         return [
             track["audioTrackId"] for track in self._video_audio_tracks(payload, id_video)
             if self._is_creator_dubbed_track(track)
+            and (selected is None or (self._translation_language(track) or "").casefold() in selected)
         ]
 
 

@@ -1219,6 +1219,38 @@ class AudioDeleteTests(unittest.TestCase):
         self.assertEqual(post.call_count, 1)
         self.assertEqual(post.call_args.kwargs["json"]["audioTrackId"], "failed-track")
 
+    def test_language_scoped_delete_keeps_source_descriptions_other_languages_and_other_videos(self):
+        module = UpdateAudioModule()
+
+        def track(track_id, language, kind="dubbed", video="video", status="READY"):
+            return {"videoId": video, "audioTrackId": track_id, "language": language,
+                    "source": "AUDIO_TRACK_SOURCE_CREATOR", "audioContentTypeString": kind,
+                    "status": "AUDIO_TRACK_STATUS_" + status}
+
+        payload = {"videoTranslations": [{"videoId": "video", "translations": []}], "audioTracks": [
+            track("en-au-ready", "en-AU"), track("en-au-failed", "en-AU", status="FAILED"),
+            track("en-au-processing", "en-AU", status="PROCESSING"), track("en-us", "en-US"),
+            track("original", "en-AU", "original"), track("description", "en-AU", "descriptive"),
+            track("failed-description", "en-AU", "descriptive", status="FAILED"),
+            track("other-video", "en-AU", video="other"),
+        ]}
+        with (
+            patch.object(module, "_get_video_translation_payload", return_value=payload),
+            patch.object(module, "delete_track_ids", return_value=200) as delete,
+        ):
+            self.assertEqual(module.delete("video", "channel", languages=["en-au"]), 200)
+        delete.assert_called_once_with("video", "channel", ["en-au-ready", "en-au-failed", "en-au-processing"])
+
+    def test_language_scoped_delete_stops_if_requested_video_is_unreadable(self):
+        module = UpdateAudioModule()
+        with (
+            patch.object(module, "_get_video_translation_payload", return_value={"videoTranslations": [], "audioTracks": []}),
+            patch.object(module, "delete_track_ids") as delete,
+        ):
+            with self.assertRaises(AudioUpdateError):
+                module.delete("video", "channel", languages=["en-AU"])
+        delete.assert_not_called()
+
     def test_delete_propagates_youtube_failure(self):
         module = UpdateAudioModule()
         with (
