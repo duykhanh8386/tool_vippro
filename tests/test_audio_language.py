@@ -11,6 +11,16 @@ from src.audio_language import (
 
 
 class AudioLanguageTests(unittest.TestCase):
+    def test_keeps_all_fifteen_input_languages_and_region_variants(self):
+        value = (
+            "en-AU en-CA en-IN en-IE en-GB en-US pt pt-BR pt-PT "
+            "es es-419 es-MX es-ES es-US fr"
+        )
+        languages = parse_language_codes(value)
+        self.assertEqual(languages, value.split())
+        self.assertEqual(len(languages), 15)
+        self.assertEqual(invalid_language_codes(languages), [])
+
     def test_parses_full_requested_language_list(self):
         value = (
             "en en-AU en-CA en-US pt de de-CH ru ru-Latn es es-US "

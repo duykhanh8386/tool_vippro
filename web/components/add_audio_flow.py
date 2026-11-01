@@ -94,8 +94,41 @@ async def _acquire_audio_mutation_guard(channel_id: str):
     return guard
 
 
-async def _add_flow_audio_description(item: dict, channel_id: str, push_log) -> str:
-    """Publish the item's full music as descriptive audio in its source language."""
+def _description_language_results(item: dict) -> dict:
+    """Keep source-only checkpoints from uploading their description again."""
+    results = dict(item.get("audio_description_results") or {})
+    source = parse_language_codes(item.get("audio_description_language"))
+    if source and item.get("steps", {}).get("add_description") == "successful":
+        results.setdefault(source[0], {"status": "successful", "error": ""})
+    item["audio_description_results"] = results
+    return results
+
+
+def _restore_flow_audio_progress(item: dict, languages: list[str]) -> bool:
+    """Resume missing language tracks without repeating video render/upload."""
+    steps = item["steps"]
+    previous_steps = dict(steps)
+    previous_results = item.get("audio_description_results")
+    results = _description_language_results(item)
+    source = parse_language_codes(item.get("audio_description_language"))
+    targets = list(dict.fromkeys(source + languages))
+    if steps.get("add_description") == "successful" and (
+        not source or len(_completed_audio_languages(targets, results)) != len(targets)
+    ):
+        steps["add_description"] = "pending"
+    if steps.get("add_audio") == "successful" and (
+        len(_completed_audio_languages(languages, item.get("audio_language_results") or {}))
+        != len(languages)
+    ):
+        steps["add_audio"] = "pending"
+    return steps != previous_steps or results != previous_results
+
+
+async def _add_flow_audio_description(
+    item: dict, channel_id: str, push_log, *, languages=(),
+    persist: Callable[[], object] = lambda: True,
+) -> str:
+    """Publish full music as descriptive audio for source and dubbed languages."""
     video_id = item.get("video_id")
     if not video_id:
         raise RuntimeError("Chưa có video ID (upload chưa xong)")
@@ -123,6 +156,14 @@ async def _add_flow_audio_description(item: dict, channel_id: str, push_log) -> 
     if info.duration_ms <= 0:
         raise RuntimeError(f"Không đọc được thời lượng video {video_id}")
 
+    targets = parse_language_codes(" ".join([language, *languages]))
+    results = _description_language_results(item)
+    item["audio_description_language"] = language
+    completed = set(_completed_audio_languages(targets, results))
+    pending = [lang for lang in targets if lang not in completed]
+    if not pending:
+        return language
+
     with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tf:
         matched_path = tf.name
     run_context = current_run_context()
@@ -140,26 +181,49 @@ async def _add_flow_audio_description(item: dict, channel_id: str, push_log) -> 
             video_duration_seconds=info.duration_ms / 1000.0,
         )
         guard = await _acquire_audio_mutation_guard(channel_id)
-        push_log(f"Thêm âm thanh mô tả — ngôn ngữ gốc {language}", "wait", indent=True)
+        errors = []
+        for lang in pending:
+            if run_context is not None:
+                run_context.checkpoint()
+            push_log(f"Thêm âm thanh mô tả — {lang}", "wait", indent=True)
 
-        def upload():
-            return update_audio_module.add(
-                id_video=video_id,
-                channel_id=channel_id,
-                file_name=audio_path,
-                language=language,
-                upload_path=matched_path,
-                audio_content_type="descriptive",
+            def upload(lang=lang):
+                return update_audio_module.add(
+                    id_video=video_id,
+                    channel_id=channel_id,
+                    file_name=audio_path,
+                    language=lang,
+                    upload_path=matched_path,
+                    audio_content_type="descriptive",
+                )
+
+            try:
+                status = await call_audio_update_with_retry(
+                    upload,
+                    on_retry=lambda attempt, delay, exc, lang=lang: push_log(
+                        f"Âm thanh mô tả {lang}: thử lại sau {delay:g}s ({attempt}/3)",
+                        "wait", indent=True,
+                    ),
+                )
+            except TaskStopped:
+                raise
+            except Exception as exc:
+                results[lang] = {"status": "unsuccessful", "error": str(exc)}
+                errors.append(f"{lang}: {exc}")
+                _require_checkpoint(persist, f"audio description {lang}")
+                push_log(f"Âm thanh mô tả {lang}: thất bại — tiếp tục mã kế tiếp", "error", indent=True)
+                continue
+            results[lang] = {
+                "status": "successful" if status == 200 else "already_added", "error": "",
+            }
+            _require_checkpoint(persist, f"audio description {lang}")
+            push_log(f"Đã xuất bản âm thanh mô tả: {lang}", "ok", indent=True)
+
+        if errors:
+            raise RuntimeError(
+                f"Âm thanh mô tả: {len(errors)}/{len(targets)} ngôn ngữ thất bại: "
+                + "; ".join(errors)
             )
-
-        await call_audio_update_with_retry(
-            upload,
-            on_retry=lambda attempt, delay, exc: push_log(
-                f"Âm thanh mô tả {language}: thử lại sau {delay:g}s ({attempt}/3)",
-                "wait", indent=True,
-            ),
-        )
-        push_log(f"Đã xuất bản âm thanh mô tả: {language}", "ok", indent=True)
         return language
     finally:
         if guard is not None:
@@ -500,7 +564,7 @@ def create_add_audio_flow_page():
     processing = {"value": False}
     stop_requested = _FLOW_STOP_REQUESTED
     active_run = _ACTIVE_FLOW_RUN
-    PERSIST_FIELDS = ("music", "music_path", "audio_path", "output_path", "video_id", "scotty_resource_id", "frontend_upload_id", "audio_language_results", "audio_description_language")
+    PERSIST_FIELDS = ("music", "music_path", "audio_path", "output_path", "video_id", "scotty_resource_id", "frontend_upload_id", "audio_language_results", "audio_description_language", "audio_description_results")
 
     def client_is_alive() -> bool:
         return (
@@ -629,8 +693,10 @@ def create_add_audio_flow_page():
                     ),
                 }
                 for field in PERSIST_FIELDS:
-                    default = {} if field == "audio_language_results" else ""
+                    default = {} if field in ("audio_language_results", "audio_description_results") else ""
                     item[field] = saved.get(field, default)
+                if not _FLOW_RUN_GUARD.locked():
+                    _restore_flow_audio_progress(item, parse_language_codes(options_state["audio_language"]))
                 items.append(item)
         if not _replace_video_items_unless_processing(
             videos_state,
@@ -698,11 +764,15 @@ def create_add_audio_flow_page():
             for field in PERSIST_FIELDS:
                 restored_value = saved.get(
                     field,
-                    {} if field == "audio_language_results" else "",
+                    {} if field in ("audio_language_results", "audio_description_results") else "",
                 )
                 if item.get(field) != restored_value:
                     item[field] = restored_value
                     changed = True
+            if not detached_run_active:
+                changed = _restore_flow_audio_progress(
+                    item, parse_language_codes(options_state["audio_language"]),
+                ) or changed
         if changed:
             refresh_video_list()
         safe_element_call(
@@ -1108,6 +1178,7 @@ def create_add_audio_flow_page():
     async def step_add_description(item, output_folder, musics, index, run_config):
         item["audio_description_language"] = await _add_flow_audio_description(
             item, run_config["channel_id"], push_log,
+            languages=run_config["audio_languages"], persist=save_state,
         )
         item["steps"]["add_description"] = "successful"
         _require_checkpoint(save_state, "audio description")
@@ -1472,6 +1543,19 @@ def create_add_audio_flow_page():
             safe_notify(f"Không tạo được folder output: {e}", type="negative")
             return
 
+        audio_languages = parse_language_codes(options_state.get("audio_language"))
+        if not audio_languages:
+            safe_notify("Hãy nhập ít nhất một mã ngôn ngữ", type="warning")
+            return
+        invalid_languages = invalid_language_codes(audio_languages)
+        if invalid_languages:
+            safe_notify(
+                f"Mã ngôn ngữ không hợp lệ: {', '.join(invalid_languages)}",
+                type="negative",
+            )
+            return
+        for item in items:
+            _restore_flow_audio_progress(item, audio_languages)
         pending_items = [
             (idx, it)
             for idx, it in enumerate(items)
@@ -1484,17 +1568,6 @@ def create_add_audio_flow_page():
         channel_snapshot = get_channels_info(selected_channel["id"])
         if not channel_snapshot:
             safe_notify("Không tìm thấy dữ liệu kênh đã chọn", type="negative")
-            return
-        audio_languages = parse_language_codes(options_state.get("audio_language"))
-        if not audio_languages:
-            safe_notify("Hãy nhập ít nhất một mã ngôn ngữ", type="warning")
-            return
-        invalid_languages = invalid_language_codes(audio_languages)
-        if invalid_languages:
-            safe_notify(
-                f"Mã ngôn ngữ không hợp lệ: {', '.join(invalid_languages)}",
-                type="negative",
-            )
             return
         run_config = {
             "channel_id": selected_channel["id"],
@@ -1688,7 +1761,7 @@ def create_add_audio_flow_page():
                 {"title": "Upload", "description": "Đăng video lên kênh", "state": "pending"},
                 {"title": "Chờ xử lý", "description": "Đợi YouTube sẵn sàng", "state": "pending"},
                 {"title": "Add audio", "description": "Thêm audio theo ngôn ngữ", "state": "pending"},
-                {"title": "Âm thanh mô tả", "description": "Nhạc đầy đủ ở ngôn ngữ gốc", "state": "pending"},
+                {"title": "Âm thanh mô tả", "description": "Nhạc đầy đủ cho mọi ngôn ngữ audio", "state": "pending"},
             ]
         )
         main_container = ui.column().classes("w-full gap-4")
@@ -1804,7 +1877,7 @@ def create_add_audio_flow_page():
                 .classes("w-64")
             )
             ui_refs["lang_input"] = lang_input
-            ui.label("Mã ngôn ngữ audio ở bước 4 (vd: en, vi, ja). Bước 5 thêm nhạc đầy đủ vào Âm thanh mô tả ở ngôn ngữ gốc của video.").classes("text-xs text-gray-500")
+            ui.label("Mã ngôn ngữ audio ở bước 4 (vd: en, vi, ja). Bước 5 thêm nhạc đầy đủ vào Âm thanh mô tả cho ngôn ngữ gốc và từng mã đã nhập.").classes("text-xs text-gray-500")
 
         with ui.row().classes("w-full gap-2 mt-3"):
             ui_refs["process_btn"] = ui.button("Xử lý", icon="play_arrow", on_click=handle_process).classes("app-button-primary flex-1")
