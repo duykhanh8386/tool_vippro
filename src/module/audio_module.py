@@ -313,8 +313,8 @@ class UpdateAudioModule(IModule):
 
         Automatic recovery uses this narrow operation so a failed language can
         be replaced without removing healthy/published languages on the same
-        video. ``delete`` below intentionally retains its historical
-        all-tracks behaviour for the manual "Xóa & thêm audio" action.
+        video. ``delete`` below removes creator dubs for the manual
+        "Xóa & thêm audio" action while preserving source/descriptive tracks.
         """
         unique_track_ids = list(
             dict.fromkeys(str(track_id).strip() for track_id in track_ids if track_id)
@@ -1494,13 +1494,172 @@ class UpdateAudioModule(IModule):
                 wait_interruptibly(2 * (attempt + 1))
         return False
 
+    @classmethod
+    def _video_audio_tracks(cls, payload: dict, video_id: str) -> list[dict]:
+        """Join typed root tracks to their language rows without mixing videos."""
+        groups = [group for group in payload.get("videoTranslations") or [] if isinstance(group, dict)]
+        matching = [group for group in groups if cls._translation_group_video_id(group) == video_id]
+        if not matching and len(groups) == 1 and cls._translation_group_video_id(groups[0]) is None:
+            matching = groups
+        roots = {
+            str(track["audioTrackId"]): track
+            for track in payload.get("audioTracks") or []
+            if isinstance(track, dict) and track.get("audioTrackId")
+            and track.get("videoId") in (None, "", video_id)
+        }
+        foreign_ids = {
+            str(track["audioTrackId"]) for track in payload.get("audioTracks") or []
+            if isinstance(track, dict) and track.get("audioTrackId")
+            and track.get("videoId") not in (None, "", video_id)
+        }
+        tracks = {
+            track_id: dict(track) for track_id, track in roots.items()
+            if track.get("videoId") == video_id
+        }
+
+        def visit(value, language: str, content_type: str | None = None):
+            if isinstance(value, list):
+                for child in value:
+                    visit(child, language, content_type)
+            elif isinstance(value, dict):
+                track_id = str(value.get("audioTrackId") or "").strip()
+                if (
+                    track_id and track_id not in foreign_ids
+                    and value.get("videoId") in (None, "", video_id)
+                    and (track_id in roots or content_type or value.get("audioContentTypeString"))
+                ):
+                    track = dict(roots.get(track_id) or value)
+                    if not cls._translation_language(track):
+                        track["language"] = language
+                    if content_type:
+                        track.setdefault("audioContentTypeString", content_type)
+                    tracks[track_id] = track
+                for key, child in value.items():
+                    if isinstance(child, (dict, list)):
+                        normalized_key = str(key).casefold()
+                        child_type = (
+                            "dubbed" if key == "audioTranslation" else
+                            "descriptive" if "audio" in normalized_key and "descript" in normalized_key else None
+                        )
+                        visit(child, language, child_type)
+
+        for group in matching:
+            for item in group.get("translations") or []:
+                if isinstance(item, dict):
+                    visit(item, cls._translation_language(item) or "")
+        return list(tracks.values())
+
+    @classmethod
+    def _audio_track_states_from_payload(cls, payload: dict, video_id: str, languages) -> dict:
+        tracks = cls._video_audio_tracks(payload, video_id)
+        result = {}
+        for language in languages:
+            entry = {}
+            for content_type in ("dubbed", "descriptive"):
+                states = set()
+                failed_ids = []
+                for track in tracks:
+                    actual_language = cls._translation_language(track)
+                    if not actual_language or actual_language.casefold() != language.casefold():
+                        continue
+                    actual_type = str(track.get("audioContentTypeString") or track.get("audioContentType") or "").casefold()
+                    if not actual_type and cls._is_creator_dubbed_track(track):
+                        actual_type = "dubbed"
+                    if actual_type != content_type and not (content_type == "dubbed" and actual_type == "original"):
+                        continue
+                    if actual_type == "original":
+                        # Source eligibility locks describe automatic dubbing;
+                        # they do not mean the video's original audio is absent.
+                        states.add("healthy")
+                        continue
+                    if cls._audio_payload_has_terminal_failure(track, assume_audio=True):
+                        states.add("terminal")
+                        if actual_type != "original":
+                            failed_ids.append(str(track["audioTrackId"]))
+                    elif cls._audio_payload_needs_attention(track, assume_audio=True):
+                        states.add("inflight")
+                    else:
+                        states.add("healthy")
+                entry[content_type] = next((state for state in ("healthy", "inflight", "terminal") if state in states), "missing")
+                entry[content_type + "_track_ids"] = failed_ids
+            result[language] = entry
+        return result
+
+    @classmethod
+    def _readable_translation_video_ids(cls, payload: dict, requested: list[str]) -> set[str]:
+        if not isinstance(payload.get("videoTranslations", []), list) or not isinstance(payload.get("audioTracks", []), list):
+            return set()
+        groups = [group for group in payload.get("videoTranslations") or [] if isinstance(group, dict)]
+        readable = {
+            cls._translation_group_video_id(group) for group in groups
+            if not any(word in str(group.get("status") or "").upper() for word in ("ERROR", "FAILED"))
+        }
+        if len(requested) == 1 and len(groups) == 1 and cls._translation_group_video_id(groups[0]) is None and None in readable:
+            readable.add(requested[0])
+        readable.update(
+            track.get("videoId") for track in payload.get("audioTracks") or []
+            if isinstance(track, dict) and track.get("videoId")
+        )
+        return set(requested).intersection(readable)
+
+    def get_audio_track_states(self, video_id: str, channel_id: str, languages) -> dict:
+        payload = self._get_video_translation_payload([video_id], channel_id)
+        if video_id not in self._readable_translation_video_ids(payload, [video_id]):
+            raise AudioUpdateError("YouTube không trả trạng thái audio của đúng video; hãy thử lại.")
+        return self._audio_track_states_from_payload(payload, video_id, languages)
+
+    def get_missing_audio_description_targets(
+        self, video_ids: list[str], channel_id: str, languages,
+        unreadable_ids: list[str] | None = None,
+    ) -> dict[str, list[dict]]:
+        """Find missing/failed descriptions in selected languages, keeping processing tracks."""
+        targets = {}
+        languages = list(dict.fromkeys(languages))
+        skipped = unreadable_ids if unreadable_ids is not None else []
+        unique_ids = list(dict.fromkeys(video_id for video_id in video_ids if video_id))
+
+        def scan(chunk):
+            try:
+                payload = self._get_video_translation_payload(chunk, channel_id)
+            except AudioUpdateError as exc:
+                if exc.status_code != 400:
+                    raise
+                if len(chunk) > 1:
+                    middle = len(chunk) // 2
+                    scan(chunk[:middle])
+                    scan(chunk[middle:])
+                    return
+                if chunk[0] not in skipped:
+                    skipped.append(chunk[0])
+                return
+            readable = self._readable_translation_video_ids(payload, chunk)
+            for video_id in chunk:
+                if video_id not in readable:
+                    if len(chunk) > 1:
+                        scan([video_id])
+                    elif video_id not in skipped:
+                        skipped.append(video_id)
+                    continue
+                states = self._audio_track_states_from_payload(payload, video_id, languages)
+                actions = [
+                    {"language": lang, "reason": "missing_description",
+                     "track_ids": state["dubbed_track_ids"] if state["dubbed"] == "terminal" else [],
+                     "audio_present": state["dubbed"] in ("healthy", "inflight")}
+                    for lang, state in states.items() if state["descriptive"] in ("missing", "terminal")
+                ]
+                if actions:
+                    targets[video_id] = actions
+
+        for start in range(0, len(unique_ids), self._TRANSLATION_BATCH_SIZE):
+            scan(unique_ids[start:start + self._TRANSLATION_BATCH_SIZE])
+        return targets
+
     def _get_all_audio_track_ids(self, id_video: str, channel_id: str):
-        track_ids = []
-        for item in self._get_audio_translation_items(id_video, channel_id):
-            track_id = (item.get("audioTranslation") or {}).get("audioTrackId")
-            if track_id:
-                track_ids.append(track_id)
-        return track_ids
+        payload = self._get_video_translation_payload([id_video], channel_id)
+        return [
+            track["audioTrackId"] for track in self._video_audio_tracks(payload, id_video)
+            if self._is_creator_dubbed_track(track)
+        ]
 
 
 update_audio_module = UpdateAudioModule()

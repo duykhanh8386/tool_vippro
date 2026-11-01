@@ -14,6 +14,7 @@ from nicegui.page import page
 
 from src.audio_recovery import get_audio_mutation_guard
 from src.module.model import Video
+from src.module.audio_module import AudioUpdateError
 from web.components import audio, remove_audio
 
 
@@ -42,6 +43,7 @@ class AudioTaskModeTests(unittest.IsolatedAsyncioTestCase):
             id="mode-test-channel", name="Test channel", img_src="", owner_email="test@example.test",
         )
         self.events = []
+        self.description_events = []
         self.timers = []
 
         def timer(_interval, callback, **kwargs):
@@ -75,7 +77,10 @@ class AudioTaskModeTests(unittest.IsolatedAsyncioTestCase):
         ))
 
         def add(**kwargs):
-            self.events.append("add:" + kwargs["language"])
+            if kwargs.get("audio_content_type") == "descriptive":
+                self.description_events.append("description:" + kwargs["language"])
+            else:
+                self.events.append("add:" + kwargs["language"])
             return 200
 
         self.add = self.patches.enter_context(patch.object(audio.update_audio_module, "add", side_effect=add))
@@ -85,6 +90,13 @@ class AudioTaskModeTests(unittest.IsolatedAsyncioTestCase):
             ),
         ))
         self.patches.enter_context(patch.object(audio, "multiply_audio"))
+        self.track_states = self.patches.enter_context(patch.object(
+            audio.update_audio_module, "get_audio_track_states",
+            side_effect=lambda video_id, channel_id, languages: {
+                language: {"dubbed": "healthy", "descriptive": "missing", "descriptive_track_ids": []}
+                for language in languages
+            },
+        ))
         self.recovery = self.patches.enter_context(patch.object(audio, "register_audio_recovery", return_value=True))
 
     def saved_add_state(self):
@@ -133,6 +145,14 @@ class AudioTaskModeTests(unittest.IsolatedAsyncioTestCase):
         with client:
             await self.button_callback(client, "Bắt đầu xóa & thêm audio")()
         self.assertEqual(self.events, ["delete", "add:en", "add:vi"])
+        self.assertEqual(self.description_events, ["description:en", "description:vi"])
+        self.assertEqual([
+            (call.kwargs["language"], call.kwargs.get("audio_content_type", "dubbed"))
+            for call in self.add.call_args_list
+        ], [("en", "dubbed"), ("vi", "dubbed"), ("en", "descriptive"), ("vi", "descriptive")])
+        self.assertEqual(self.state.states["audio_add"]["video_description_status"]["video"], {
+            "en": "successful", "vi": "successful",
+        })
         self.assertEqual(self.state.states["audio_add"]["video_cleanup_status"]["video"], "successful")
         self.assertNotIn("audio_add_only", self.state.states)
         self.assertFalse(get_audio_mutation_guard(self.channel.id).locked())
@@ -155,6 +175,139 @@ class AudioTaskModeTests(unittest.IsolatedAsyncioTestCase):
         labels = [element.text for element in client.elements.values() if isinstance(element, ui.label)]
         self.assertIn("Thành công", labels)
         self.assertNotIn("Chờ xóa audio cũ", labels)
+
+    async def test_failed_description_resumes_without_repeating_delete_or_dub_uploads(self):
+        self.state.states["audio_add"] = self.saved_add_state()
+        client = self.render()
+        original_add = self.add.side_effect
+        failed_once = False
+
+        def add(**kwargs):
+            nonlocal failed_once
+            if kwargs.get("audio_content_type") == "descriptive" and kwargs["language"] == "en" and not failed_once:
+                failed_once = True
+                raise AudioUpdateError("description rejected")
+            return original_add(**kwargs)
+
+        self.add.side_effect = add
+        with client:
+            await self.button_callback(client, "Bắt đầu xóa & thêm audio")()
+        saved = self.state.states["audio_add"]
+        self.assertEqual(saved["video_processing_status"]["video"], {"en": "successful", "vi": "successful"})
+        self.assertEqual(saved["video_description_status"]["video"], {"en": "unsuccessful", "vi": "successful"})
+        self.assertEqual(saved["video_description_errors"]["video"]["en"], "description rejected")
+        reopened = self.render()
+        with reopened:
+            await self.button_callback(reopened, "Bắt đầu xóa & thêm audio")()
+        self.delete.assert_called_once()
+        self.assertEqual(self.events, ["delete", "add:en", "add:vi"])
+        self.assertEqual(self.description_events, ["description:vi", "description:en"])
+        self.assertEqual(self.state.states["audio_add"]["video_description_status"]["video"], {"en": "successful", "vi": "successful"})
+        self.assertEqual(self.state.states["audio_add"]["video_description_errors"]["video"], {})
+
+    async def test_existing_description_is_kept_and_only_the_missing_language_is_uploaded(self):
+        self.state.states["audio_add"] = self.saved_add_state()
+        self.track_states.side_effect = None
+        self.track_states.return_value = {
+            "en": {"descriptive": "healthy"}, "vi": {"descriptive": "missing"},
+        }
+        client = self.render()
+        with client:
+            await self.button_callback(client, "Bắt đầu xóa & thêm audio")()
+        self.assertEqual(self.description_events, ["description:vi"])
+        self.assertEqual(self.state.states["audio_add"]["video_description_status"]["video"]["en"], "already_added")
+
+    async def test_missing_description_scan_uses_selected_languages_and_preserves_healthy_dubs(self):
+        saved = self.saved_add_state()
+        saved["selected_languages"] = ["en-AU", "es-419"]
+        saved["audio_path_history"] = {self.channel.id: {"video": str(self.music)}}
+        saved["video_source_state"].update({"mode": "failed", "audio_filter": "missing_description", "scan_scope": "public"})
+        self.state.states["audio_add"] = saved
+        client = self.render()
+        targets = {"video": [{"language": "en-AU", "reason": "missing_description", "track_ids": [], "audio_present": True}]}
+        with (
+            patch.object(audio, "_fetch_channel_videos", return_value=[Video(
+                id="video", channel_id=self.channel.id, title="Video", description="", thumbnail="", duration_ms=60000,
+            )]),
+            patch.object(audio.update_audio_module, "get_missing_audio_description_targets", return_value=targets) as scan,
+            client,
+        ):
+            await self.button_callback(client, "Quét ID audio cần xử lý")()
+            self.assertEqual(scan.call_args.args[2], ["en-AU", "es-419"])
+            self.assertEqual(self.state.states["audio_add"]["video_ids"], ["video"])
+            self.assertEqual(self.state.states["audio_add"]["video_source_state"]["audio_filter"], "missing_description")
+            await self.button_callback(client, "Bắt đầu xóa & thêm audio")()
+        self.assertEqual(self.events, [])
+        self.assertEqual(self.description_events, ["description:en-AU"])
+        self.delete.assert_not_called()
+        self.delete_tracks.assert_not_called()
+        self.assertEqual(scan.call_count, 2)
+        reopened = self.render()
+        control = next(element for element in reopened.elements.values()
+                       if isinstance(element, ui.toggle) and "missing_description" in element.options)
+        self.assertEqual(control.value, "missing_description")
+
+    async def test_description_published_between_scan_and_start_is_not_uploaded_again(self):
+        saved = self.saved_add_state()
+        saved["video_source_state"].update({
+            "mode": "failed", "audio_filter": "missing_description", "failed_channel": self.channel.id,
+            "last_scan_languages": ["en", "vi"], "failed_targets": {"video": [{
+                "language": "en", "reason": "missing_description", "track_ids": [], "audio_present": True,
+            }]},
+        })
+        self.state.states["audio_add"] = saved
+        client = self.render()
+        with patch.object(audio.update_audio_module, "get_missing_audio_description_targets", return_value={}), client:
+            await self.button_callback(client, "Bắt đầu xóa & thêm audio")()
+        self.add.assert_not_called()
+        self.delete.assert_not_called()
+        self.delete_tracks.assert_not_called()
+        self.assertEqual(self.state.states["audio_add"]["video_description_status"]["video"]["en"], "already_added")
+
+    async def test_description_scan_requires_languages_and_never_calls_youtube_for_empty_input(self):
+        saved = self.saved_add_state()
+        saved["selected_languages"] = []
+        saved["video_source_state"].update({"mode": "failed", "audio_filter": "missing_description"})
+        self.state.states["audio_add"] = saved
+        client = self.render()
+        with patch.object(audio, "_fetch_channel_videos") as fetch, client:
+            await self.button_callback(client, "Quét ID audio cần xử lý")()
+        fetch.assert_not_called()
+
+    async def test_both_videos_use_their_own_full_audio_for_all_fifteen_input_languages(self):
+        languages = (
+            "en-AU en-CA en-IN en-IE en-GB en-US pt pt-BR pt-PT "
+            "es es-419 es-MX es-ES es-US fr"
+        ).split()
+        other_music = self.music.with_name("other.mp3")
+        other_music.write_bytes(b"other full music")
+        expected = {"first": self.music.read_bytes(), "second": other_music.read_bytes()}
+        saved = self.saved_add_state()
+        saved.update({
+            "video_ids": ["first", "second"], "selected_languages": languages,
+            "id_to_path": {"first": str(self.music), "second": str(other_music)},
+        })
+        self.state.states["audio_add"] = saved
+
+        def prepare(**kwargs):
+            Path(kwargs["output_file"]).write_bytes(Path(kwargs["input_file"]).read_bytes())
+
+        def upload(**kwargs):
+            self.assertEqual(Path(kwargs["file_name"]).read_bytes(), expected[kwargs["id_video"]])
+            return 200
+
+        self.add.side_effect = upload
+        client = self.render()
+        with patch.object(audio, "multiply_audio", side_effect=prepare), client:
+            await self.button_callback(client, "Bắt đầu xóa & thêm audio")()
+        self.assertEqual(self.add.call_count, 60)
+        for video_id in expected:
+            calls = [call for call in self.add.call_args_list if call.kwargs["id_video"] == video_id]
+            self.assertEqual([call.kwargs["language"] for call in calls[:15]], languages)
+            self.assertEqual([call.kwargs["language"] for call in calls[15:]], languages)
+            self.assertTrue(all(call.kwargs.get("audio_content_type") == "descriptive" for call in calls[15:]))
+            self.assertEqual(set(self.state.states["audio_add"]["video_description_status"][video_id]), set(languages))
+        self.assertTrue(all(not Path(call.kwargs["file_name"]).exists() for call in self.add.call_args_list))
 
     async def test_add_only_error_scan_never_deletes_failed_track_ids(self):
         saved = self.saved_add_state()
