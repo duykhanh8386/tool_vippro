@@ -186,6 +186,7 @@ _RECOVERY_WORKER_POOL: ContextVar[ThreadPoolExecutor | None] = ContextVar(
     "audio_recovery_worker_pool", default=None
 )
 _RUNTIME_STATUS = {
+    "enabled": True,
     "monitor_running": False,
     "active": False,
     "phase": "stopped",
@@ -850,6 +851,24 @@ def get_audio_recovery_state() -> dict:
         return _load_state()
 
 
+def is_audio_recovery_enabled() -> bool:
+    """Read the global switch independently of individual channel opt-outs."""
+    with _STATE_LOCK:
+        return bool(_load_state().get("enabled", True))
+
+
+def set_audio_recovery_enabled(enabled: bool) -> bool:
+    """Persist the master switch while keeping all registry entries and scopes."""
+    with _STATE_LOCK:
+        state = _load_state()
+        state["enabled"] = bool(enabled)
+        saved = state_manager.save_state(RECOVERY_STATE_NAME, state)
+        if saved:
+            with _RUNTIME_STATUS_LOCK:
+                _RUNTIME_STATUS["enabled"] = bool(enabled)
+        return saved
+
+
 def get_audio_recovery_registry_items() -> tuple[list[dict], list[dict]]:
     """List registered channels and videos with their effective scan status."""
     state = get_audio_recovery_state()
@@ -958,14 +977,17 @@ def is_audio_recovery_channel_enabled(channel_id: str) -> bool:
 def is_audio_recovery_video_enabled(channel_id: str, video_id: str) -> bool:
     """Check live opt-outs before scheduling another video or language."""
     with _STATE_LOCK:
-        return _video_is_in_recovery_scope(_load_state(), channel_id, video_id)
+        state = _load_state()
+        return bool(state.get("enabled", True)) and _video_is_in_recovery_scope(
+            state, channel_id, video_id,
+        )
 
 
 def _enabled_recovery_video_ids(channel_id: str, video_ids: Iterable[str]) -> list[str]:
     """Filter a batch with one state read, even for large channel registries."""
     with _STATE_LOCK:
         state = _load_state()
-        if not _channel_is_in_recovery_scope(state, channel_id):
+        if not state.get("enabled", True) or not _channel_is_in_recovery_scope(state, channel_id):
             return []
         disabled = _normalize_video_ids_by_channel(state.get("disabled_video_ids"))
         excluded = set(disabled.get(channel_id, []))
@@ -2064,6 +2086,12 @@ async def run_audio_recovery_cycle(
     *, now: float | None = None, stop_event: asyncio.Event | None = None,
 ) -> dict:
     """Scan once, or reuse free channel slots until a queued round finishes."""
+    if not get_audio_recovery_state().get("enabled", True):
+        _update_runtime_status(
+            enabled=False, active=False, phase="disabled",
+            message="Auto Registry đã tắt",
+        )
+        return {"skipped": "disabled", "repaired": 0, "failed": 0}
     cycle_time = float(now if now is not None else time.time())
     with _RUNTIME_STATUS_LOCK:
         cycle_id = int(_RUNTIME_STATUS.get("cycle_id") or 0) + 1
@@ -2086,6 +2114,7 @@ async def run_audio_recovery_cycle(
     cancelled_by_clear = False
     worker_pool: ThreadPoolExecutor | None = None
     _update_runtime_status(
+        enabled=True,
         active=True,
         phase="scanning",
         message="Đang tự động quét trạng thái audio...",
@@ -2198,6 +2227,7 @@ async def run_audio_recovery_cycle(
             return (
                 cycle_cancelled or cancelled_by_clear
                 or (stop_event is not None and stop_event.is_set())
+                or not is_audio_recovery_enabled()
             )
 
         async def process_channel(
@@ -2974,6 +3004,7 @@ def start_audio_recovery_monitor() -> None:
         _monitor_loop(_MONITOR_STOP), name="audio-auto-recovery"
     )
     _update_runtime_status(
+        enabled=is_audio_recovery_enabled(),
         monitor_running=True,
         phase="idle",
         message="Tự động khôi phục audio đang hoạt động",

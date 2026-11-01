@@ -469,7 +469,11 @@ def create_drawer():
                         ).on("click", open_recovery_details):
                             with ui.row().classes("w-full items-center gap-2 no-wrap"):
                                 ui.icon("sync").classes("text-blue-700 animate-spin")
-                                ui.label(str(status.get("message") or "Đang tự động quét audio")) \
+                                ui.label(
+                                    "Đang tắt Auto Registry — chờ tác vụ hiện tại kết thúc"
+                                    if not status.get("enabled", True)
+                                    else str(status.get("message") or "Đang tự động quét audio")
+                                ) \
                                     .classes("text-xs font-semibold text-blue-900")
 
                             ui.label(_recovery_channel_summary(status)).classes(
@@ -515,6 +519,15 @@ def create_drawer():
                             ui.label("Nhấp để xem Channel ID và Video ID").classes(
                                 "text-[10px] text-blue-600 underline"
                             )
+                    elif not status.get("enabled", True):
+                        with ui.card().classes(
+                            "w-full p-2 bg-gray-50 border border-gray-200 shadow-none"
+                        ):
+                            with ui.row().classes("w-full items-center gap-2 no-wrap"):
+                                ui.icon("pause_circle_outline").classes("text-gray-600")
+                                ui.label("Auto Registry đã tắt").classes(
+                                    "text-xs font-semibold text-gray-700"
+                                )
                     elif status.get("monitor_running"):
                         with ui.card().classes(
                             "w-full p-2 bg-emerald-50 border border-emerald-200 shadow-none "

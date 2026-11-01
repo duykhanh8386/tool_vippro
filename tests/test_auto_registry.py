@@ -20,14 +20,17 @@ from src.audio_recovery import (
     get_audio_recovery_registry_items,
     get_audio_recovery_scan_preferences,
     get_audio_recovery_state,
+    get_audio_recovery_runtime_status,
     import_add_audio_flow_recovery_state,
     is_audio_recovery_channel_enabled,
     is_audio_recovery_video_enabled,
+    is_audio_recovery_enabled,
     register_audio_recovery,
     remove_audio_recovery_items,
     run_audio_recovery_cycle,
     set_audio_recovery_items_enabled,
     set_audio_recovery_scan_preferences,
+    set_audio_recovery_enabled,
 )
 from src.state_manager import StateManager
 
@@ -67,6 +70,43 @@ class RegistryStorage:
 
 
 class AutoRegistryPersistenceTests(RegistryStorage, unittest.TestCase):
+    def test_master_switch_survives_restart_and_preserves_registry_and_opt_outs(self):
+        set_audio_recovery_items_enabled(
+            enabled=False, video_ids_by_channel={"channel-a": ["video-other"]},
+        )
+        before = get_audio_recovery_state()
+        self.assertTrue(set_audio_recovery_enabled(False))
+        self.manager._conn.close()
+        self.manager._conn = None
+        saved = get_audio_recovery_state()
+        self.assertFalse(saved["enabled"])
+        self.assertFalse(is_audio_recovery_enabled())
+        self.assertFalse(is_audio_recovery_channel_enabled("channel-a"))
+        self.assertFalse(is_audio_recovery_video_enabled("channel-a", "video-shared"))
+        self.assertEqual(saved["entries"], before["entries"])
+        self.assertEqual(saved["disabled_video_ids"], before["disabled_video_ids"])
+        self.assertEqual(saved["last_cycle_result"], before["last_cycle_result"])
+        self.assertTrue(set_audio_recovery_enabled(True))
+        self.assertTrue(is_audio_recovery_video_enabled("channel-a", "video-shared"))
+        self.assertFalse(is_audio_recovery_video_enabled("channel-a", "video-other"))
+
+    def test_registering_more_audio_does_not_enable_the_master_switch(self):
+        self.assertTrue(set_audio_recovery_enabled(False))
+        self.assertTrue(register_audio_recovery(
+            channel_id="channel-new", video_id="video-new", audio_path="music.mp3",
+            languages=["en"], repeat_times=1, extra_minutes=0,
+        ))
+        self.assertFalse(is_audio_recovery_enabled())
+        self.assertFalse(get_audio_recovery_runtime_status()["enabled"])
+        self.assertIn("video-new", get_audio_recovery_state()["entries"]["channel-new"])
+
+    def test_master_switch_failed_save_does_not_change_saved_or_runtime_state(self):
+        self.assertTrue(set_audio_recovery_enabled(True))
+        with patch.object(self.manager, "save_state", return_value=False):
+            self.assertFalse(set_audio_recovery_enabled(False))
+        self.assertTrue(is_audio_recovery_enabled())
+        self.assertTrue(get_audio_recovery_runtime_status()["enabled"])
+
     def test_legacy_scan_and_repair_delays_are_removed_without_changing_entries(self):
         for interval in (15 * 60, 6 * 60 * 60):
             with self.subTest(interval=interval):
@@ -290,6 +330,76 @@ class AutoRegistryPersistenceTests(RegistryStorage, unittest.TestCase):
 
 
 class AutoRegistryCycleTests(RegistryStorage, unittest.IsolatedAsyncioTestCase):
+    async def test_disabling_during_upload_finishes_it_without_starting_the_next_track(self):
+        from src.audio_recovery import get_audio_mutation_guard
+
+        source = Path(self.folder.name) / "source.mp3"
+        source.write_bytes(b"full music")
+        register_audio_recovery(
+            channel_id="channel-a", video_id="video-shared", audio_path=str(source),
+            languages=["en", "es"], repeat_times=1, extra_minutes=0,
+        )
+        set_audio_recovery_items_enabled(
+            enabled=False, channel_ids=["channel-b"],
+            video_ids_by_channel={"channel-a": ["video-other"]},
+        )
+        payload = {"videoTranslations": [], "audioTracks": [
+            {
+                "videoId": "video-shared", "audioTrackId": "failed-" + language,
+                "language": language, "source": "AUDIO_TRACK_SOURCE_CREATOR",
+                "audioContentTypeString": "dubbed", "status": "AUDIO_TRACK_STATUS_FAILED",
+            } for language in ("en", "es")
+        ]}
+        temporary_paths = []
+
+        def prepare(**kwargs):
+            path = Path(kwargs["output_file"])
+            temporary_paths.append(path)
+            path.write_bytes(b"full music")
+
+        def upload(**kwargs):
+            self.assertTrue(Path(kwargs["file_name"]).exists())
+            self.assertTrue(set_audio_recovery_enabled(False))
+            return 200
+
+        with (
+            patch("src.audio_recovery._get_registered_video_scan_statuses", return_value=({"video-shared": True}, set())),
+            patch("src.audio_recovery.update_audio_module._get_video_translation_payload", return_value=payload),
+            patch("src.audio_recovery.update_audio_module._get_video_info", return_value=SimpleNamespace(duration_ms=60000)),
+            patch("src.audio_recovery.multiply_audio", side_effect=prepare),
+            patch("src.audio_recovery.update_audio_module.delete_track_ids", return_value=200) as delete,
+            patch("src.audio_recovery.update_audio_module.add", side_effect=upload) as add,
+        ):
+            result = await run_audio_recovery_cycle(now=2000)
+            self.assertEqual(result["repaired"], 1)
+            add.assert_called_once()
+            self.assertEqual(add.call_args.kwargs["language"], "en")
+            delete.assert_called_once_with("video-shared", "channel-a", ["failed-en"])
+            self.assertFalse(get_audio_recovery_runtime_status()["enabled"])
+            self.assertEqual((await run_audio_recovery_cycle())["skipped"], "disabled")
+            add.assert_called_once()
+        self.assertFalse(is_audio_recovery_enabled())
+        self.assertFalse(get_audio_mutation_guard("channel-a").locked())
+        self.assertTrue(temporary_paths)
+        self.assertTrue(all(not path.exists() for path in temporary_paths))
+
+    async def test_master_switch_off_prevents_audio_and_caption_requests(self):
+        self.assertTrue(set_audio_recovery_enabled(False))
+        with (
+            patch("src.audio_recovery._get_registered_video_scan_statuses") as visibility,
+            patch("src.audio_recovery.update_audio_module._get_video_translation_payload") as scan,
+            patch("src.audio_recovery.update_audio_module.delete_track_ids") as delete,
+            patch("src.audio_recovery.update_audio_module.add") as add,
+            patch("src.audio_recovery._monitor_failed_caption_tracks", new=AsyncMock()) as captions,
+        ):
+            result = await run_audio_recovery_cycle()
+        self.assertEqual(result["skipped"], "disabled")
+        for operation in (visibility, scan, delete, add):
+            operation.assert_not_called()
+        captions.assert_not_awaited()
+        self.assertEqual(get_audio_recovery_runtime_status()["phase"], "disabled")
+        self.assertFalse(get_audio_recovery_runtime_status()["active"])
+
     def setUp(self):
         super().setUp()
         caption_patch = patch(
@@ -613,15 +723,40 @@ class AutoRegistryUiTests(RegistryStorage, unittest.TestCase):
         return next(
             element for element in self.client.elements.values()
             if isinstance(element, self.ui.toggle)
-            and RECOVERY_VIDEO_SCOPE_PUBLIC in element._props.get("options", {})
+            and RECOVERY_VIDEO_SCOPE_PUBLIC in element.options
         )
 
     def concurrency_mode_control(self):
         return next(
             element for element in self.client.elements.values()
             if isinstance(element, self.ui.toggle)
-            and RECOVERY_CONCURRENCY_MODE_CHANNELS in element._props.get("options", {})
+            and RECOVERY_CONCURRENCY_MODE_CHANNELS in element.options
         )
+
+    def test_master_button_toggles_and_refresh_restores_the_saved_choice(self):
+        self.click_action("Tắt Auto Registry")
+        self.assertFalse(is_audio_recovery_enabled())
+        self.assertEqual(get_audio_recovery_state()["entries"], self.original_entries)
+        self.assertTrue(all(not row["enabled"] for table in self.tables for row in table.rows))
+        with self.client:
+            self.refresh()
+        self.assertTrue(any(
+            isinstance(element, self.ui.button) and element.text == "Bật Auto Registry"
+            for element in self.client.elements.values()
+        ))
+        self.click_action("Bật Auto Registry")
+        self.assertTrue(is_audio_recovery_enabled())
+        self.assertTrue(all(row["enabled"] for table in self.tables for row in table.rows))
+
+    def test_master_button_reports_failed_save_without_disabling(self):
+        with patch("web.components.auto_registry.set_audio_recovery_enabled", return_value=False):
+            self.click_action("Tắt Auto Registry")
+        self.assertTrue(is_audio_recovery_enabled())
+        self.assertEqual(self.notify.call_args.kwargs["type"], "negative")
+        self.assertTrue(any(
+            isinstance(element, self.ui.button) and element.text == "Tắt Auto Registry"
+            for element in self.client.elements.values()
+        ))
 
     def test_calendar_saves_reloads_and_clears_without_changing_registered_videos(self):
         calendar = next(element for element in self.client.elements.values()

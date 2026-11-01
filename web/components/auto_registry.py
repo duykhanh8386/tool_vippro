@@ -14,9 +14,11 @@ from src.audio_recovery import (
     RECOVERY_VIDEO_SCOPE_PUBLIC,
     get_audio_recovery_registry_items,
     get_audio_recovery_scan_preferences,
+    get_audio_recovery_state,
     remove_audio_recovery_items,
     set_audio_recovery_items_enabled,
     set_audio_recovery_scan_preferences,
+    set_audio_recovery_enabled,
 )
 from src.utils import get_channels_info
 from src.video_scan_dates import scan_date_label, validate_scan_start_date
@@ -32,6 +34,7 @@ def create_auto_registry_content(*, on_change: Callable[[], None] | None = None)
         try:
             channel_items, video_items = get_audio_recovery_registry_items()
             preferences = get_audio_recovery_scan_preferences()
+            enabled = bool(get_audio_recovery_state().get("enabled", True))
             names = {
                 channel.id: channel.name for channel in (get_channels_info() or [])
             }
@@ -40,6 +43,12 @@ def create_auto_registry_content(*, on_change: Callable[[], None] | None = None)
             ui.notify("Không thể tải danh sách Auto Registry.", type="negative")
             return
 
+        global_button.set_text("Tắt Auto Registry" if enabled else "Bật Auto Registry")
+        global_button.props(
+            f'icon={"pause_circle_outline" if enabled else "play_circle_outline"} '
+            f'color={"negative" if enabled else "positive"}'
+        )
+        global_status.set_text("Auto Registry đang bật" if enabled else "Auto Registry đã tắt")
         preference_sync["active"] = True
         try:
             if concurrency_mode_toggle.value != preferences.get("concurrency_mode"):
@@ -74,6 +83,7 @@ def create_auto_registry_content(*, on_change: Callable[[], None] | None = None)
                 "inactive_reason": (
                     "" if item["enabled"]
                     else "Video đã Deactive" if not item["video_enabled"]
+                    else "Auto Registry đang tắt" if not enabled
                     else "Kênh chưa được phép tự động quét" if not item["channel_enabled"]
                     else "Auto Registry đang tắt"
                 ),
@@ -107,6 +117,21 @@ def create_auto_registry_content(*, on_change: Callable[[], None] | None = None)
             f' · {sum(item.get("processing_warning_count", 0) for item in channel_items)} audio quá 2 giờ chờ thay lại'
             + (f' · {scan_date_label(preferences["scan_start_date"], date_type=preferences["scan_date_type"])}'
                if preferences["scan_start_date"] else "")
+        )
+
+    def toggle_registry() -> None:
+        enabled = not bool(get_audio_recovery_state().get("enabled", True))
+        if not set_audio_recovery_enabled(enabled):
+            refresh()
+            ui.notify("Không thể lưu trạng thái Auto Registry.", type="negative")
+            return
+        refresh()
+        if on_change is not None:
+            on_change()
+        ui.notify(
+            "Đã bật Auto Registry." if enabled else
+            "Đã tắt Auto Registry. Thao tác đang chạy sẽ kết thúc trước khi dừng.",
+            type="positive",
         )
 
     def change_concurrency_mode(event) -> None:
@@ -365,6 +390,16 @@ def create_auto_registry_content(*, on_change: Callable[[], None] | None = None)
             ui.button(icon="refresh", on_click=refresh).props(
                 "flat round dense"
             ).tooltip("Làm mới Auto Registry")
+        with ui.row().classes("w-full items-center justify-between gap-3"):
+            global_status = ui.label("").classes("text-sm font-semibold")
+            global_button = ui.button(
+                "Tắt Auto Registry", icon="pause_circle_outline", on_click=toggle_registry,
+            ).props("color=negative")
+        ui.label(
+            "Tắt để ngừng tự động quét và khôi phục audio/phụ đề. "
+            "Thao tác đang chạy được hoàn tất; danh sách đăng ký và lựa chọn bật/tắt "
+            "được giữ khi mở lại ứng dụng."
+        ).classes("text-xs text-gray-500")
         summary = ui.label("").classes("text-xs text-gray-500")
         ui.label(
             "Quét liên tục theo chế độ được chọn, tự xóa track lỗi và thêm lại audio. "

@@ -1156,7 +1156,7 @@ def create_add_audio_flow_page():
                     ",".join(recovery_languages),
                 )
                 push_log(
-                    "Đã bật tự động kiểm tra và thêm lại audio nếu YouTube xóa",
+                    "Đã lưu danh sách audio cho Auto Registry",
                     "ok",
                     indent=True,
                 )
