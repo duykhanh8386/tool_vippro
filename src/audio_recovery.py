@@ -1,13 +1,4 @@
-"""Persistent background recovery for creator-uploaded YouTube audio tracks.
-
-The registry lives in the app SQLite database, so it survives browser/NiceGUI
-disconnects and process restarts on the same machine or VM. Videos with any
-healthy creator dub skip normal failure/missing repairs. Otherwise the monitor replaces failed tracks
-and adds missing registered languages, without touching the source/original
-audio or treating an unreadable response as an empty video.
-Processing tracks observed for at least two hours are replaced by exact Track
-ID, after a fresh status check. Younger tracks are left to finish.
-"""
+"""Persistently add full descriptive audio until each registered video is done."""
 
 from __future__ import annotations
 
@@ -26,6 +17,12 @@ from typing import Callable, Iterable, Mapping
 from loguru import logger
 
 from src.audio_language import call_audio_update_with_retry
+from src.audio_description_recovery import (
+    DESCRIPTION_RETRY_SECONDS, DESCRIPTION_VERIFY_SECONDS,
+    build_description_recovery_plan, description_entry_complete,
+    description_languages, description_work_due, registry_work_due,
+    resolve_description_audio_path,
+)
 from src.channel_store import channel_store
 from src.module.audio_module import update_audio_module
 from src.module.list_videos_module import list_videos_module
@@ -685,6 +682,18 @@ def register_audio_recovery(
             updated_entry["processing_observations"] = dict(
                 previous["processing_observations"]
             )
+        if same_audio_configuration and isinstance(previous, dict):
+            for field in ("description_completed_languages", "description_completed_at",
+                          "description_next_check_at", "description_attempts",
+                          "description_processing_observations"):
+                if field in previous:
+                    updated_entry[field] = previous[field]
+            # Newly registered languages must be considered on the next pass.
+            if any(language.casefold() not in {str(old).casefold() for old in previous.get("languages") or []}
+                   for language in clean_languages):
+                updated_entry.pop("description_next_check_at", None)
+            if not description_entry_complete(updated_entry):
+                updated_entry.pop("description_completed_at", None)
         videos[clean_video] = updated_entry
         # A new manual submission can enroll a previously removed video again.
         removed = _normalize_video_ids_by_channel(state.get("removed_video_ids"))
@@ -885,7 +894,7 @@ def get_audio_recovery_registry_items() -> tuple[list[dict], list[dict]]:
             if not isinstance(entry, dict):
                 continue
             video_enabled = video_id not in excluded
-            trackers = entry.get("processing_observations")
+            trackers = entry.get("description_processing_observations")
             if not isinstance(trackers, dict):
                 trackers = {}
             processing_warnings = [
@@ -905,6 +914,16 @@ def get_audio_recovery_registry_items() -> tuple[list[dict], list[dict]]:
                 "channel_id": channel_id,
                 "video_id": video_id,
                 "languages": list(entry.get("languages") or []),
+                "description_complete": description_entry_complete(entry),
+                "description_completed_count": sum(
+                    language.casefold() in {str(done).casefold() for done in entry.get("description_completed_languages") or []}
+                    for language in description_languages(entry)
+                ),
+                "description_total": len(description_languages(entry)),
+                "audio_path": str(entry.get("audio_path") or ""),
+                "description_last_error": next((str(attempt.get("message") or "")
+                    for attempt in (entry.get("description_attempts") or {}).values()
+                    if isinstance(attempt, dict) and attempt.get("succeeded") is False), ""),
                 "processing_warnings": processing_warnings,
                 "enabled": (
                     bool(state.get("enabled", True)) and channel_enabled and video_enabled
@@ -917,7 +936,8 @@ def get_audio_recovery_registry_items() -> tuple[list[dict], list[dict]]:
             "channel_id": channel_id,
             "enabled": bool(state.get("enabled", True)) and channel_enabled,
             "video_count": len(channel_videos),
-            "active_video_count": sum(video["enabled"] for video in channel_videos),
+            "active_video_count": sum(video["enabled"] and not video["description_complete"] for video in channel_videos),
+            "completed_video_count": sum(video["description_complete"] for video in channel_videos),
             "processing_warning_count": sum(len(video["processing_warnings"]) for video in channel_videos),
         })
     return channels, videos
@@ -1673,6 +1693,111 @@ def _record_processing_observations(
     return warnings
 
 
+def _registry_pending_entries(state: dict, channel_id: str, now: float) -> dict:
+    entries = (state.get("entries") or {}).get(channel_id) or {}
+    if not isinstance(entries, dict):
+        return {}
+    excluded = set((state.get("disabled_video_ids") or {}).get(channel_id, []))
+    pending = {
+        video_id: entry for video_id, entry in entries.items()
+        if isinstance(entry, dict) and video_id not in excluded and registry_work_due(entry, now)
+    }
+    return entries if len(pending) == len(entries) else pending
+
+
+def _record_description_observations(
+    *, channel_id: str, requested_entries: dict, observations: dict,
+    observed_at: float, stale_after_seconds: float,
+) -> tuple[list[dict], set[str]]:
+    stale_actions = []
+    completed_videos = set()
+    with _STATE_LOCK:
+        state = _load_state()
+        for video_id, language_states in observations.items():
+            requested = requested_entries.get(video_id) or {}
+            entry = (state.get("entries") or {}).get(channel_id, {}).get(video_id)
+            if not isinstance(entry, dict) or entry.get("audio_path") != requested.get("audio_path"):
+                continue
+            languages = {language.casefold(): language for language in description_languages(entry)}
+            completed = {str(language).casefold() for language in entry.get("description_completed_languages") or []}
+            trackers = entry.setdefault("description_processing_observations", {})
+            for key, observed in language_states.items():
+                if key not in languages:
+                    continue
+                status = observed["state"]
+                if status == "healthy":
+                    completed.add(key)
+                    trackers.pop(key, None)
+                elif status == "processing":
+                    previous = trackers.get(key) or {}
+                    ids = observed["track_ids"]
+                    same_track = previous.get("track_ids") == ids
+                    first_seen = float(previous.get("first_seen_at", observed_at)) if same_track else observed_at
+                    tracker = {"language": languages[key], "track_ids": ids,
+                               "first_seen_at": first_seen, "last_seen_at": observed_at,
+                               "consecutive_scans": int(previous.get("consecutive_scans") or 0) + 1 if same_track else 1}
+                    if (observed_at - first_seen >= stale_after_seconds
+                            and tracker["consecutive_scans"] >= MIN_STALE_PROCESSING_SCANS):
+                        tracker.update(warning_reason=PROCESSING_WARNING_REASON, warned_at=observed_at)
+                        stale_actions.append({"video_id": video_id, "language": languages[key],
+                                              "track_ids": ids, "reason": PROCESSING_WARNING_REASON})
+                    trackers[key] = tracker
+                else:
+                    trackers.pop(key, None)
+            entry["description_completed_languages"] = [language for key, language in languages.items() if key in completed]
+            if description_entry_complete(entry):
+                entry["description_completed_at"] = observed_at
+                entry.pop("description_next_check_at", None)
+                completed_videos.add(video_id)
+            else:
+                entry.pop("description_completed_at", None)
+                entry["description_next_check_at"] = observed_at + DESCRIPTION_VERIFY_SECONDS
+        if not state_manager.save_state(RECOVERY_STATE_NAME, state):
+            raise RuntimeError("Không thể lưu trạng thái âm thanh mô tả của Auto Registry")
+    return stale_actions, completed_videos
+
+
+def _record_description_attempt(
+    channel_id: str, video_id: str, language: str, *, succeeded: bool | None,
+    message: str, attempted_at: float,
+) -> None:
+    with _STATE_LOCK:
+        state = _load_state()
+        entry = (state.get("entries") or {}).get(channel_id, {}).get(video_id)
+        if not isinstance(entry, dict):
+            return
+        attempts = entry.setdefault("description_attempts", {})
+        previous = attempts.get(language.casefold()) or {}
+        attempts[language.casefold()] = {
+            "attempted_at": attempted_at, "succeeded": succeeded, "message": str(message),
+            "count": int(previous.get("count") or 0) + int(succeeded is None),
+        }
+        entry["description_next_check_at"] = attempted_at + DESCRIPTION_RETRY_SECONDS
+        if succeeded:
+            entry.get("description_processing_observations", {}).pop(language.casefold(), None)
+        if not state_manager.save_state(RECOVERY_STATE_NAME, state):
+            raise RuntimeError("Không thể lưu lần tải âm thanh mô tả của Auto Registry")
+
+
+def _resolve_registry_description_source(channel_id: str, video_id: str, entry: dict, title: str) -> Path:
+    path = resolve_description_audio_path(
+        channel_id=channel_id, video_id=video_id, entry=entry, title=title,
+        page_states={name: state_manager.load_state(name) or {}
+                     for name in ("audio_add", "audio_add_only", "add_audio_flow")},
+    )
+    if str(path) != str(entry.get("audio_path") or ""):
+        with _STATE_LOCK:
+            state = _load_state()
+            live = (state.get("entries") or {}).get(channel_id, {}).get(video_id)
+            if not isinstance(live, dict) or live.get("audio_path") != entry.get("audio_path"):
+                raise RuntimeError("Ghép file nhạc đã thay đổi; chờ lượt Auto Registry tiếp theo")
+            live["audio_path"] = str(path)
+            if not state_manager.save_state(RECOVERY_STATE_NAME, state):
+                raise RuntimeError("Không thể lưu file nhạc vừa tìm được")
+        entry["audio_path"] = str(path)
+    return path
+
+
 def _record_recovery_attempt(
     channel_id: str,
     video_id: str,
@@ -1950,7 +2075,7 @@ def _summarize_channel_result(result: dict) -> None:
     if result["submitted"]:
         parts.append(f"Đã gửi {result['submitted']} audio, chờ YouTube xử lý")
     if result["healthy_skipped"]:
-        parts.append(f"Bỏ qua {result['healthy_skipped']} video còn audio tốt")
+        parts.append(f"Hoàn tất mô tả: {result['healthy_skipped']} video")
     if result["processing_tracks"]:
         parts.append(f"Còn {result['processing_tracks']} track đang xử lý, chưa thay lại")
     if result.get("reason"):
@@ -1974,6 +2099,7 @@ async def _schedule_recovery_channels(
     should_stop: Callable[[], bool],
     on_complete: Callable[[], None],
     channel_concurrency: int = MAX_CONCURRENT_RECOVERY_CHANNELS,
+    get_time: Callable[[], float] = time.time,
 ) -> None:
     """Reuse idle slots unless a queue requires finishing the entire round."""
     pending = deque(initial_entries)
@@ -1987,11 +2113,12 @@ async def _schedule_recovery_channels(
         while not should_stop():
             latest = get_audio_recovery_state()
             eligible = {
-                channel_id: entries
+                channel_id: _registry_pending_entries(latest, channel_id, get_time())
                 for channel_id, entries in (latest.get("entries") or {}).items()
                 if latest.get("enabled", True) and isinstance(entries, dict)
                 and _channel_is_in_recovery_scope(latest, channel_id)
             }
+            eligible = {channel: entries for channel, entries in eligible.items() if entries}
             active_ids = set(running.values())
             started.intersection_update(set(eligible) | active_ids)
             pending = deque(channel for channel in pending if channel in eligible and channel not in active_ids)
@@ -2117,7 +2244,7 @@ async def run_audio_recovery_cycle(
         enabled=True,
         active=True,
         phase="scanning",
-        message="Đang tự động quét trạng thái audio...",
+        message="Đang kiểm tra âm thanh mô tả...",
         cycle_id=cycle_id,
         cycle_started_at=cycle_time,
         channel_index=0,
@@ -2159,13 +2286,15 @@ async def run_audio_recovery_cycle(
         scan_preferences = _scan_preferences_from_state(state)
         selected_channel_ids = set(scan_preferences["selected_channel_ids"])
         entries_by_channel = {
-            channel_id: video_entries
+            channel_id: _registry_pending_entries(state, channel_id, cycle_time)
             for channel_id, video_entries in all_entries_by_channel.items()
-            if _channel_is_in_recovery_scope(state, channel_id)
+            if isinstance(video_entries, dict) and _channel_is_in_recovery_scope(state, channel_id)
         }
         scope_skipped_channel_ids.update(
-            set(all_entries_by_channel) - set(entries_by_channel)
+            channel_id for channel_id in all_entries_by_channel
+            if not _channel_is_in_recovery_scope(state, channel_id)
         )
+        entries_by_channel = {channel: entries for channel, entries in entries_by_channel.items() if entries}
         concurrency_mode = scan_preferences.get(
             "concurrency_mode", DEFAULT_RECOVERY_CONCURRENCY_MODE
         )
@@ -2199,11 +2328,15 @@ async def run_audio_recovery_cycle(
             final_message = "Chưa có video được đăng ký tự động khôi phục"
             return {"skipped": "empty", "repaired": 0, "failed": 0}
         if not entries_by_channel:
-            final_message = "Danh sách kênh tự động quét chưa có kênh phù hợp"
+            final_message = (
+                "Danh sách kênh tự động quét chưa có kênh phù hợp" if scope_skipped_channel_ids else
+                "Auto Registry: video đã đủ mô tả hoặc đang chờ lượt xác nhận tiếp theo"
+            )
             return {
-                "skipped": "no_selected_channels",
+                "skipped": "no_selected_channels" if scope_skipped_channel_ids else "complete_or_waiting",
                 "repaired": 0,
                 "failed": 0,
+                "deferred_initial_grace": 0,
                 "scan_mode": scan_preferences["scan_mode"],
                 "scope_skipped_channel_ids": sorted(scope_skipped_channel_ids),
             }
@@ -2298,7 +2431,7 @@ async def run_audio_recovery_cycle(
                     eligible_entries = {
                         video_id: entry
                         for video_id, entry in active_entries.items()
-                        if isinstance(entry, dict)
+                        if isinstance(entry, dict) and registry_work_due(entry, cycle_time)
                     }
                     if not eligible_entries:
                         channel_result["reason"] = "Không có video Active để quét"
@@ -2425,6 +2558,8 @@ async def run_audio_recovery_cycle(
                         language="",
                         _upload_progress=None,
                     )
+                    video_ids = [video_id for video_id in video_ids
+                                 if description_work_due(eligible_entries[video_id], cycle_time)]
                     batch_size = update_audio_module._TRANSLATION_BATCH_SIZE
                     channel_actions: list[dict] = []
                     for start in range(0, len(video_ids), batch_size):
@@ -2461,44 +2596,27 @@ async def run_audio_recovery_cycle(
                             if channel_requires_refresh:
                                 break
                             continue
-                        processing_observations: dict = {}
-                        chunk_entries = {
-                            video_id: eligible_entries[video_id] for video_id in chunk
-                        }
-                        actions, unreadable_chunk = build_audio_recovery_plan(
-                            payload,
-                            chunk_entries,
-                            chunk,
-                            observation_sink=processing_observations,
+                        chunk_entries = {video_id: eligible_entries[video_id] for video_id in chunk}
+                        actions, unreadable_chunk, observations = build_description_recovery_plan(
+                            payload, chunk_entries, chunk,
                         )
                         channel_result["scanned_videos"] += len(chunk) - len(unreadable_chunk)
                         if unreadable_chunk:
                             channel_result["errors"] += len(unreadable_chunk)
-                            channel_result["last_error"] = "YouTube chưa trả đủ dữ liệu audio để kiểm tra video"
+                            channel_result["last_error"] = "YouTube chưa trả đủ dữ liệu âm thanh mô tả"
                         channel_result["processing_tracks"] += sum(
-                            "inflight" in observed.get("states", [])
-                            for languages in processing_observations.values()
-                            for observed in languages.values()
+                            observed["state"] == "processing"
+                            for languages in observations.values() for observed in languages.values()
                         )
-                        stale_actions = _record_processing_observations(
-                            channel_id=channel_id,
-                            requested_entries=chunk_entries,
-                            observations={
-                                video_id: languages
-                                for video_id, languages in processing_observations.items()
-                                if video_id not in unreadable_chunk
-                            },
+                        stale_actions, completed_videos = _record_description_observations(
+                            channel_id=channel_id, requested_entries=chunk_entries,
+                            observations=observations,
                             observed_at=float(now if now is not None else time.time()),
                             stale_after_seconds=stale_processing_seconds,
                         )
                         processing_warnings.extend(stale_actions)
                         actions.extend(stale_actions)
-                        action_video_ids = {action["video_id"] for action in actions}
-                        channel_result["healthy_skipped"] += sum(
-                            any("healthy" in observed.get("states", []) for observed in languages.values())
-                            for video_id, languages in processing_observations.items()
-                            if video_id not in action_video_ids
-                        )
+                        channel_result["healthy_skipped"] += len(completed_videos)
                         _update_runtime_status(
                             processing_warning_count=sum(len(warnings) for warnings in warnings_by_channel.values())
                         )
@@ -2545,29 +2663,6 @@ async def run_audio_recovery_cycle(
                                     video_id,
                                 )
                                 return
-                            audio_path = Path(str(entry.get("audio_path") or ""))
-                            if not audio_path.is_file():
-                                channel_result["errors"] += len(actions)
-                                channel_result["last_error"] = "Không tìm thấy file audio nguồn để tải lại"
-                                message = f"Không còn file audio: {audio_path}"
-                                logger.error(
-                                    "Audio auto-recovery skipped channel={} video={}: {}",
-                                    channel_id,
-                                    video_id,
-                                    message,
-                                )
-                                for action in actions:
-                                    failed += 1
-                                    _record_recovery_attempt(
-                                        channel_id,
-                                        video_id,
-                                        action["language"],
-                                        succeeded=False,
-                                        message=message,
-                                        attempted_at=cycle_time,
-                                    )
-                                return
-
                             temp_audio_path: Path | None = None
                             preparation_stage = "metadata"
                             preparation_started = time.monotonic()
@@ -2595,11 +2690,14 @@ async def run_audio_recovery_cycle(
                                     video_id=video_id,
                                     channel_id=channel_id,
                                 )
-                                duration_seconds = (
-                                    video_info.duration_ms / 1000.0
-                                    if video_info.duration_ms > 0
-                                    else None
+                                if video_info.duration_ms <= 0:
+                                    raise RuntimeError("Chưa đọc được thời lượng video để chuẩn bị âm thanh mô tả")
+                                duration_seconds = video_info.duration_ms / 1000.0
+                                audio_path = await _run_recovery_blocking(
+                                    _resolve_registry_description_source, channel_id, video_id, entry,
+                                    str(getattr(video_info, "title", "") or ""),
                                 )
+                                fresh_observations = None
                                 with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as temp_file:
                                     temp_audio_path = Path(temp_file.name)
                                 preparation_stage = "rendering"
@@ -2651,43 +2749,30 @@ async def run_audio_recovery_cycle(
                                         break
                                     video_owned_guard = channel_mutation_guard
                                     try:
-                                        if action["reason"] == PROCESSING_WARNING_REASON:
-                                            # MP3 preparation can take minutes. Re-read under
-                                            # the channel guard before deleting a timed-out track.
+                                        if fresh_observations is None:
                                             fresh_payload = await _run_recovery_blocking(
                                                 update_audio_module._get_video_translation_payload,
                                                 [video_id], channel_id,
                                             )
-                                            fresh_observations: dict = {}
-                                            _, fresh_unreadable = build_audio_recovery_plan(
+                                            _, fresh_unreadable, fresh_observations = build_description_recovery_plan(
                                                 fresh_payload, {video_id: entry}, [video_id],
-                                                observation_sink=fresh_observations,
                                             )
-                                            if video_id in fresh_unreadable:
-                                                _record_processing_observations(
-                                                    channel_id=channel_id,
-                                                    requested_entries={video_id: entry}, observations={},
-                                                    observed_at=float(now if now is not None else time.time()),
-                                                    stale_after_seconds=stale_processing_seconds,
-                                                )
-                                                raise RuntimeError("Chưa đọc được trạng thái audio trước khi xóa track quá 2 giờ")
-                                            fresh_language = fresh_observations.get(video_id, {}).get(language.casefold(), {})
-                                            current_ids = set(fresh_language.get("inflight_track_ids") or [])
-                                            if (
-                                                "healthy" in (fresh_language.get("states") or [])
-                                                or current_ids != set(action["track_ids"])
-                                            ):
-                                                _record_processing_observations(
-                                                    channel_id=channel_id,
-                                                    requested_entries={video_id: entry}, observations=fresh_observations,
-                                                    observed_at=float(now if now is not None else time.time()),
-                                                    stale_after_seconds=stale_processing_seconds,
-                                                )
-                                                logger.info(
-                                                    "Audio timeout repair skipped after fresh check: channel={} video={} language={}",
-                                                    channel_id, video_id, language,
-                                                )
-                                                continue
+                                            if fresh_unreadable:
+                                                raise RuntimeError("YouTube không trả trạng thái mô tả mới nhất; chờ lượt tiếp theo")
+                                            _record_description_observations(
+                                                channel_id=channel_id, requested_entries={video_id: entry},
+                                                observations=fresh_observations,
+                                                observed_at=float(now if now is not None else time.time()),
+                                                stale_after_seconds=stale_processing_seconds,
+                                            )
+                                        observed = fresh_observations.get(video_id, {}).get(language.casefold(), {})
+                                        if observed.get("state") == "healthy":
+                                            continue
+                                        if observed.get("state") == "processing" and (
+                                            action["reason"] != PROCESSING_WARNING_REASON
+                                            or set(observed.get("track_ids") or []) != set(action.get("track_ids") or [])
+                                        ):
+                                            continue
                                         if should_stop() or not is_audio_recovery_video_enabled(channel_id, video_id) or channel_requires_refresh:
                                             break
                                         upload_progress = {
@@ -2698,7 +2783,7 @@ async def run_audio_recovery_cycle(
                                         _update_runtime_status(
                                             phase="uploading",
                                             message=(
-                                                "Đang tự động add lại audio "
+                                                "Đang bổ sung âm thanh mô tả "
                                                 f"{action_index + 1}/{len(actions)}"
                                             ),
                                             channel_id=channel_id,
@@ -2719,15 +2804,11 @@ async def run_audio_recovery_cycle(
                                             action["reason"],
                                             ",".join(action["track_ids"]) or "none",
                                         )
-                                        if action["track_ids"]:
-                                            await call_audio_update_with_retry(
-                                                lambda action=action: update_audio_module.delete_track_ids(
-                                                    video_id,
-                                                    channel_id,
-                                                    action["track_ids"],
-                                                ),
-                                                run_blocking=_run_recovery_blocking,
-                                            )
+                                        _record_description_attempt(
+                                            channel_id, video_id, language, succeeded=None,
+                                            message="Đang tải âm thanh mô tả",
+                                            attempted_at=float(now if now is not None else time.time()),
+                                        )
                                         await call_audio_update_with_retry(
                                             lambda language=language: update_audio_module.add(
                                                 id_video=video_id,
@@ -2736,6 +2817,7 @@ async def run_audio_recovery_cycle(
                                                 language=language,
                                                 data=None,
                                                 progress=upload_progress,
+                                                audio_content_type="descriptive",
                                             ),
                                             run_blocking=_run_recovery_blocking,
                                         )
@@ -2744,13 +2826,13 @@ async def run_audio_recovery_cycle(
                                         if action["reason"] == PROCESSING_WARNING_REASON:
                                             channel_result["processing_tracks"] = max(0, channel_result["processing_tracks"] - 1)
                                         _update_runtime_status(repaired=repaired)
-                                        _record_recovery_attempt(
+                                        _record_description_attempt(
                                             channel_id,
                                             video_id,
                                             language,
                                             succeeded=True,
                                             message=action["reason"],
-                                            attempted_at=cycle_time,
+                                            attempted_at=float(now if now is not None else time.time()),
                                         )
                                         logger.info(
                                             "Audio auto-recovery upload submitted: channel={} video={} "
@@ -2770,13 +2852,13 @@ async def run_audio_recovery_cycle(
                                                 channel_id, exc, now=cycle_time
                                             )
                                             channel_requires_refresh = True
-                                        _record_recovery_attempt(
+                                        _record_description_attempt(
                                             channel_id,
                                             video_id,
                                             language,
                                             succeeded=False,
                                             message=str(exc),
-                                            attempted_at=cycle_time,
+                                            attempted_at=float(now if now is not None else time.time()),
                                         )
                                         logger.error(
                                             "Audio auto-recovery failed: channel={} video={} language={} error={}",
@@ -2805,13 +2887,13 @@ async def run_audio_recovery_cycle(
                                 )
                                 for action in actions:
                                     failed += 1
-                                    _record_recovery_attempt(
+                                    _record_description_attempt(
                                         channel_id,
                                         video_id,
                                         action["language"],
                                         succeeded=False,
                                         message=str(exc),
-                                        attempted_at=cycle_time,
+                                        attempted_at=float(now if now is not None else time.time()),
                                     )
                             finally:
                                 if video_owned_guard is not None:
@@ -2828,7 +2910,13 @@ async def run_audio_recovery_cycle(
                             asyncio.create_task(_process_single_video(vid, acts))
                             for vid, acts in actions_by_video.items()
                         ]
-                        await asyncio.gather(*video_tasks)
+                        video_results = await asyncio.gather(*video_tasks, return_exceptions=True)
+                        for video_result in video_results:
+                            if isinstance(video_result, BaseException):
+                                channel_result["errors"] += 1
+                                channel_result["last_error"] = _recovery_channel_error(video_result)
+                                failed += 1
+                                logger.error("Description recovery worker failed: channel={} error={}", channel_id, video_result)
 
                     if should_stop():
                         return
@@ -2895,6 +2983,7 @@ async def run_audio_recovery_cycle(
                 stop_event=stop_event, should_stop=should_stop,
                 on_complete=save_cycle_result,
                 channel_concurrency=channel_concurrency,
+                get_time=lambda: float(now if now is not None else time.time()),
             ))
         try:
             await asyncio.shield(channel_group)
@@ -3007,7 +3096,7 @@ def start_audio_recovery_monitor() -> None:
         enabled=is_audio_recovery_enabled(),
         monitor_running=True,
         phase="idle",
-        message="Tự động khôi phục audio đang hoạt động",
+        message="Tự động bổ sung âm thanh mô tả đang hoạt động",
     )
     logger.info("Audio auto-recovery monitor is running (continuous scans, no audio repair delay).")
 

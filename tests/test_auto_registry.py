@@ -129,7 +129,7 @@ class AutoRegistryPersistenceTests(RegistryStorage, unittest.TestCase):
             "first_seen_at": 1000, "last_seen_at": 22600, "scan_count": 2,
             "warning_reason": PROCESSING_WARNING_REASON, "warned_at": 22600,
         }
-        state["entries"]["channel-a"]["video-shared"]["processing_observations"] = {"en": tracker}
+        state["entries"]["channel-a"]["video-shared"]["description_processing_observations"] = {"en": tracker}
         self.assertTrue(self.manager.save_state("audio_recovery", state))
         self.manager._conn.close()
         self.manager._conn = None
@@ -374,7 +374,8 @@ class AutoRegistryCycleTests(RegistryStorage, unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result["repaired"], 1)
             add.assert_called_once()
             self.assertEqual(add.call_args.kwargs["language"], "en")
-            delete.assert_called_once_with("video-shared", "channel-a", ["failed-en"])
+            delete.assert_not_called()
+            self.assertEqual(add.call_args.kwargs["audio_content_type"], "descriptive")
             self.assertFalse(get_audio_recovery_runtime_status()["enabled"])
             self.assertEqual((await run_audio_recovery_cycle())["skipped"], "disabled")
             add.assert_called_once()
@@ -441,7 +442,7 @@ class AutoRegistryCycleTests(RegistryStorage, unittest.IsolatedAsyncioTestCase):
         captions = AsyncMock(return_value={})
         payload = {"videoTranslations": [{"videoId": "video-other", "translations": []}],
                    "audioTracks": [{"videoId": "video-other", "audioTrackId": "healthy-en", "language": "en",
-                                    "source": "AUDIO_TRACK_SOURCE_CREATOR", "audioContentTypeString": "dubbed",
+                                    "source": "AUDIO_TRACK_SOURCE_CREATOR", "audioContentTypeString": "descriptive",
                                     "status": "AUDIO_TRACK_STATUS_READY"}]}
         with (
             patch("src.video_scan_dates.scan_today", return_value=date(2026, 10, 22)),
@@ -456,7 +457,7 @@ class AutoRegistryCycleTests(RegistryStorage, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(set(captions.await_args.kwargs["entries"]), {"video-other"})
         self.assertEqual(result["deferred_video_scope"], 1)
         self.assertEqual(result["scan_start_date"], "2026-10-20")
-        self.assertEqual(get_audio_recovery_state()["entries"], self.original_entries)
+        self.assertEqual(get_audio_recovery_state()["entries"]["channel-a"]["video-other"]["audio_path"], "source.mp3")
 
     async def test_date_type_filters_publication_and_schedules_before_recovery(self):
         from src.audio_recovery import _get_registered_video_scan_statuses
@@ -474,13 +475,20 @@ class AutoRegistryCycleTests(RegistryStorage, unittest.IsolatedAsyncioTestCase):
 
         def healthy(video_ids, _channel):
             return {"videoTranslations": [{"videoId": vid, "translations": []} for vid in video_ids],
-                    "audioTracks": [{"videoId": vid, "audioTrackId": f"healthy-{vid}", "language": "en",
-                                     "source": "AUDIO_TRACK_SOURCE_CREATOR", "audioContentTypeString": "dubbed",
-                                     "status": "AUDIO_TRACK_STATUS_READY"} for vid in video_ids]}
+                    "audioTracks": [{"videoId": vid, "audioTrackId": f"healthy-{vid}-{language}", "language": language,
+                                     "source": "AUDIO_TRACK_SOURCE_CREATOR", "audioContentTypeString": "descriptive",
+                                     "status": "AUDIO_TRACK_STATUS_READY"} for vid in video_ids for language in ("en", "es")]}
 
         for date_type, expected in (("auto", ["video-shared", "scheduled-video"]),
                                     ("uploaded", ["video-other"]), ("published", ["video-shared"]),
                                     ("scheduled", ["scheduled-video"])):
+            fresh = get_audio_recovery_state()
+            for entries in fresh["entries"].values():
+                for entry in entries.values():
+                    for key in list(entry):
+                        if key.startswith("description_"):
+                            entry.pop(key)
+            self.manager.save_state("audio_recovery", fresh)
             set_audio_recovery_scan_preferences(video_scan_scope=RECOVERY_VIDEO_SCOPE_BOTH,
                                                 scan_start_date="2026-10-20", scan_date_type=date_type)
             with (
@@ -661,7 +669,7 @@ class AutoRegistryUiTests(RegistryStorage, unittest.TestCase):
     def test_processing_warning_is_displayed_and_clears_when_resolved(self):
         state = get_audio_recovery_state()
         entry = state["entries"]["channel-a"]["video-shared"]
-        entry["processing_observations"] = {"en": {
+        entry["description_processing_observations"] = {"en": {
             "language": "en", "track_ids": ["processing-en"],
             "warning_reason": PROCESSING_WARNING_REASON,
         }}
@@ -673,9 +681,9 @@ class AutoRegistryUiTests(RegistryStorage, unittest.TestCase):
         video = next(item for item in videos.rows if item["channel_id"] == "channel-a"
                      and item["video_id"] == "video-shared")
         self.assertEqual(channel["processing_warning_count"], 1)
-        self.assertEqual(video["processing_warning"], "Đang xử lý lâu: en · Chờ xóa và add lại")
+        self.assertEqual(video["processing_warning"], "Đang xử lý lâu: en · Chờ thêm lại mô tả")
 
-        entry.pop("processing_observations")
+        entry.pop("description_processing_observations")
         self.manager.save_state("audio_recovery", state)
         with self.client:
             self.refresh()

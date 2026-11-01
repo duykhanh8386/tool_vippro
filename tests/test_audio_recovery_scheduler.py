@@ -99,6 +99,34 @@ class AudioRecoverySchedulerTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(task, timeout=1)
         self.assertEqual(calls, dict.fromkeys("abcde", 1))
 
+    async def test_completed_description_channel_is_not_repeated_while_another_is_working(self):
+        self.add_channels("a", "b")
+        release_slow = asyncio.Event()
+        finished_fast = asyncio.Event()
+        calls = Counter()
+
+        async def process(_index, channel, entries, **kwargs):
+            calls[channel] += 1
+            if channel == "b":
+                await release_slow.wait()
+            for entry in entries.values():
+                entry["description_completed_languages"] = ["en"]
+            self.results[channel] = {"scan_performed": True}
+            if channel == "a":
+                finished_fast.set()
+
+        task = self.schedule(process)
+        try:
+            await asyncio.wait_for(finished_fast.wait(), timeout=1)
+            await asyncio.sleep(0.05)
+            self.assertEqual(calls["a"], 1)
+            self.assertFalse(task.done())
+        finally:
+            self.stop.set()
+            release_slow.set()
+            await asyncio.wait_for(task, timeout=1)
+        self.assertEqual(calls, {"a": 1, "b": 1})
+
     async def test_repeat_uses_fresh_registration_and_deactivation_stops_it(self):
         self.add_channels("a")
         calls = 0

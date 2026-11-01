@@ -535,7 +535,7 @@ def create_drawer():
                         ).on("click", open_recovery_details):
                             with ui.row().classes("w-full items-center gap-2 no-wrap"):
                                 ui.icon("verified").classes("text-emerald-700")
-                                ui.label("Auto audio đang quét liên tục").classes(
+                                ui.label("Auto Registry đang chờ video cần mô tả").classes(
                                     "text-xs font-semibold text-emerald-900"
                                 )
                             finished_at = status.get("last_cycle_finished_at")
@@ -575,7 +575,7 @@ def create_drawer():
 
                     if processing_warning_count:
                         ui.label(
-                            f"{processing_warning_count} audio xử lý quá 2 giờ: xóa và add lại. "
+                            f"{processing_warning_count} mô tả xử lý quá 2 giờ đang chờ thêm lại. "
                             "Xem chi tiết trong Auto Registry."
                         ).classes("text-[11px] text-amber-800")
                     channel_errors = sum(

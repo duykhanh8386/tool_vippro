@@ -70,6 +70,7 @@ def create_auto_registry_content(*, on_change: Callable[[], None] | None = None)
                 "id": item["channel_id"],
                 "name": names.get(item["channel_id"], item["channel_id"]),
                 "status": "Active" if item["enabled"] else "Deactive",
+                "completed_video_count": item.get("completed_video_count", 0),
             }
             for item in channel_items
         ]
@@ -79,6 +80,12 @@ def create_auto_registry_content(*, on_change: Callable[[], None] | None = None)
                 "id": f'{item["channel_id"]}:{item["video_id"]}',
                 "name": names.get(item["channel_id"], item["channel_id"]),
                 "languages": ", ".join(item["languages"]),
+                "description_status": (
+                    "Hoàn tất — bỏ qua các lượt quét âm thanh tiếp theo"
+                    if item.get("description_complete") else
+                    f'{item.get("description_completed_count", 0)}/{item.get("description_total", len(item["languages"]))} ngôn ngữ · '
+                    + (item.get("description_last_error") or "Đang chờ bổ sung/xác nhận mô tả")
+                ),
                 "status": "Active" if item["enabled"] else "Deactive",
                 "inactive_reason": (
                     "" if item["enabled"]
@@ -90,7 +97,7 @@ def create_auto_registry_content(*, on_change: Callable[[], None] | None = None)
                 "processing_warning": (
                     "Đang xử lý lâu: "
                     + ", ".join(warning["language"] for warning in item.get("processing_warnings") or [])
-                    + " · Chờ xóa và add lại"
+                    + " · Chờ thêm lại mô tả"
                     if item.get("processing_warnings") else ""
                 ),
             }
@@ -111,7 +118,8 @@ def create_auto_registry_content(*, on_change: Callable[[], None] | None = None)
             f"{len(channel_rows)} kênh "
             f"({active_channels} Active · {len(channel_rows) - active_channels} Deactive) · "
             f"{len(video_rows)} video · "
-            f'{sum(item["enabled"] for item in video_items)} video được phép tự động quét'
+            f'{sum(item["enabled"] and not item.get("description_complete") for item in video_items)} video chờ mô tả'
+            f' · {sum(bool(item.get("description_complete")) for item in video_items)} video hoàn tất'
             f' · {concurrency_label}'
             f' · {RECOVERY_VIDEO_SCOPE_LABELS[preferences["video_scan_scope"]]}'
             f' · {sum(item.get("processing_warning_count", 0) for item in channel_items)} audio quá 2 giờ chờ thay lại'
@@ -402,9 +410,8 @@ def create_auto_registry_content(*, on_change: Callable[[], None] | None = None)
         ).classes("text-xs text-gray-500")
         summary = ui.label("").classes("text-xs text-gray-500")
         ui.label(
-            "Quét liên tục theo chế độ được chọn, tự xóa track lỗi và thêm lại audio. "
-            "Ưu tiên kênh đang chờ; không còn hàng chờ thì quét lại kênh vừa xong ngay. "
-            "Khi có hàng chờ, hết lượt tất cả kênh sẽ lấy lại danh sách cho vòng mới."
+            "Tự tìm file nhạc đã ghép với video và thêm âm thanh mô tả đầy đủ cho các ngôn ngữ đăng ký. "
+            "Video đã đủ mô tả dùng được được lưu hoàn tất và bỏ qua các lượt quét âm thanh tiếp theo."
         ).classes("text-xs text-gray-500")
         ui.label("Chế độ quét song song").classes("text-sm font-medium")
         concurrency_mode_toggle = ui.toggle(
@@ -430,14 +437,12 @@ def create_auto_registry_content(*, on_change: Callable[[], None] | None = None)
             "Lựa chọn áp dụng từ vòng quét tiếp theo và được lưu khi mở lại ứng dụng."
         ).classes("text-xs text-gray-500")
         ui.label(
-            "Video còn ngôn ngữ audio dùng được sẽ được giữ lại, ngoại trừ track đang xử lý quá 2 giờ. "
-            "Khi không còn bản audio tốt, tool sửa audio lỗi và thêm các ngôn ngữ còn thiếu "
-            "theo danh sách đã đăng ký, kể cả video toàn dấu “-”."
+            "Trạng thái audio ngôn ngữ không quyết định việc bổ sung mô tả. "
+            "Các video trong Auto Registry từ trước cũng được xử lý tự động khi chưa đủ mô tả."
         ).classes("text-xs text-gray-500")
         ui.label(
-            "Audio ở trạng thái Đang xử lý từ 2 giờ trở lên sẽ tự xóa đúng track rồi add lại. "
-            "Thời gian tính từ lần tool ghi nhận cùng Track ID và được lưu qua lần mở lại; "
-            "track chưa đủ 2 giờ và audio tốt được giữ nguyên."
+            "Mô tả thiếu, bị lỗi hoặc xử lý quá 2 giờ sẽ được thử thêm lại. "
+            "Sau mỗi lượt gửi, tool chờ ít nhất 30 giây trước lượt xác nhận hoặc thử lại tiếp theo."
         ).classes("text-xs text-amber-700")
         ui.label(
             "Mặc định tự động quét tất cả các kênh Active. Kênh Deactive vẫn ở trong "
@@ -455,6 +460,7 @@ def create_auto_registry_content(*, on_change: Callable[[], None] | None = None)
                     {"name": "channel_id", "label": "Channel ID", "field": "channel_id", "classes": "font-mono select-text"},
                     {"name": "video_count", "label": "Tổng video", "field": "video_count"},
                     {"name": "active_video_count", "label": "Video được quét", "field": "active_video_count"},
+                    {"name": "completed_video_count", "label": "Đã đủ mô tả", "field": "completed_video_count"},
                     {"name": "processing_warning_count", "label": "Audio xử lý lâu", "field": "processing_warning_count"},
                     {"name": "status", "label": "Trạng thái", "field": "status"},
                     {"name": "actions", "label": "Thao tác", "field": "id", "sortable": False},
@@ -465,6 +471,7 @@ def create_auto_registry_content(*, on_change: Callable[[], None] | None = None)
                     {"name": "channel_id", "label": "Channel ID", "field": "channel_id", "classes": "font-mono select-text"},
                     {"name": "name", "label": "Kênh", "field": "name"},
                     {"name": "languages", "label": "Ngôn ngữ audio", "field": "languages"},
+                    {"name": "description_status", "label": "Âm thanh mô tả", "field": "description_status", "classes": "whitespace-normal"},
                     {"name": "processing_warning", "label": "Cảnh báo", "field": "processing_warning", "classes": "whitespace-normal text-amber-700"},
                     {"name": "status", "label": "Trạng thái", "field": "status"},
                     {"name": "actions", "label": "Thao tác", "field": "id", "sortable": False},

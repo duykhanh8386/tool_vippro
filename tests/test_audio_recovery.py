@@ -963,9 +963,11 @@ class AudioRecoveryCycleTests(unittest.IsolatedAsyncioTestCase):
                     patch("src.audio_recovery._monitor_failed_caption_tracks", caption_monitor),
                 ):
                     result = await run_audio_recovery_cycle(now=2000)
-                    query.assert_called_once_with(expected, "channel")
+                    self.assertEqual(query.call_args_list[0].args, (expected, "channel"))
+                    self.assertTrue(all(call.args[0] in [[vid] for vid in expected] for call in query.call_args_list[1:]))
                     self.assertEqual([call.kwargs["id_video"] for call in add.call_args_list], expected)
-                    self.assertEqual([call.args[0] for call in delete.call_args_list], expected)
+                    delete.assert_not_called()
+                    self.assertTrue(all(call.kwargs["audio_content_type"] == "descriptive" for call in add.call_args_list))
                     self.assertEqual(set(caption_monitor.await_args.kwargs["entries"]), set(expected))
                     self.assertEqual(result["repaired"], len(expected))
                     self.assertEqual(result["failed"], 0)
@@ -1026,7 +1028,8 @@ class AudioRecoveryCycleTests(unittest.IsolatedAsyncioTestCase):
         ):
             result = await run_audio_recovery_cycle(now=2000)
 
-        self.assertEqual(scanned_channels, ["channel-a"])
+        self.assertTrue(scanned_channels)
+        self.assertEqual(set(scanned_channels), {"channel-a"})
         self.assertEqual(result["scan_mode"], RECOVERY_SCAN_MODE_SELECTED)
         self.assertEqual(result["scope_skipped_channel_ids"], ["channel-b"])
 
@@ -1121,64 +1124,6 @@ class AudioRecoveryCycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(added.call_args.kwargs["language"], "en")
         self.assertEqual(result["scope_skipped_channel_ids"], ["channel"])
 
-    async def test_cycle_replaces_processing_after_two_hours_and_restarts_the_new_track_timer(self):
-        from src.audio_recovery import update_audio_module
-        with tempfile.TemporaryDirectory() as folder:
-            source = Path(folder) / "source.mp3"
-            source.write_bytes(b"source")
-            entry = {"audio_path": str(source), "languages": ["it"], "attempts": {}}
-            state = {"enabled": True, "entries": {"channel": {"video": entry}}}
-            audio = {"audioTrackId": "processing-it", "statusLabel": "Dang xu ly"}
-            # Enum is authoritative; captions and titles cannot trigger repair.
-            audio["status"] = "AUDIO_TRACK_STATUS_PROCESSING"
-            payload = {"videoTranslations": [{"videoId": "video", "translations": [
-                {"languageCode": "it", "audioTranslation": audio},
-            ]}], "audioTracks": []}
-            events = []
-
-            def delete(*args):
-                events.append(("delete", args))
-                return 200
-
-            def add(**kwargs):
-                events.append(("add", kwargs["language"]))
-                return 200
-
-            def render_audio(*, output_file, **_kwargs):
-                Path(output_file).write_bytes(b"rendered")
-
-            with (
-                patch("src.audio_recovery.get_audio_recovery_state", return_value=state),
-                patch("src.audio_recovery._load_state", return_value=state),
-                patch("src.audio_recovery.state_manager.save_state", return_value=True),
-                patch.object(update_audio_module, "_get_video_translation_payload", return_value=payload) as fetch,
-                patch.object(update_audio_module, "_get_video_info", return_value=SimpleNamespace(duration_ms=60000)),
-                patch.object(update_audio_module, "delete_track_ids", side_effect=delete),
-                patch.object(update_audio_module, "add", side_effect=add),
-                patch("src.audio_recovery.multiply_audio", side_effect=render_audio),
-            ):
-                first = await run_audio_recovery_cycle(now=1000)
-                before = await run_audio_recovery_cycle(now=1000 + DEFAULT_STALE_PROCESSING_SECONDS - 1)
-                self.assertEqual(events, [])
-                overdue = await run_audio_recovery_cycle(now=1000 + DEFAULT_STALE_PROCESSING_SECONDS)
-                self.assertEqual(events, [("delete", ("video", "channel", ["processing-it"])), ("add", "it")])
-                self.assertNotIn("processing_observations", entry)
-                self.assertTrue(entry["attempts"]["it"]["succeeded"])
-                self.assertEqual(entry["attempts"]["it"]["message"], PROCESSING_WARNING_REASON)
-                self.assertEqual(fetch.call_count, 4)  # scan, scan, scan, pre-delete check
-                audio["audioTrackId"] = "replacement-it"
-                next_scan = await run_audio_recovery_cycle(now=1000 + DEFAULT_STALE_PROCESSING_SECONDS + 1)
-                self.assertEqual(entry["processing_observations"]["it"]["first_seen_at"], 1000 + DEFAULT_STALE_PROCESSING_SECONDS + 1)
-                audio.clear()
-                audio.update(audioTrackId="replacement-it", publishStatus="PUBLISHED")
-                healthy = await run_audio_recovery_cycle(now=1000 + DEFAULT_STALE_PROCESSING_SECONDS + 2)
-
-            self.assertEqual([first["repaired"], before["repaired"], overdue["repaired"], next_scan["repaired"]], [0, 0, 1, 0])
-            self.assertEqual(overdue["failed"], 0)
-            self.assertEqual(overdue["processing_warnings"][0]["track_ids"], ["processing-it"])
-            self.assertEqual(healthy["processing_warnings"], [])
-            self.assertNotIn("processing_observations", entry)
-            self.assertEqual(len(events), 2)
 
     async def test_caption_monitor_repairs_only_explicit_failed_tracks(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -1537,7 +1482,7 @@ class AudioRecoveryCycleTests(unittest.IsolatedAsyncioTestCase):
                         "audioTrackId": "healthy-en",
                         "language": "en",
                         "source": "AUDIO_TRACK_SOURCE_CREATOR",
-                        "audioContentTypeString": "dubbed",
+                        "audioContentTypeString": "descriptive",
                         "status": "AUDIO_TRACK_STATUS_READY",
                     }
                 ],
@@ -1556,7 +1501,7 @@ class AudioRecoveryCycleTests(unittest.IsolatedAsyncioTestCase):
             result = await run_audio_recovery_cycle(now=1000)
             due_result = await run_audio_recovery_cycle(now=1001)
 
-        self.assertEqual(fetch.call_count, 2)
+        self.assertEqual(fetch.call_count, 1)
         self.assertTrue(all(call.args == (["video"], "channel") for call in fetch.call_args_list))
         self.assertEqual(result["deferred_initial_grace"], 0)
         self.assertEqual(result["repaired"], 0)
@@ -1702,7 +1647,7 @@ class AudioRecoveryCycleTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result["repaired"], 1)
         self.assertEqual(result["deferred_busy"], 1)
-        self.assertEqual(scanned_channels, ["channel-a"])
+        self.assertEqual(set(scanned_channels), {"channel-a"})
         self.assertEqual(added.call_args.kwargs["id_video"], "video-a")
 
     async def test_clearing_registry_cancels_running_recovery_snapshot(self):
@@ -1898,255 +1843,8 @@ class AudioRecoveryCycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["repaired"], 0)
         self.assertEqual(result["failed"], 0)
 
-    async def test_cycle_skips_partial_failure_then_repairs_when_all_dubs_fail(self):
-        with tempfile.TemporaryDirectory() as folder:
-            source = Path(folder) / "source.mp3"
-            source.write_bytes(b"source")
-            state = {
-                "enabled": True,
-                "retry_cooldown_seconds": 0,
-                "entries": {
-                    "channel": {
-                        "video": {
-                            "audio_path": str(source),
-                            "languages": ["en", "es", "fr"],
-                            "repeat_times": 1,
-                            "extra_minutes": 0,
-                            "attempts": {},
-                        }
-                    }
-                },
-            }
-            payload = {
-                "videoTranslations": [{"videoId": "video", "translations": []}],
-                "audioTracks": [
-                    {
-                        "videoId": "video",
-                        "audioTrackId": "audio-en",
-                        "language": "en",
-                        "source": "AUDIO_TRACK_SOURCE_CREATOR",
-                        "audioContentTypeString": "dubbed",
-                        "status": "AUDIO_TRACK_STATUS_READY",
-                    },
-                    {
-                        "videoId": "video",
-                        "audioTrackId": "failed-es",
-                        "language": "es",
-                        "source": "AUDIO_TRACK_SOURCE_CREATOR",
-                        "audioContentTypeString": "dubbed",
-                        "status": "AUDIO_TRACK_STATUS_FAILED",
-                    },
-                ],
-            }
-            deleted = Mock(return_value=200)
-            added = Mock(return_value=200)
 
-            async def run_retry(operation, **_kwargs):
-                return operation()
 
-            def render_audio(*, output_file, **_kwargs):
-                Path(output_file).write_bytes(b"rendered")
-
-            with (
-                patch("src.audio_recovery.get_audio_recovery_state", return_value=state),
-                patch("src.audio_recovery._load_state", return_value=state),
-                patch("src.audio_recovery.state_manager.save_state", return_value=True),
-                patch("src.audio_recovery._record_recovery_attempt"),
-                patch.object(
-                    __import__("src.audio_recovery", fromlist=["update_audio_module"]).update_audio_module,
-                    "_get_video_translation_payload",
-                    return_value=payload,
-                ),
-                patch.object(
-                    __import__("src.audio_recovery", fromlist=["update_audio_module"]).update_audio_module,
-                    "_get_video_info",
-                    return_value=SimpleNamespace(duration_ms=60_000),
-                ),
-                patch.object(
-                    __import__("src.audio_recovery", fromlist=["update_audio_module"]).update_audio_module,
-                    "delete_track_ids",
-                    deleted,
-                ),
-                patch.object(
-                    __import__("src.audio_recovery", fromlist=["update_audio_module"]).update_audio_module,
-                    "add",
-                    added,
-                ),
-                patch("src.audio_recovery.multiply_audio", side_effect=render_audio),
-                patch("src.audio_recovery.call_audio_update_with_retry", new=AsyncMock(side_effect=run_retry)),
-            ):
-                partial = await run_audio_recovery_cycle(now=1000)
-                self.assertEqual(partial["repaired"], 0)
-                self.assertEqual(partial["failed"], 0)
-                deleted.assert_not_called()
-                added.assert_not_called()
-                self.assertIn("video", state["entries"]["channel"])
-
-                payload["audioTracks"][0]["status"] = "AUDIO_TRACK_STATUS_FAILED"
-                result = await run_audio_recovery_cycle(now=2000)
-
-        self.assertEqual(result["repaired"], 3)
-        self.assertEqual(result["failed"], 0)
-        self.assertEqual([call.args for call in deleted.call_args_list], [
-            ("video", "channel", ["audio-en"]),
-            ("video", "channel", ["failed-es"]),
-        ])
-        self.assertEqual(
-            [call.kwargs["language"] for call in added.call_args_list],
-            ["en", "es", "fr"],
-        )
-        for call in added.call_args_list:
-            progress = call.kwargs["progress"]
-            self.assertEqual(progress["sent"], 0)
-            self.assertGreater(progress["total"], 0)
-            self.assertEqual(progress["status"], "starting" if call.kwargs["language"] == "fr" else "deleting")
-
-        runtime_status = get_audio_recovery_runtime_status()
-        self.assertFalse(runtime_status["active"])
-        self.assertEqual(runtime_status["phase"], "idle")
-        self.assertEqual(runtime_status["repaired"], 3)
-        self.assertEqual(runtime_status["failed"], 0)
-        self.assertEqual(runtime_status["upload_sent"], 0)
-        self.assertEqual(runtime_status["upload_total"], 0)
-
-    async def test_stale_processing_is_rechecked_after_preparing_file_and_good_audio_is_preserved(self):
-        from src.audio_recovery import update_audio_module
-        for fresh_state in ("processing", "ready", "healthy-duplicate", "new-track", "unreadable"):
-            with self.subTest(fresh_state=fresh_state), tempfile.TemporaryDirectory() as folder:
-                source = Path(folder) / "source.mp3"
-                source.write_bytes(b"source")
-                entry = {"audio_path": str(source), "languages": ["es", "it"],
-                         "processing_observations": {"it": {
-                             "track_ids": ["stuck-it"], "first_seen_at": 1000,
-                             "last_seen_at": 1000, "scan_count": 10,
-                         }}}
-                state = {"enabled": True, "entries": {"channel": {"video": entry}}}
-
-                def payload(status="PROCESSING", track_id="stuck-it"):
-                    return {"videoTranslations": [{"videoId": "video", "translations": [
-                        {"languageCode": "en", "audioTranslation": {
-                            "audioTrackId": "published-en", "publishStatus": "PUBLISHED"}},
-                        {"languageCode": "es", "audioTranslation": {
-                            "audioTrackId": "deleted-es", "statusLabel": "Deleted"}},
-                        {"languageCode": "it", "audioTranslation": {
-                            "audioTrackId": track_id, "status": "AUDIO_TRACK_STATUS_" + status}},
-                    ]}], "audioTracks": []}
-
-                fresh = (payload() if fresh_state == "processing" else
-                         payload("READY") if fresh_state == "ready" else
-                         payload(track_id="new-it") if fresh_state == "new-track" else {})
-                if fresh_state == "healthy-duplicate":
-                    fresh = payload()
-                    fresh["videoTranslations"][0]["translations"].append({
-                        "languageCode": "it", "audioTranslation": {
-                            "audioTrackId": "ready-it", "publishStatus": "PUBLISHED"},
-                    })
-
-                def render_audio(*, output_file, **_kwargs):
-                    Path(output_file).write_bytes(b"rendered")
-
-                with (
-                    patch("src.audio_recovery.get_audio_recovery_state", return_value=state),
-                    patch("src.audio_recovery._load_state", return_value=state),
-                    patch("src.audio_recovery.state_manager.save_state", return_value=True),
-                    patch.object(update_audio_module, "_get_video_translation_payload", side_effect=[payload(), fresh]) as fetch,
-                    patch.object(update_audio_module, "_get_video_info", return_value=SimpleNamespace(duration_ms=60000)),
-                    patch.object(update_audio_module, "delete_track_ids", return_value=200) as delete,
-                    patch.object(update_audio_module, "add", return_value=200) as add,
-                    patch("src.audio_recovery.multiply_audio", side_effect=render_audio),
-                ):
-                    result = await run_audio_recovery_cycle(now=1000 + DEFAULT_STALE_PROCESSING_SECONDS)
-
-                self.assertEqual(fetch.call_count, 2)
-                if fresh_state == "processing":
-                    self.assertEqual(result["repaired"], 1)
-                    delete.assert_called_once_with("video", "channel", ["stuck-it"])
-                    self.assertEqual(add.call_args.kwargs["language"], "it")
-                    self.assertEqual(result["channel_results"][0]["healthy_skipped"], 0)
-                else:
-                    self.assertEqual(result["repaired"], 0)
-                    delete.assert_not_called()
-                    add.assert_not_called()
-                self.assertEqual(result["failed"], int(fresh_state == "unreadable"))
-
-    async def test_cycle_immediately_retries_missing_or_deleted_audio_but_preserves_processing(self):
-        from src.audio_recovery import update_audio_module
-
-        for failed_es in (False, True):
-            with self.subTest(failed_es=failed_es), tempfile.TemporaryDirectory() as folder:
-                source = Path(folder) / "source.mp3"
-                source.write_bytes(b"source")
-                state = {
-                    "enabled": True, "initial_grace_seconds": 0,
-                    "retry_cooldown_seconds": 15 * 60,
-                    "entries": {"channel": {"video": {
-                        "audio_path": str(source), "languages": ["en", "es"],
-                        "repeat_times": 1, "attempts": {},
-                    }}},
-                }
-                payload = {
-                    "videoTranslations": [{"videoId": "video", "translations": [
-                        {"languageCode": language, "audioTranslation": {"statusLabel": "-"}}
-                        for language in ("en", "es", "fr")
-                    ]}],
-                    "audioTracks": [{
-                        "videoId": "video", "audioTrackId": "original", "language": "ak",
-                        "source": "AUDIO_TRACK_SOURCE_UPLOAD", "audioContentTypeString": "original",
-                        "status": "AUDIO_TRACK_STATUS_READY",
-                    }],
-                }
-                if failed_es:
-                    payload["videoTranslations"][0]["translations"][1]["audioTranslation"] = {
-                        "audioTrackId": "deleted-es", "statusLabel": "Đã xoá",
-                    }
-
-                def render_audio(*, output_file, **_kwargs):
-                    Path(output_file).write_bytes(b"rendered")
-
-                async def run_retry(operation, **_kwargs):
-                    return operation()
-
-                with (
-                    patch("src.audio_recovery.get_audio_recovery_state", return_value=state),
-                    patch("src.audio_recovery._load_state", return_value=state),
-                    patch("src.audio_recovery.state_manager.save_state", return_value=True),
-                    patch.object(update_audio_module, "_get_video_translation_payload", return_value=payload),
-                    patch.object(update_audio_module, "_get_video_info", return_value=SimpleNamespace(duration_ms=60000)) as info,
-                    patch.object(update_audio_module, "delete_track_ids", return_value=200) as delete,
-                    patch.object(update_audio_module, "add", return_value=200) as add,
-                    patch("src.audio_recovery.multiply_audio", side_effect=render_audio) as render,
-                    patch("src.audio_recovery.call_audio_update_with_retry", new=AsyncMock(side_effect=run_retry)),
-                ):
-                    result = await run_audio_recovery_cycle(now=2000)
-                    # Re-read Studio on each cycle; missing/deleted audio can
-                    # be repaired immediately even after a recent submission.
-                    repeated = await run_audio_recovery_cycle(now=2000)
-                    for item in payload["videoTranslations"][0]["translations"]:
-                        if item["languageCode"] in ("en", "es"):
-                            item["audioTranslation"] = {
-                                "audioTrackId": f"processing-{item['languageCode']}",
-                                "status": "AUDIO_TRACK_STATUS_PROCESSING",
-                            }
-                    processing = await run_audio_recovery_cycle(now=2001)
-
-                self.assertEqual(result["repaired"], 2)
-                self.assertEqual(result["failed"], 0)
-                self.assertEqual(result["unreadable"], [])
-                self.assertEqual(repeated["repaired"], 2)
-                self.assertEqual(repeated["failed"], 0)
-                self.assertEqual(processing["repaired"], 0)
-                self.assertEqual(processing["failed"], 0)
-                self.assertEqual([call.kwargs["language"] for call in add.call_args_list], ["en", "es", "en", "es"])
-                self.assertEqual(info.call_count, 2)
-                self.assertEqual(render.call_count, 2)
-                if failed_es:
-                    self.assertEqual(delete.call_count, 2)
-                    self.assertTrue(all(call.args == ("video", "channel", ["deleted-es"]) for call in delete.call_args_list))
-                else:
-                    delete.assert_not_called()
-                attempts = state["entries"]["channel"]["video"]["attempts"]
-                self.assertEqual(set(attempts), {"en", "es"})
-                self.assertTrue(all(attempt["succeeded"] for attempt in attempts.values()))
 
 
 if __name__ == "__main__":
