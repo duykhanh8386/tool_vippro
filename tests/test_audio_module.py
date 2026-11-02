@@ -1,3 +1,4 @@
+import json
 import unittest
 import tempfile
 import threading
@@ -23,17 +24,17 @@ class Response:
 
 
 class AudioUploadTests(unittest.TestCase):
-    def test_start_matches_the_tv_automation_audiotrack_protocol(self):
+    def test_start_matches_studios_video_bound_audiotrack_protocol(self):
         module = UpdateAudioModule()
         headers = {"X-Goog-Upload-Status": "active", "X-Goog-Upload-URL": "https://session",
                    "X-Goog-Upload-Header-Scotty-Resource-Id": "resource"}
         with patch("src.module.audio_module.post_with_stop", return_value=Response(headers=headers)) as post:
-            self.assertEqual(module._upload_http("song.mp3", "cookie"),
+            self.assertEqual(module._upload_http("song.mp3", "cookie", video_id="video", file_size=123),
                              ("https://session", "resource"))
         self.assertEqual(post.call_args.kwargs["headers"]["X-Goog-Upload-Protocol"], "resumable")
         self.assertEqual(post.call_args.kwargs["headers"]["X-Goog-Upload-Command"], "start")
-        self.assertEqual(post.call_args.kwargs["data"], "{}")
-        self.assertNotIn("X-Goog-Upload-Header-Content-Length", post.call_args.kwargs["headers"])
+        self.assertEqual(json.loads(post.call_args.kwargs["data"]), {"videoId": "video"})
+        self.assertEqual(post.call_args.kwargs["headers"]["X-Goog-Upload-Header-Content-Length"], "123")
         self.assertNotIn("X-Goog-Upload-Header-Content-Type", post.call_args.kwargs["headers"])
 
     def test_empty_audio_is_rejected_before_registering_a_track(self):
@@ -403,7 +404,7 @@ class AudioUploadTests(unittest.TestCase):
         ):
             status = module.add("video", "channel", "audio.mp3", "pt", b"abc")
         self.assertEqual(status, 409)
-        upload.assert_called_once()
+        upload.assert_not_called()
 
     def test_unverified_409_is_not_success(self):
         module = UpdateAudioModule()
@@ -420,7 +421,7 @@ class AudioUploadTests(unittest.TestCase):
             with self.assertRaises(AudioUpdateError) as raised:
                 module.add("video", "channel", "audio.mp3", "pt", b"abc")
         self.assertEqual(raised.exception.status_code, 409)
-        upload.assert_called_once()
+        upload.assert_not_called()
 
     def test_processing_95_percent_is_not_treated_as_existing_success(self):
         module = UpdateAudioModule()

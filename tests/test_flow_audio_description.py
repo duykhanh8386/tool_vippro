@@ -330,7 +330,7 @@ class AudioDescriptionApiTests(unittest.TestCase):
         ):
             with self.assertRaises(AudioUpdateError):
                 module.add("video", "channel", "music.mp3", "pcm", data=b"full-music", audio_content_type="descriptive")
-        upload.assert_called_once()
+        upload.assert_not_called()
 
     def test_audio_registration_sends_the_descriptive_type(self):
         module = UpdateAudioModule()

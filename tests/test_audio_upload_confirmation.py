@@ -43,7 +43,7 @@ class AudioUploadConfirmationTests(unittest.TestCase):
         return result
 
     def publish(self, **kwargs):
-        self.assertEqual(self.events, ["start", "finalize"])
+        self.assertEqual(self.events, ["start"])
         self.events.append("publish")
         if self.new_track is not None:
             self.payload["audioTracks"].append(self.new_track)
@@ -53,10 +53,10 @@ class AudioUploadConfirmationTests(unittest.TestCase):
         return self.module.add("video", "channel", "music.mp3", "en", data=b"audio",
                                audio_content_type=kind, progress=progress)
 
-    def test_file_finishes_before_publish_and_new_processing_track_is_verified(self):
+    def test_registers_before_transfer_and_verifies_processing_only_after_file_finishes(self):
         progress = {}
         self.assertEqual(self.add(progress=progress), 200)
-        self.assertEqual(self.events, ["start", "finalize", "publish"])
+        self.assertEqual(self.events, ["start", "publish", "finalize"])
         self.assertEqual(progress["studio_state"], "processing")
         self.assertEqual(progress["track_id"], "new")
         self.assertEqual(self.fetch.call_count, 2)
@@ -128,15 +128,19 @@ class AudioUploadConfirmationTests(unittest.TestCase):
         self.module._verify_audio_upload("video", "channel", "en", "descriptive", {"existing": old}, progress=progress)
         self.assertEqual(progress["studio_state"], "processing")
 
-    def test_upload_failure_never_registers_a_track(self):
+    def test_upload_failure_keeps_the_registered_track_unconfirmed(self):
         self.upload.side_effect = AudioUpdateError("file not finalized")
+        progress = {}
         with self.assertRaisesRegex(AudioUpdateError, "not finalized"):
-            self.add()
-        self.register.assert_not_called()
+            self.add(progress=progress)
+        self.register.assert_called_once()
+        self.assertTrue(progress["registered"])
+        self.assertFalse(progress["file_finalized"])
+        self.assertEqual(self.fetch.call_count, 1)
 
-    def test_session_token_is_acquired_after_the_file_finishes(self):
+    def test_session_token_is_acquired_before_registering_the_track(self):
         def token(_channel):
-            self.assertEqual(self.events, ["start", "finalize"])
+            self.assertEqual(self.events, ["start"])
             return "fresh-token"
 
         with patch.object(self.module, "_get_session_token", side_effect=token):

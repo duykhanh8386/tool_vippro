@@ -1,5 +1,6 @@
 """HTTP checks for the TV Automation upload shape, without running its EXE."""
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -33,6 +34,50 @@ def response(headers=None, body=None):
 
 
 class TvAudioUploadTests(unittest.TestCase):
+    def test_studio_upload_binds_video_and_size_then_registers_before_file_transfer_for_each_type(self):
+        for kind in ("dubbed", "descriptive"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as folder, requests.Session() as session:
+                module = UpdateAudioModule()
+                path = Path(folder) / "music.mp3"
+                path.write_bytes(b"abcdefghij")
+                calls = []
+                channel = SimpleNamespace(id="channel", role="OWNER", delegated_session_id="owner", cookies=[])
+
+                def receive(request):
+                    calls.append(request)
+                    if len(calls) == 1:
+                        self.assertEqual(json.loads(request.body), {"videoId": "video"})
+                        self.assertEqual(request.headers["X-Goog-Upload-Header-Content-Length"], "10")
+                        self.assertEqual(int(request.headers["Content-Length"]), len(request.body))
+                        return response({"X-Goog-Upload-Status": "active", "X-Goog-Upload-URL": "https://upload.youtube.com/session",
+                                         "X-Goog-Upload-Header-Scotty-Resource-Id": "resource"})
+                    if len(calls) == 2:
+                        payload = json.loads(request.body)
+                        self.assertIn("creator/add_audio_track", request.url)
+                        self.assertEqual(payload["resourceId"], {"scottyResourceId": {"id": "resource"}})
+                        self.assertEqual((payload["videoId"], payload["language"], payload["audioContentTypeString"]),
+                                         ("video", "en", kind))
+                        return response()
+                    self.assertEqual(request.headers["Content-Type"], "application/x-www-form-urlencoded;charset=utf-8")
+                    self.assertEqual(request.headers["Content-Length"], "10")
+                    self.assertNotIn("Transfer-Encoding", request.headers)
+                    self.assertEqual(request.body.read(), b"abcdefghij")
+                    return response({"X-Goog-Upload-Status": "final"})
+
+                session.mount("https://", RecordingAdapter(receive))
+                before = {"videoTranslations": [{"videoId": "video", "translations": []}], "audioTracks": []}
+                after = {**before, "audioTracks": [{"videoId": "video", "audioTrackId": "new", "language": "en",
+                                                   "audioContentTypeString": kind, "status": "AUDIO_TRACK_STATUS_PENDING"}]}
+                with (
+                    patch("src.module.audio_module.get_channels_info", return_value=channel),
+                    patch("src.module.audio_module.requests.Session", return_value=session),
+                    patch("src.module.audio_module.studio_authorization_header", return_value="auth"),
+                    patch.object(module, "_get_session_token", return_value="token"),
+                    patch.object(module, "_get_video_translation_payload", side_effect=[before, after]),
+                ):
+                    self.assertEqual(module.add("video", "channel", str(path), "en", audio_content_type=kind), 200)
+                self.assertEqual(len(calls), 3)
+
     def test_file_is_one_finalize_request_with_exact_length_and_byte_progress(self):
         module = UpdateAudioModule()
         module._CHUNK_SIZE = 4
@@ -41,6 +86,7 @@ class TvAudioUploadTests(unittest.TestCase):
         def receive(request):
             calls.append(request)
             self.assertEqual(request.headers["Content-Length"], "10")
+            self.assertEqual(request.headers["Content-Type"], "application/x-www-form-urlencoded;charset=utf-8")
             self.assertNotIn("Transfer-Encoding", request.headers)
             self.assertEqual(request.headers["X-Goog-Upload-Command"], "upload, finalize")
             self.assertEqual(request.headers["X-Goog-Upload-Offset"], "0")

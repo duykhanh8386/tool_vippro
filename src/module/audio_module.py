@@ -1,4 +1,5 @@
 # RECOVERED: depyo output corrected from CPython 3.12 disassembly
+import json
 import os
 import time
 import unicodedata
@@ -174,23 +175,14 @@ class UpdateAudioModule(IModule):
                 fname_header=fname_header,
                 cookie_string=cookie_string,
                 session=session,
+                video_id=id_video,
+                file_size=file_size,
             )
-            # Finish the file before publishing its resource, as with Studio's
-            # file picker followed by Publish. A pending resource must never be
-            # mistaken for a successfully uploaded language track.
-            self._next_upload_http(
-                next_url=upload_url,
-                fname_header=fname_header,
-                cookie_string=cookie_string,
-                data=data,
-                file_path=source_path,
-                progress=progress,
-                session=session,
-                single_request=True,
-            )
+            # Studio registers the resource on the resumable STARTED event,
+            # before sending its file bytes. Keep the complete transfer and
+            # subsequent track verification synchronous for our caller.
             if progress is not None:
-                progress.update(file_finalized=True, status="registering")
-            # Large files can outlive the session-token cache's TTL.
+                progress["status"] = "registering"
             session_token = self._get_session_token(channel_info)
             res = self._update(
                 video_id=id_video,
@@ -216,6 +208,18 @@ class UpdateAudioModule(IModule):
                 )
             if progress is not None:
                 progress["registered"] = True
+            self._next_upload_http(
+                next_url=upload_url,
+                fname_header=fname_header,
+                cookie_string=cookie_string,
+                data=data,
+                file_path=source_path,
+                progress=progress,
+                session=session,
+                single_request=True,
+            )
+            if progress is not None:
+                progress["file_finalized"] = True
             self._verify_audio_upload(
                 id_video, channel_id, language, audio_content_type, before,
                 progress=progress,
@@ -319,12 +323,20 @@ class UpdateAudioModule(IModule):
         fname_header: str,
         cookie_string: str,
         session: requests.Session | None = None,
+        *,
+        video_id: str,
+        file_size: int,
     ):
+        if not video_id or file_size <= 0:
+            raise AudioUpdateError("Thiếu video hoặc dung lượng file để mở phiên tải audio")
         url = "https://upload.youtube.com/upload/audiotrack?authuser=0"
         headers = self._base_upload_headers(fname_header, cookie_string)
-        # Match TV Automation's audiotrack initialization (the body is just {}).
-        headers.update({"X-Goog-Upload-Protocol": "resumable", "X-Goog-Upload-Command": "start"})
-        response = post_with_stop(url, headers=headers, data="{}", session=session)
+        # Studio's uYm.start binds the upload to videoId; Cxe.start_ moves
+        # the Blob's size into X-Goog-Upload-Header-Content-Length.
+        headers.update({"X-Goog-Upload-Protocol": "resumable", "X-Goog-Upload-Command": "start",
+                        "X-Goog-Upload-Header-Content-Length": str(file_size)})
+        metadata = json.dumps({"videoId": video_id}, separators=(",", ":"))
+        response = post_with_stop(url, headers=headers, data=metadata, session=session)
         if response.status_code != 200:
             raise AudioUpdateError(_youtube_error_message(response, "khởi tạo tải audio"), status_code=response.status_code, retryable=response.status_code == 429 or response.status_code >= 500)
         status = str(response.headers.get("X-Goog-Upload-Status") or "").lower()
