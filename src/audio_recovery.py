@@ -2935,7 +2935,7 @@ async def run_audio_recovery_cycle(
                                             description_pair=audio_content_type == "dubbed" and "descriptive" in current_types,
                                         )
                                         if failed_description_ids:
-                                            _update_runtime_status(message=f"Đang xóa {track_label} để tải lại: {language}")
+                                            _update_runtime_status(message=f"Đang xóa và chờ YouTube xác nhận {track_label}: {language}")
                                             deletion_state = {}
 
                                             def delete_still_failed_track():

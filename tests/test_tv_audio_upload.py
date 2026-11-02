@@ -121,12 +121,14 @@ class TvAudioUploadTests(unittest.TestCase):
             patch("src.module.audio_module.get_channels_info", return_value=channel),
             patch("src.module.audio_module.studio_authorization_header", return_value="test-auth"),
             patch.object(module, "_get_session_token", return_value="token"),
-            patch("src.module.audio_module.post_with_stop", return_value=response(body={"audioTracks": []})) as post,
+            patch("src.module.audio_module.post_with_stop", return_value=response(body={
+                "videoTranslations": [{"videoId": "video", "translations": []}], "audioTracks": [],
+            })) as post,
         ):
             module._update("video", "resource", channel, "cookie", "token", "en", audio_content_type="descriptive")
             module.delete_track_ids("video", "channel", ["failed-description"])
             module._get_video_translation_payload(["video"], "channel")
-        self.assertEqual(post.call_count, 3)
+        self.assertEqual(post.call_count, 4)
         for call in post.call_args_list:
             self.assertEqual(call.kwargs["json"]["context"]["user"]["serializedDelegationContext"],
                              "captured-channel-context")

@@ -1309,6 +1309,7 @@ class AudioDeleteTests(unittest.TestCase):
     def test_delete_returns_only_after_all_tracks_succeed(self):
         module = UpdateAudioModule()
         with (
+            patch.object(module, "_confirm_audio_tracks_deleted") as confirm,
             patch("src.module.audio_module.get_channels_info", return_value=self._channel()),
             patch.object(module, "_get_session_token", return_value="token"),
             patch.object(module, "_get_all_audio_track_ids", return_value=["a", "b"]),
@@ -1316,10 +1317,12 @@ class AudioDeleteTests(unittest.TestCase):
         ):
             self.assertEqual(module.delete("video", "channel"), 200)
         self.assertEqual(post.call_count, 2)
+        confirm.assert_called_once_with("video", "channel", ["a", "b"])
 
     def test_delete_track_ids_does_not_discover_or_delete_healthy_tracks(self):
         module = UpdateAudioModule()
         with (
+            patch.object(module, "_confirm_audio_tracks_deleted") as confirm,
             patch("src.module.audio_module.get_channels_info", return_value=self._channel()),
             patch.object(module, "_get_session_token", return_value="token"),
             patch.object(module, "_get_all_audio_track_ids") as discover,
@@ -1331,6 +1334,7 @@ class AudioDeleteTests(unittest.TestCase):
             )
 
         discover.assert_not_called()
+        confirm.assert_called_once_with("video", "channel", ["failed-track"])
         self.assertEqual(post.call_count, 1)
         self.assertEqual(post.call_args.kwargs["json"]["audioTrackId"], "failed-track")
 

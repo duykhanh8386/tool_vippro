@@ -8,6 +8,7 @@ from src import audio_recovery as recovery
 from src.audio_description_recovery import enabled_audio_types, registry_entry_complete
 from src.module.audio_module import AudioUpdateError, UpdateAudioModule
 from test_registry_descriptions import RegistryAudioFixture, audio_track, response
+from test_audio_module import Response
 
 
 class RegistryAudioTypeTests(RegistryAudioFixture, unittest.IsolatedAsyncioTestCase):
@@ -182,6 +183,55 @@ class RegistryAudioTypeTests(RegistryAudioFixture, unittest.IsolatedAsyncioTestC
         result = await recovery.run_audio_recovery_cycle(now=2000)
         self.assertEqual((result["repaired"], result["failed"]), (0, 4))
         self.assertEqual(result["channel_results"][0]["submitted"], 0)
+        self.assertFalse(self.saved_entry()["description_attempts"]["en"]["succeeded"])
+
+    async def test_failed_description_is_not_added_until_youtube_commits_its_deletion(self):
+        self.entry["languages"] = ["en"]
+        self.reset_registry()
+        recovery.set_audio_recovery_audio_types(["dubbed", "descriptive"])
+        self.payload = response([audio_track("en", "dubbed"), audio_track("en", status="FAILED")])
+        module = UpdateAudioModule()
+        self.delete_ids.side_effect = module.delete_track_ids
+        reads = []
+
+        def committed_inventory(*_args):
+            reads.append(len(reads))
+            self.assertFalse(any(event[0] == "add" for event in self.events))
+            if len(reads) == 2:
+                self.payload["audioTracks"] = [t for t in self.payload["audioTracks"] if t["audioContentTypeString"] != "descriptive"]
+            return copy.deepcopy(self.payload)
+
+        with (
+            patch("src.module.audio_module.get_channels_info", return_value=SimpleNamespace(
+                id="channel", role="OWNER", delegated_session_id="owner", cookies=[],
+            )),
+            patch("src.module.audio_module.studio_authorization_header", return_value="auth"),
+            patch.object(module, "_get_session_token", return_value="token"),
+            patch("src.module.audio_module.post_with_stop", return_value=Response(200)) as post,
+            patch.object(module, "_get_video_translation_payload", side_effect=committed_inventory),
+            patch("src.module.audio_module.wait_interruptibly"),
+        ):
+            result = await recovery.run_audio_recovery_cycle(now=2000)
+        self.assertEqual(len(reads), 2)
+        self.assertEqual(post.call_args.kwargs["json"]["audioTrackId"], "video-en-descriptive")
+        self.assertEqual(self.events, [("add", "descriptive", "en")])
+        self.assertEqual(result["repaired"], 1)
+
+    async def test_auto_does_not_add_description_when_youtube_has_not_committed_the_delete(self):
+        self.entry["languages"] = ["en"]
+        self.reset_registry()
+        self.payload = response([audio_track("en", "dubbed"), audio_track("en", status="FAILED")])
+        module = UpdateAudioModule()
+        self.delete_ids.side_effect = lambda vid, channel, ids: (
+            module._confirm_audio_tracks_deleted(vid, channel, ids) or 200
+        )
+        with (
+            patch.object(module, "_get_video_translation_payload", side_effect=lambda *_: copy.deepcopy(self.payload)),
+            patch("src.module.audio_module.wait_interruptibly"),
+        ):
+            result = await recovery.run_audio_recovery_cycle(now=2000)
+        self.add.assert_not_called()
+        self.assertEqual(result["failed"], 1)
         self.assertFalse(self.saved_entry()["description_attempts"]["en"]["succeeded"])
 
     async def test_healthy_dub_duplicate_keeps_language_audio_while_description_is_replaced(self):

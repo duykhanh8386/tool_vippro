@@ -161,6 +161,38 @@ class AudioUploadConfirmationTests(unittest.TestCase):
         self.assertEqual(raised.exception.status_code, 403)
         self.assertFalse(raised.exception.retryable)
 
+    def test_deletion_waits_for_committed_inventory_and_keeps_unrelated_tracks(self):
+        failed = track(status="FAILED", track_id="old")
+        working = track(status="PROCESSED", track_id="working", language="fr")
+        self.fetch.side_effect = [
+            {"videoTranslations": [{"videoId": "video"}], "audioTracks": [failed, working]},
+            {"videoTranslations": [{"videoId": "video"}], "audioTracks": [working]},
+        ]
+        self.module._confirm_audio_tracks_deleted("video", "channel", ["old"])
+        self.assertEqual(self.fetch.call_count, 2)
+        self.wait.assert_called_once_with(2)
+
+    def test_unchanged_failed_track_cannot_confirm_deletion(self):
+        self.payload["audioTracks"] = [track(status="FAILED", track_id="old")]
+        with self.assertRaisesRegex(AudioUpdateError, "track_ids=old"):
+            self.module._confirm_audio_tracks_deleted("video", "channel", ["old"])
+        self.assertEqual(self.fetch.call_count, 4)
+
+    def test_unreadable_inventory_cannot_confirm_deletion(self):
+        self.payload = {"videoTranslations": [], "audioTracks": []}
+        with self.assertRaises(AudioUpdateError):
+            self.module._confirm_audio_tracks_deleted("video", "channel", ["old"])
+
+    def test_deleted_tombstone_confirms_deletion(self):
+        self.payload["audioTracks"] = [track(status="DELETED", track_id="old")]
+        self.module._confirm_audio_tracks_deleted("video", "channel", ["old"])
+        self.wait.assert_not_called()
+
+    def test_empty_other_video_cannot_confirm_deletion_of_target_video(self):
+        self.payload = {"videoTranslations": [{"videoId": "other"}], "audioTracks": []}
+        with self.assertRaises(AudioUpdateError):
+            self.module._confirm_audio_tracks_deleted("video", "channel", ["old"])
+
     def test_missing_upload_status_requires_a_confirming_query(self):
         with patch("src.module.audio_module.post_with_stop", side_effect=[
             Response(headers={}), Response(headers={"X-Goog-Upload-Status": "final"}),

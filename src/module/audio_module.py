@@ -563,7 +563,33 @@ class UpdateAudioModule(IModule):
                     retryable=response.status_code == 429 or response.status_code >= 500,
                 )
             self._check_audio_rpc_response(response, "xóa audio track")
+        self._confirm_audio_tracks_deleted(id_video, channel_id, unique_track_ids)
         return 200
+
+    def _confirm_audio_tracks_deleted(self, video_id: str, channel_id: str, track_ids: list[str]) -> None:
+        """Wait for Studio's committed inventory before uploading a replacement."""
+        expected = set(track_ids)
+        remaining = expected
+        for attempt in range(4):
+            check_stopped()
+            payload = self._get_video_translation_payload([video_id], channel_id)
+            if video_id not in self._readable_translation_video_ids(payload, [video_id]):
+                raise AudioUpdateError("Không đọc được trạng thái video sau khi xóa audio; chưa thêm bản thay thế")
+            remaining = {
+                str(track["audioTrackId"])
+                for track in self._video_audio_tracks(payload, video_id)
+                if str(track["audioTrackId"]) in expected
+                and not str(track.get("status") or "").upper().endswith(("DELETED", "REMOVED"))
+            }
+            if not remaining:
+                logger.info("YouTube audio deletion verified: video={} track_ids={}", video_id, ",".join(sorted(expected)))
+                return
+            if attempt < 3:
+                wait_interruptibly(2 * (attempt + 1))
+        raise AudioUpdateError(
+            "YouTube chưa áp dụng việc xóa audio; chưa thêm bản thay thế. "
+            f"video={video_id}, track_ids={','.join(sorted(remaining))}"
+        )
 
     def delete(self, id_video: str, channel_id: str, languages: list[str] | None = None):
         """Delete creator dubs, optionally scoped to exact language codes."""
