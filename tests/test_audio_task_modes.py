@@ -394,6 +394,26 @@ class AudioTaskModeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.description_events, ["description:vi"])
         self.assertEqual(self.state.states["audio_add"]["video_description_status"]["video"]["en"], "already_added")
 
+    async def test_server_rejection_during_normal_transfer_still_allows_its_description(self):
+        self.state.states["audio_add"] = self.saved_add_state()
+        client = self.render()
+        original_add = self.add.side_effect
+
+        def add(**kwargs):
+            if kwargs.get("audio_content_type") != "descriptive" and kwargs["language"] == "en":
+                kwargs["progress"].update(registered=True, file_finalized=False, server_rejected=True,
+                                          studio_state="failed", track_status="AUDIO_TRACK_STATUS_FAILED")
+                raise AudioUpdateError("YouTube rejected track during transfer")
+            return original_add(**kwargs)
+
+        self.add.side_effect = add
+        with client:
+            await self.button_callback(client, "Bắt đầu xóa & thêm audio")()
+        saved = self.state.states["audio_add"]
+        self.assertEqual(saved["video_processing_status"]["video"]["en"], "unsuccessful")
+        self.assertEqual(saved["video_description_status"]["video"]["en"], "successful")
+        self.assertEqual(self.description_events, ["description:en", "description:vi"])
+
     async def test_failed_description_is_deleted_before_reupload_and_healthy_description_is_kept(self):
         self.state.states["audio_add"] = self.saved_add_state()
         self.track_states.side_effect = None

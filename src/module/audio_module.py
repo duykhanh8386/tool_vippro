@@ -26,17 +26,20 @@ class AudioUpdateError(Exception):
 class _AudioUploadBody(BytesIO):
     """Report bytes handed to HTTP without waiting for a whole chunk's reply."""
 
-    def __init__(self, data: bytes, offset: int, progress: dict | None):
+    def __init__(self, data: bytes, offset: int, progress: dict | None, check_upload=None):
         super().__init__(data)
         self._size = len(data)
         self._offset = offset
         self._progress = progress
+        self._check_upload = check_upload
 
     def __len__(self) -> int:
         return self._size
 
     def read(self, size: int = -1) -> bytes:
         check_stopped()
+        if self._check_upload is not None:
+            self._check_upload()
         block = super().read(size)
         if block and self._progress is not None:
             sent = self._offset + self.tell()
@@ -51,10 +54,11 @@ class _AudioUploadBody(BytesIO):
 class _AudioUploadFile:
     """Stream one whole HTTP body without buffering the complete music file."""
 
-    def __init__(self, source, size: int, progress: dict | None):
+    def __init__(self, source, size: int, progress: dict | None, check_upload=None):
         self.source = source
         self.size = size
         self.progress = progress
+        self.check_upload = check_upload
 
     def __len__(self):
         return self.size
@@ -76,6 +80,8 @@ class _AudioUploadFile:
 
     def read(self, size=-1):
         check_stopped()
+        if self.check_upload is not None:
+            self.check_upload()
         remaining = self.size - self.tell()
         block = self.source.read(remaining if size is None or size < 0 else min(size, remaining))
         if not block and remaining:
@@ -154,8 +160,11 @@ class UpdateAudioModule(IModule):
         file_size = len(data) if data is not None else os.path.getsize(source_path)
         if file_size <= 0:
             raise AudioUpdateError("File audio rỗng, không thể tải lên")
+        if progress is None:
+            progress = {}
         if progress is not None:
-            progress.update(file_finalized=False, registered=False, track_id="", track_status="", studio_state="")
+            progress.update(file_finalized=False, registered=False, track_id="", track_status="", studio_state="",
+                            server_rejected=False, studio_checked_at=0)
         before = self._audio_upload_snapshot(id_video, channel_id, language, audio_content_type)
         if any(self._audio_upload_track_state(track) == "published" for track in before.values()):
             if progress is not None:
@@ -193,6 +202,7 @@ class UpdateAudioModule(IModule):
                 language=language,
                 session=session,
                 audio_content_type=audio_content_type,
+                progress=progress,
             )
             if res == 409:
                 if self._has_audio_track(
@@ -217,6 +227,7 @@ class UpdateAudioModule(IModule):
                 progress=progress,
                 session=session,
                 single_request=True,
+                check_upload=self._audio_upload_watchdog(id_video, channel_id, language, audio_content_type, progress),
             )
             if progress is not None:
                 progress["file_finalized"] = True
@@ -238,19 +249,60 @@ class UpdateAudioModule(IModule):
                     ("dubbed" if self._is_creator_dubbed_track(track) else "")).casefold() == content_type
         }
 
+    def _audio_upload_watchdog(self, video_id, channel_id, language, content_type, progress):
+        """Stop a slow transfer when its exact registered track already failed."""
+        track_id = progress.get("track_id")
+        if not track_id:
+            return None
+        next_check = time.monotonic() + 5
+        failure = None
+
+        def check():
+            nonlocal next_check, failure
+            if failure is not None:
+                raise failure
+            if time.monotonic() < next_check:
+                return
+            next_check = time.monotonic() + 15
+            try:
+                track = self._audio_upload_snapshot(video_id, channel_id, language, content_type).get(track_id)
+            except TaskStopped:
+                raise
+            except Exception as exc:
+                # A read outage is not proof that an in-flight file failed.
+                logger.warning("Cannot observe uploading audio: video={} track_id={} error_type={}",
+                               video_id, track_id, type(exc).__name__)
+                return
+            if track is None:
+                return
+            state = self._audio_upload_track_state(track)
+            status = str(track.get("status") or track.get("publishStatus") or "unknown")
+            progress.update(track_status=status, studio_state=state, studio_checked_at=time.time())
+            if state == "failed":
+                progress.update(status="error", server_rejected=True)
+                reason = str(track.get("failureReason") or track.get("rejectedReason") or "unknown")
+                failure = AudioUpdateError(
+                    f"YouTube trả {status} ngay trong lúc gửi {content_type} ({language}); "
+                    f"track={track_id}, reason={reason}. Đã dừng gửi file vì track đã lỗi."
+                )
+                raise failure
+
+        return check
+
     def _verify_audio_upload(self, video_id, channel_id, language, content_type, before, *, progress=None):
         if progress is not None:
             progress["status"] = "verifying"
         last = "missing"
+        expected_track_id = progress.get("track_id") if progress is not None else None
         for attempt in range(4):
             check_stopped()
             tracks = self._audio_upload_snapshot(video_id, channel_id, language, content_type)
             candidates = {
                 track_id: track for track_id, track in tracks.items()
-                if track_id not in before or (
+                if (not expected_track_id or track_id == expected_track_id) and (track_id not in before or (
                     self._audio_upload_track_state(before[track_id]) == "failed"
                     and self._audio_upload_track_state(track) in {"processing", "published"}
-                )
+                ))
             }
             for track_id, track in sorted(candidates.items(), key=lambda item: (
                 {"published": 0, "processing": 1, "failed": 2, "unknown": 3}[self._audio_upload_track_state(item[1])],
@@ -261,7 +313,8 @@ class UpdateAudioModule(IModule):
                 if state == "failed":
                     reason = str(track.get("failureReason") or track.get("rejectedReason") or "unknown")
                     if progress is not None:
-                        progress.update(status="error", track_id=track_id, track_status=last)
+                        progress.update(status="error", track_id=track_id, track_status=last,
+                                        studio_state="failed", server_rejected=True, studio_checked_at=time.time())
                     raise AudioUpdateError(
                         f"YouTube trả {last} sau khi tải {content_type} ({language}); "
                         f"track={track_id}, reason={reason}. Không tính là đã thêm thành công."
@@ -269,7 +322,7 @@ class UpdateAudioModule(IModule):
                 if state in {"published", "processing"}:
                     if progress is not None:
                         progress.update(status="complete", track_id=track_id, track_status=last,
-                                        studio_state=state)
+                                        studio_state=state, studio_checked_at=time.time())
                     logger.info(
                         "YouTube audio upload verified: video={} language={} type={} track_id={} status={}",
                         video_id, language, content_type, track_id, last,
@@ -280,7 +333,7 @@ class UpdateAudioModule(IModule):
             if attempt < 3:
                 wait_interruptibly(2 * (attempt + 1))
         if progress is not None:
-            progress["status"] = "error"
+            progress.update(status="error", studio_state="unconfirmed")
         raise AudioUpdateError(
             f"YouTube chưa xác nhận track mới {content_type} ({language}) trên video {video_id}: {last}. "
             "Không tính là đã thêm thành công; kiểm tra lại Studio trước khi thử lại."
@@ -403,6 +456,7 @@ class UpdateAudioModule(IModule):
         progress: dict | None = None,
         session: requests.Session | None = None,
         single_request: bool = False,
+        check_upload=None,
     ) -> str:
         """Upload a complete body like TV Automation, with resumable retries."""
         base_headers = self._base_upload_headers(fname_header, cookie_string)
@@ -432,16 +486,16 @@ class UpdateAudioModule(IModule):
                 end = total if single_request else min(offset + self._CHUNK_SIZE, total)
                 if single_request and source_file is not None and offset < total:
                     source_file.seek(offset)
-                    body = _AudioUploadFile(source_file, total, progress)
+                    body = _AudioUploadFile(source_file, total, progress, check_upload)
                     body_size = end - offset
                 elif source_file is not None:
                     source_file.seek(offset)
                     chunk = source_file.read(end - offset)
-                    body = _AudioUploadBody(chunk, offset, progress)
+                    body = _AudioUploadBody(chunk, offset, progress, check_upload)
                     body_size = len(chunk)
                 else:
                     chunk = data[offset:end]
-                    body = _AudioUploadBody(chunk, offset, progress)
+                    body = _AudioUploadBody(chunk, offset, progress, check_upload)
                     body_size = len(chunk)
                 if not body_size and not needs_finalize:
                     raise AudioUpdateError(
@@ -497,6 +551,9 @@ class UpdateAudioModule(IModule):
                 except TaskStopped:
                     raise
                 except Exception as exc:
+                    if check_upload is not None:
+                        # Requests may wrap a body-reader error in ConnectionError.
+                        check_upload()
                     if isinstance(exc, AudioUpdateError) and not exc.retryable:
                         if progress is not None:
                             progress["status"] = "error"
@@ -541,13 +598,20 @@ class UpdateAudioModule(IModule):
         if progress is not None:
             progress["status"] = "complete"
         return "final"
-    def _update(self, video_id: str, scotty_resource_id: str, channel_info: ChannelInfo, cookie_string: str, session_token: str, language: str, session: requests.Session | None = None, audio_content_type: str = "dubbed"):
+    def _update(self, video_id: str, scotty_resource_id: str, channel_info: ChannelInfo, cookie_string: str, session_token: str, language: str, session: requests.Session | None = None, audio_content_type: str = "dubbed", progress: dict | None = None):
         url = "https://studio.youtube.com/youtubei/v1/creator/add_audio_track?alt=json"; headers = {"Host": "studio.youtube.com", "Cookie": cookie_string, "Authorization": studio_authorization_header(channel_info.cookies), "Content-Type": "application/json", "Origin": "https://studio.youtube.com", "Referer": f"https://studio.youtube.com/video/{video_id}/translations", "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36", "Accept": "*/*", "Accept-Language": "en-US,en;q=0.9"}; payload = {"videoId": video_id, "resourceId": {"scottyResourceId": {"id": scotty_resource_id}}, "language": language, "audioContentTypeString": audio_content_type, "audioTrackSource": "AUDIO_TRACK_SOURCE_CREATOR", "context": {"client": {"clientName": 62, "clientVersion": "1.20250902.04.00", "hl": "en", "gl": "VN", "utcOffsetMinutes": 420, "userInterfaceTheme": "USER_INTERFACE_THEME_DARK", "screenWidthPoints": 1920, "screenHeightPoints": 945, "screenPixelDensity": 1, "screenDensityFloat": 1}, "request": {"returnLogEntry": True, "internalExperimentFlags": [], "eats": "AWSNWa0l7AGlCHtnt233UutuGGeh33lZ817vfraxpNhL8LY5gqkpaiN73HzUXyRRQ2ApQuCVRfHRtr9rlEQ8rczpjRVn_mm0nP74Qdc4IR95HbzJKhorwIoTVAqfC4o=", "sessionInfo": {"token": session_token}}, "user": {"onBehalfOfUser": channel_info.delegated_session_id, "delegationContext": {"externalChannelId": channel_info.id, "roleType": {"channelRoleType": channel_info.role}}, "serializedDelegationContext": self._serialized_delegation_context(channel_info)}, "clickTracking": {"visualElement": {"veType": 74_618}}, "clientScreenNonce": "UUFKQY_AX3QaOzkG"}}; response = post_with_stop(url, headers=headers, json=payload, session=session)
         if response.status_code not in (200, 409):
             logger.error("YouTube add_audio_track failed: status={} body={}", response.status_code, response.text[:1000])
             raise AudioUpdateError(_youtube_error_message(response, "gắn audio vào video"), status_code=response.status_code, retryable=response.status_code == 429 or response.status_code >= 500)
         if response.status_code == 200:
-            self._check_audio_rpc_response(response, "gắn audio vào video")
+            result = self._check_audio_rpc_response(response, "gắn audio vào video")
+            if result.get("videoId") not in (None, video_id):
+                raise AudioUpdateError("YouTube trả track thuộc video khác; chưa xác nhận tải audio")
+            track_id = result.get("audioTrackId")
+            if progress is not None and isinstance(track_id, str) and track_id:
+                progress["track_id"] = track_id
+                logger.info("YouTube audio track registered: video={} language={} type={} track_id={}",
+                            video_id, language, audio_content_type, track_id)
         return response.status_code
     def delete_track_ids(
         self, id_video: str, channel_id: str, track_ids: list[str]

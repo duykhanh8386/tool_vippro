@@ -185,6 +185,24 @@ class RegistryAudioTypeTests(RegistryAudioFixture, unittest.IsolatedAsyncioTestC
         self.assertEqual(result["channel_results"][0]["submitted"], 0)
         self.assertFalse(self.saved_entry()["description_attempts"]["en"]["succeeded"])
 
+    async def test_early_registered_dub_failure_does_not_block_its_description(self):
+        def upload(**kwargs):
+            kind, language = kwargs["audio_content_type"], kwargs["language"]
+            if kind == "dubbed":
+                self.events.append(("add", kind, language))
+                self.payload["audioTracks"].append(audio_track(language, kind, "FAILED"))
+                kwargs["progress"].update(registered=True, file_finalized=False, server_rejected=True,
+                                          studio_state="failed", track_status="AUDIO_TRACK_STATUS_FAILED")
+                raise AudioUpdateError("server rejected track during transfer")
+            return self.upload(**kwargs)
+
+        self.add.side_effect = upload
+        result = await recovery.run_audio_recovery_cycle(now=2000)
+        self.assertEqual(self.events, [("add", kind, lang) for lang in ("en", "vi") for kind in ("dubbed", "descriptive")])
+        self.assertEqual((result["repaired"], result["failed"]), (2, 2))
+        self.assertFalse(self.saved_entry()["dubbed_attempts"]["en"]["succeeded"])
+        self.assertTrue(self.saved_entry()["description_attempts"]["en"]["succeeded"])
+
     async def test_failed_description_is_not_added_until_youtube_commits_its_deletion(self):
         self.entry["languages"] = ["en"]
         self.reset_registry()

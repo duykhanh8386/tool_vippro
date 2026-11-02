@@ -57,7 +57,7 @@ class TvAudioUploadTests(unittest.TestCase):
                         self.assertEqual(payload["resourceId"], {"scottyResourceId": {"id": "resource"}})
                         self.assertEqual((payload["videoId"], payload["language"], payload["audioContentTypeString"]),
                                          ("video", "en", kind))
-                        return response()
+                        return response(body={"videoId": "video", "audioTrackId": "new"})
                     self.assertEqual(request.headers["Content-Type"], "application/x-www-form-urlencoded;charset=utf-8")
                     self.assertEqual(request.headers["Content-Length"], "10")
                     self.assertNotIn("Transfer-Encoding", request.headers)

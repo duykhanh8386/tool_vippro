@@ -2610,7 +2610,9 @@ def create_add_audio_page(*, delete_existing: bool = True):
             except TaskStopped:
                 raise
             except Exception as exc:
-                if not descriptive and upload_progress.get("file_finalized") and upload_progress.get("registered"):
+                if not descriptive and upload_progress.get("registered") and (
+                    upload_progress.get("file_finalized") or upload_progress.get("server_rejected")
+                ):
                     submitted_normal_audio.add((vid, lang))
                 statuses.setdefault(vid, {})[lang] = "unsuccessful"
                 overall_errors.append(f"{vid}-{lang}{' (mô tả)' if descriptive else ''}: {exc}")

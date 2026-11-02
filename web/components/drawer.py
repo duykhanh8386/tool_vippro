@@ -75,6 +75,8 @@ def _recovery_transfer_text(job: dict) -> str:
         )
     if job.get("phase") != "uploading":
         return "—"
+    if job.get("upload_studio_state") == "failed":
+        return "YouTube báo không xử lý được · đã dừng gửi file"
     stage = {
         "deleting": "Đang xóa track cần thay lại",
         "authenticating": "Đang xác thực",
@@ -95,6 +97,20 @@ def _recovery_transfer_text(job: dict) -> str:
     total = int(job.get("upload_total") or 0)
     fraction = float(job.get("upload_fraction") or 0)
     return f"{stage} · {fraction:.0%} · {_format_transfer_size(sent)} / {_format_transfer_size(total)}"
+
+
+def _recovery_studio_text(job: dict) -> str:
+    """Describe observed server state separately from local byte progress."""
+    if job.get("phase") != "uploading":
+        return "—"
+    state = job.get("upload_studio_state")
+    if state == "failed":
+        return "Không xử lý được"
+    if state == "published":
+        return "Đã xuất bản"
+    if state == "processing":
+        return "Đang xử lý" if job.get("upload_status") == "complete" else "Đang chờ nhận đủ file"
+    return "Chưa xác nhận trạng thái"
 
 
 def _navigate(route: str) -> None:
@@ -312,6 +328,7 @@ def create_drawer():
                         {"name": "pass_index", "label": "Lượt quét", "field": "pass_index"},
                         {"name": "message", "label": "Tiến độ / Kết quả", "field": "message", "classes": "whitespace-normal", "style": "min-width: 200px; max-width: 350px"},
                         {"name": "transfer", "label": "Tiến độ file", "field": "transfer", "style": "min-width: 240px"},
+                        {"name": "studio", "label": "Trạng thái YouTube", "field": "studio", "style": "min-width: 180px"},
                     ],
                     rows=[], row_key="channel_id",
                 ).props("dense flat").classes("w-full")
@@ -324,6 +341,24 @@ def create_drawer():
                             <span>{{ props.row.transfer }}</span>
                         </div>
                         <span v-else>{{ props.row.transfer }}</span>
+                    </q-td>
+                ''')
+                recovery_channel_table.add_slot("body-cell-studio", '''
+                    <q-td :props="props">
+                        <span :class="props.row.upload_studio_state === 'failed' ? 'text-negative' : ''">
+                            {{ props.row.studio }}
+                        </span>
+                        <div v-if="props.row.upload_track_id" class="text-caption text-grey-7">
+                            {{ props.row.upload_track_id }}
+                        </div>
+                    </q-td>
+                ''')
+                recovery_channel_table.add_slot("body-cell-message", '''
+                    <q-td :props="props" style="min-width: 200px; max-width: 350px; white-space: normal">
+                        <div>{{ props.row.message }}</div>
+                        <div v-if="props.row.last_error" class="text-caption text-negative">
+                            Lỗi gần nhất: {{ props.row.last_error }}
+                        </div>
                     </q-td>
                 ''')
                 recovery_detail_progress = ui.linear_progress(value=0, show_value=False, size="12px").props(
@@ -391,6 +426,7 @@ def create_drawer():
                         **job,
                         "name": get_recovery_channel_name(job["channel_id"]),
                         "transfer": _recovery_transfer_text(job),
+                        "studio": _recovery_studio_text(job),
                     }
                     for job in status.get("channels", []) if active
                 ] + [
@@ -398,7 +434,7 @@ def create_drawer():
                         **result,
                         "pass_index": result.get("pass_count", 1),
                         "name": get_recovery_channel_name(result["channel_id"]),
-                        "video_id": "—", "language": "—", "transfer": "—",
+                        "video_id": "—", "language": "—", "transfer": "—", "studio": "—",
                     }
                     for result in status.get("channel_results", [])
                 ])

@@ -293,6 +293,9 @@ def _with_upload_progress(snapshot: dict) -> dict:
     snapshot["upload_confirmed"] = confirmed
     snapshot["upload_status"] = str(upload.get("status") or "")
     snapshot["upload_studio_state"] = str(upload.get("studio_state") or "")
+    snapshot["upload_track_id"] = str(upload.get("track_id") or "")
+    snapshot["upload_track_status"] = str(upload.get("track_status") or "")
+    snapshot["upload_studio_checked_at"] = upload.get("studio_checked_at") or 0
     snapshot["upload_fraction"] = min(1.0, sent / total) if total else 0.0
     output_path = snapshot.pop("_preparation_output_path", None)
     snapshot["preparation_elapsed_seconds"] = 0
@@ -3029,16 +3032,23 @@ async def run_audio_recovery_cycle(
                                         )
                                     except Exception as exc:
                                         if audio_content_type == "dubbed":
-                                            if upload_progress.get("file_finalized") and upload_progress.get("registered"):
+                                            if upload_progress.get("registered") and (
+                                                upload_progress.get("file_finalized") or upload_progress.get("server_rejected")
+                                            ):
                                                 # A completed ordinary upload can still be rejected
-                                                # by processing; the description gets its own attempt.
+                                                # by processing. An explicit early server rejection
+                                                # also leaves a registered dub; try its description
+                                                # independently instead of blocking that repair.
                                                 submitted_dubbed_languages.add(language.casefold())
                                             else:
                                                 failed_dubbed_languages.add(language.casefold())
                                         channel_result["errors"] += 1
                                         channel_result["last_error"] = _recovery_channel_error(exc)
                                         failed += 1
-                                        _update_runtime_status(failed=failed)
+                                        _update_runtime_status(
+                                            failed=failed,
+                                            last_error=f"{video_id} · {language} · {track_label}: {channel_result['last_error']}",
+                                        )
                                         if _requires_channel_refresh(exc):
                                             mark_channel_refresh_required(
                                                 channel_id, exc, now=cycle_time
