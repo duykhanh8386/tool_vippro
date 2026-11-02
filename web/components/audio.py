@@ -3230,25 +3230,30 @@ def create_add_audio_page(*, delete_existing: bool = True):
                         f"Tối đa {max_concurrency} video song song; ngôn ngữ chạy lần lượt"
                     ),
                 )
-                for language_index, lang in enumerate(missing_languages, 1):
+                for language_index, lang in enumerate(languages_for_video, 1):
                     check_stopped()
-                    best_effort_ui(
-                        "render language upload state",
-                        lambda language_index=language_index, lang=lang: status_label.set_text(
-                            f"Đang tải mã còn thiếu {language_index}/{len(missing_languages)}: {lang}"
-                        ),
-                    )
-                    await run_upload(
-                        vid=vid,
-                        lang=lang,
-                        temp_audio_path=temp_audio_path,
-                    )
-                    completed_tasks += 1
-                    completed_by_video[vid] += 1
-                    save_right_panel_state()
+                    if lang in missing_languages:
+                        best_effort_ui(
+                            "render language upload state",
+                            lambda language_index=language_index, lang=lang: status_label.set_text(
+                                f"Đang thêm audio ngôn ngữ {language_index}/{len(languages_for_video)}: {lang}"
+                            ),
+                        )
+                        await run_upload(
+                            vid=vid,
+                            lang=lang,
+                            temp_audio_path=temp_audio_path,
+                        )
+                        completed_tasks += 1
+                        completed_by_video[vid] += 1
+                        if save_right_panel_state() is False:
+                            raise RuntimeError("Không thể lưu checkpoint audio ngôn ngữ")
+                    # Complete this language's description before moving on,
+                    # including published/processing normal tracks kept above.
+                    await run_descriptions(vid, [lang], temp_audio_path)
                     best_effort_ui(
                         "render completed language",
-                        lambda language_index=language_index: (
+                        lambda language_index=language_index, lang=lang: (
                             setattr(
                                 progress_bar,
                                 "value",
@@ -3256,11 +3261,10 @@ def create_add_audio_page(*, delete_existing: bool = True):
                             ),
                             refresh_right_panel(force=False),
                             status_label.set_text(
-                                f"Hoàn thành {language_index}/{len(missing_languages)} mã còn thiếu cho video {vid}"
+                                f"Đã xử lý audio và mô tả {language_index}/{len(languages_for_video)}: {lang}"
                             ),
                         ),
                     )
-                await run_descriptions(vid, languages_for_video, temp_audio_path)
                 if all(
                     video_processing_status.get(vid, {}).get(language)
                     in ("successful", "already_added")

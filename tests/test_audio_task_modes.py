@@ -158,13 +158,69 @@ class AudioTaskModeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([
             (call.kwargs["language"], call.kwargs.get("audio_content_type", "dubbed"))
             for call in self.add.call_args_list
-        ], [("en", "dubbed"), ("vi", "dubbed"), ("en", "descriptive"), ("vi", "descriptive")])
+        ], [("en", "dubbed"), ("en", "descriptive"), ("vi", "dubbed"), ("vi", "descriptive")])
         self.assertEqual(self.state.states["audio_add"]["video_description_status"]["video"], {
             "en": "successful", "vi": "successful",
         })
         self.assertEqual(self.state.states["audio_add"]["video_cleanup_status"]["video"], "successful")
         self.assertNotIn("audio_add_only", self.state.states)
         self.assertFalse(get_audio_mutation_guard(self.channel.id).locked())
+
+    async def test_description_checkpoint_exists_before_the_next_language_starts_in_both_add_modes(self):
+        for delete_existing, state_key, button in (
+            (True, "audio_add", "Bắt đầu xóa & thêm audio"),
+            (False, "audio_add_only", "Bắt đầu thêm audio"),
+        ):
+            with self.subTest(delete_existing=delete_existing):
+                self.state.states[state_key] = self.saved_add_state()
+                self.add.reset_mock()
+
+                def upload(**kwargs):
+                    if kwargs["language"] == "vi" and kwargs.get("audio_content_type") != "descriptive":
+                        saved = self.state.states[state_key]
+                        self.assertEqual(saved["video_description_status"]["video"]["en"], "successful")
+                    return 200
+
+                self.add.side_effect = upload
+                client = self.render(delete_existing=delete_existing)
+                with client:
+                    await self.button_callback(client, button)()
+                self.assertEqual([
+                    (call.kwargs["language"], call.kwargs.get("audio_content_type", "dubbed"))
+                    for call in self.add.call_args_list
+                ], [("en", "dubbed"), ("en", "descriptive"), ("vi", "dubbed"), ("vi", "descriptive")])
+
+    async def test_resume_twelve_normal_tracks_fills_descriptions_before_the_seven_remaining_language_pairs(self):
+        languages = "en-AU en-CA en-US pt de de-CH ru ru-Latn es es-US nl nl-BE nl-NL it ja fr th km my".split()
+        saved = self.saved_add_state()
+        saved.update({"selected_languages": languages,
+                      "video_processing_status": {"video": {lang: "successful" for lang in languages[:12]}}})
+        self.state.states["audio_add"] = saved
+        self.track_states.side_effect = lambda _vid, _channel, requested: {
+            lang: {"dubbed": "inflight" if lang in languages[:12] else "missing", "descriptive": "missing"}
+            for lang in requested
+        }
+
+        def upload(**kwargs):
+            if kwargs.get("audio_content_type") != "descriptive":
+                descriptions = self.state.states["audio_add"]["video_description_status"]["video"]
+                for lang in languages[:languages.index(kwargs["language"])]:
+                    self.assertEqual(descriptions[lang], "successful")
+            return 200
+
+        self.add.side_effect = upload
+        client = self.render()
+        with client:
+            await self.button_callback(client, "Bắt đầu xóa & thêm audio")()
+        expected = [(lang, "descriptive") for lang in languages[:12]]
+        expected += [(lang, kind) for lang in languages[12:] for kind in ("dubbed", "descriptive")]
+        self.assertEqual([
+            (call.kwargs["language"], call.kwargs.get("audio_content_type", "dubbed"))
+            for call in self.add.call_args_list
+        ], expected)
+        self.assertEqual(set(self.state.states["audio_add"]["video_description_status"]["video"]), set(languages))
+        self.delete.assert_not_called()
+        self.delete_tracks.assert_not_called()
 
     async def test_combined_manual_keeps_published_dub_and_repairs_only_failed_language(self):
         self.state.states["audio_add"] = self.saved_add_state()
@@ -657,9 +713,10 @@ class AudioTaskModeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.add.call_count, 60)
         for video_id in expected:
             calls = [call for call in self.add.call_args_list if call.kwargs["id_video"] == video_id]
-            self.assertEqual([call.kwargs["language"] for call in calls[:15]], languages)
-            self.assertEqual([call.kwargs["language"] for call in calls[15:]], languages)
-            self.assertTrue(all(call.kwargs.get("audio_content_type") == "descriptive" for call in calls[15:]))
+            self.assertEqual([
+                (call.kwargs["language"], call.kwargs.get("audio_content_type", "dubbed"))
+                for call in calls
+            ], [(language, kind) for language in languages for kind in ("dubbed", "descriptive")])
             self.assertEqual(set(self.state.states["audio_add"]["video_description_status"][video_id]), set(languages))
         self.assertTrue(all(not Path(call.kwargs["file_name"]).exists() for call in self.add.call_args_list))
 
