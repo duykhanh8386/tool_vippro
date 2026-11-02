@@ -111,14 +111,13 @@ class RegistryAudioTypeTests(RegistryAudioFixture, unittest.IsolatedAsyncioTestC
         await recovery.run_audio_recovery_cycle(now=2031)
         self.assertTrue(registry_entry_complete(self.saved_entry(), self.selected()))
 
-    async def test_both_types_replace_healthy_language_audio_before_failed_description(self):
+    async def test_both_types_preserve_healthy_language_audio_and_replace_only_failed_description(self):
         self.entry["languages"] = ["en"]
         self.reset_registry()
         recovery.set_audio_recovery_audio_types(["dubbed", "descriptive"])
         self.payload = response([audio_track("en", "dubbed"), audio_track("en", status="FAILED")])
         await recovery.run_audio_recovery_cycle(now=2000)
         self.assertEqual(self.events, [
-            ("delete", ("video-en-dubbed",)), ("add", "dubbed", "en"),
             ("delete", ("video-en-descriptive",)), ("add", "descriptive", "en"),
         ])
 
@@ -135,7 +134,7 @@ class RegistryAudioTypeTests(RegistryAudioFixture, unittest.IsolatedAsyncioTestC
         self.assertEqual(len(self.events), 4)
         self.assertTrue(registry_entry_complete(self.saved_entry(), self.selected()))
 
-    async def test_paired_replacement_deletes_all_creator_dubs_of_only_the_target_language(self):
+    async def test_healthy_dub_duplicate_keeps_language_audio_while_description_is_replaced(self):
         self.entry["languages"] = ["en"]
         self.reset_registry()
         recovery.set_audio_recovery_audio_types(["dubbed", "descriptive"])
@@ -144,10 +143,10 @@ class RegistryAudioTypeTests(RegistryAudioFixture, unittest.IsolatedAsyncioTestC
             audio_track("en", status="FAILED"), audio_track("fr", "dubbed"), audio_track("fr"),
         ])
         await recovery.run_audio_recovery_cycle(now=2000)
-        self.assertEqual(self.events[0], ("delete", ("duplicate-failed", "video-en-dubbed")))
+        self.assertEqual(self.events[0], ("delete", ("video-en-descriptive",)))
         self.assertTrue(all("video-fr" not in str(event) for event in self.events))
         self.assertEqual([event for event in self.events if event[0] == "add"], [
-            ("add", "dubbed", "en"), ("add", "descriptive", "en"),
+            ("add", "descriptive", "en"),
         ])
 
     async def test_processed_tracks_are_completed_and_not_replaced_as_if_they_were_stuck(self):
@@ -186,7 +185,7 @@ class RegistryAudioTypeTests(RegistryAudioFixture, unittest.IsolatedAsyncioTestC
         self.add.assert_not_called()
         self.assertTrue(registry_entry_complete(self.saved_entry(), self.selected()))
 
-    async def test_description_retry_does_not_repeatedly_delete_successfully_replaced_language_audio(self):
+    async def test_description_retry_never_deletes_healthy_language_audio(self):
         self.entry["languages"] = ["en"]
         self.reset_registry()
         recovery.set_audio_recovery_audio_types(["dubbed", "descriptive"])
@@ -200,11 +199,44 @@ class RegistryAudioTypeTests(RegistryAudioFixture, unittest.IsolatedAsyncioTestC
         self.add.side_effect = upload
         await recovery.run_audio_recovery_cycle(now=2000)
         await recovery.run_audio_recovery_cycle(now=2031)
-        self.assertEqual([event for event in self.events if event[0] == "add"], [("add", "dubbed", "en")])
-        self.assertEqual([event for event in self.events if event == ("delete", ("video-en-dubbed",))], [
-            ("delete", ("video-en-dubbed",)),
-        ])
+        self.assertEqual([event for event in self.events if event[0] == "add"], [])
+        self.assertEqual([event for event in self.events if event == ("delete", ("video-en-dubbed",))], [])
         self.assertFalse(self.saved_entry()["description_attempts"]["en"]["succeeded"])
+
+    async def test_language_processed_during_render_is_preserved_while_failed_description_is_replaced(self):
+        self.entry["languages"] = ["en"]
+        self.reset_registry()
+        recovery.set_audio_recovery_audio_types(["dubbed", "descriptive"])
+        self.payload = response([audio_track("en", "dubbed", "FAILED"), audio_track("en", status="FAILED")])
+
+        def render(**kwargs):
+            Path(kwargs["output_file"]).write_bytes(self.source.read_bytes())
+            self.payload = response([audio_track("en", "dubbed", "PROCESSED"), audio_track("en", status="FAILED")])
+
+        self.render.side_effect = render
+        await recovery.run_audio_recovery_cycle(now=2000)
+        self.assertEqual(self.events, [("delete", ("video-en-descriptive",)), ("add", "descriptive", "en")])
+
+    async def test_language_delete_retry_keeps_a_track_which_has_become_processed(self):
+        from src.audio_language import call_audio_update_with_retry as retry
+        self.entry["languages"] = ["en"]
+        self.reset_registry()
+        recovery.set_audio_recovery_audio_types(["dubbed", "descriptive"])
+        self.payload = response([audio_track("en", "dubbed", "FAILED")])
+
+        def fail_delete(*_args):
+            self.payload = response([audio_track("en", "dubbed", "PROCESSED")])
+            raise AudioUpdateError("retry later", status_code=503, retryable=True)
+
+        async def fast_retry(operation, **kwargs):
+            return await retry(operation, sleep=AsyncMock(), **kwargs)
+
+        self.delete_ids.side_effect = fail_delete
+        with patch.object(recovery, "call_audio_update_with_retry", side_effect=fast_retry):
+            await recovery.run_audio_recovery_cycle(now=2000)
+        self.delete_ids.assert_called_once_with("video", "channel", ["video-en-dubbed"])
+        self.assertEqual(self.events, [("add", "descriptive", "en")])
+        self.assertEqual(self.saved_entry()["dubbed_completed_languages"], ["en"])
 
     async def test_waiting_for_language_processing_does_not_repeatedly_render_full_audio(self):
         self.payload = response([audio_track("en", "dubbed", "PROCESSING"), audio_track("vi", "dubbed", "PROCESSING")])

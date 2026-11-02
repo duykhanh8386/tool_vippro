@@ -182,11 +182,6 @@ def build_registry_recovery_plan(payload: dict, entries: dict, video_ids, audio_
                 deferred_descriptions.add((video_id, key))
             if (video_id, key) in normal_actions:
                 normal_actions[video_id, key]["description_pair"] = True
-            elif (normal.get("state") == "healthy" and not normal.get("original")
-                  and key not in {str(lang).casefold() for lang in entries[video_id].get("dubbed_prepared_for_description") or []}):
-                actions.append({"video_id": video_id, "language": action["language"],
-                                "audio_content_type": "dubbed", "reason": "paired_description",
-                                "track_ids": normal["track_ids"], "description_pair": True})
         actions = [action for action in actions if action["audio_content_type"] != "descriptive"
                    or (action["video_id"], action["language"].casefold()) not in deferred_descriptions]
     sort_registry_actions(actions, entries, video_ids)

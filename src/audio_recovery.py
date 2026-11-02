@@ -2830,8 +2830,6 @@ async def run_audio_recovery_cycle(
                                     current_types = enabled_audio_types(get_audio_recovery_state())
                                     if audio_content_type not in current_types:
                                         continue
-                                    if action["reason"] == "paired_description" and "descriptive" not in current_types:
-                                        continue
                                     track_label = "audio ngôn ngữ" if audio_content_type == "dubbed" else "âm thanh mô tả"
                                     if not channel_mutation_guard.acquire(blocking=False):
                                         channel_result["reason"] = "Tạm hoãn: kênh đang chạy tác vụ audio khác"
@@ -2866,12 +2864,6 @@ async def run_audio_recovery_cycle(
                                                 audio_content_type=audio_content_type,
                                             )
                                         observed = fresh_observations[audio_content_type].get(video_id, {}).get(language.casefold(), {})
-                                        if action["reason"] == "paired_description":
-                                            _, _, description_now = build_description_recovery_plan(
-                                                fresh_payload, {video_id: {**entry, "description_completed_languages": []}}, [video_id],
-                                            )
-                                            if description_now.get(video_id, {}).get(language.casefold(), {}).get("state") in {"healthy", "processing"}:
-                                                continue
                                         if audio_content_type == "descriptive" and "dubbed" in current_types:
                                             if language.casefold() in failed_dubbed_languages:
                                                 continue
@@ -2887,7 +2879,7 @@ async def run_audio_recovery_cycle(
                                                 # The normal file must be uploaded, but its server-side
                                                 # processing does not have to finish before its description.
                                                 continue
-                                        if observed.get("state") == "healthy" and (action["reason"] != "paired_description" or observed.get("original")):
+                                        if observed.get("state") == "healthy":
                                             continue
                                         if observed.get("state") == "processing" and (
                                             action["reason"] != PROCESSING_WARNING_REASON
@@ -2900,8 +2892,7 @@ async def run_audio_recovery_cycle(
                                             continue
                                         failed_description_ids = (
                                             observed.get("track_ids") or []
-                                        ) if (observed.get("state") == "terminal" or
-                                              (action["reason"] == "paired_description" and observed.get("state") == "healthy")) else []
+                                        ) if observed.get("state") == "terminal" else []
                                         upload_progress = {
                                             "sent": 0,
                                             "total": temp_audio_path.stat().st_size,
@@ -2941,12 +2932,39 @@ async def run_audio_recovery_cycle(
                                         )
                                         if failed_description_ids:
                                             _update_runtime_status(message=f"Đang xóa {track_label} để tải lại: {language}")
+                                            deletion_state = {}
+
+                                            def delete_still_failed_track():
+                                                latest_payload = update_audio_module._get_video_translation_payload([video_id], channel_id)
+                                                _, unreadable_now, latest_observations = build_description_recovery_plan(
+                                                    latest_payload,
+                                                    {video_id: {**entry, track_state_prefix(audio_content_type) + "_completed_languages": []}},
+                                                    [video_id], audio_content_type,
+                                                )
+                                                if unreadable_now:
+                                                    raise RuntimeError("Không đọc được trạng thái mới nhất; giữ audio và chờ lượt sau")
+                                                latest = latest_observations.get(video_id, {}).get(language.casefold(), {})
+                                                deletion_state.update(observations=latest_observations,
+                                                                      preserve=latest.get("state") in {"healthy", "processing"})
+                                                if latest.get("state") != "terminal":
+                                                    return 200
+                                                return update_audio_module.delete_track_ids(
+                                                    video_id, channel_id, latest.get("track_ids") or [],
+                                                )
+
                                             await call_audio_update_with_retry(
-                                                lambda: update_audio_module.delete_track_ids(
-                                                    video_id, channel_id, failed_description_ids,
-                                                ),
+                                                delete_still_failed_track,
                                                 run_blocking=_run_recovery_blocking,
                                             )
+                                            if deletion_state.get("preserve"):
+                                                _record_description_observations(
+                                                    channel_id=channel_id, requested_entries={video_id: entry},
+                                                    observations=deletion_state["observations"],
+                                                    observed_at=float(now if now is not None else time.time()),
+                                                    stale_after_seconds=stale_processing_seconds,
+                                                    audio_content_type=audio_content_type,
+                                                )
+                                                continue
                                             logger.info(
                                                 "Audio auto-recovery deleted tracks: "
                                                 "channel={} video={} language={} type={} track_ids={}",

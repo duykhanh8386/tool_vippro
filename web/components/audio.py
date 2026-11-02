@@ -1376,8 +1376,8 @@ def create_add_audio_page(*, delete_existing: bool = True):
 
                 concurrency_input.on("change", update_concurrency)
                 ui.label(
-                    "Mỗi lần bấm sẽ xóa và thêm lại audio ngôn ngữ, kể cả khi quét video thiếu hoặc lỗi mô tả. "
-                    "Chạy đồng thời 3–5 video; sau audio ngôn ngữ sẽ thêm hoặc sửa âm thanh mô tả."
+                    "Giữ audio ngôn ngữ đã xuất bản hoặc đang xử lý; chỉ xóa bản lỗi và thêm bản còn thiếu. "
+                    "Ngôn ngữ đã có audio tốt vẫn được bổ sung mô tả còn thiếu hoặc thay mô tả lỗi."
                     if delete_existing
                     else "Chạy đồng thời 3–5 video; thêm lần lượt audio theo ngôn ngữ cho từng video."
                 ).classes("app-section-copy flex-1")
@@ -2465,9 +2465,8 @@ def create_add_audio_page(*, delete_existing: bool = True):
         repeat_times = repeat_settings["times"]
         extra_minutes = repeat_settings["extra_minutes"]
         if delete_existing:
-            # The combined action always starts a new delete/add cycle. A
-            # successful checkpoint from an earlier click must not turn it
-            # into a description-only retry.
+            # Recheck current YouTube state on every run. Previous successful
+            # uploads may have failed later; healthy tracks must be preserved.
             for vid in job_video_ids:
                 video_cleanup_status.pop(vid, None)
                 video_processing_status.pop(vid, None)
@@ -2506,6 +2505,29 @@ def create_add_audio_page(*, delete_existing: bool = True):
             performance_settings.get("max_concurrency")
         )
         active_uploads: dict[str, dict] = {}
+        latest_audio_states: dict[str, dict] = {}
+        deleted_dubbed_ids: dict[str, set[str]] = {}
+
+        def delete_failed_dubs(vid: str, languages: list[str]) -> int:
+            if not languages:
+                return 200
+            # This runs again on retries so a track which became published
+            # after the scan is never deleted using an obsolete track list.
+            states = update_audio_module.get_audio_track_states(vid, channel_id, languages)
+            check_stopped()
+            latest_audio_states.setdefault(vid, {}).update(states)
+            deleted = deleted_dubbed_ids.setdefault(vid, set())
+            failed_ids = list(dict.fromkeys(
+                track_id for language in languages for state in [states.get(language, {})]
+                if state.get("dubbed") == "terminal"
+                for track_id in state.get("dubbed_track_ids") or [] if track_id not in deleted
+            ))
+            if not failed_ids:
+                return 200
+            result = update_audio_module.delete_track_ids(vid, channel_id, failed_ids)
+            if result == 200:
+                deleted.update(failed_ids)
+            return result
 
         def refresh_upload_progress() -> None:
             summary = _upload_progress_summary(active_uploads.values())
@@ -2541,6 +2563,18 @@ def create_add_audio_page(*, delete_existing: bool = True):
                 )
 
                 def update_one_language():
+                    if not descriptive:
+                        current = update_audio_module.get_audio_track_states(vid, channel_id, [lang])
+                        check_stopped()
+                        state = current.get(lang, {})
+                        if state.get("dubbed") in ("healthy", "inflight"):
+                            return 409
+                        if delete_existing and state.get("dubbed") == "terminal":
+                            result = delete_failed_dubs(vid, [lang])
+                            if result != 200:
+                                return result
+                            if latest_audio_states.get(vid, {}).get(lang, {}).get("dubbed") in ("healthy", "inflight"):
+                                return 409
                     return update_audio_module.add(
                         id_video=vid,
                         channel_id=channel_id,
@@ -2602,7 +2636,7 @@ def create_add_audio_page(*, delete_existing: bool = True):
                         statuses[lang] = "already_added"
                         video_description_errors.setdefault(vid, {}).pop(lang, None)
                     elif state.get("descriptive") == "terminal" or (
-                        statuses.get(lang) not in ("successful", "already_added")
+                        (state.get("descriptive") == "missing" or statuses.get(lang) not in ("successful", "already_added"))
                         and video_processing_status.get(vid, {}).get(lang) in ("successful", "already_added")
                     ):
                         failed_ids = (state.get("descriptive_track_ids") or []) if state.get("descriptive") == "terminal" else []
@@ -2951,11 +2985,18 @@ def create_add_audio_page(*, delete_existing: bool = True):
                     for language in languages_for_video
                     if language.casefold() not in current_failed_languages
                 ]
+                current_audio_states = await asyncio.to_thread(
+                    update_audio_module.get_audio_track_states, vid, channel_id, languages_for_video,
+                )
+                check_stopped()
+                latest_audio_states[vid] = current_audio_states
                 failed_track_ids = list(
                     dict.fromkeys(
                         track_id
-                        for action in repair_actions
-                        for track_id in action.get("track_ids") or []
+                        for lang, state in current_audio_states.items()
+                        if state.get("dubbed") == "terminal"
+                        and (not selective_repair or lang.casefold() in current_failed_languages)
+                        for track_id in state.get("dubbed_track_ids") or []
                     )
                 )
                 workflow_signature = _audio_workflow_signature(
@@ -2999,34 +3040,15 @@ def create_add_audio_page(*, delete_existing: bool = True):
                                 f"Video {video_index}/{total_videos}: {vid}"
                             ),
                             status_label.set_text(
-                                "Bước 1/2: Đang xóa đúng audio lỗi..."
-                                if selective_repair
-                                else "Bước 1/2: Đang xóa toàn bộ audio cũ..."
+                                "Bước 1/2: Giữ audio tốt, chỉ xóa audio lỗi..."
                             ),
                             refresh_right_panel(force=False),
                         ),
                     )
 
                     def delete_old_audio():
-                        if description_scan:
-                            if not repair_actions:
-                                return 200
-                            return update_audio_module.delete(
-                                id_video=vid,
-                                channel_id=channel_id,
-                                languages=[action["language"] for action in repair_actions],
-                            )
-                        if selective_repair:
-                            if not failed_track_ids:
-                                return 200
-                            return update_audio_module.delete_track_ids(
-                                vid,
-                                channel_id,
-                                failed_track_ids,
-                            )
-                        return update_audio_module.delete(
-                            id_video=vid,
-                            channel_id=channel_id,
+                        return delete_failed_dubs(
+                            vid, [action["language"] for action in repair_actions],
                         )
 
                     def log_delete_retry(attempt, delay, exc):
@@ -3086,6 +3108,9 @@ def create_add_audio_page(*, delete_existing: bool = True):
                     existing_status[language] = "already_added"
                     if description_scan:
                         video_description_status.setdefault(vid, {})[language] = "already_added"
+                for lang, state in latest_audio_states.get(vid, {}).items():
+                    if state.get("dubbed") in ("healthy", "inflight"):
+                        existing_status[lang] = "already_added"
                 if description_only:
                     for action in repair_actions:
                         if action.get("audio_present"):
@@ -3112,7 +3137,7 @@ def create_add_audio_page(*, delete_existing: bool = True):
                     )
                     check_stopped()
                     for lang in languages_for_video:
-                        if current_descriptions.get(lang, {}).get("descriptive") == "terminal":
+                        if current_descriptions.get(lang, {}).get("descriptive") in ("terminal", "missing"):
                             video_description_status[vid].pop(lang, None)
                 if not missing_languages and all(
                     video_description_status.get(vid, {}).get(lang) in ("successful", "already_added")
