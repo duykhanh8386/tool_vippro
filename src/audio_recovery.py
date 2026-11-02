@@ -2151,7 +2151,11 @@ def _summarize_channel_result(result: dict) -> None:
     if result["scanned_videos"]:
         parts.append(f"Đã đọc audio {result['scanned_videos']} video")
     if result["submitted"]:
-        parts.append(f"Đã gửi {result['submitted']} audio, chờ YouTube xử lý")
+        parts.append(f"YouTube đã xác nhận {result['submitted']} track mới")
+    if result.get("published_submitted"):
+        parts.append(f"Đã xuất bản {result['published_submitted']} track")
+    if result.get("processing_submitted"):
+        parts.append(f"Đang xử lý {result['processing_submitted']} track mới")
     if result["healthy_skipped"]:
         parts.append(f"Hoàn tất audio đã chọn: {result['healthy_skipped']} video")
     if result["processing_tracks"]:
@@ -2975,7 +2979,7 @@ async def run_audio_recovery_cycle(
                                             break
                                         upload_progress["status"] = "starting"
                                         _update_runtime_status(message=f"Đang thêm {track_label}: {language}")
-                                        await call_audio_update_with_retry(
+                                        upload_result = await call_audio_update_with_retry(
                                             lambda language=language: update_audio_module.add(
                                                 id_video=video_id,
                                                 channel_id=channel_id,
@@ -2987,10 +2991,15 @@ async def run_audio_recovery_cycle(
                                             ),
                                             run_blocking=_run_recovery_blocking,
                                         )
-                                        repaired += 1
+                                        if upload_result == 200:
+                                            repaired += 1
+                                            channel_result["submitted"] += 1
+                                            studio_state = upload_progress.get("studio_state")
+                                            if studio_state in {"published", "processing"}:
+                                                field = studio_state + "_submitted"
+                                                channel_result[field] = channel_result.get(field, 0) + 1
                                         if audio_content_type == "dubbed":
                                             submitted_dubbed_languages.add(language.casefold())
-                                        channel_result["submitted"] += 1
                                         if action["reason"] == PROCESSING_WARNING_REASON:
                                             channel_result["processing_tracks"] = max(0, channel_result["processing_tracks"] - 1)
                                         _update_runtime_status(repaired=repaired)
@@ -2999,23 +3008,32 @@ async def run_audio_recovery_cycle(
                                             video_id,
                                             language,
                                             succeeded=True,
-                                            message=action["reason"],
+                                            message=(f"YouTube: {upload_progress['track_status']} "
+                                                     f"(track={upload_progress.get('track_id', '')})"
+                                                     if upload_progress.get("track_status") else action["reason"]),
                                             attempted_at=float(now if now is not None else time.time()),
                                             audio_content_type=audio_content_type,
                                             description_pair=audio_content_type == "dubbed" and "descriptive" in current_types,
                                         )
                                         logger.info(
-                                            "Audio auto-recovery upload submitted: channel={} video={} "
-                                            "language={} type={} reason={} (YouTube processing will be checked in a later cycle)",
+                                            "Audio auto-recovery upload verified: channel={} video={} "
+                                            "language={} type={} reason={} track_id={} status={}",
                                             channel_id,
                                             video_id,
                                             language,
                                             audio_content_type,
                                             action["reason"],
+                                            upload_progress.get("track_id", "existing"),
+                                            upload_progress.get("track_status", "existing"),
                                         )
                                     except Exception as exc:
                                         if audio_content_type == "dubbed":
-                                            failed_dubbed_languages.add(language.casefold())
+                                            if upload_progress.get("file_finalized") and upload_progress.get("registered"):
+                                                # A completed ordinary upload can still be rejected
+                                                # by processing; the description gets its own attempt.
+                                                submitted_dubbed_languages.add(language.casefold())
+                                            else:
+                                                failed_dubbed_languages.add(language.casefold())
                                         channel_result["errors"] += 1
                                         channel_result["last_error"] = _recovery_channel_error(exc)
                                         failed += 1

@@ -2507,6 +2507,7 @@ def create_add_audio_page(*, delete_existing: bool = True):
         active_uploads: dict[str, dict] = {}
         latest_audio_states: dict[str, dict] = {}
         deleted_dubbed_ids: dict[str, set[str]] = {}
+        submitted_normal_audio: set[tuple[str, str]] = set()
 
         def delete_failed_dubs(vid: str, languages: list[str]) -> int:
             if not languages:
@@ -2609,6 +2610,8 @@ def create_add_audio_page(*, delete_existing: bool = True):
             except TaskStopped:
                 raise
             except Exception as exc:
+                if not descriptive and upload_progress.get("file_finalized") and upload_progress.get("registered"):
+                    submitted_normal_audio.add((vid, lang))
                 statuses.setdefault(vid, {})[lang] = "unsuccessful"
                 overall_errors.append(f"{vid}-{lang}{' (mô tả)' if descriptive else ''}: {exc}")
                 errors.setdefault(vid, {})[lang] = str(exc)
@@ -2637,7 +2640,8 @@ def create_add_audio_page(*, delete_existing: bool = True):
                         video_description_errors.setdefault(vid, {}).pop(lang, None)
                     elif state.get("descriptive") == "terminal" or (
                         (state.get("descriptive") == "missing" or statuses.get(lang) not in ("successful", "already_added"))
-                        and video_processing_status.get(vid, {}).get(lang) in ("successful", "already_added")
+                        and (video_processing_status.get(vid, {}).get(lang) in ("successful", "already_added")
+                             or (vid, lang) in submitted_normal_audio)
                     ):
                         failed_ids = (state.get("descriptive_track_ids") or []) if state.get("descriptive") == "terminal" else []
                         if state.get("descriptive") == "terminal" and not failed_ids:

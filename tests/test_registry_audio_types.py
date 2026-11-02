@@ -1,11 +1,12 @@
 import copy
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from src import audio_recovery as recovery
 from src.audio_description_recovery import enabled_audio_types, registry_entry_complete
-from src.module.audio_module import AudioUpdateError
+from src.module.audio_module import AudioUpdateError, UpdateAudioModule
 from test_registry_descriptions import RegistryAudioFixture, audio_track, response
 
 
@@ -133,6 +134,55 @@ class RegistryAudioTypeTests(RegistryAudioFixture, unittest.IsolatedAsyncioTestC
         await recovery.run_audio_recovery_cycle(now=2031)
         self.assertEqual(len(self.events), 4)
         self.assertTrue(registry_entry_complete(self.saved_entry(), self.selected()))
+
+    def use_verified_backend(self, normal_status="PENDING", publish=True):
+        module = UpdateAudioModule()
+        self.add.side_effect = module.add
+        self.stack.enter_context(patch.object(module, "_get_video_translation_payload",
+                                             side_effect=lambda *_: copy.deepcopy(self.payload)))
+        self.stack.enter_context(patch("src.module.audio_module.get_channels_info",
+                                      return_value=SimpleNamespace(cookies=[])))
+        self.stack.enter_context(patch.object(module, "_get_session_token", return_value="token"))
+        self.stack.enter_context(patch.object(module, "_upload_http", return_value=("https://session", "resource")))
+        self.stack.enter_context(patch.object(module, "_next_upload_http", return_value="final"))
+        self.stack.enter_context(patch("src.module.audio_module.wait_interruptibly"))
+
+        def register(**kwargs):
+            kind, language = kwargs["audio_content_type"], kwargs["language"]
+            self.events.append(("add", kind, language))
+            if publish:
+                self.payload["audioTracks"].append(audio_track(
+                    language, kind, normal_status if kind == "dubbed" else "PROCESSED",
+                ))
+            return 200
+
+        self.stack.enter_context(patch.object(module, "_update", side_effect=register))
+
+    async def test_real_backend_verifies_each_language_then_its_description(self):
+        self.use_verified_backend()
+        result = await recovery.run_audio_recovery_cycle(now=2000)
+        self.assertEqual(self.events, [("add", kind, lang) for lang in ("en", "vi") for kind in ("dubbed", "descriptive")])
+        report = result["channel_results"][0]
+        self.assertEqual(report["submitted"], 4)
+        self.assertEqual(report["processing_submitted"], 2)
+        self.assertEqual(report["published_submitted"], 2)
+        self.assertIn("AUDIO_TRACK_STATUS_PENDING", self.saved_entry()["dubbed_attempts"]["en"]["message"])
+
+    async def test_verified_normal_processing_failure_is_reported_and_description_still_gets_its_attempt(self):
+        self.use_verified_backend(normal_status="FAILED")
+        result = await recovery.run_audio_recovery_cycle(now=2000)
+        self.assertEqual(self.events, [("add", kind, lang) for lang in ("en", "vi") for kind in ("dubbed", "descriptive")])
+        self.assertEqual((result["repaired"], result["failed"]), (2, 2))
+        self.assertEqual(result["channel_results"][0]["submitted"], 2)
+        self.assertFalse(self.saved_entry()["dubbed_attempts"]["en"]["succeeded"])
+        self.assertTrue(self.saved_entry()["description_attempts"]["en"]["succeeded"])
+
+    async def test_http_success_with_no_new_tracks_does_not_increment_submitted(self):
+        self.use_verified_backend(publish=False)
+        result = await recovery.run_audio_recovery_cycle(now=2000)
+        self.assertEqual((result["repaired"], result["failed"]), (0, 4))
+        self.assertEqual(result["channel_results"][0]["submitted"], 0)
+        self.assertFalse(self.saved_entry()["description_attempts"]["en"]["succeeded"])
 
     async def test_healthy_dub_duplicate_keeps_language_audio_while_description_is_replaced(self):
         self.entry["languages"] = ["en"]

@@ -229,10 +229,13 @@ class AudioRecoveryConcurrencyTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(request.body.read()), 120)
             response = requests.Response()
             response.status_code = 200
+            response.headers["X-Goog-Upload-Status"] = "final"
             response._content = b""
             return response
 
         with (
+            patch.object(module, "_audio_upload_snapshot", return_value={}),
+            patch.object(module, "_verify_audio_upload"),
             patch("src.module.audio_module.get_channels_info", side_effect=lambda channel: SimpleNamespace(
                 cookies=[{"name": "test", "value": channel}],
             )),
@@ -372,7 +375,7 @@ class AudioRecoveryConcurrencyTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(finished["channel_id"], self.channels[0])
             self.assertEqual(finished["submitted"], 2)
             self.assertEqual(finished["outcome"], "submitted")
-            self.assertIn("chờ YouTube xử lý", finished["message"])
+            self.assertIn("YouTube đã xác nhận", finished["message"])
             self.assertEqual(self.mocks["_get_registered_video_scan_statuses"].call_count, 2)
             self.assertEqual(self.events[self.channels[0]], [
                 ("add", "en"), ("add", "es"),

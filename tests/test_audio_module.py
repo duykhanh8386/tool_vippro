@@ -14,7 +14,7 @@ from src.module.audio_module import AudioUpdateError, UpdateAudioModule
 class Response:
     def __init__(self, status_code=200, headers=None, body=None):
         self.status_code = status_code
-        self.headers = headers or {}
+        self.headers = {"X-Goog-Upload-Status": "final"} if headers is None else headers
         self.text = ""
         self._body = body or {}
 
@@ -267,6 +267,8 @@ class AudioUploadTests(unittest.TestCase):
         session_context.__exit__ = Mock(return_value=False)
 
         with (
+            patch.object(module, "_audio_upload_snapshot", return_value={}),
+            patch.object(module, "_verify_audio_upload"),
             patch("src.module.audio_module.get_channels_info", return_value=channel),
             patch.object(module, "_get_session_token", return_value="token"),
             patch("src.module.audio_module.requests.Session", return_value=session_context),
@@ -396,11 +398,12 @@ class AudioUploadTests(unittest.TestCase):
             patch.object(module, "_upload_http", return_value=("https://session", "resource")),
             patch.object(module, "_update", return_value=409),
             patch.object(module, "_has_audio_track", return_value=True),
+            patch.object(module, "_audio_upload_snapshot", return_value={}),
             patch.object(module, "_next_upload_http") as upload,
         ):
             status = module.add("video", "channel", "audio.mp3", "pt", b"abc")
         self.assertEqual(status, 409)
-        upload.assert_not_called()
+        upload.assert_called_once()
 
     def test_unverified_409_is_not_success(self):
         module = UpdateAudioModule()
@@ -411,12 +414,13 @@ class AudioUploadTests(unittest.TestCase):
             patch.object(module, "_upload_http", return_value=("https://session", "resource")),
             patch.object(module, "_update", return_value=409),
             patch.object(module, "_has_audio_track", return_value=False),
+            patch.object(module, "_audio_upload_snapshot", return_value={}),
             patch.object(module, "_next_upload_http") as upload,
         ):
             with self.assertRaises(AudioUpdateError) as raised:
                 module.add("video", "channel", "audio.mp3", "pt", b"abc")
         self.assertEqual(raised.exception.status_code, 409)
-        upload.assert_not_called()
+        upload.assert_called_once()
 
     def test_processing_95_percent_is_not_treated_as_existing_success(self):
         module = UpdateAudioModule()

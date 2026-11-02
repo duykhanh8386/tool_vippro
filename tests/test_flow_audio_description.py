@@ -301,6 +301,8 @@ class AudioDescriptionApiTests(unittest.TestCase):
     def test_descriptive_upload_registers_the_type_and_finalizes_the_bytes(self):
         module = UpdateAudioModule()
         with (
+            patch.object(module, "_audio_upload_snapshot", return_value={}),
+            patch.object(module, "_verify_audio_upload"),
             patch("src.module.audio_module.get_channels_info", return_value=SimpleNamespace(cookies=[])),
             patch.object(module, "_get_session_token", return_value="token"),
             patch.object(module, "_upload_http", return_value=("https://upload-session", "resource")),
@@ -328,14 +330,14 @@ class AudioDescriptionApiTests(unittest.TestCase):
         ):
             with self.assertRaises(AudioUpdateError):
                 module.add("video", "channel", "music.mp3", "pcm", data=b"full-music", audio_content_type="descriptive")
-        upload.assert_not_called()
+        upload.assert_called_once()
 
     def test_audio_registration_sends_the_descriptive_type(self):
         module = UpdateAudioModule()
         channel = SimpleNamespace(cookies=[], id="channel", delegated_session_id="delegate", role="OWNER")
         with (
             patch("src.module.audio_module.studio_authorization_header", return_value="auth"),
-            patch("src.module.audio_module.post_with_stop", return_value=SimpleNamespace(status_code=200)) as post,
+            patch("src.module.audio_module.post_with_stop", return_value=SimpleNamespace(status_code=200, json=lambda: {})) as post,
         ):
             module._update("video", "resource", channel, "cookie", "token", "pcm", audio_content_type="descriptive")
         payload = post.call_args.kwargs["json"]

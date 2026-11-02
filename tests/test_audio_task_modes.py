@@ -307,6 +307,25 @@ class AudioTaskModeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.state.states["audio_add"]["video_description_status"]["video"], {"en": "successful", "vi": "already_added"})
         self.assertEqual(self.state.states["audio_add"]["video_description_errors"]["video"], {})
 
+    async def test_normal_processing_failure_is_recorded_and_missing_description_is_still_attempted(self):
+        self.state.states["audio_add"] = self.saved_add_state()
+        client = self.render()
+        original_add = self.add.side_effect
+
+        def add(**kwargs):
+            if kwargs.get("audio_content_type") != "descriptive" and kwargs["language"] == "en":
+                kwargs["progress"].update(file_finalized=True, registered=True, track_status="AUDIO_TRACK_STATUS_FAILED")
+                raise AudioUpdateError("AUDIO_TRACK_STATUS_FAILED")
+            return original_add(**kwargs)
+
+        self.add.side_effect = add
+        with client:
+            await self.button_callback(client, "Bắt đầu xóa & thêm audio")()
+        saved = self.state.states["audio_add"]
+        self.assertEqual(saved["video_processing_status"]["video"]["en"], "unsuccessful")
+        self.assertEqual(saved["video_description_status"]["video"]["en"], "successful")
+        self.assertEqual(self.description_events, ["description:en", "description:vi"])
+
     async def test_existing_description_is_kept_and_only_the_missing_language_is_uploaded(self):
         self.state.states["audio_add"] = self.saved_add_state()
         self.track_states.side_effect = None
