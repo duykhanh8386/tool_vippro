@@ -1,11 +1,14 @@
 # RECOVERED: depyo output corrected from CPython 3.12 disassembly
 import json
 import os
+import socket
 import time
 import unicodedata
 from io import BytesIO
 from urllib.parse import quote
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.connection import HTTPConnection
 from loguru import logger
 from src.module.base import IModule
 from src.module.model import ChannelInfo
@@ -21,6 +24,40 @@ class AudioUpdateError(Exception):
         super().__init__(message)
         self.status_code = status_code
         self.retryable = retryable
+
+
+class _AudioUploadAdapter(HTTPAdapter):
+    """Send a complete file with larger writes while retaining bounded memory."""
+
+    BLOCK_SIZE = 1024 * 1024
+
+    @classmethod
+    def _pool_options(cls):
+        return {
+            "blocksize": cls.BLOCK_SIZE,
+            "socket_options": list(HTTPConnection.default_socket_options) + [
+                (socket.SOL_SOCKET, socket.SO_SNDBUF, cls.BLOCK_SIZE),
+            ],
+        }
+
+    def init_poolmanager(self, connections, maxsize, block=False, **pool_kwargs):
+        return super().init_poolmanager(connections, maxsize, block, **{**self._pool_options(), **pool_kwargs})
+
+    def proxy_manager_for(self, proxy, **proxy_kwargs):
+        return super().proxy_manager_for(proxy, **{**self._pool_options(), **proxy_kwargs})
+
+
+def _audio_upload_error_summary(exc):
+    """Keep upload session URLs out of logs and persisted UI errors."""
+    if isinstance(exc, requests.exceptions.SSLError):
+        return "SSLError: kết nối TLS bị ngắt khi gửi file"
+    if isinstance(exc, requests.exceptions.Timeout):
+        return "Timeout: hết thời gian chờ kết nối hoặc phản hồi tải file"
+    if isinstance(exc, requests.exceptions.ConnectionError):
+        return "ConnectionError: kết nối gửi file bị gián đoạn"
+    if isinstance(exc, AudioUpdateError):
+        return str(exc)
+    return type(exc).__name__
 
 
 class _AudioUploadBody(BytesIO):
@@ -178,6 +215,7 @@ class UpdateAudioModule(IModule):
         cookie_string = "; ".join([f"{cookie['name']}={cookie['value']}" for cookie in channel_info.cookies])
         fname_header = quote(os.path.basename(file_name), safe="")
         with requests.Session() as session:
+            self._configure_upload_session(session)
             if progress is not None:
                 progress["status"] = "starting"
             upload_url, scotty_resource_id = self._upload_http(
@@ -236,6 +274,13 @@ class UpdateAudioModule(IModule):
                 progress=progress,
             )
             return res
+
+    @staticmethod
+    def _configure_upload_session(session):
+        url = "https://upload.youtube.com/"
+        # Preserve explicitly supplied adapters (including test transports).
+        if type(session.get_adapter(url)) is HTTPAdapter:
+            session.mount(url, _AudioUploadAdapter())
 
     def _audio_upload_snapshot(self, video_id, channel_id, language, content_type):
         payload = self._get_video_translation_payload([video_id], channel_id)
@@ -442,7 +487,7 @@ class UpdateAudioModule(IModule):
         except TaskStopped:
             raise
         except Exception as exc:
-            logger.warning("Cannot query audio upload offset: {}", exc)
+            logger.warning("Cannot query audio upload offset: {}", _audio_upload_error_summary(exc))
             return None
 
     def _next_upload_http(
@@ -564,7 +609,7 @@ class UpdateAudioModule(IModule):
                             progress["status"] = "error"
                         raise AudioUpdateError(
                             f"Tải audio bị gián đoạn tại {offset}/{total} byte sau "
-                            f"{self._MAX_UPLOAD_RETRIES} lần thử: {exc}",
+                            f"{self._MAX_UPLOAD_RETRIES} lần thử: {_audio_upload_error_summary(exc)}",
                             status_code=getattr(exc, "status_code", None),
                         ) from exc
                     upload_state = {}
@@ -587,7 +632,7 @@ class UpdateAudioModule(IModule):
                         progress["status"] = "retrying"
                     logger.warning(
                         "Retry audio upload in same session: offset={}/{} attempt={}/{} error={}",
-                        offset, total, retries, self._MAX_UPLOAD_RETRIES, exc,
+                        offset, total, retries, self._MAX_UPLOAD_RETRIES, _audio_upload_error_summary(exc),
                     )
                     wait_interruptibly(min(2**retries, 10))
                     if progress is not None:
