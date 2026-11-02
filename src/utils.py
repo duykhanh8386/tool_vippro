@@ -363,7 +363,7 @@ def multiply_audio(input_file: str, output_file: str, times: int, extra_minutes=
     Super-fast version: no filters, no temp files.
     - Computes total target duration.
     - Uses -stream_loop to repeat input and -t to trim exactly.
-    - Selects exactly one audio stream and encodes a valid MP3 directly.
+    - Copies compatible MP3 audio without re-encoding; otherwise encodes MP3.
     - If video_duration_seconds is provided, trims the final audio to match video duration.
     """
     if times < 1:
@@ -383,9 +383,15 @@ def multiply_audio(input_file: str, output_file: str, times: int, extra_minutes=
     needed_copies = math.ceil(total_seconds / dur)
     stream_loop = max(0, needed_copies - 1)
     base_cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-stats", "-y", "-stream_loop", str(stream_loop), "-i", src, "-t", f"{total_seconds:.6f}"]
-    # The upload output is always MP3. Stream-copying AAC/OPUS/etc. into this
-    # container produces "Exactly one MP3 audio stream is required". Encode
-    # once and explicitly select the first audio stream instead.
+    # Match TV Automation's copy-first preparation. The MP3 muxer validates
+    # the source codec; AAC/OPUS/etc. fall back to encoding a real MP3.
+    if Path(dst).suffix.casefold() == ".mp3":
+        cmd_copy = base_cmd + ["-map", "0:a:0", "-vn", "-c:a", "copy", dst]
+        try:
+            run_owned_process(cmd_copy, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            return
+        except subprocess.CalledProcessError:
+            logger.debug("Audio cannot be copied into MP3; encoding the selected audio stream")
     cmd_reencode = base_cmd + ["-map", "0:a:0", "-vn", "-c:a", "libmp3lame", "-q:a", "2", dst]
     run_owned_process(cmd_reencode, check=True)
 

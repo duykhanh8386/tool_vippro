@@ -79,12 +79,18 @@ def _recovery_transfer_text(job: dict) -> str:
         "deleting": "Đang xóa track cần thay lại",
         "authenticating": "Đang xác thực",
         "starting": "Đang mở phiên tải",
-        "registering": "Đang đăng ký audio",
-        "finalizing": "Chờ YouTube xác nhận",
+        "registering": "Đang xuất bản track",
+        "finalizing": "Đang hoàn tất tải file",
+        "verifying": "Đang kiểm tra track trên YouTube",
         "retrying": "Đang thử tải lại",
         "complete": "Đã gửi file",
         "error": "Tải file lỗi",
     }.get(job.get("upload_status"), "Đang gửi file")
+    if job.get("upload_status") == "complete":
+        stage = {
+            "processing": "YouTube đã nhận, đang xử lý",
+            "published": "Đã xuất bản",
+        }.get(job.get("upload_studio_state"), stage)
     sent = int(job.get("upload_sent") or 0)
     total = int(job.get("upload_total") or 0)
     fraction = float(job.get("upload_fraction") or 0)
@@ -314,7 +320,7 @@ def create_drawer():
                         <div v-if="props.row.phase === 'uploading'" class="column q-gutter-xs">
                             <q-linear-progress rounded color="blue" size="8px"
                                 :value="props.row.upload_fraction || 0"
-                                :indeterminate="['deleting', 'authenticating', 'starting', 'registering'].includes(props.row.upload_status)" />
+                                :indeterminate="['deleting', 'authenticating', 'starting', 'registering', 'verifying'].includes(props.row.upload_status)" />
                             <span>{{ props.row.transfer }}</span>
                         </div>
                         <span v-else>{{ props.row.transfer }}</span>

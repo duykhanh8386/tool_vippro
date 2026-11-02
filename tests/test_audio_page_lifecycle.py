@@ -1,4 +1,5 @@
 import asyncio
+import subprocess
 import tempfile
 import threading
 import unittest
@@ -604,10 +605,10 @@ class AudioPageLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(events, ["enter", "job", "exit"])
 
-    def test_multiply_audio_encodes_one_mp3_audio_stream_directly(self):
+    def test_multiply_audio_encodes_one_mp3_stream_if_copy_is_incompatible(self):
         with (
             patch("src.utils.get_video_duration", return_value=30),
-            patch("src.utils.run_owned_process") as run_process,
+            patch("src.utils.run_owned_process", side_effect=[subprocess.CalledProcessError(1, "ffmpeg"), None]) as run_process,
         ):
             multiply_audio("source.m4a", "output.mp3", times=2)
 
@@ -617,6 +618,20 @@ class AudioPageLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("-vn", command)
         self.assertIn("libmp3lame", command)
         self.assertNotIn("copy", command)
+        self.assertEqual(run_process.call_count, 2)
+        self.assertIn("copy", run_process.call_args_list[0].args[0])
+
+    def test_multiply_audio_keeps_compatible_mp3_packets_without_encoding(self):
+        with (
+            patch("src.utils.get_video_duration", return_value=30),
+            patch("src.utils.run_owned_process") as run_process,
+        ):
+            multiply_audio("source.mp3", "output.mp3", times=2)
+        command = run_process.call_args.args[0]
+        self.assertIn("copy", command)
+        self.assertIn("0:a:0", command)
+        self.assertIn("-vn", command)
+        self.assertNotIn("libmp3lame", command)
         run_process.assert_called_once()
 
     def test_add_audio_restart_only_retries_interrupted_languages(self):

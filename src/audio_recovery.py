@@ -292,6 +292,7 @@ def _with_upload_progress(snapshot: dict) -> dict:
     snapshot["upload_total"] = total
     snapshot["upload_confirmed"] = confirmed
     snapshot["upload_status"] = str(upload.get("status") or "")
+    snapshot["upload_studio_state"] = str(upload.get("studio_state") or "")
     snapshot["upload_fraction"] = min(1.0, sent / total) if total else 0.0
     output_path = snapshot.pop("_preparation_output_path", None)
     snapshot["preparation_elapsed_seconds"] = 0
