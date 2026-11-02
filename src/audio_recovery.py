@@ -92,13 +92,7 @@ PUBLIC_VIDEO_PRIVACY_VALUES = {
 
 
 class AudioMutationGuard:
-    """Channel-level mutation lock protecting against manual-flow collisions.
-
-    In manual mode (outside Auto Registry), acquiring the guard gives exclusive
-    access to the channel so Auto Registry does not collide.
-    In Auto Registry mode, multiple concurrent video workers on the same channel
-    can share the registry guard while still keeping manual flow locked out.
-    """
+    """Coordinate video locks and retain legacy channel-wide reservations."""
 
     def __init__(self, channel_id: str):
         self.channel_id = channel_id
@@ -106,6 +100,14 @@ class AudioMutationGuard:
         self._condition = threading.Condition(self._lock)
         self._manual_owner: threading.Thread | None = None
         self._registry_holders: int = 0
+        self._video_holders: dict[str, bool] = {}
+        self._video_guards: dict[str, VideoAudioMutationGuard] = {}
+
+    def for_video(self, video_id: str):
+        with self._condition:
+            if video_id not in self._video_guards:
+                self._video_guards[video_id] = VideoAudioMutationGuard(self, video_id)
+            return self._video_guards[video_id]
 
     def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
         deadline = None if timeout < 0 else (time.monotonic() + timeout)
@@ -113,11 +115,11 @@ class AudioMutationGuard:
         with self._condition:
             while True:
                 if is_registry:
-                    if self._manual_owner is None:
+                    if self._manual_owner is None and not self._video_holders:
                         self._registry_holders += 1
                         return True
                 else:
-                    if self._manual_owner is None and self._registry_holders == 0:
+                    if self._manual_owner is None and self._registry_holders == 0 and not self._video_holders:
                         self._manual_owner = threading.current_thread()
                         return True
                 if not blocking:
@@ -152,9 +154,10 @@ class AudioMutationGuard:
 
     def locked(self) -> bool:
         with self._lock:
-            return self._manual_owner is not None or self._registry_holders > 0
+            return self._manual_owner is not None or self._registry_holders > 0 or bool(self._video_holders)
 
     def is_manually_locked(self) -> bool:
+        """Report only a legacy reservation covering the entire channel."""
         with self._lock:
             return self._manual_owner is not None
 
@@ -167,9 +170,58 @@ class AudioMutationGuard:
         self.release()
 
 
-# Shared with the manual add-audio page. Mutations are serialized per channel,
-# so recovery on channel A can continue while the user works on channel B,
-# without ever allowing two delete/add flows to collide on the same channel.
+class VideoAudioMutationGuard:
+    """Exclude every other mutation of this video, including registry workers."""
+
+    def __init__(self, channel: AudioMutationGuard, video_id: str):
+        self.channel = channel
+        self.video_id = video_id
+
+    def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
+        deadline = None if timeout < 0 else time.monotonic() + timeout
+        channel = self.channel
+        with channel._condition:
+            while True:
+                if (channel._manual_owner is None and channel._registry_holders == 0
+                        and self.video_id not in channel._video_holders):
+                    channel._video_holders[self.video_id] = _RUNTIME_CHANNEL_CONTEXT.get() is not None
+                    return True
+                if not blocking:
+                    return False
+                if deadline is None:
+                    channel._condition.wait()
+                else:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return False
+                    channel._condition.wait(remaining)
+
+    def release(self) -> None:
+        with self.channel._condition:
+            if self.video_id not in self.channel._video_holders:
+                raise RuntimeError("release unlocked video lock")
+            del self.channel._video_holders[self.video_id]
+            self.channel._condition.notify_all()
+
+    def locked(self) -> bool:
+        with self.channel._condition:
+            return (self.channel._manual_owner is not None or self.channel._registry_holders > 0
+                    or self.video_id in self.channel._video_holders)
+
+    def is_manually_locked(self) -> bool:
+        with self.channel._condition:
+            return self.channel._manual_owner is not None or self.channel._video_holders.get(self.video_id) is False
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, *_args):
+        self.release()
+
+
+# Every feature reserves the specific channel/video it mutates. The channel
+# object remains available for aggregate status and older whole-channel callers.
 _AUDIO_MUTATION_GUARDS: dict[str, AudioMutationGuard] = {}
 _AUDIO_MUTATION_GUARDS_LOCK = threading.RLock()
 
@@ -337,7 +389,7 @@ def get_audio_recovery_runtime_status() -> dict:
     return _with_upload_progress(snapshot)
 
 
-def get_audio_mutation_guard(channel_id: str) -> AudioMutationGuard:
+def get_audio_mutation_guard(channel_id: str, video_id: str | None = None) -> AudioMutationGuard | VideoAudioMutationGuard:
     clean_channel_id = str(channel_id or "").strip()
     if not clean_channel_id:
         raise ValueError("channel_id is required for an audio mutation guard")
@@ -346,7 +398,12 @@ def get_audio_mutation_guard(channel_id: str) -> AudioMutationGuard:
         if guard is None:
             guard = AudioMutationGuard(clean_channel_id)
             _AUDIO_MUTATION_GUARDS[clean_channel_id] = guard
-        return guard
+        if video_id is None:
+            return guard
+        clean_video_id = str(video_id or "").strip()
+        if not clean_video_id:
+            raise ValueError("video_id is required for a video mutation guard")
+        return guard.for_video(clean_video_id)
 
 
 def _is_public_video_privacy(value: object) -> bool:
@@ -1958,7 +2015,6 @@ async def _monitor_failed_caption_tracks(
     repaired = 0
     failed = 0
     quota_message = ""
-    guard = get_audio_mutation_guard(channel_id)
     can_continue = continue_allowed or (lambda: True)
     video_can_continue = video_continue_allowed or (lambda _video_id: True)
 
@@ -2000,6 +2056,7 @@ async def _monitor_failed_caption_tracks(
                 last_error="Không còn file SRT nguồn để sửa phụ đề failed.",
             )
             continue
+        guard = get_audio_mutation_guard(channel_id, video_id)
         if not guard.acquire(blocking=False):
             continue
         try:
@@ -2524,9 +2581,8 @@ async def run_audio_recovery_cycle(
                         channel_result["reason"] = "Không có video Active để quét"
                         return
 
-                    # The normal/manual flow owns this guard for its entire channel
-                    # batch. Do not even scan YouTube while it is active; defer this
-                    # channel to keep recovery traffic and state decisions isolated.
+                    # Respect legacy whole-channel reservations. Current audio
+                    # pages reserve videos individually and allow this scan.
                     channel_mutation_guard = get_audio_mutation_guard(channel_id)
                     if channel_mutation_guard.is_manually_locked():
                         channel_result["reason"] = "Tạm hoãn: kênh đang chạy tác vụ audio khác"
@@ -2746,9 +2802,9 @@ async def run_audio_recovery_cycle(
                                 return
 
                             entry = eligible_entries.get(video_id) or {}
-                            channel_mutation_guard = get_audio_mutation_guard(channel_id)
-                            if channel_mutation_guard.is_manually_locked():
-                                channel_result["reason"] = "Tạm hoãn: kênh đang chạy tác vụ audio khác"
+                            channel_mutation_guard = get_audio_mutation_guard(channel_id, video_id)
+                            if channel_mutation_guard.locked():
+                                channel_result["reason"] = f"Tạm hoãn: video {video_id} đang có tác vụ audio khác"
                                 deferred_busy += len(actions)
                                 logger.info(
                                     "Audio auto-recovery deferred for channel={} video={}: "
@@ -2760,7 +2816,7 @@ async def run_audio_recovery_cycle(
                             temp_audio_path: Path | None = None
                             preparation_stage = "metadata"
                             preparation_started = time.monotonic()
-                            video_owned_guard: AudioMutationGuard | None = None
+                            video_owned_guard: VideoAudioMutationGuard | None = None
                             try:
                                 _update_runtime_status(
                                     phase="preparing",
@@ -2840,7 +2896,7 @@ async def run_audio_recovery_cycle(
                                         continue
                                     track_label = "audio ngôn ngữ" if audio_content_type == "dubbed" else "âm thanh mô tả"
                                     if not channel_mutation_guard.acquire(blocking=False):
-                                        channel_result["reason"] = "Tạm hoãn: kênh đang chạy tác vụ audio khác"
+                                        channel_result["reason"] = f"Tạm hoãn: video {video_id} đang có tác vụ audio khác"
                                         deferred_busy += len(actions) - action_index
                                         logger.info(
                                             "Audio auto-recovery deferred for channel={}: "

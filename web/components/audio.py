@@ -282,6 +282,7 @@ async def _run_concurrently_isolated(
     *,
     max_concurrency: int,
     stop_on_error: Callable[[Exception], bool] | None = None,
+    can_start: Callable[[_T], bool] | None = None,
 ) -> list[tuple[_T, Exception]]:
     """Process independent videos concurrently while isolating item failures."""
     pending = list(items)
@@ -301,10 +302,19 @@ async def _run_concurrently_isolated(
             except TaskStopped as exc:
                 fatal_errors.append(exc)
                 return
-            try:
-                item = queue.get_nowait()
-            except asyncio.QueueEmpty:
+            if queue.empty():
                 return
+            item_found = False
+            for _ in range(queue.qsize()):
+                item = queue.get_nowait()
+                if can_start is None or can_start(item):
+                    item_found = True
+                    break
+                queue.task_done()
+                queue.put_nowait(item)
+            if not item_found:
+                await asyncio.sleep(0.25)
+                continue
             try:
                 await process_item(item)
             except TaskStopped as exc:
@@ -2451,16 +2461,6 @@ def create_add_audio_page(*, delete_existing: bool = True):
             ui.notify("Tác vụ audio đang chạy ở một trang khác.", type="warning")
             return None
         _own_audio_run_lock(_ADD_AUDIO_RUN_GUARD)
-        channel_mutation_guard = get_audio_mutation_guard(selected_channel["id"])
-        if not channel_mutation_guard.acquire(blocking=False):
-            _release_audio_run_lock(_ADD_AUDIO_RUN_GUARD)
-            ui.notify(
-                "Một tác vụ audio khác đang cập nhật kênh này. "
-                "Vui lòng thử lại sau ít giây.",
-                type="warning",
-            )
-            return None
-        _own_audio_run_lock(channel_mutation_guard)
         channel_id = selected_channel["id"]
         repeat_times = repeat_settings["times"]
         extra_minutes = repeat_settings["extra_minutes"]
@@ -2473,7 +2473,6 @@ def create_add_audio_page(*, delete_existing: bool = True):
                 delete_requested.pop(vid, None)
         video_processing_errors.clear()
         if save_right_panel_state() is False:
-            _release_audio_run_lock(channel_mutation_guard)
             _release_audio_run_lock(_ADD_AUDIO_RUN_GUARD)
             ui.notify("Không thể lưu phiên xử lý. Vui lòng thử lại.", type="negative")
             return None
@@ -2945,7 +2944,33 @@ def create_add_audio_page(*, delete_existing: bool = True):
                 languages=monitor_languages,
             )
 
+        waiting_videos: set[str] = set()
+
+        def video_can_start(item: tuple[int, str]) -> bool:
+            _, vid = item
+            if get_audio_mutation_guard(channel_id, vid).locked():
+                if vid not in waiting_videos:
+                    waiting_videos.add(vid)
+                    best_effort_ui("show reserved video", lambda: status_label.set_text(
+                        f"{vid} — chờ tác vụ khác trên cùng video; video khác vẫn chạy"
+                    ))
+                return False
+            return True
+
         async def process_video(item: tuple[int, str]) -> None:
+            _, vid = item
+            guard = get_audio_mutation_guard(channel_id, vid)
+            while not guard.acquire(blocking=False):
+                check_stopped()
+                await asyncio.sleep(0.25)
+            _own_audio_run_lock(guard)
+            try:
+                check_stopped()
+                await process_owned_video(item)
+            finally:
+                _release_audio_run_lock(guard)
+
+        async def process_owned_video(item: tuple[int, str]) -> None:
             nonlocal completed_tasks
             check_stopped()
             video_index, vid = item
@@ -3324,6 +3349,7 @@ def create_add_audio_page(*, delete_existing: bool = True):
                 handle_video_error,
                 max_concurrency=max_concurrency,
                 stop_on_error=_is_youtube_auth_error,
+                can_start=video_can_start,
             )
         except TaskStopped:
             logger.info("Manual delete/add audio workflow received a stop request")
@@ -3339,7 +3365,6 @@ def create_add_audio_page(*, delete_existing: bool = True):
             save_right_panel_state()
             best_effort_ui("close progress dialog", progress_dialog.close)
             best_effort_ui("render final audio state", refresh_right_panel)
-            _release_audio_run_lock(channel_mutation_guard)
             _release_audio_run_lock(_ADD_AUDIO_RUN_GUARD)
         total_videos = len(job_video_ids)
         successful_videos = 0

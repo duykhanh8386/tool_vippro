@@ -83,9 +83,9 @@ def _register_add_audio_flow_recovery(
     return completed
 
 
-async def _acquire_audio_mutation_guard(channel_id: str):
-    """Wait interruptibly until recovery/manual audio mutation is idle."""
-    guard = get_audio_mutation_guard(channel_id)
+async def _acquire_audio_mutation_guard(channel_id: str, video_id: str):
+    """Wait interruptibly for mutations of this video only."""
+    guard = get_audio_mutation_guard(channel_id, video_id)
     while not guard.acquire(blocking=False):
         run_context = current_run_context()
         if run_context is not None:
@@ -180,7 +180,7 @@ async def _add_flow_audio_description(
             extra_minutes=0,
             video_duration_seconds=info.duration_ms / 1000.0,
         )
-        guard = await _acquire_audio_mutation_guard(channel_id)
+        guard = await _acquire_audio_mutation_guard(channel_id, video_id)
         errors = []
         for lang in pending:
             if run_context is not None:
@@ -1066,7 +1066,7 @@ def create_add_audio_flow_page():
             language_errors = []
             language_results = dict(item.get("audio_language_results") or {})
             item["audio_language_results"] = language_results
-            channel_mutation_guard = await _acquire_audio_mutation_guard(channel_id)
+            channel_mutation_guard = await _acquire_audio_mutation_guard(channel_id, video_id)
             for language_index, lang in enumerate(languages, 1):
                 previous = language_results.get(lang) or {}
                 if previous.get("status") in ("successful", "already_added"):

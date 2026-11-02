@@ -564,17 +564,7 @@ def create_remove_audio_page():
         if not channel_id:
             ui.notify("Vui lòng chọn kênh", type="warning")
             return
-        channel_guard = get_audio_mutation_guard(channel_id)
-        if not channel_guard.acquire(blocking=False):
-            ui.notify(
-                "Một tác vụ audio khác đang cập nhật kênh này. Vui lòng thử lại sau ít giây.",
-                type="warning",
-            )
-            return
-        try:
-            await execute_remove_audio()
-        finally:
-            channel_guard.release()
+        await execute_remove_audio()
 
     async def execute_remove_audio():
         if scan_runtime["running"]:
@@ -626,6 +616,15 @@ def create_remove_audio_page():
         semaphore = asyncio.Semaphore(max_concurrency)
 
         async def run_delete(vid: str):
+            guard = get_audio_mutation_guard(channel_id, vid)
+            while not guard.acquire(blocking=False):
+                await asyncio.sleep(0.25)
+            try:
+                await execute_delete(vid)
+            finally:
+                guard.release()
+
+        async def execute_delete(vid: str):
             nonlocal completed_tasks, skipped_tasks
             async with semaphore:
                 try:

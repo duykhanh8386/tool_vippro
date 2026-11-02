@@ -1007,17 +1007,138 @@ class AudioTaskModeTests(unittest.IsolatedAsyncioTestCase):
         self.delete.assert_not_called()
         self.delete_tracks.assert_not_called()
 
-    async def test_remove_only_is_blocked_by_other_audio_mutations_on_the_same_channel(self):
+    async def test_remove_only_waits_for_other_audio_mutations_on_the_same_video(self):
         self.state.states["audio_remove"] = {"selected_channel": self.channel.id, "ids": ["video"]}
         client = self.render(remove_only=True)
-        guard = get_audio_mutation_guard(self.channel.id)
+        guard = get_audio_mutation_guard(self.channel.id, "video")
         guard.acquire()
+        released = False
         try:
-            with client:
-                await self.button_callback(client, "Bắt đầu xóa")()
+            with patch.object(remove_audio.update_audio_module, "get_terminal_audio_repair_targets", return_value={
+                "video": [{"track_ids": ["failed"]}],
+            }), client:
+                async def run_remove():
+                    with client:
+                        await self.button_callback(client, "Bắt đầu xóa")()
+
+                task = asyncio.create_task(run_remove())
+                await asyncio.sleep(0.03)
+                self.assertFalse(task.done())
+                self.delete_tracks.assert_not_called()
+                guard.release()
+                released = True
+                await asyncio.wait_for(task, 2)
+            self.assertFalse(guard.locked())
+        finally:
+            if not released:
+                guard.release()
+        self.delete_tracks.assert_called_once_with("video", self.channel.id, ["failed"])
+        self.delete.assert_not_called()
+        self.add.assert_not_called()
+
+    async def test_manual_add_modes_run_beside_auto_upload_on_another_video_in_same_channel(self):
+        from src import audio_recovery as recovery
+        guard = get_audio_mutation_guard(self.channel.id, "auto-video")
+        token = recovery._RUNTIME_CHANNEL_CONTEXT.set((999, self.channel.id))
+        try:
+            self.assertTrue(guard.acquire(blocking=False))
+        finally:
+            recovery._RUNTIME_CHANNEL_CONTEXT.reset(token)
+        try:
+            for delete_existing in (True, False):
+                with self.subTest(delete_existing=delete_existing):
+                    key = "audio_add" if delete_existing else "audio_add_only"
+                    self.state.states[key] = self.saved_add_state()
+                    self.events.clear()
+                    self.description_events.clear()
+                    client = self.render(delete_existing=delete_existing)
+                    label = "Bắt đầu xóa & thêm audio" if delete_existing else "Bắt đầu thêm audio"
+                    with client:
+                        await asyncio.wait_for(self.button_callback(client, label)(), 2)
+                    self.assertEqual(self.events, ["add:en", "add:vi"])
+                    self.assertEqual(self.description_events, ["description:en", "description:vi"])
+                    self.assertTrue(guard.locked())
+                    self.assertFalse(get_audio_mutation_guard(self.channel.id, "video").locked())
+        finally:
+            guard.release()
+
+    async def test_remove_only_runs_while_other_video_on_same_channel_is_busy(self):
+        self.state.states["audio_remove"] = {"selected_channel": self.channel.id, "ids": ["video"]}
+        client = self.render(remove_only=True)
+        guard = get_audio_mutation_guard(self.channel.id, "auto-video")
+        self.assertTrue(guard.acquire(blocking=False))
+        try:
+            with patch.object(remove_audio.update_audio_module, "get_terminal_audio_repair_targets", return_value={
+                "video": [{"track_ids": ["failed"]}],
+            }), client:
+                async def run_remove():
+                    with client:
+                        await self.button_callback(client, "Bắt đầu xóa")()
+
+                await asyncio.wait_for(run_remove(), 2)
             self.assertTrue(guard.locked())
-            self.delete.assert_not_called()
+            self.delete_tracks.assert_called_once_with("video", self.channel.id, ["failed"])
+            self.assertFalse(get_audio_mutation_guard(self.channel.id, "video").locked())
+        finally:
+            guard.release()
+
+    async def test_busy_videos_do_not_occupy_all_manual_upload_workers(self):
+        from src import audio_recovery as recovery
+        videos = ["busy-0", "busy-1", "busy-2", "free"]
+        saved = self.saved_add_state()
+        saved.update(video_ids=videos, id_to_path=dict.fromkeys(videos, str(self.music)))
+        self.state.states["audio_add"] = saved
+        guards = [get_audio_mutation_guard(self.channel.id, vid) for vid in videos[:3]]
+        token = recovery._RUNTIME_CHANNEL_CONTEXT.set((999, self.channel.id))
+        try:
+            for guard in guards:
+                self.assertTrue(guard.acquire(blocking=False))
+        finally:
+            recovery._RUNTIME_CHANNEL_CONTEXT.reset(token)
+        free_done = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        seen = []
+        original_add = self.add.side_effect
+
+        def add(**kwargs):
+            vid = kwargs["id_video"]
+            seen.append(vid)
+            self.assertTrue(get_audio_mutation_guard(self.channel.id, vid).locked())
+            if vid == "free" and kwargs.get("audio_content_type") == "descriptive" and kwargs["language"] == "vi":
+                loop.call_soon_threadsafe(free_done.set)
+            return original_add(**kwargs)
+
+        self.add.side_effect = add
+        client = self.render()
+        with client:
+            task = asyncio.create_task(self.button_callback(client, "Bắt đầu xóa & thêm audio")())
+        try:
+            await asyncio.wait_for(free_done.wait(), 2)
+            self.assertEqual(set(seen), {"free"})
+            self.assertFalse(task.done())
+        finally:
+            for guard in guards:
+                guard.release()
+            await asyncio.wait_for(task, 3)
+        self.assertEqual(set(seen), set(videos))
+        self.assertTrue(all(not guard.locked() for guard in guards))
+
+    async def test_stop_while_waiting_for_video_keeps_auto_lock(self):
+        self.state.states["audio_add"] = self.saved_add_state()
+        guard = get_audio_mutation_guard(self.channel.id, "video")
+        self.assertTrue(guard.acquire(blocking=False))
+        client = self.render()
+        with client:
+            task = asyncio.create_task(self.button_callback(client, "Bắt đầu xóa & thêm audio")())
+        try:
+            await asyncio.sleep(0.03)
+            self.assertFalse(task.done())
+            await audio._stop_active_audio_runs()
+            await asyncio.wait_for(task, 2)
+            self.assertTrue(guard.locked())
             self.add.assert_not_called()
+            self.delete_tracks.assert_not_called()
+            self.assertFalse(audio._ADD_AUDIO_RUN_GUARD.locked())
         finally:
             guard.release()
 
