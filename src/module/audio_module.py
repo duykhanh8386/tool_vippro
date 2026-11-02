@@ -2,7 +2,6 @@
 import os
 import time
 import unicodedata
-import mimetypes
 from io import BytesIO
 from urllib.parse import quote
 import requests
@@ -48,6 +47,51 @@ class _AudioUploadBody(BytesIO):
         return block
 
 
+class _AudioUploadFile:
+    """Stream one whole HTTP body without buffering the complete music file."""
+
+    def __init__(self, source, size: int, progress: dict | None):
+        self.source = source
+        self.size = size
+        self.progress = progress
+
+    def __len__(self):
+        return self.size
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        block = self.read(64 * 1024)
+        if not block:
+            raise StopIteration
+        return block
+
+    def tell(self):
+        return self.source.tell()
+
+    def seek(self, offset, whence=0):
+        return self.source.seek(offset, whence)
+
+    def read(self, size=-1):
+        check_stopped()
+        remaining = self.size - self.tell()
+        block = self.source.read(remaining if size is None or size < 0 else min(size, remaining))
+        if not block and remaining:
+            raise AudioUpdateError("File audio bị thay đổi hoặc không đọc đủ dữ liệu khi tải lên")
+        if self.progress is not None:
+            self.progress.update(sent=self.tell(), updated_at=time.monotonic(),
+                                 status="finalizing" if self.tell() >= self.size else "uploading")
+        return block
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        # The upload loop owns the file across retries and closes it once.
+        pass
+
+
 def _youtube_error_message(response: requests.Response, action: str) -> str:
     try:
         api_message = response.json().get("error", {}).get("message", "")
@@ -76,6 +120,20 @@ class UpdateAudioModule(IModule):
     _MAX_UPLOAD_RETRIES = 5
     _UPLOAD_TIMEOUT = (30, 900)
     _TRANSLATION_BATCH_SIZE = 50
+
+    @staticmethod
+    def _serialized_delegation_context(channel_info) -> str:
+        captured = getattr(channel_info, "studio_context", {}) or {}
+        user = captured.get("user") or {} if isinstance(captured, dict) else {}
+        if not isinstance(user, dict):
+            raise AudioUpdateError("Ngữ cảnh đăng nhập không hợp lệ; hãy quét lại kênh")
+        delegation = user.get("delegationContext") or {}
+        if not isinstance(delegation, dict):
+            raise AudioUpdateError("Thông tin ủy quyền kênh không hợp lệ; hãy quét lại kênh")
+        if delegation.get("externalChannelId") not in (None, "", channel_info.id):
+            raise AudioUpdateError("Ngữ cảnh đăng nhập thuộc kênh khác; hãy quét lại đúng kênh trước khi sửa audio")
+        value = getattr(channel_info, "serialized_delegation_context", "") or user.get("serializedDelegationContext", "")
+        return value if isinstance(value, str) else ""
 
     def add(
         self,
@@ -108,8 +166,6 @@ class UpdateAudioModule(IModule):
                 fname_header=fname_header,
                 cookie_string=cookie_string,
                 session=session,
-                file_size=file_size,
-                content_type=mimetypes.guess_type(file_name)[0] or "application/octet-stream",
             )
             # YouTube's audio-track flow first registers the pending Scotty resource
             # with the video, then uploads/finalizes the resource bytes.  Keep the
@@ -146,6 +202,7 @@ class UpdateAudioModule(IModule):
                 file_path=source_path,
                 progress=progress,
                 session=session,
+                single_request=True,
             )
             return res
     def _upload_http(
@@ -153,15 +210,11 @@ class UpdateAudioModule(IModule):
         fname_header: str,
         cookie_string: str,
         session: requests.Session | None = None,
-        file_size: int | None = None,
-        content_type: str = "audio/mpeg",
     ):
         url = "https://upload.youtube.com/upload/audiotrack?authuser=0"
         headers = self._base_upload_headers(fname_header, cookie_string)
-        headers.update({"X-Goog-Upload-Protocol": "resumable", "X-Goog-Upload-Command": "start",
-                        "X-Goog-Upload-Header-Content-Type": content_type})
-        if file_size is not None:
-            headers["X-Goog-Upload-Header-Content-Length"] = str(file_size)
+        # Match TV Automation's audiotrack initialization (the body is just {}).
+        headers.update({"X-Goog-Upload-Protocol": "resumable", "X-Goog-Upload-Command": "start"})
         response = post_with_stop(url, headers=headers, data="{}", session=session)
         if response.status_code != 200:
             raise AudioUpdateError(_youtube_error_message(response, "khởi tạo tải audio"), status_code=response.status_code, retryable=response.status_code == 429 or response.status_code >= 500)
@@ -179,6 +232,9 @@ class UpdateAudioModule(IModule):
             "Cookie": cookie_string,
             "X-Goog-Upload-File-Name": fname_header,
             "Content-Type": "application/x-www-form-urlencoded;charset=utf-8",
+            "Sec-Ch-Ua-Platform": '"Windows"',
+            "Sec-Ch-Ua": '"Chromium";v="139", "Not;A=Brand";v="99"',
+            "Sec-Ch-Ua-Mobile": "?0",
             "Accept-Language": "en-US,en;q=0.9",
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36",
             "Accept": "*/*",
@@ -225,8 +281,9 @@ class UpdateAudioModule(IModule):
         file_path: str | None = None,
         progress: dict | None = None,
         session: requests.Session | None = None,
+        single_request: bool = False,
     ) -> str:
-        """Upload in chunks and resume the same Scotty session after a timeout."""
+        """Upload a complete body like TV Automation, with resumable retries."""
         base_headers = self._base_upload_headers(fname_header, cookie_string)
         if data is None and not file_path:
             raise AudioUpdateError("Không có dữ liệu audio để tải lên")
@@ -251,13 +308,21 @@ class UpdateAudioModule(IModule):
         try:
             while offset < total or needs_finalize:
                 check_stopped()
-                end = min(offset + self._CHUNK_SIZE, total)
-                if source_file is not None:
+                end = total if single_request else min(offset + self._CHUNK_SIZE, total)
+                if single_request and source_file is not None and offset < total:
+                    source_file.seek(offset)
+                    body = _AudioUploadFile(source_file, total, progress)
+                    body_size = end - offset
+                elif source_file is not None:
                     source_file.seek(offset)
                     chunk = source_file.read(end - offset)
+                    body = _AudioUploadBody(chunk, offset, progress)
+                    body_size = len(chunk)
                 else:
                     chunk = data[offset:end]
-                if not chunk and not needs_finalize:
+                    body = _AudioUploadBody(chunk, offset, progress)
+                    body_size = len(chunk)
+                if not body_size and not needs_finalize:
                     raise AudioUpdateError(
                         f"Không đọc được audio tại vị trí {offset}/{total} byte"
                     )
@@ -265,11 +330,11 @@ class UpdateAudioModule(IModule):
                 headers["X-Goog-Upload-Offset"] = str(offset)
                 headers["X-Goog-Upload-Command"] = "upload, finalize" if end == total else "upload"
                 try:
-                    with _AudioUploadBody(chunk, offset, progress) as body:
+                    with body:
                         response = post_with_stop(
                             next_url,
                             headers=headers,
-                            data=body,
+                            data=body if body_size else b"",
                             timeout=self._UPLOAD_TIMEOUT,
                             session=session,
                         )
@@ -283,7 +348,7 @@ class UpdateAudioModule(IModule):
                     server_status = str(response.headers.get("X-Goog-Upload-Status") or "").lower()
                     if server_status and server_status not in {"active", "final"}:
                         raise AudioUpdateError(f"YouTube từ chối phiên tải audio: {server_status}")
-                    offset += len(chunk)
+                    offset += body_size
                     needs_finalize = offset >= total and server_status == "active"
                     if needs_finalize:
                         finalize_attempts += 1
@@ -344,7 +409,7 @@ class UpdateAudioModule(IModule):
             progress["status"] = "complete"
         return "final"
     def _update(self, video_id: str, scotty_resource_id: str, channel_info: ChannelInfo, cookie_string: str, session_token: str, language: str, session: requests.Session | None = None, audio_content_type: str = "dubbed"):
-        url = "https://studio.youtube.com/youtubei/v1/creator/add_audio_track?alt=json"; headers = {"Host": "studio.youtube.com", "Cookie": cookie_string, "Authorization": studio_authorization_header(channel_info.cookies), "Content-Type": "application/json", "Origin": "https://studio.youtube.com", "Referer": f"https://studio.youtube.com/video/{video_id}/translations", "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36", "Accept": "*/*", "Accept-Language": "en-US,en;q=0.9"}; payload = {"videoId": video_id, "resourceId": {"scottyResourceId": {"id": scotty_resource_id}}, "language": language, "audioContentTypeString": audio_content_type, "audioTrackSource": "AUDIO_TRACK_SOURCE_CREATOR", "context": {"client": {"clientName": 62, "clientVersion": "1.20250902.04.00", "hl": "en", "gl": "VN", "utcOffsetMinutes": 420, "userInterfaceTheme": "USER_INTERFACE_THEME_DARK", "screenWidthPoints": 1920, "screenHeightPoints": 945, "screenPixelDensity": 1, "screenDensityFloat": 1}, "request": {"returnLogEntry": True, "internalExperimentFlags": [], "eats": "AWSNWa0l7AGlCHtnt233UutuGGeh33lZ817vfraxpNhL8LY5gqkpaiN73HzUXyRRQ2ApQuCVRfHRtr9rlEQ8rczpjRVn_mm0nP74Qdc4IR95HbzJKhorwIoTVAqfC4o=", "sessionInfo": {"token": session_token}}, "user": {"onBehalfOfUser": channel_info.delegated_session_id, "delegationContext": {"externalChannelId": channel_info.id, "roleType": {"channelRoleType": channel_info.role}}, "serializedDelegationContext": ""}, "clickTracking": {"visualElement": {"veType": 74_618}}, "clientScreenNonce": "UUFKQY_AX3QaOzkG"}}; response = post_with_stop(url, headers=headers, json=payload, session=session)
+        url = "https://studio.youtube.com/youtubei/v1/creator/add_audio_track?alt=json"; headers = {"Host": "studio.youtube.com", "Cookie": cookie_string, "Authorization": studio_authorization_header(channel_info.cookies), "Content-Type": "application/json", "Origin": "https://studio.youtube.com", "Referer": f"https://studio.youtube.com/video/{video_id}/translations", "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36", "Accept": "*/*", "Accept-Language": "en-US,en;q=0.9"}; payload = {"videoId": video_id, "resourceId": {"scottyResourceId": {"id": scotty_resource_id}}, "language": language, "audioContentTypeString": audio_content_type, "audioTrackSource": "AUDIO_TRACK_SOURCE_CREATOR", "context": {"client": {"clientName": 62, "clientVersion": "1.20250902.04.00", "hl": "en", "gl": "VN", "utcOffsetMinutes": 420, "userInterfaceTheme": "USER_INTERFACE_THEME_DARK", "screenWidthPoints": 1920, "screenHeightPoints": 945, "screenPixelDensity": 1, "screenDensityFloat": 1}, "request": {"returnLogEntry": True, "internalExperimentFlags": [], "eats": "AWSNWa0l7AGlCHtnt233UutuGGeh33lZ817vfraxpNhL8LY5gqkpaiN73HzUXyRRQ2ApQuCVRfHRtr9rlEQ8rczpjRVn_mm0nP74Qdc4IR95HbzJKhorwIoTVAqfC4o=", "sessionInfo": {"token": session_token}}, "user": {"onBehalfOfUser": channel_info.delegated_session_id, "delegationContext": {"externalChannelId": channel_info.id, "roleType": {"channelRoleType": channel_info.role}}, "serializedDelegationContext": self._serialized_delegation_context(channel_info)}, "clickTracking": {"visualElement": {"veType": 74_618}}, "clientScreenNonce": "UUFKQY_AX3QaOzkG"}}; response = post_with_stop(url, headers=headers, json=payload, session=session)
         if response.status_code not in (200, 409):
             logger.error("YouTube add_audio_track failed: status={} body={}", response.status_code, response.text[:1000])
             raise AudioUpdateError(_youtube_error_message(response, "gắn audio vào video"), status_code=response.status_code, retryable=response.status_code == 429 or response.status_code >= 500)
@@ -366,7 +431,7 @@ class UpdateAudioModule(IModule):
             return 200
         channel_info = get_channels_info(channel_id); url = "https://studio.youtube.com/youtubei/v1/creator/delete_audio_track?alt=json"; cookie_string = "; ".join([f"{cookie['name']}={cookie['value']}" for cookie in channel_info.cookies]); session_token = self._get_session_token(channel_info); headers = {"Host": "studio.youtube.com", "Cookie": cookie_string, "Authorization": studio_authorization_header(channel_info.cookies), "Content-Type": "application/json", "Origin": "https://studio.youtube.com", "Referer": f"https://studio.youtube.com/video/{id_video}/translations", "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36"}
         for track_id in unique_track_ids:
-            payload = {"videoId": id_video, "audioTrackId": track_id, "unpublishTrack": False, "context": {"client": {"clientName": 62, "clientVersion": "1.20250902.04.00", "hl": "en", "gl": "VN", "experimentsToken": "", "utcOffsetMinutes": 420, "userInterfaceTheme": "USER_INTERFACE_THEME_DARK", "screenWidthPoints": 1920, "screenHeightPoints": 945, "screenPixelDensity": 1, "screenDensityFloat": 1}, "request": {"returnLogEntry": True, "internalExperimentFlags": [], "eats": "AWSNWa3PV1e-JQRiHlmMmNXCMA9Kt6en05uq7bbw9WnQgnJdNT8RNsEfMheyglxoOPf_TMIzUzU80CM9khDsuy6zp2Uz9ROtcC5RGvGrdEkSa_rIL5z6FDB2wAAYVWg=", "sessionInfo": {"token": session_token}}, "user": {"onBehalfOfUser": channel_info.delegated_session_id, "delegationContext": {"externalChannelId": channel_info.id, "roleType": {"channelRoleType": channel_info.role}}, "serializedDelegationContext": ""}, "clientScreenNonce": "7nFa5dcSfcGGJAJS"}}
+            payload = {"videoId": id_video, "audioTrackId": track_id, "unpublishTrack": False, "context": {"client": {"clientName": 62, "clientVersion": "1.20250902.04.00", "hl": "en", "gl": "VN", "experimentsToken": "", "utcOffsetMinutes": 420, "userInterfaceTheme": "USER_INTERFACE_THEME_DARK", "screenWidthPoints": 1920, "screenHeightPoints": 945, "screenPixelDensity": 1, "screenDensityFloat": 1}, "request": {"returnLogEntry": True, "internalExperimentFlags": [], "eats": "AWSNWa3PV1e-JQRiHlmMmNXCMA9Kt6en05uq7bbw9WnQgnJdNT8RNsEfMheyglxoOPf_TMIzUzU80CM9khDsuy6zp2Uz9ROtcC5RGvGrdEkSa_rIL5z6FDB2wAAYVWg=", "sessionInfo": {"token": session_token}}, "user": {"onBehalfOfUser": channel_info.delegated_session_id, "delegationContext": {"externalChannelId": channel_info.id, "roleType": {"channelRoleType": channel_info.role}}, "serializedDelegationContext": self._serialized_delegation_context(channel_info)}, "clientScreenNonce": "7nFa5dcSfcGGJAJS"}}
             response = post_with_stop(url, headers=headers, json=payload)
             if response.status_code != 200:
                 raise AudioUpdateError(
@@ -395,7 +460,7 @@ class UpdateAudioModule(IModule):
         cookie_string = "; ".join([f"{cookie['name']}={cookie['value']}" for cookie in channel_info.cookies])
         session_token = self._get_session_token(channel_info)
         headers = {"Host": "studio.youtube.com", "Cookie": cookie_string, "Authorization": studio_authorization_header(channel_info.cookies), "Content-Type": "application/json", "Origin": "https://studio.youtube.com", "Referer": f"https://studio.youtube.com/video/{video_ids[0]}/translations", "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36"}
-        payload = {"context": {"client": {"clientName": 62, "clientVersion": "1.20260924.00.01", "hl": "vi", "gl": "VN", "experimentsToken": "", "utcOffsetMinutes": 420, "userInterfaceTheme": "USER_INTERFACE_THEME_LIGHT", "screenWidthPoints": 1920, "screenHeightPoints": 945, "screenPixelDensity": 1, "screenDensityFloat": 1}, "request": {"returnLogEntry": True, "internalExperimentFlags": [], "eats": self.EATS, "sessionInfo": {"token": session_token}, "consistencyTokenJars": []}, "user": {"onBehalfOfUser": channel_info.delegated_session_id, "delegationContext": {"externalChannelId": channel_info.id, "roleType": {"channelRoleType": channel_info.role}}, "serializedDelegationContext": ""}, "clientScreenNonce": self.CLIENT_SCREEN_NONCE}, "videoIds": video_ids, "filters": ["TRANSLATION_FILTER_DRAFT", "TRANSLATION_FILTER_PUBLISHED"], "fetchAloudData": False, "fetchAutoDubbingData": False, "fetchAutoDubbingAsrData": False, "fetchBulkActionsStatus": False, "fetchDataFromInternalService": False}
+        payload = {"context": {"client": {"clientName": 62, "clientVersion": "1.20260924.00.01", "hl": "vi", "gl": "VN", "experimentsToken": "", "utcOffsetMinutes": 420, "userInterfaceTheme": "USER_INTERFACE_THEME_LIGHT", "screenWidthPoints": 1920, "screenHeightPoints": 945, "screenPixelDensity": 1, "screenDensityFloat": 1}, "request": {"returnLogEntry": True, "internalExperimentFlags": [], "eats": self.EATS, "sessionInfo": {"token": session_token}, "consistencyTokenJars": []}, "user": {"onBehalfOfUser": channel_info.delegated_session_id, "delegationContext": {"externalChannelId": channel_info.id, "roleType": {"channelRoleType": channel_info.role}}, "serializedDelegationContext": self._serialized_delegation_context(channel_info)}, "clientScreenNonce": self.CLIENT_SCREEN_NONCE}, "videoIds": video_ids, "filters": ["TRANSLATION_FILTER_DRAFT", "TRANSLATION_FILTER_PUBLISHED"], "fetchAloudData": False, "fetchAutoDubbingData": False, "fetchAutoDubbingAsrData": False, "fetchBulkActionsStatus": False, "fetchDataFromInternalService": False}
         response = post_with_stop(url, headers=headers, json=payload)
         if response.status_code != 200:
             raise AudioUpdateError(

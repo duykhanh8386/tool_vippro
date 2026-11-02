@@ -23,15 +23,18 @@ class Response:
 
 
 class AudioUploadTests(unittest.TestCase):
-    def test_start_declares_the_real_audio_size_and_type(self):
+    def test_start_matches_the_tv_automation_audiotrack_protocol(self):
         module = UpdateAudioModule()
         headers = {"X-Goog-Upload-Status": "active", "X-Goog-Upload-URL": "https://session",
                    "X-Goog-Upload-Header-Scotty-Resource-Id": "resource"}
         with patch("src.module.audio_module.post_with_stop", return_value=Response(headers=headers)) as post:
-            self.assertEqual(module._upload_http("song.mp3", "cookie", file_size=123, content_type="audio/mpeg"),
+            self.assertEqual(module._upload_http("song.mp3", "cookie"),
                              ("https://session", "resource"))
-        self.assertEqual(post.call_args.kwargs["headers"]["X-Goog-Upload-Header-Content-Length"], "123")
-        self.assertEqual(post.call_args.kwargs["headers"]["X-Goog-Upload-Header-Content-Type"], "audio/mpeg")
+        self.assertEqual(post.call_args.kwargs["headers"]["X-Goog-Upload-Protocol"], "resumable")
+        self.assertEqual(post.call_args.kwargs["headers"]["X-Goog-Upload-Command"], "start")
+        self.assertEqual(post.call_args.kwargs["data"], "{}")
+        self.assertNotIn("X-Goog-Upload-Header-Content-Length", post.call_args.kwargs["headers"])
+        self.assertNotIn("X-Goog-Upload-Header-Content-Type", post.call_args.kwargs["headers"])
 
     def test_empty_audio_is_rejected_before_registering_a_track(self):
         module = UpdateAudioModule()
@@ -45,7 +48,7 @@ class AudioUploadTests(unittest.TestCase):
         progress, chunks = {}, []
 
         def post(_url, **kwargs):
-            chunks.append(kwargs["data"].read())
+            chunks.append(kwargs["data"].read() if hasattr(kwargs["data"], "read") else kwargs["data"])
             if len(chunks) == 1:
                 return Response(headers={"X-Goog-Upload-Status": "active"})
             self.assertEqual(progress["status"], "finalizing")
@@ -64,7 +67,7 @@ class AudioUploadTests(unittest.TestCase):
         def post(_url, **kwargs):
             if kwargs["headers"]["X-Goog-Upload-Command"] == "query":
                 return Response(headers={"X-Goog-Upload-Size-Received": "3", "X-Goog-Upload-Status": "active"})
-            chunks.append(kwargs["data"].read())
+            chunks.append(kwargs["data"].read() if hasattr(kwargs["data"], "read") else kwargs["data"])
             if len(chunks) == 1:
                 raise requests.exceptions.Timeout("response lost after receiving all bytes")
             return Response(headers={"X-Goog-Upload-Status": "final"})
@@ -289,7 +292,7 @@ class AudioUploadTests(unittest.TestCase):
             )
 
         self.assertIs(start.call_args.kwargs["session"], session)
-        self.assertEqual(start.call_args.kwargs["file_size"], 123)
+        self.assertTrue(upload.call_args.kwargs["single_request"])
         self.assertIs(register.call_args.kwargs["session"], session)
         self.assertIs(upload.call_args.kwargs["session"], session)
         self.assertIsNone(upload.call_args.kwargs["data"])
