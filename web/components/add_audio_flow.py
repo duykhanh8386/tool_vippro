@@ -45,6 +45,10 @@ _ACTIVE_FLOW_RUN = {"parent": None, "children": {}, "task": None}
 _FLOW_STOP_REQUESTED = {"value": False}
 
 
+class FlowAudioLanguageFailures(RuntimeError):
+    """Normal track failures that still allow the description step to run."""
+
+
 def _completed_audio_languages(languages, language_results: dict) -> list[str]:
     """Return flow languages whose upload was accepted by YouTube."""
     return [
@@ -1119,7 +1123,7 @@ def create_add_audio_flow_page():
                         "error": message,
                     }
                     language_errors.append(f"{lang}: {message}")
-                    save_state()
+                    _require_checkpoint(save_state, f"audio language {lang}")
                     logger.error(
                         "Add audio failed for video {} language {}: {}",
                         video_id,
@@ -1162,7 +1166,7 @@ def create_add_audio_flow_page():
                 )
 
             if language_errors:
-                raise Exception(
+                raise FlowAudioLanguageFailures(
                     f"{len(language_errors)}/{len(languages)} ngôn ngữ thất bại: "
                     + "; ".join(language_errors)
                 )
@@ -1370,6 +1374,14 @@ def create_add_audio_flow_page():
                             item["name"],
                             exc,
                         )
+                        if step_key == "add_audio" and isinstance(exc, FlowAudioLanguageFailures):
+                            push_log(
+                                f"{item['name']}: audio thường có ngôn ngữ lỗi — "
+                                "vẫn tiếp tục thêm âm thanh mô tả",
+                                "info",
+                                indent=True,
+                            )
+                            continue
                         break
                     finally:
                         refresh_video_list()
