@@ -49,7 +49,7 @@ class VideoTitleController:
                 return
             self.settings.update(changes)
             # A preview always belongs to its exact channel/folder/filter settings.
-            if set(changes) & {"channel_id", "mode", "scope", "limit", "start_date", "end_date", "date_type"}:
+            if set(changes) & {"channel_id", "mode", "scope", "limit", "start_date", "end_date", "date_type", "title_keyword"}:
                 self.rows = []
                 self.message = "Phạm vi đã đổi. Quét lại video để tạo danh sách mới."
             elif set(changes) & {"folder", "recursive", "tolerance"}:
@@ -88,13 +88,15 @@ class VideoTitleController:
             self._save()
 
     def start(self, action):
-        if action not in {"scan", "scan_part", "scan_manual", "match", "update"}:
+        if action not in {"scan", "scan_keyword", "scan_manual", "match", "update"}:
             raise ValueError("Tác vụ tiêu đề không hợp lệ.")
         with self.lock:
             if self.busy:
                 raise ValueError("Tác vụ đang chạy. Chờ hoàn tất hoặc bấm Dừng.")
             if not self.settings["channel_id"]:
                 raise ValueError("Chọn một kênh YouTube trước.")
+            if action == "scan_keyword" and not self.settings["title_keyword"].strip():
+                raise ValueError("Nhập từ khóa trong tiêu đề trước khi quét.")
             if action == "scan_manual":
                 parse_manual_title_ids(self.settings["manual_ids"])
             if action in {"match", "update"} and not self.rows:
@@ -105,7 +107,8 @@ class VideoTitleController:
                 raise ValueError("Chọn ít nhất một video đã ghép để đổi tiêu đề.")
             self.busy, self.phase = True, action
             self.revision += 1
-            self.message = {"scan": "Đang quét video trên kênh…", "scan_part": "Đang quét video có chữ “part” trong tiêu đề…",
+            self.message = {"scan": "Đang quét video trên kênh…",
+                            "scan_keyword": f'Đang quét video có từ khóa “{self.settings["title_keyword"].strip()}” trong tiêu đề…',
                             "scan_manual": "Đang đọc các Video ID nhập thủ công…",
                             "match": "Đang đọc thời lượng nhạc…", "update": "Đang kiểm tra và đổi tiêu đề…"}[action]
             self.run = create_run_context("video_titles")
@@ -132,7 +135,7 @@ class VideoTitleController:
         try:
             with bind_run_context(run):
                 settings = dict(self.settings)
-                if action in {"scan", "scan_part", "scan_manual"}:
+                if action in {"scan", "scan_keyword", "scan_manual"}:
                     if action == "scan_manual":
                         identifiers = parse_manual_title_ids(settings["manual_ids"])
                         videos = []
@@ -146,15 +149,15 @@ class VideoTitleController:
                     else:
                         videos = scan_title_videos(settings["channel_id"], mode=settings["mode"], scope=settings["scope"],
                                                    limit=settings["limit"], start_date=settings["start_date"], end_date=settings["end_date"],
-                                                   date_type=settings["date_type"], title_contains="part" if action == "scan_part" else "",
+                                                   date_type=settings["date_type"], title_contains=settings["title_keyword"].strip() if action == "scan_keyword" else "",
                                                    progress=self._progress)
                     run.checkpoint()
                     with self.lock:
                         self.rows = [dict(video_id=v.id, channel_id=v.channel_id, old_title=v.title,
                                           duration_seconds=float(v.duration_ms or 0) / 1000, status="scanned",
                                           audio_path="", new_title="", selected=False, detail="Chưa ghép nhạc.") for v in videos]
-                        source = {"scan": "Đã quét", "scan_part": "Đã quét", "scan_manual": "Đã đọc"}[action]
-                        criterion = " có chữ “part” trong tiêu đề" if action == "scan_part" else " nhập thủ công" if action == "scan_manual" else ""
+                        source = {"scan": "Đã quét", "scan_keyword": "Đã quét", "scan_manual": "Đã đọc"}[action]
+                        criterion = f' có từ khóa “{settings["title_keyword"].strip()}” trong tiêu đề' if action == "scan_keyword" else " nhập thủ công" if action == "scan_manual" else ""
                         self.message = f"{source} {len(self.rows)} video{criterion}. Chọn thư mục nhạc rồi bấm Ghép theo thời lượng."
                         self.revision += 1
                         self._save()

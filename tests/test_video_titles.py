@@ -54,6 +54,14 @@ class MemoryState:
 
 
 class TitleScanTests(unittest.TestCase):
+    def test_custom_phrase_matches_titles_across_pages_without_case_or_outer_spaces(self):
+        pages = [([video(title="Part 40"), video(OTHER, title="Tuyển Tập NHẠC XƯA hay")], "next"),
+                 ([video("Ghi123_-XYZ", title="Nhạc mới"), video("Jkl123_-XYZ", title="Nhạc Xưa 2026")], None)]
+        with patch("src.video_title_matching.list_videos_module.list_all_videos", side_effect=pages) as listing:
+            result = scan_title_videos(CHANNEL, limit=2, title_contains="  nhạc xưa  ")
+        self.assertEqual([item.id for item in result], [OTHER, "Jkl123_-XYZ"])
+        self.assertEqual(listing.call_count, 2)
+
     def test_part_scan_counts_matching_titles_across_pages_and_ignores_case(self):
         pages = [([video(title="Song without the keyword"), video(OTHER, title="1026(1)_PART40")], "next"),
                  ([video(OTHER, title="Repeated part"), video("Ghi123_-XYZ", title="Mix Part 2"),
@@ -324,8 +332,11 @@ class TitleControllerTests(unittest.TestCase):
         self.assertFalse(self.controller.busy)
         self.module.read_video.assert_not_called()
 
-    def test_part_button_starts_filtered_scan_and_normal_scan_stays_unfiltered(self):
-        for action, criterion in (("scan_part", "part"), ("scan", "")):
+    def test_keyword_scan_uses_saved_input_and_normal_scan_stays_unfiltered(self):
+        self.controller.change_settings(title_keyword="  Nhạc Xưa  ")
+        self.controller = VideoTitleController(storage=self.state, module=self.module)
+        self.assertEqual(self.controller.settings["title_keyword"], "  Nhạc Xưa  ")
+        for action, criterion in (("scan_keyword", "Nhạc Xưa"), ("scan", "")):
             with self.subTest(action=action), patch("src.video_title_tasks.scan_title_videos", return_value=[video()]) as scan:
                 self.controller.start(action)
                 self.controller.thread.join(5)
@@ -333,7 +344,21 @@ class TitleControllerTests(unittest.TestCase):
                 self.assertEqual(scan.call_args.kwargs["title_contains"], criterion)
                 self.assertEqual(scan.call_args.args, (CHANNEL,))
                 self.assertEqual(self.controller.rows[0]["old_title"], "1026(1)_part40")
+                if criterion:
+                    self.assertIn(criterion, self.controller.message)
         self.module.update_title.assert_not_called()
+
+    def test_blank_keyword_does_not_start_unfiltered_scan_or_replace_preview(self):
+        for keyword in ("", "   "):
+            self.controller.change_settings(title_keyword=keyword)
+            self.controller.rows = [row()]
+            with patch("src.video_title_tasks.scan_title_videos") as scan:
+                with self.assertRaisesRegex(ValueError, "Nhập từ khóa"):
+                    self.controller.start("scan_keyword")
+                scan.assert_not_called()
+            self.assertFalse(self.controller.busy)
+            self.assertIsNone(self.controller.thread)
+            self.assertEqual(len(self.controller.rows), 1)
 
     def test_confirmed_changes_are_saved_and_reload_does_not_select_successes(self):
         self.run_update()
@@ -391,6 +416,43 @@ class TitleControllerTests(unittest.TestCase):
 
 
 class TitlePageTests(unittest.TestCase):
+    def test_keyword_input_starts_scan_with_entered_phrase(self):
+        from nicegui import Client, ui
+        from nicegui.page import page
+        from web.components import video_titles
+        controller = VideoTitleController(storage=MemoryState(), module=Mock())
+        controller.settings["channel_id"] = CHANNEL
+        client = Client(page("/titles-keyword-ui-test"), request=None)
+        timers = []
+        try:
+            with (
+                patch.object(video_titles, "get_video_title_controller", return_value=controller),
+                patch.object(video_titles, "get_channels_info", return_value=[]),
+                patch.object(video_titles.ui, "timer", side_effect=lambda interval, callback, **kwargs: timers.append(callback)),
+                patch.object(video_titles.ui, "notify"),
+                patch("src.video_title_tasks.scan_title_videos", return_value=[video(title="My NONSTOP mix")]) as scan,
+                client,
+            ):
+                video_titles.create_video_titles_page()
+                field = next(item for item in client.elements.values()
+                             if isinstance(item, ui.input) and item._props.get("label") == "Từ khóa trong tiêu đề")
+                button = next(item for item in client.elements.values()
+                              if isinstance(item, ui.button) and item.text == "Quét theo từ khóa")
+                self.assertTrue(button._props.get("disable"))
+                field.set_value("nonstop")
+                self.assertFalse(button._props.get("disable"))
+                listener = next(item for item in button._event_listeners.values() if item.type == "click")
+                inspect.getclosurevars(listener.handler).nonlocals["callback"]()
+                controller.thread.join(5)
+                timers[-1]()
+                self.assertEqual(scan.call_args.kwargs["title_contains"], "nonstop")
+                self.assertEqual(controller.rows[0]["old_title"], "My NONSTOP mix")
+                field.set_value(None)
+                self.assertEqual(controller.settings["title_keyword"], "")
+                self.assertTrue(button._props.get("disable"))
+        finally:
+            client.delete()
+
     def test_action_button_uses_selected_controller_rows_and_refresh_reattaches(self):
         from nicegui import Client, ui
         from nicegui.page import page

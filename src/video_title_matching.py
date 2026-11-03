@@ -80,7 +80,8 @@ def scan_title_videos(channel_id: str, *, mode="count", scope="all", limit=50,
         except (ValueError, TypeError):
             raise ValueError("Khoảng ngày không hợp lệ; ngày kết thúc phải từ ngày bắt đầu trở đi.") from None
     videos, seen, tokens = [], set(), set()
-    title_filter = str(title_contains or "").casefold()
+    title_contains = str(title_contains or "").strip()
+    title_filter = title_contains.casefold()
     token = None
     while True:
         check_stopped()
@@ -178,4 +179,5 @@ def build_title_matches(rows, folder, *, recursive=True, tolerance=2.0,
 def default_title_settings():
     return {"channel_id": "", "mode": "count", "scope": "all", "limit": 50,
             "start_date": scan_today().isoformat(), "end_date": scan_today().isoformat(),
-            "date_type": "auto", "folder": "", "recursive": True, "tolerance": 2.0, "manual_ids": ""}
+            "date_type": "auto", "folder": "", "recursive": True, "tolerance": 2.0, "manual_ids": "",
+            "title_keyword": ""}
