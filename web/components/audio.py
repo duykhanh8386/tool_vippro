@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Awaitable, Callable, Iterable, TypeVar
 from loguru import logger
 from nicegui import context, ui
+from src.audio_description_recovery import AUDIO_CONTENT_TYPES, enabled_audio_types
 from src.audio_recovery import (
     _is_currently_public_video,
     _is_currently_scheduled_video,
@@ -807,6 +808,7 @@ def create_add_audio_page(*, delete_existing: bool = True):
     video_workflow_signatures = {}
     audio_path_history = {}
     repeat_settings = {"times": 2, "extra_minutes": 0}
+    audio_type_settings = {"audio_content_types": list(AUDIO_CONTENT_TYPES)}
     performance_settings = {
         "max_concurrency": DEFAULT_AUDIO_UPLOAD_CONCURRENCY,
         "mode": _AUDIO_UPLOAD_CONCURRENCY_MODE,
@@ -878,6 +880,8 @@ def create_add_audio_page(*, delete_existing: bool = True):
         "scan_start_date_input": None,
         "scan_date_type_select": None,
         "subtitle_switch": None,
+        "dubbed_switch": None,
+        "description_switch": None,
         "caption_oauth_status": None,
     }
 
@@ -931,6 +935,7 @@ def create_add_audio_page(*, delete_existing: bool = True):
                 "audio_path_history": audio_path_history,
                 "selected_languages": selected_languages["languages"],
                 "repeat_settings": repeat_settings,
+                "audio_content_types": list(enabled_audio_types(audio_type_settings)),
                 "selected_channel": selected_channel["id"],
                 "performance_settings": performance_settings,
                 "subtitle_settings": subtitle_settings,
@@ -1014,6 +1019,8 @@ def create_add_audio_page(*, delete_existing: bool = True):
                 selected_languages["languages"] = state["selected_languages"]
             if "repeat_settings" in state:
                 repeat_settings.update(state["repeat_settings"])
+            if delete_existing:
+                audio_type_settings["audio_content_types"] = list(enabled_audio_types(state))
             if "selected_channel" in state:
                 selected_channel["id"] = state["selected_channel"]
             restored_performance, performance_changed = (
@@ -1105,6 +1112,9 @@ def create_add_audio_page(*, delete_existing: bool = True):
                         ui_refs["scan_date_type_select"].value = video_source_state["scan_date_type"]
                     if ui_refs["subtitle_switch"]:
                         ui_refs["subtitle_switch"].value = subtitle_settings["enabled"]
+                    for kind, key in (("dubbed", "dubbed_switch"), ("descriptive", "description_switch")):
+                        if ui_refs[key]:
+                            ui_refs[key].value = kind in enabled_audio_types(audio_type_settings)
                     refresh_caption_oauth_status()
                     request_caption_oauth_if_needed()
                     refresh_video_source_controls()
@@ -1338,6 +1348,42 @@ def create_add_audio_page(*, delete_existing: bool = True):
                 "Lần đầu model nhận dạng sẽ được tải về. Khi quota YouTube hết, "
                 "audio vẫn chạy; lần sau bấm chạy lại sẽ tiếp tục các phụ đề còn thiếu."
             ).classes("text-[11px] text-gray-500")
+
+    def create_audio_type_settings():
+        def change_audio_type(kind, event):
+            selected = list(enabled_audio_types(audio_type_settings))
+            if bool(event.value) == (kind in selected):
+                return
+            if configuration_change_blocked():
+                event.sender.value = kind in selected
+                return
+            if event.value:
+                selected.append(kind)
+            else:
+                selected.remove(kind)
+            audio_type_settings["audio_content_types"] = [
+                value for value in AUDIO_CONTENT_TYPES if value in selected
+            ]
+            save_right_panel_state()
+            refresh_right_panel()
+
+        with app_card(classes="audio-add-section"):
+            ui.label("Loại âm thanh cần xử lý").classes("app-section-title mb-2")
+            with ui.row().classes("gap-4 items-center flex-wrap"):
+                for kind, key, label in (
+                    ("dubbed", "dubbed_switch", "Audio ngôn ngữ"),
+                    ("descriptive", "description_switch", "Âm thanh mô tả"),
+                ):
+                    ui_refs[key] = ui.switch(
+                        label, value=kind in enabled_audio_types(audio_type_settings),
+                        on_change=lambda event, kind=kind: change_audio_type(kind, event),
+                    )
+            ui.label(
+                "Bật một công tắc để chỉ xóa bản lỗi và thêm bản thiếu của loại đó; "
+                "bật cả hai để xử lý audio ngôn ngữ rồi mô tả theo từng ngôn ngữ. "
+                "Bản đã xuất bản hoặc đang xử lý được giữ nguyên. "
+                "Lựa chọn được lưu riêng cho tác vụ này; Auto Registry dùng lựa chọn tại mục Auto Registry."
+            ).classes("app-section-copy")
 
     def create_repeat_settings():
         """Create repeat settings interface"""
@@ -2089,6 +2135,10 @@ def create_add_audio_page(*, delete_existing: bool = True):
             return
         right_panel_refresh["last"] = now
         right_panel_container.clear()
+        audio_types = enabled_audio_types(audio_type_settings)
+        dubbed_enabled = "dubbed" in audio_types
+        description_enabled = "descriptive" in audio_types
+        cleanup_dubs = delete_existing and dubbed_enabled
 
         with right_panel_container:
             with ui.row().classes("audio-add-table-header w-full min-h-[42px] items-center font-semibold text-xs text-gray-500 bg-gray-50 border-b border-gray-200 px-2"):
@@ -2099,7 +2149,7 @@ def create_add_audio_page(*, delete_existing: bool = True):
                 ui.label("").classes("w-1/12")
             for vid in video_ids_state["ids"]:
                 current_path_value = id_to_path.get(vid, "")
-                video_status = video_processing_status.get(vid, {})
+                video_status = (video_processing_status if dubbed_enabled else video_description_status).get(vid, {})
                 caption_status = video_caption_status.get(vid, {})
                 caption_errors = video_caption_errors.get(vid, {})
                 if video_source_state.get("mode") == "failed":
@@ -2121,8 +2171,8 @@ def create_add_audio_page(*, delete_existing: bool = True):
                 video_errors = {
                     language: message
                     for language, message in video_processing_errors.get(vid, {}).items()
-                    if language in active_language_set
-                    or language in {"xử lý", "xóa audio"}
+                    if (dubbed_enabled and language in active_language_set)
+                    or language == "xử lý" or (cleanup_dubs and language == "xóa audio")
                 }
                 active_statuses = [video_status.get(language) for language in active_languages]
                 descriptions = video_description_status.get(vid, {})
@@ -2134,21 +2184,21 @@ def create_add_audio_page(*, delete_existing: bool = True):
                 already_added_count = active_statuses.count("already_added")
                 unsuccessful_count = active_statuses.count("unsuccessful")
                 effective_success = successful_count + already_added_count
-                if total_languages == 0:
+                if total_languages == 0 or not audio_types:
                     overall_status = "pending"
                     status_color = "text-yellow-600"
                     status_icon = "schedule"
                 elif (
-                    (not delete_existing or cleanup_status == "successful")
+                    (not cleanup_dubs or cleanup_status == "successful")
                     and effective_success == total_languages
-                    and description_complete == total_languages
+                    and (not description_enabled or description_complete == total_languages)
                 ):
                     overall_status = "successful"
                     status_color = "text-green-600"
                     status_icon = "check_circle"
-                elif (delete_existing and cleanup_status == "unsuccessful") or unsuccessful_count > 0 or any(
+                elif (cleanup_dubs and cleanup_status == "unsuccessful") or unsuccessful_count > 0 or (description_enabled and any(
                     descriptions.get(lang) == "unsuccessful" for lang in active_languages
-                ):
+                )):
                     overall_status = "unsuccessful"
                     status_color = "text-red-600"
                     status_icon = "error"
@@ -2182,7 +2232,7 @@ def create_add_audio_page(*, delete_existing: bool = True):
                             ui.label(match_label).classes(
                                 "px-2 text-[10px] font-medium text-emerald-600"
                             )
-                        if delete_existing:
+                        if cleanup_dubs:
                             if video_source_state.get("mode") == "failed":
                                 cleanup_labels = {
                                     "pending": ("Chờ xóa đúng audio lỗi", "text-gray-500"),
@@ -2313,9 +2363,12 @@ def create_add_audio_page(*, delete_existing: bool = True):
 
                 with ui.row().classes("w-full items-center gap-2 bg-emerald-50 border-b border-emerald-100 px-4 py-2"):
                     ui.icon("record_voice_over").classes("text-emerald-700")
-                    ui.label(f"Âm thanh mô tả: {description_complete}/{total_languages} ngôn ngữ").classes("text-xs font-medium text-emerald-800")
+                    ui.label(
+                        f"Âm thanh mô tả: {description_complete}/{total_languages} ngôn ngữ"
+                        if description_enabled else "Âm thanh mô tả: Đã tắt trong tác vụ này"
+                    ).classes("text-xs font-medium text-emerald-800")
                     for lang, error in video_description_errors.get(vid, {}).items():
-                        if lang in active_language_set:
+                        if description_enabled and lang in active_language_set:
                             ui.label(f"{lang}: {error}").classes("text-xs text-red-700 whitespace-normal break-words")
 
                 if subtitle_settings["enabled"] or caption_status:
@@ -2379,6 +2432,13 @@ def create_add_audio_page(*, delete_existing: bool = True):
         if _ADD_AUDIO_RUN_GUARD.locked():
             ui.notify("Tác vụ audio đang chạy ở một trang khác.", type="warning")
             return None
+        audio_types = enabled_audio_types(audio_type_settings)
+        if not audio_types:
+            ui.notify("Hãy bật Audio ngôn ngữ hoặc Âm thanh mô tả trước khi chạy.", type="warning")
+            return None
+        dubbed_enabled = "dubbed" in audio_types
+        description_enabled = "descriptive" in audio_types
+        cleanup_dubs = delete_existing and dubbed_enabled
         if not selected_channel["id"]:
             ui.notify("Hãy chọn kênh", type="warning")
             return None
@@ -2464,14 +2524,18 @@ def create_add_audio_page(*, delete_existing: bool = True):
         channel_id = selected_channel["id"]
         repeat_times = repeat_settings["times"]
         extra_minutes = repeat_settings["extra_minutes"]
-        if delete_existing:
+        if cleanup_dubs:
             # Recheck current YouTube state on every run. Previous successful
             # uploads may have failed later; healthy tracks must be preserved.
             for vid in job_video_ids:
                 video_cleanup_status.pop(vid, None)
                 video_processing_status.pop(vid, None)
                 delete_requested.pop(vid, None)
-        video_processing_errors.clear()
+        if dubbed_enabled:
+            video_processing_errors.clear()
+        else:
+            for errors in video_processing_errors.values():
+                errors.pop("xử lý", None)
         if save_right_panel_state() is False:
             _release_audio_run_lock(_ADD_AUDIO_RUN_GUARD)
             ui.notify("Không thể lưu phiên xử lý. Vui lòng thử lại.", type="negative")
@@ -2490,7 +2554,7 @@ def create_add_audio_page(*, delete_existing: bool = True):
         best_effort_ui("open progress dialog", progress_dialog.open)
         total_videos = len(job_video_ids)
         tasks_by_video = {
-            video_id: 2 * len(actions) + int(delete_existing)
+            video_id: len(audio_types) * len(actions) + int(cleanup_dubs)
             for video_id, actions in repair_actions_by_video.items()
         }
         total_tasks = sum(tasks_by_video.values())
@@ -2509,7 +2573,7 @@ def create_add_audio_page(*, delete_existing: bool = True):
         submitted_normal_audio: set[tuple[str, str]] = set()
 
         def delete_failed_dubs(vid: str, languages: list[str]) -> int:
-            if not languages:
+            if not dubbed_enabled or not languages:
                 return 200
             # This runs again on retries so a track which became published
             # after the scan is never deleted using an obsolete track list.
@@ -2624,6 +2688,8 @@ def create_add_audio_page(*, delete_existing: bool = True):
 
         async def run_descriptions(vid: str, languages: list[str], temp_audio_path: Path):
             nonlocal completed_tasks
+            if not description_enabled:
+                return
             statuses = video_description_status.setdefault(vid, {})
             for lang in languages:
                 check_stopped()
@@ -2642,7 +2708,7 @@ def create_add_audio_page(*, delete_existing: bool = True):
                     elif state.get("descriptive") == "terminal" or (
                         (state.get("descriptive") == "missing" or statuses.get(lang) not in ("successful", "already_added"))
                         and (video_processing_status.get(vid, {}).get(lang) in ("successful", "already_added")
-                             or (vid, lang) in submitted_normal_audio)
+                             or (vid, lang) in submitted_normal_audio or not dubbed_enabled)
                     ):
                         failed_ids = (state.get("descriptive_track_ids") or []) if state.get("descriptive") == "terminal" else []
                         if state.get("descriptive") == "terminal" and not failed_ids:
@@ -3025,7 +3091,7 @@ def create_add_audio_page(*, delete_existing: bool = True):
                     dict.fromkeys(
                         track_id
                         for lang, state in current_audio_states.items()
-                        if state.get("dubbed") == "terminal"
+                        if dubbed_enabled and state.get("dubbed") == "terminal"
                         and (not selective_repair or lang.casefold() in current_failed_languages)
                         for track_id in state.get("dubbed_track_ids") or []
                     )
@@ -3050,10 +3116,10 @@ def create_add_audio_page(*, delete_existing: bool = True):
                     video_workflow_signatures[vid] = workflow_signature
 
                 existing_status = video_processing_status.setdefault(vid, {})
-                if delete_existing and video_cleanup_status.get(vid) == "successful":
+                if cleanup_dubs and video_cleanup_status.get(vid) == "successful":
                     completed_tasks += 1
                     completed_by_video[vid] += 1
-                elif delete_existing:
+                elif cleanup_dubs:
                     # In error-scan mode this invalidates only the exact failed
                     # languages, never every configured language.
                     existing_status.clear()
@@ -3136,22 +3202,26 @@ def create_add_audio_page(*, delete_existing: bool = True):
                 for language in no_longer_failed:
                     # It became READY/PUBLISHED or is still PROCESSING between
                     # the scan and this click. Either way it must not be added.
-                    existing_status[language] = "already_added"
+                    if dubbed_enabled:
+                        existing_status[language] = "already_added"
                     if description_scan:
                         video_description_status.setdefault(vid, {})[language] = "already_added"
                 for lang, state in latest_audio_states.get(vid, {}).items():
-                    if state.get("dubbed") in ("healthy", "inflight"):
+                    if dubbed_enabled and state.get("dubbed") in ("healthy", "inflight"):
                         existing_status[lang] = "already_added"
-                if description_only:
+                    if description_enabled and state.get("descriptive") in ("healthy", "inflight"):
+                        video_description_status.setdefault(vid, {})[lang] = "already_added"
+                        video_description_errors.setdefault(vid, {}).pop(lang, None)
+                if dubbed_enabled and description_only:
                     for action in repair_actions:
                         if action.get("audio_present"):
                             existing_status[action["language"]] = "already_added"
                 missing_languages = [
                     lang
                     for lang in languages_for_video
-                    if existing_status.get(lang) not in ("successful", "already_added")
+                    if dubbed_enabled and existing_status.get(lang) not in ("successful", "already_added")
                 ]
-                skipped_count = len(languages_for_video) - len(missing_languages)
+                skipped_count = len(languages_for_video) - len(missing_languages) if dubbed_enabled else 0
                 if skipped_count:
                     completed_tasks += skipped_count
                     completed_by_video[vid] += skipped_count
@@ -3159,7 +3229,7 @@ def create_add_audio_page(*, delete_existing: bool = True):
                         "update skipped-language progress",
                         lambda: setattr(progress_bar, "value", completed_tasks / total_tasks),
                     )
-                if not missing_languages and all(
+                if description_enabled and not missing_languages and all(
                     video_description_status.get(vid, {}).get(lang) in ("successful", "already_added")
                     for lang in languages_for_video
                 ):
@@ -3170,12 +3240,13 @@ def create_add_audio_page(*, delete_existing: bool = True):
                     for lang in languages_for_video:
                         if current_descriptions.get(lang, {}).get("descriptive") in ("terminal", "missing"):
                             video_description_status[vid].pop(lang, None)
-                if not missing_languages and all(
+                if not missing_languages and (not description_enabled or all(
                     video_description_status.get(vid, {}).get(lang) in ("successful", "already_added")
                     for lang in languages_for_video
-                ):
-                    completed_tasks += len(languages_for_video)
-                    completed_by_video[vid] += len(languages_for_video)
+                )):
+                    if description_enabled:
+                        completed_tasks += len(languages_for_video)
+                        completed_by_video[vid] += len(languages_for_video)
                     register_audio_recovery(
                         channel_id=channel_id,
                         video_id=vid,
@@ -3198,7 +3269,7 @@ def create_add_audio_page(*, delete_existing: bool = True):
                                 f"Video {video_index}/{total_videos}: {vid}"
                             ),
                             status_label.set_text(
-                                "Đã đủ audio track — không cần tải lại"
+                                "Đã đủ các loại audio được chọn — không cần tải lại"
                             ),
                             refresh_right_panel(force=False),
                         ),
@@ -3216,7 +3287,7 @@ def create_add_audio_page(*, delete_existing: bool = True):
                         ),
                         status_label.set_text(
                             "Bước 2/2: Đang lấy thông tin video..."
-                            if delete_existing else "Đang lấy thông tin video..."
+                            if cleanup_dubs else "Đang lấy thông tin video..."
                         ),
                     ),
                 )
@@ -3288,11 +3359,11 @@ def create_add_audio_page(*, delete_existing: bool = True):
                             ),
                             refresh_right_panel(force=False),
                             status_label.set_text(
-                                f"Đã xử lý audio và mô tả {language_index}/{len(languages_for_video)}: {lang}"
+                                f"Đã xử lý {language_index}/{len(languages_for_video)} ngôn ngữ: {lang}"
                             ),
                         ),
                     )
-                if all(
+                if not dubbed_enabled or all(
                     video_processing_status.get(vid, {}).get(language)
                     in ("successful", "already_added")
                     for language in languages_for_video
@@ -3377,7 +3448,8 @@ def create_add_audio_page(*, delete_existing: bool = True):
             successful_count = sum(
                 1
                 for language in languages_for_video
-                if video_status.get(language) in ("successful", "already_added")
+                if (not dubbed_enabled or video_status.get(language) in ("successful", "already_added"))
+                and (not description_enabled or video_description_status.get(vid, {}).get(language) in ("successful", "already_added"))
             )
             if total_languages > 0 and successful_count == total_languages:
                 successful_videos += 1
@@ -3430,6 +3502,9 @@ def create_add_audio_page(*, delete_existing: bool = True):
         ui_refs["refresh_channel_display"] = refresh_channel_display
     with page:
         refresh_language_chips = create_language_input_and_chips()
+    if delete_existing:
+        with page:
+            create_audio_type_settings()
     with page:
         create_subtitle_settings()
     with page:
@@ -3851,6 +3926,10 @@ def create_add_audio_page(*, delete_existing: bool = True):
                 return
             try:
                 suppress_autosave["value"] = True
+                audio_type_settings["audio_content_types"] = list(AUDIO_CONTENT_TYPES)
+                for key in ("dubbed_switch", "description_switch"):
+                    if ui_refs[key]:
+                        ui_refs[key].value = True
                 if ui_refs["ids_textarea"]:
                     ui_refs["ids_textarea"].value = ""
                 if ui_refs["language_input"]:

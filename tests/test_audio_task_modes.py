@@ -142,6 +142,172 @@ class AudioTaskModeTests(unittest.IsolatedAsyncioTestCase):
                       if isinstance(element, ui.number) and element._props.get("label") == "Số video muốn quét")
         return toggle, number
 
+    def audio_type_switches(self, client):
+        return {
+            element.text: element for element in client.elements.values()
+            if isinstance(element, ui.switch) and element.text in {"Audio ngôn ngữ", "Âm thanh mô tả"}
+        }
+
+    async def test_manual_audio_type_switches_restore_save_and_do_not_change_registry_preferences(self):
+        self.state.states["audio_add"] = self.saved_add_state()
+        self.state.states["audio_recovery"] = {"audio_content_types": ["dubbed"]}
+        client = self.render()
+        switches = self.audio_type_switches(client)
+        self.assertEqual(set(switches), {"Audio ngôn ngữ", "Âm thanh mô tả"})
+        self.assertTrue(all(control.value for control in switches.values()))
+        with client:
+            switches["Audio ngôn ngữ"].set_value(False)
+        self.assertEqual(self.state.states["audio_add"]["audio_content_types"], ["descriptive"])
+        reopened = self.render()
+        restored = self.audio_type_switches(reopened)
+        self.assertFalse(restored["Audio ngôn ngữ"].value)
+        self.assertTrue(restored["Âm thanh mô tả"].value)
+        self.assertEqual(self.state.states["audio_recovery"], {"audio_content_types": ["dubbed"]})
+        with reopened:
+            self.button_callback(reopened, "Xóa dữ liệu")()
+        self.assertTrue(all(control.value for control in restored.values()))
+        self.assertEqual(self.state.states["audio_add"]["audio_content_types"], ["dubbed", "descriptive"])
+        self.assertEqual(self.state.states["audio_recovery"], {"audio_content_types": ["dubbed"]})
+
+    async def test_language_only_deletes_and_replaces_failed_dubs_without_touching_descriptions(self):
+        saved = self.saved_add_state()
+        saved["audio_content_types"] = ["dubbed"]
+        self.state.states["audio_add"] = saved
+        self.track_states.side_effect = lambda _vid, _channel, languages: {
+            lang: {"dubbed": "terminal", "dubbed_track_ids": ["failed-dub-" + lang],
+                   "descriptive": "terminal", "descriptive_track_ids": ["failed-desc-" + lang]}
+            for lang in languages
+        }
+        client = self.render()
+        await self.button_callback(client, "Bắt đầu xóa & thêm audio")()
+        self.assertEqual(self.events, ["delete_tracks", "add:en", "add:vi"])
+        self.assertEqual(self.description_events, [])
+        self.assertEqual(self.delete_tracks.call_args.args[2], ["failed-dub-en", "failed-dub-vi"])
+        self.invalidate_description.assert_not_called()
+        self.assertTrue(all(call.kwargs.get("audio_content_type", "dubbed") == "dubbed"
+                            for call in self.add.call_args_list))
+
+    async def test_description_only_replaces_failed_descriptions_without_touching_failed_dubs(self):
+        saved = self.saved_add_state()
+        saved["audio_content_types"] = ["descriptive"]
+        saved["video_processing_errors"] = {"video": {"en": "old dubbed error"}}
+        self.state.states["audio_add"] = saved
+        self.track_states.side_effect = lambda _vid, _channel, languages: {
+            lang: {"dubbed": "terminal", "dubbed_track_ids": ["failed-dub-" + lang],
+                   "descriptive": "terminal", "descriptive_track_ids": ["failed-desc-" + lang]}
+            for lang in languages
+        }
+        client = self.render()
+        await self.button_callback(client, "Bắt đầu xóa & thêm audio")()
+        self.assertEqual(self.description_events, ["description:en", "description:vi"])
+        self.assertEqual(self.events, ["delete_tracks", "delete_tracks"])
+        self.assertEqual([call.args[2] for call in self.delete_tracks.call_args_list],
+                         [["failed-desc-en"], ["failed-desc-vi"]])
+        self.assertTrue(all(call.kwargs["audio_content_type"] == "descriptive" for call in self.add.call_args_list))
+        self.assertEqual(audio.ui.notify.call_args.kwargs["type"], "positive")
+        self.assertIn("1/1 video thành công", audio.ui.notify.call_args.args[0])
+
+    async def test_description_only_can_add_missing_descriptions_when_normal_audio_is_missing(self):
+        saved = self.saved_add_state()
+        saved["audio_content_types"] = ["descriptive"]
+        self.state.states["audio_add"] = saved
+        client = self.render()
+        await self.button_callback(client, "Bắt đầu xóa & thêm audio")()
+        self.assertEqual(self.events, [])
+        self.assertEqual(self.description_events, ["description:en", "description:vi"])
+        self.delete_tracks.assert_not_called()
+
+    async def test_manual_audio_types_both_off_prevents_any_delete_or_upload(self):
+        saved = self.saved_add_state()
+        saved["audio_content_types"] = []
+        self.state.states["audio_add"] = saved
+        client = self.render()
+        await self.button_callback(client, "Bắt đầu xóa & thêm audio")()
+        self.track_states.assert_not_called()
+        self.delete.assert_not_called()
+        self.delete_tracks.assert_not_called()
+        self.add.assert_not_called()
+        self.assertFalse(audio._ADD_AUDIO_RUN_GUARD.locked())
+        self.assertIn("Hãy bật", audio.ui.notify.call_args.args[0])
+
+    async def test_single_audio_type_preserves_published_and_processing_tracks_without_rendering(self):
+        for kind in ("dubbed", "descriptive"):
+            for track_state in ("healthy", "inflight"):
+                with self.subTest(kind=kind, track_state=track_state):
+                    saved = self.saved_add_state()
+                    saved["audio_content_types"] = [kind]
+                    self.state.states["audio_add"] = saved
+                    self.track_states.side_effect = lambda _vid, _channel, languages: {
+                        lang: {"dubbed": track_state, "descriptive": track_state} for lang in languages
+                    }
+                    client = self.render()
+                    with patch.object(audio, "multiply_audio") as render:
+                        await self.button_callback(client, "Bắt đầu xóa & thêm audio")()
+                    render.assert_not_called()
+        self.add.assert_not_called()
+        self.delete_tracks.assert_not_called()
+        self.delete.assert_not_called()
+
+    async def test_single_audio_type_keeps_scanned_language_scope_and_deletes_only_selected_track_type(self):
+        targets = {"video": [{"language": "en", "reason": "terminal", "track_ids": ["failed-dub-en"]}]}
+        for kind in ("dubbed", "descriptive"):
+            with self.subTest(kind=kind):
+                saved = self.saved_add_state()
+                saved["audio_content_types"] = [kind]
+                saved["video_source_state"].update({
+                    "mode": "failed", "failed_channel": self.channel.id, "failed_targets": targets,
+                })
+                self.state.states["audio_add"] = saved
+                self.track_states.side_effect = lambda _vid, _channel, languages: {
+                    lang: {"dubbed": "terminal", "dubbed_track_ids": ["failed-dub-" + lang],
+                           "descriptive": "terminal", "descriptive_track_ids": ["failed-desc-" + lang]}
+                    for lang in languages
+                }
+                self.add.reset_mock()
+                self.delete_tracks.reset_mock()
+                client = self.render()
+                with patch.object(audio.update_audio_module, "get_terminal_audio_repair_targets", return_value=targets):
+                    await self.button_callback(client, "Bắt đầu xóa & thêm audio")()
+                self.add.assert_called_once()
+                self.assertEqual(self.add.call_args.kwargs["language"], "en")
+                self.assertEqual(self.add.call_args.kwargs.get("audio_content_type", "dubbed"), kind)
+                self.delete_tracks.assert_called_once()
+                self.assertEqual(self.delete_tracks.call_args.args[2],
+                                 ["failed-dub-en" if kind == "dubbed" else "failed-desc-en"])
+
+    async def test_switching_to_description_only_after_language_only_adds_just_missing_descriptions(self):
+        saved = self.saved_add_state()
+        saved["audio_content_types"] = ["dubbed"]
+        self.state.states["audio_add"] = saved
+        client = self.render()
+        await self.button_callback(client, "Bắt đầu xóa & thêm audio")()
+        self.assertEqual(self.events, ["add:en", "add:vi"])
+        self.assertEqual(self.description_events, [])
+        switches = self.audio_type_switches(client)
+        with client:
+            switches["Audio ngôn ngữ"].set_value(False)
+            switches["Âm thanh mô tả"].set_value(True)
+        await self.button_callback(client, "Bắt đầu xóa & thêm audio")()
+        self.assertEqual(self.events, ["add:en", "add:vi"])
+        self.assertEqual(self.description_events, ["description:en", "description:vi"])
+        self.assertEqual(self.add.call_count, 4)
+        self.assertEqual(self.state.states["audio_add"]["video_processing_status"]["video"],
+                         {"en": "successful", "vi": "successful"})
+
+    async def test_audio_type_change_is_rejected_while_a_manual_audio_run_owns_configuration(self):
+        self.state.states["audio_add"] = self.saved_add_state()
+        client = self.render()
+        switch = self.audio_type_switches(client)["Audio ngôn ngữ"]
+        self.assertTrue(audio._ADD_AUDIO_RUN_GUARD.acquire(blocking=False))
+        try:
+            with client:
+                switch.set_value(False)
+            self.assertTrue(switch.value)
+            self.assertEqual(self.state.states["audio_add"].get("audio_content_types", ["dubbed", "descriptive"]),
+                             ["dubbed", "descriptive"])
+        finally:
+            audio._ADD_AUDIO_RUN_GUARD.release()
+
     async def test_combined_workflow_deletes_only_failed_dubs_before_uploading_replacements(self):
         self.state.states["audio_add"] = self.saved_add_state()
         self.track_states.side_effect = lambda _vid, _channel, languages: {
