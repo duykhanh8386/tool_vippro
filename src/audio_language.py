@@ -15,6 +15,27 @@ _LANGUAGE_CODE_RE = re.compile(
 )
 
 
+def audio_error_message(error: BaseException | str, *, max_length: int = 280) -> str:
+    """Keep UI/checkpoint errors concise without exposing upload session URLs."""
+    message = " ".join(str(error).split())
+    if isinstance(error, requests.exceptions.SSLError) or "SSLError(" in message:
+        return "Kết nối bảo mật tới YouTube bị gián đoạn. Hãy thử lại phần audio lỗi."
+    if isinstance(error, requests.exceptions.Timeout):
+        return "Hết thời gian chờ YouTube phản hồi. Hãy thử lại phần audio lỗi."
+    if isinstance(error, (requests.exceptions.ConnectionError, requests.exceptions.ChunkedEncodingError)) or "HTTPSConnectionPool(" in message:
+        return "Kết nối tới YouTube bị gián đoạn. Hãy thử lại phần audio lỗi."
+    message = re.sub(r"https?://\S+", "[địa chỉ tải lên]", message)
+    return message if len(message) <= max_length else message[:max_length - 1] + "…"
+
+
+def summarize_audio_errors(errors: list[str]) -> str:
+    """Show one actionable error; keep per-language details in their own rows."""
+    if not errors:
+        return ""
+    first = audio_error_message(errors[0], max_length=160)
+    return first + (f" (+{len(errors) - 1} lỗi khác; xem chi tiết từng ngôn ngữ)." if len(errors) > 1 else "")
+
+
 def normalize_language_code(code: str) -> str:
     """Return a consistently cased BCP-47-style language code."""
     parts = code.strip().split("-")

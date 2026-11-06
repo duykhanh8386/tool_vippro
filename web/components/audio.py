@@ -28,6 +28,7 @@ from src.audio_batch_matcher import (
     match_audio_files_sequentially,
 )
 from src.audio_language import (
+    audio_error_message,
     call_audio_update_with_retry,
     invalid_language_codes,
     parse_language_codes,
@@ -2367,9 +2368,17 @@ def create_add_audio_page(*, delete_existing: bool = True):
                         f"Âm thanh mô tả: {description_complete}/{total_languages} ngôn ngữ"
                         if description_enabled else "Âm thanh mô tả: Đã tắt trong tác vụ này"
                     ).classes("text-xs font-medium text-emerald-800")
-                    for lang, error in video_description_errors.get(vid, {}).items():
-                        if description_enabled and lang in active_language_set:
-                            ui.label(f"{lang}: {error}").classes("text-xs text-red-700 whitespace-normal break-words")
+                    description_errors = {
+                        lang: error for lang, error in video_description_errors.get(vid, {}).items()
+                        if description_enabled and lang in active_language_set
+                    }
+                    if description_errors:
+                        with ui.expansion(
+                            f"{len(description_errors)} ngôn ngữ mô tả lỗi — xem chi tiết",
+                            icon="error_outline",
+                        ).classes("w-full text-xs text-red-700"):
+                            for lang, error in description_errors.items():
+                                ui.label(f"{lang}: {audio_error_message(error)}").classes("text-xs whitespace-normal break-words")
 
                 if subtitle_settings["enabled"] or caption_status:
                     caption_complete = sum(
@@ -2426,8 +2435,12 @@ def create_add_audio_page(*, delete_existing: bool = True):
                         with ui.row().classes("items-center gap-2"):
                             ui.icon("error").classes("text-red-600")
                             ui.label(f"Không thể cập nhật audio cho video {vid}").classes("font-semibold text-red-700")
-                        for error_lang, error_message in video_errors.items():
-                            ui.label(f"Ngôn ngữ {error_lang}: {error_message}").classes("text-sm text-red-700 whitespace-normal break-words")
+                        with ui.expansion(
+                            f"{len(video_errors)} ngôn ngữ audio lỗi — xem chi tiết",
+                            icon="error_outline",
+                        ).classes("w-full text-xs text-red-700"):
+                            for error_lang, error_message in video_errors.items():
+                                ui.label(f"Ngôn ngữ {error_lang}: {audio_error_message(error_message)}").classes("text-sm whitespace-normal break-words")
     async def _execute_add_audio():
         if _ADD_AUDIO_RUN_GUARD.locked():
             ui.notify("Tác vụ audio đang chạy ở một trang khác.", type="warning")
@@ -2678,8 +2691,9 @@ def create_add_audio_page(*, delete_existing: bool = True):
                 ):
                     submitted_normal_audio.add((vid, lang))
                 statuses.setdefault(vid, {})[lang] = "unsuccessful"
-                overall_errors.append(f"{vid}-{lang}{' (mô tả)' if descriptive else ''}: {exc}")
-                errors.setdefault(vid, {})[lang] = str(exc)
+                message = audio_error_message(exc)
+                overall_errors.append(f"{vid}-{lang}{' (mô tả)' if descriptive else ''}: {message}")
+                errors.setdefault(vid, {})[lang] = message
                 save_right_panel_state()
                 if _is_youtube_auth_error(exc):
                     raise
@@ -2735,8 +2749,9 @@ def create_add_audio_page(*, delete_existing: bool = True):
                     raise
                 except Exception as exc:
                     statuses[lang] = "unsuccessful"
-                    video_description_errors.setdefault(vid, {})[lang] = str(exc)
-                    overall_errors.append(f"{vid}-{lang} (mô tả): {exc}")
+                    message = audio_error_message(exc)
+                    video_description_errors.setdefault(vid, {})[lang] = message
+                    overall_errors.append(f"{vid}-{lang} (mô tả): {message}")
                     if save_right_panel_state() is False:
                         raise RuntimeError("Không thể lưu lỗi thay thế âm thanh mô tả") from exc
                     if _is_youtube_auth_error(exc):
@@ -3468,7 +3483,8 @@ def create_add_audio_page(*, delete_existing: bool = True):
             best_effort_ui(
                 "notify audio errors",
                 lambda: ui.notify(
-                    f"Cập nhật thất bại: {overall_errors[0]}. Xem chi tiết trong khung màu đỏ bên dưới.",
+                    f"Tác vụ còn {len(overall_errors)} lỗi cần xử lý. "
+                    "Xem trạng thái và mở chi tiết lỗi của từng video bên dưới.",
                     type="negative",
                 ),
             )

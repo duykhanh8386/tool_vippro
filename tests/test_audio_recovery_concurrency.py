@@ -477,7 +477,7 @@ class AudioRecoveryConcurrencyTests(unittest.IsolatedAsyncioTestCase):
                     result = await self.finish_cycle(task)
                 self.assertEqual(result["repaired"], 4)
 
-    async def test_descriptions_wait_for_verification_before_retrying_after_submission(self):
+    async def test_accepted_descriptions_are_monitored_without_duplicate_uploads(self):
         await run_audio_recovery_cycle(now=2000)
         add = self.mocks["update_audio_module.add"]
         add.reset_mock()
@@ -485,12 +485,12 @@ class AudioRecoveryConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         add.assert_not_called()
         self.assertEqual(waiting["skipped"], "complete_or_waiting")
         result = await run_audio_recovery_cycle(now=2031)
-        self.assertEqual(add.call_count, 10)
-        self.assertEqual(result["repaired"], 10)
+        add.assert_not_called()
+        self.assertEqual(result["repaired"], 0)
         self.assertEqual(len(result["channel_results"]), 5)
         for report in result["channel_results"]:
-            self.assertEqual(report["outcome"], "submitted")
-            self.assertEqual(report["submitted"], 2)
+            self.assertEqual(report["outcome"], "scanned")
+            self.assertEqual(report["submitted"], 0)
             self.assertEqual(report["cooldown_tracks"], 0)
 
     async def test_deactivating_queued_channel_prevents_its_scan_and_mutations(self):

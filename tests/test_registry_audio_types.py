@@ -109,7 +109,7 @@ class RegistryAudioTypeTests(RegistryAudioFixture, unittest.IsolatedAsyncioTestC
             ("add", "dubbed", "en"), ("add", "descriptive", "en"),
             ("add", "dubbed", "vi"), ("add", "descriptive", "vi"),
         ])
-        self.assertFalse(registry_entry_complete(self.saved_entry(), self.selected()))
+        self.assertTrue(registry_entry_complete(self.saved_entry(), self.selected()))
         await recovery.run_audio_recovery_cycle(now=2031)
         self.assertTrue(registry_entry_complete(self.saved_entry(), self.selected()))
 
@@ -356,13 +356,13 @@ class RegistryAudioTypeTests(RegistryAudioFixture, unittest.IsolatedAsyncioTestC
         self.assertEqual(self.events, [("add", "descriptive", "en")])
         self.assertEqual(self.saved_entry()["dubbed_completed_languages"], ["en"])
 
-    async def test_waiting_for_language_processing_does_not_repeatedly_render_full_audio(self):
+    async def test_processing_language_audio_allows_descriptions_without_repeated_rendering(self):
         self.payload = response([audio_track("en", "dubbed", "PROCESSING"), audio_track("vi", "dubbed", "PROCESSING")])
         await recovery.run_audio_recovery_cycle(now=2000)
         await recovery.run_audio_recovery_cycle(now=2031)
-        self.metadata.assert_not_called()
-        self.render.assert_not_called()
-        self.add.assert_not_called()
+        self.metadata.assert_called_once()
+        self.render.assert_called_once()
+        self.assertEqual(self.events, [("add", "descriptive", "en"), ("add", "descriptive", "vi")])
         self.delete_ids.assert_not_called()
 
     async def test_original_audio_is_preserved_when_both_types_are_enabled(self):

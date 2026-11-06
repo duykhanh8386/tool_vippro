@@ -50,7 +50,8 @@ def description_work_due(entry: dict, now: float) -> bool:
 
 
 def audio_work_due(entry: dict, now: float, audio_content_type: str) -> bool:
-    if audio_entry_complete(entry, audio_content_type) or not description_languages(entry):
+    watching = entry.get(track_state_prefix(audio_content_type) + "_processing_observations")
+    if (audio_entry_complete(entry, audio_content_type) and not watching) or not description_languages(entry):
         return False
     try:
         return float(entry.get(track_state_prefix(audio_content_type) + "_next_check_at") or 0) <= now
@@ -59,7 +60,9 @@ def audio_work_due(entry: dict, now: float, audio_content_type: str) -> bool:
 
 
 def registry_work_due(entry: dict, now: float, audio_types=("descriptive",)) -> bool:
-    if audio_types and registry_entry_complete(entry, audio_types):
+    if audio_types and registry_entry_complete(entry, audio_types) and not any(
+        entry.get(track_state_prefix(kind) + "_processing_observations") for kind in audio_types
+    ):
         return False
     if any(audio_work_due(entry, now, kind) for kind in audio_types):
         return True
@@ -104,10 +107,11 @@ def build_description_recovery_plan(payload: dict, entries: dict, video_ids, aud
         video_observations = observations[video_id] = {}
         for language in description_languages(entry):
             key = language.casefold()
-            if key in completed:
+            if key in completed and key not in (entry.get(track_state_prefix(audio_content_type) + "_processing_observations") or {}):
                 continue
             states = {}
             original = False
+            confirmed_processing = False
             for track in tracks:
                 if (UpdateAudioModule._translation_language(track) or "").casefold() != key:
                     continue
@@ -118,6 +122,7 @@ def build_description_recovery_plan(payload: dict, entries: dict, video_ids, aud
                     state = "terminal"
                 elif UpdateAudioModule._audio_payload_needs_attention(track, assume_audio=True):
                     state = "processing"
+                    confirmed_processing = True
                 elif _confirmed_description(track):
                     state = "healthy"
                 else:
@@ -128,9 +133,11 @@ def build_description_recovery_plan(payload: dict, entries: dict, video_ids, aud
             if audio_content_type == "dubbed" and state == "healthy" and not original:
                 track_ids = sorted({track_id for ids in states.values() for track_id in ids})
             video_observations[key] = {"language": language, "state": state, "track_ids": track_ids}
+            if state == "processing" and not confirmed_processing:
+                video_observations[key]["unconfirmed"] = True
             if original:
                 video_observations[key]["original"] = True
-            if state in {"missing", "terminal"}:
+            if state in {"missing", "terminal"} and (key not in completed or state == "terminal"):
                 actions.append({"video_id": video_id, "language": language, "track_ids": track_ids,
                                 "reason": ("missing_description" if audio_content_type == "descriptive" else "missing_audio") if state == "missing" else "terminal",
                                 "audio_content_type": audio_content_type})
@@ -177,7 +184,8 @@ def build_registry_recovery_plan(payload: dict, entries: dict, video_ids, audio_
                 continue
             video_id, key = action["video_id"], action["language"].casefold()
             normal = observations.get("dubbed", {}).get(video_id, {}).get(key, {})
-            if (normal.get("state") == "processing" and (video_id, key) not in normal_actions
+            if (normal.get("state") == "processing" and normal.get("unconfirmed")
+                    and (video_id, key) not in normal_actions
                     and not dubbed_upload_submitted(entries[video_id], key)):
                 deferred_descriptions.add((video_id, key))
             if (video_id, key) in normal_actions:

@@ -92,7 +92,7 @@ class RegistryDescriptionTests(RegistryAudioFixture, unittest.IsolatedAsyncioTes
                 self.assertEqual(result["repaired"], 2)
                 self.assertEqual([call.kwargs["language"] for call in self.add.call_args_list], ["en", "vi"])
                 self.assertTrue(all(call.kwargs["audio_content_type"] == "descriptive" for call in self.add.call_args_list))
-                self.assertFalse(description_entry_complete(self.saved_entry()))
+                self.assertTrue(description_entry_complete(self.saved_entry()))
         self.assertTrue(all(not path.exists() for path in self.temp_paths))
 
     async def test_confirmed_descriptions_are_completed_and_never_rescanned_after_restart(self):
@@ -118,7 +118,7 @@ class RegistryDescriptionTests(RegistryAudioFixture, unittest.IsolatedAsyncioTes
         self.payload = response([audio_track("en"), audio_track("vi", "dubbed", "DELETED")])
         await recovery.run_audio_recovery_cycle(now=2000)
         self.assertEqual([call.kwargs["language"] for call in self.add.call_args_list], ["vi"])
-        self.assertEqual(self.saved_entry()["description_completed_languages"], ["en"])
+        self.assertEqual(self.saved_entry()["description_completed_languages"], ["en", "vi"])
         self.assertTrue(self.saved_entry()["description_attempts"]["vi"]["succeeded"])
         self.fetch.reset_mock()
         await recovery.run_audio_recovery_cycle(now=2005)
@@ -181,7 +181,7 @@ class RegistryDescriptionTests(RegistryAudioFixture, unittest.IsolatedAsyncioTes
         self.payload = response()
         await recovery.run_audio_recovery_cycle(now=2031)
         self.add.assert_called_once()
-        self.assertFalse(description_entry_complete(self.saved_entry()))
+        self.assertTrue(description_entry_complete(self.saved_entry()))
         self.payload = response([audio_track("es-MX")])
         await recovery.run_audio_recovery_cycle(now=2062)
         self.assertTrue(description_entry_complete(self.saved_entry()))
@@ -207,7 +207,7 @@ class RegistryDescriptionTests(RegistryAudioFixture, unittest.IsolatedAsyncioTes
         self.add.side_effect = upload
         await recovery.run_audio_recovery_cycle(now=2000)
         self.assertEqual(events, [("delete", ["failed-en"]), ("add", "en")])
-        self.assertEqual(self.saved_entry()["description_completed_languages"], ["vi"])
+        self.assertEqual(self.saved_entry()["description_completed_languages"], ["en", "vi"])
 
     async def test_changed_failed_description_uses_fresh_track_ids(self):
         self.entry["languages"] = ["en"]
@@ -246,7 +246,7 @@ class RegistryDescriptionTests(RegistryAudioFixture, unittest.IsolatedAsyncioTes
         self.delete_ids.assert_not_called()
         self.assertTrue(description_entry_complete(self.saved_entry()))
 
-    async def test_processing_description_is_retried_only_after_two_hours_without_delete(self):
+    async def test_processing_description_is_successful_and_never_replaced_for_age(self):
         self.entry["languages"] = ["en"]
         self.reset_registry()
         self.payload = response([audio_track("en", status="PROCESSING")])
@@ -254,9 +254,9 @@ class RegistryDescriptionTests(RegistryAudioFixture, unittest.IsolatedAsyncioTes
         await recovery.run_audio_recovery_cycle(now=2031)
         self.add.assert_not_called()
         await recovery.run_audio_recovery_cycle(now=9201)
-        self.add.assert_called_once()
+        self.add.assert_not_called()
         self.delete_ids.assert_not_called()
-        self.assertFalse(description_entry_complete(self.saved_entry()))
+        self.assertTrue(description_entry_complete(self.saved_entry()))
 
     async def test_description_ready_during_render_is_not_uploaded_again(self):
         def render(**kwargs):
@@ -283,7 +283,7 @@ class RegistryDescriptionTests(RegistryAudioFixture, unittest.IsolatedAsyncioTes
         self.assertFalse(description_entry_complete(self.saved_entry()))
         await recovery.run_audio_recovery_cycle(now=2001)
         self.assertEqual([call.kwargs["language"] for call in self.add.call_args_list], ["fr"])
-        self.assertEqual(self.saved_entry()["description_completed_languages"], ["en", "vi"])
+        self.assertEqual(self.saved_entry()["description_completed_languages"], ["en", "vi", "fr"])
 
     async def test_missing_old_source_is_recovered_from_the_saved_channel_history(self):
         self.entry["audio_path"] = str(self.folder / "moved" / "song.mp3")
@@ -317,20 +317,16 @@ class RegistryDescriptionTests(RegistryAudioFixture, unittest.IsolatedAsyncioTes
         await recovery.run_audio_recovery_cycle(now=2031)
         self.assertTrue(description_entry_complete(self.saved_entry()))
 
-    async def test_changed_processing_track_is_left_to_finish_after_render(self):
+    async def test_changed_processing_track_stays_successful_without_rendering(self):
         self.entry["languages"] = ["en"]
         self.reset_registry()
         self.payload = response([audio_track("en", status="PROCESSING")])
         await recovery.run_audio_recovery_cycle(now=2000)
 
-        def render(**kwargs):
-            Path(kwargs["output_file"]).write_bytes(b"full music")
-            self.payload = response([audio_track("en", status="PROCESSING", track_id="new-track")])
-
-        self.render.side_effect = render
+        self.payload = response([audio_track("en", status="PROCESSING", track_id="new-track")])
         await recovery.run_audio_recovery_cycle(now=9201)
         self.add.assert_not_called()
-        self.assertFalse(description_entry_complete(self.saved_entry()))
+        self.assertTrue(description_entry_complete(self.saved_entry()))
         self.assertEqual(self.saved_entry()["description_processing_observations"]["en"]["track_ids"], ["new-track"])
 
     async def test_unknown_description_status_is_not_prematurely_completed(self):

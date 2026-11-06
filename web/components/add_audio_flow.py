@@ -5,9 +5,11 @@ from pathlib import Path
 from loguru import logger
 from nicegui import context, ui
 from src.audio_language import (
+    audio_error_message,
     call_audio_update_with_retry,
     invalid_language_codes,
     parse_language_codes,
+    summarize_audio_errors,
 )
 from src.audio_recovery import get_audio_mutation_guard, register_audio_recovery
 from src.channel_store import channel_store
@@ -212,8 +214,10 @@ async def _add_flow_audio_description(
             except TaskStopped:
                 raise
             except Exception as exc:
-                results[lang] = {"status": "unsuccessful", "error": str(exc)}
-                errors.append(f"{lang}: {exc}")
+                message = audio_error_message(exc)
+                results[lang] = {"status": "unsuccessful", "error": message}
+                errors.append(f"{lang}: {message}")
+                logger.error("Description audio failed: video={} language={} error={}", video_id, lang, message)
                 _require_checkpoint(persist, f"audio description {lang}")
                 push_log(f"Âm thanh mô tả {lang}: thất bại — tiếp tục mã kế tiếp", "error", indent=True)
                 continue
@@ -226,7 +230,7 @@ async def _add_flow_audio_description(
         if errors:
             raise RuntimeError(
                 f"Âm thanh mô tả: {len(errors)}/{len(targets)} ngôn ngữ thất bại: "
-                + "; ".join(errors)
+                + summarize_audio_errors(errors)
             )
         return language
     finally:
@@ -1117,7 +1121,7 @@ def create_add_audio_flow_page():
                 except TaskStopped:
                     raise
                 except Exception as exc:
-                    message = str(exc)
+                    message = audio_error_message(exc)
                     language_results[lang] = {
                         "status": "unsuccessful",
                         "error": message,
@@ -1168,7 +1172,7 @@ def create_add_audio_flow_page():
             if language_errors:
                 raise FlowAudioLanguageFailures(
                     f"{len(language_errors)}/{len(languages)} ngôn ngữ thất bại: "
-                    + "; ".join(language_errors)
+                    + summarize_audio_errors(language_errors)
                 )
         finally:
             if channel_mutation_guard is not None:

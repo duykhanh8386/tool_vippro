@@ -148,6 +148,32 @@ class AudioTaskModeTests(unittest.IsolatedAsyncioTestCase):
             if isinstance(element, ui.switch) and element.text in {"Audio ngôn ngữ", "Âm thanh mô tả"}
         }
 
+    async def test_upload_errors_stay_compact_and_details_are_collapsed_in_both_add_modes(self):
+        for delete_existing, key, button in (
+            (True, "audio_add", "Bắt đầu xóa & thêm audio"),
+            (False, "audio_add_only", "Bắt đầu thêm audio"),
+        ):
+            with self.subTest(delete_existing=delete_existing):
+                self.state.states[key] = self.saved_add_state()
+
+                def reject(**kwargs):
+                    kwargs["progress"].update(registered=True, file_finalized=True)
+                    raise AudioUpdateError("AUDIO_TRACK_STATUS_FAILED " + "details " * 1000)
+
+                self.add.side_effect = reject
+                client = self.render(delete_existing=delete_existing)
+                await self.button_callback(client, button)()
+                saved = self.state.states[key]
+                self.assertLessEqual(len(saved["video_processing_errors"]["video"]["en"]), 280)
+                self.assertLessEqual(len(saved["video_description_errors"]["video"]["en"]), 280)
+                details = [element for element in client.elements.values()
+                           if isinstance(element, ui.expansion) and "xem chi tiết" in element.text]
+                self.assertEqual(len(details), 2)
+                self.assertTrue(all(not element.value for element in details))
+                message = audio.ui.notify.call_args.args[0]
+                self.assertLess(len(message), 200)
+                self.assertNotIn("details", message)
+
     async def test_manual_audio_type_switches_restore_save_and_do_not_change_registry_preferences(self):
         self.state.states["audio_add"] = self.saved_add_state()
         self.state.states["audio_recovery"] = {"audio_content_types": ["dubbed"]}

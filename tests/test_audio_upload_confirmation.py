@@ -111,9 +111,12 @@ class AudioUploadConfirmationTests(unittest.TestCase):
 
     def test_an_existing_processing_track_is_preserved(self):
         self.payload["audioTracks"] = [track(track_id="already-processing")]
-        with self.assertRaises(AudioUpdateError):
-            self.add()
+        progress = {}
+        self.assertEqual(self.add(progress=progress), 409)
+        self.assertEqual(progress["studio_state"], "processing")
         self.start.assert_not_called()
+        self.upload.assert_not_called()
+        self.register.assert_not_called()
 
     def test_processing_snapshot_never_counts_an_unchanged_track_as_new(self):
         old = track(track_id="existing")

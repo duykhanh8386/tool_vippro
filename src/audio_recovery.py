@@ -1849,7 +1849,10 @@ def _record_description_observations(
                     completed.add(key)
                     trackers.pop(key, None)
                 elif status == "processing":
-                    completed.discard(key)
+                    # Accepted by YouTube counts as success immediately. Keep
+                    # observing it so a later explicit failure can reopen it.
+                    if not observed.get("unconfirmed"):
+                        completed.add(key)
                     previous = trackers.get(key) or {}
                     ids = observed["track_ids"]
                     same_track = previous.get("track_ids") == ids
@@ -1857,20 +1860,21 @@ def _record_description_observations(
                     tracker = {"language": languages[key], "track_ids": ids,
                                "first_seen_at": first_seen, "last_seen_at": observed_at,
                                "consecutive_scans": int(previous.get("consecutive_scans") or 0) + 1 if same_track else 1}
-                    if (observed_at - first_seen >= stale_after_seconds
-                            and tracker["consecutive_scans"] >= MIN_STALE_PROCESSING_SCANS):
-                        tracker.update(warning_reason=PROCESSING_WARNING_REASON, warned_at=observed_at)
-                        stale_actions.append({"video_id": video_id, "language": languages[key],
-                                              "track_ids": ids, "reason": PROCESSING_WARNING_REASON,
-                                              "audio_content_type": audio_content_type})
                     trackers[key] = tracker
-                else:
+                elif status == "terminal" or key not in completed:
                     completed.discard(key)
                     trackers.pop(key, None)
+                if key in completed:
+                    previous_attempt = entry.get(prefix + "_attempts", {}).get(key)
+                    if isinstance(previous_attempt, dict) and previous_attempt.get("succeeded") is False:
+                        previous_attempt.update(succeeded=True, message="YouTube đã nhận audio")
             entry[prefix + "_completed_languages"] = [language for key, language in languages.items() if key in completed]
             if audio_entry_complete(entry, audio_content_type):
                 entry[prefix + "_completed_at"] = observed_at
-                entry.pop(prefix + "_next_check_at", None)
+                if trackers:
+                    entry[prefix + "_next_check_at"] = observed_at + DESCRIPTION_VERIFY_SECONDS
+                else:
+                    entry.pop(prefix + "_next_check_at", None)
                 completed_videos.add(video_id)
             else:
                 entry.pop(prefix + "_completed_at", None)
@@ -1890,12 +1894,13 @@ def _record_description_attempt(
         entry = (state.get("entries") or {}).get(channel_id, {}).get(video_id)
         if not isinstance(entry, dict):
             return
-        if succeeded is None:
+        if succeeded is not True:
             entry[prefix + "_completed_languages"] = [
                 done for done in entry.get(prefix + "_completed_languages") or []
                 if str(done).casefold() != language.casefold()
             ]
             entry.pop(prefix + "_completed_at", None)
+            entry.get(prefix + "_processing_observations", {}).pop(language.casefold(), None)
             if audio_content_type == "dubbed":
                 entry["dubbed_prepared_for_description"] = [
                     prepared for prepared in entry.get("dubbed_prepared_for_description") or []
@@ -1913,7 +1918,19 @@ def _record_description_attempt(
         }
         entry[prefix + "_next_check_at"] = attempted_at + DESCRIPTION_RETRY_SECONDS
         if succeeded:
-            entry.get(prefix + "_processing_observations", {}).pop(language.casefold(), None)
+            completed = {str(done).casefold() for done in entry.get(prefix + "_completed_languages") or []}
+            completed.add(language.casefold())
+            entry[prefix + "_completed_languages"] = [
+                lang for lang in description_languages(entry) if lang.casefold() in completed
+            ]
+            # One later observation confirms whether Studio finished or failed;
+            # completion shown to the operator need not wait for that scan.
+            entry.setdefault(prefix + "_processing_observations", {})[language.casefold()] = {
+                "language": language, "track_ids": [], "first_seen_at": attempted_at,
+                "last_seen_at": attempted_at, "consecutive_scans": 0,
+            }
+            if audio_entry_complete(entry, audio_content_type):
+                entry[prefix + "_completed_at"] = attempted_at
         if not state_manager.save_state(RECOVERY_STATE_NAME, state):
             raise RuntimeError("Không thể lưu lần tải audio của Auto Registry")
 
@@ -2216,11 +2233,11 @@ def _summarize_channel_result(result: dict) -> None:
     if result.get("published_submitted"):
         parts.append(f"Đã xuất bản {result['published_submitted']} track")
     if result.get("processing_submitted"):
-        parts.append(f"Đang xử lý {result['processing_submitted']} track mới")
+        parts.append(f"Thành công {result['processing_submitted']} track mới (YouTube đang xử lý)")
     if result["healthy_skipped"]:
         parts.append(f"Hoàn tất audio đã chọn: {result['healthy_skipped']} video")
     if result["processing_tracks"]:
-        parts.append(f"Còn {result['processing_tracks']} track đang xử lý, chưa thay lại")
+        parts.append(f"Thành công {result['processing_tracks']} track (YouTube đang xử lý)")
     if result.get("reason"):
         parts.append(result["reason"])
     if result.get("last_error"):
@@ -2934,12 +2951,16 @@ async def run_audio_recovery_cycle(
                                             _, _, normal_now = build_description_recovery_plan(
                                                 fresh_payload, {video_id: {**entry, "dubbed_completed_languages": []}}, [video_id], "dubbed",
                                             )
-                                            normal_state = normal_now.get(video_id, {}).get(language.casefold(), {}).get("state")
+                                            normal_observed = normal_now.get(video_id, {}).get(language.casefold(), {})
+                                            normal_state = normal_observed.get("state")
                                             live_entry = (get_audio_recovery_state().get("entries") or {}).get(channel_id, {}).get(video_id, {})
                                             submitted = (language.casefold() in submitted_dubbed_languages
                                                          or (dubbed_upload_submitted(live_entry, language)
                                                              and normal_state in {"processing", "terminal"}))
-                                            if normal_state != "healthy" and not submitted:
+                                            normal_accepted = normal_state == "healthy" or (
+                                                normal_state == "processing" and not normal_observed.get("unconfirmed")
+                                            )
+                                            if not normal_accepted and not submitted:
                                                 # The normal file must be uploaded, but its server-side
                                                 # processing does not have to finish before its description.
                                                 continue
@@ -3273,8 +3294,7 @@ async def run_audio_recovery_cycle(
             f"{deferred_video_scope} video ngoài loại đã chọn, "
             f"{deferred_visibility_unknown} video chưa đọc được trạng thái, "
             f"lỗi {failed}; phụ đề failed đã sửa "
-            f"{captions_repaired}, lỗi {captions_failed}; "
-            f"{len(result['processing_warnings'])} audio xử lý quá 2 giờ được phát hiện để thay lại"
+            f"{captions_repaired}, lỗi {captions_failed}"
         )
         return result
     except asyncio.CancelledError:

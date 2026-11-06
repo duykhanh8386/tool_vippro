@@ -9,7 +9,6 @@ import requests
 
 from src import audio_recovery as recovery
 from src.module.audio_module import AudioUpdateError, UpdateAudioModule
-from src.task_runtime import TaskStopped
 from web.components.drawer import _recovery_studio_text, _recovery_transfer_text
 from test_audio_upload_confirmation import track
 from test_tv_audio_upload import RecordingAdapter, response
@@ -64,18 +63,18 @@ class UploadWatchdogTests(unittest.TestCase):
                 finally:
                     wait.assert_not_called()
 
-    def test_server_failure_stops_both_types_mid_transfer_without_upload_retry(self):
+    def test_server_failure_is_reported_only_after_file_finalization(self):
         for kind in ("dubbed", "descriptive"):
             for wrapped in (False, True):
                 for data_bytes in (False, True):
                     with self.subTest(kind=kind, wrapped=wrapped, data_bytes=data_bytes):
                         with self.assertRaisesRegex(AudioUpdateError, "AUDIO_TRACK_STATUS_FAILED"):
                             self.run_transfer(kind, [track(kind, "FAILED", "ours")], wrapped_error=wrapped, data_bytes=data_bytes)
-                        self.assertEqual(bytes(self.received), b"abc")
+                        self.assertEqual(bytes(self.received), b"abcdefghij")
                         self.assertEqual(len(self.calls), 3)
                         self.assertTrue(self.final_progress["registered"])
                         self.assertTrue(self.final_progress["server_rejected"])
-                        self.assertFalse(self.final_progress["file_finalized"])
+                        self.assertTrue(self.final_progress["file_finalized"])
                         self.assertEqual(self.final_progress["track_id"], "ours")
                         self.assertEqual(self.final_progress["studio_state"], "failed")
                         self.assertEqual(self.final_progress["status"], "error")
@@ -86,36 +85,7 @@ class UploadWatchdogTests(unittest.TestCase):
         self.assertEqual(self.final_progress["track_id"], "ours")
         self.assertEqual(self.final_progress["studio_state"], "processing")
 
-    def test_read_outage_does_not_abort_an_upload_and_polling_is_bounded(self):
-        module = UpdateAudioModule()
-        clock = [100.0]
-        progress = {"track_id": "ours"}
-        with (
-            patch("src.module.audio_module.time.monotonic", side_effect=lambda: clock[0]),
-            patch.object(module, "_audio_upload_snapshot", side_effect=[AudioUpdateError("read unavailable"), {"ours": track(track_id="ours")}]) as fetch,
-        ):
-            check = module._audio_upload_watchdog("video", "channel", "en", "descriptive", progress)
-            check()
-            fetch.assert_not_called()
-            clock[0] = 105
-            check()
-            for value in (106, 110, 119):
-                clock[0] = value
-                check()
-            self.assertEqual(fetch.call_count, 1)
-            clock[0] = 120
-            check()
-            self.assertEqual(fetch.call_count, 2)
-            self.assertEqual(progress["studio_state"], "processing")
 
-    def test_stopping_the_task_propagates_out_of_status_polling(self):
-        module = UpdateAudioModule()
-        with patch("src.module.audio_module.time.monotonic", side_effect=[100, 106, 106]), patch.object(
-            module, "_audio_upload_snapshot", side_effect=TaskStopped("stopped"),
-        ):
-            check = module._audio_upload_watchdog("video", "channel", "en", "descriptive", {"track_id": "ours"})
-            with self.assertRaises(TaskStopped):
-                check()
 
     def test_verification_cannot_accept_a_different_new_track(self):
         module = UpdateAudioModule()

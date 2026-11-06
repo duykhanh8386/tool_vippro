@@ -63,20 +63,17 @@ def _audio_upload_error_summary(exc):
 class _AudioUploadBody(BytesIO):
     """Report bytes handed to HTTP without waiting for a whole chunk's reply."""
 
-    def __init__(self, data: bytes, offset: int, progress: dict | None, check_upload=None):
+    def __init__(self, data: bytes, offset: int, progress: dict | None):
         super().__init__(data)
         self._size = len(data)
         self._offset = offset
         self._progress = progress
-        self._check_upload = check_upload
 
     def __len__(self) -> int:
         return self._size
 
     def read(self, size: int = -1) -> bytes:
         check_stopped()
-        if self._check_upload is not None:
-            self._check_upload()
         block = super().read(size)
         if block and self._progress is not None:
             sent = self._offset + self.tell()
@@ -91,11 +88,10 @@ class _AudioUploadBody(BytesIO):
 class _AudioUploadFile:
     """Stream one whole HTTP body without buffering the complete music file."""
 
-    def __init__(self, source, size: int, progress: dict | None, check_upload=None):
+    def __init__(self, source, size: int, progress: dict | None):
         self.source = source
         self.size = size
         self.progress = progress
-        self.check_upload = check_upload
 
     def __len__(self):
         return self.size
@@ -117,8 +113,6 @@ class _AudioUploadFile:
 
     def read(self, size=-1):
         check_stopped()
-        if self.check_upload is not None:
-            self.check_upload()
         remaining = self.size - self.tell()
         block = self.source.read(remaining if size is None or size < 0 else min(size, remaining))
         if not block and remaining:
@@ -208,7 +202,10 @@ class UpdateAudioModule(IModule):
                 progress.update(status="complete", studio_state="published")
             return 409
         if any(self._audio_upload_track_state(track) == "processing" for track in before.values()):
-            raise AudioUpdateError(f"YouTube đang xử lý {audio_content_type} ({language}); giữ track hiện có")
+            # The existing upload is already accepted. Preserve it just as the
+            # manual task does, and let Studio/Registry finish processing it.
+            progress.update(status="complete", studio_state="processing")
+            return 409
         if progress is not None:
             progress["status"] = "authenticating"
         channel_info = get_channels_info(channel_id)
@@ -265,7 +262,6 @@ class UpdateAudioModule(IModule):
                 progress=progress,
                 session=session,
                 single_request=True,
-                check_upload=self._audio_upload_watchdog(id_video, channel_id, language, audio_content_type, progress),
             )
             if progress is not None:
                 progress["file_finalized"] = True
@@ -293,46 +289,6 @@ class UpdateAudioModule(IModule):
             and str(track.get("audioContentTypeString") or track.get("audioContentType") or
                     ("dubbed" if self._is_creator_dubbed_track(track) else "")).casefold() == content_type
         }
-
-    def _audio_upload_watchdog(self, video_id, channel_id, language, content_type, progress):
-        """Stop a slow transfer when its exact registered track already failed."""
-        track_id = progress.get("track_id")
-        if not track_id:
-            return None
-        next_check = time.monotonic() + 5
-        failure = None
-
-        def check():
-            nonlocal next_check, failure
-            if failure is not None:
-                raise failure
-            if time.monotonic() < next_check:
-                return
-            next_check = time.monotonic() + 15
-            try:
-                track = self._audio_upload_snapshot(video_id, channel_id, language, content_type).get(track_id)
-            except TaskStopped:
-                raise
-            except Exception as exc:
-                # A read outage is not proof that an in-flight file failed.
-                logger.warning("Cannot observe uploading audio: video={} track_id={} error_type={}",
-                               video_id, track_id, type(exc).__name__)
-                return
-            if track is None:
-                return
-            state = self._audio_upload_track_state(track)
-            status = str(track.get("status") or track.get("publishStatus") or "unknown")
-            progress.update(track_status=status, studio_state=state, studio_checked_at=time.time())
-            if state == "failed":
-                progress.update(status="error", server_rejected=True)
-                reason = str(track.get("failureReason") or track.get("rejectedReason") or "unknown")
-                failure = AudioUpdateError(
-                    f"YouTube trả {status} ngay trong lúc gửi {content_type} ({language}); "
-                    f"track={track_id}, reason={reason}. Đã dừng gửi file vì track đã lỗi."
-                )
-                raise failure
-
-        return check
 
     def _verify_audio_upload(self, video_id, channel_id, language, content_type, before, *, progress=None):
         if progress is not None:
@@ -501,9 +457,13 @@ class UpdateAudioModule(IModule):
         progress: dict | None = None,
         session: requests.Session | None = None,
         single_request: bool = False,
-        check_upload=None,
     ) -> str:
-        """Upload a complete body like TV Automation, with resumable retries."""
+        """Upload continuously; verify Studio only after file finalization.
+
+        A Studio RPC inside body.read() blocks the upload socket for up to its
+        HTTP timeout and can abort an unfinished resource on an interim status.
+        Keep stop checks in each read and validate the exact track in add().
+        """
         base_headers = self._base_upload_headers(fname_header, cookie_string)
         if data is None and not file_path:
             raise AudioUpdateError("Không có dữ liệu audio để tải lên")
@@ -531,16 +491,16 @@ class UpdateAudioModule(IModule):
                 end = total if single_request else min(offset + self._CHUNK_SIZE, total)
                 if single_request and source_file is not None and offset < total:
                     source_file.seek(offset)
-                    body = _AudioUploadFile(source_file, total, progress, check_upload)
+                    body = _AudioUploadFile(source_file, total, progress)
                     body_size = end - offset
                 elif source_file is not None:
                     source_file.seek(offset)
                     chunk = source_file.read(end - offset)
-                    body = _AudioUploadBody(chunk, offset, progress, check_upload)
+                    body = _AudioUploadBody(chunk, offset, progress)
                     body_size = len(chunk)
                 else:
                     chunk = data[offset:end]
-                    body = _AudioUploadBody(chunk, offset, progress, check_upload)
+                    body = _AudioUploadBody(chunk, offset, progress)
                     body_size = len(chunk)
                 if not body_size and not needs_finalize:
                     raise AudioUpdateError(
@@ -596,9 +556,6 @@ class UpdateAudioModule(IModule):
                 except TaskStopped:
                     raise
                 except Exception as exc:
-                    if check_upload is not None:
-                        # Requests may wrap a body-reader error in ConnectionError.
-                        check_upload()
                     if isinstance(exc, AudioUpdateError) and not exc.retryable:
                         if progress is not None:
                             progress["status"] = "error"
