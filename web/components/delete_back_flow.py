@@ -843,7 +843,7 @@ def create_delete_back_flow_page():
         music = run_config["music_plan"][index]
 
         await _render_delete_back_output(
-            item, output_folder, music, index, run_config["overlay_png"],
+            item, output_folder, music, index + 1, run_config["overlay_png"],
             loop_transition=run_config["loop_transition"],
         )
 
@@ -861,7 +861,7 @@ def create_delete_back_flow_page():
                 upload_video_module.upload,
                 channel_id=channel_id,
                 file_path=item["output_path"],
-                index=index,
+                index=index + 1,
                 progress=upload_prog,
             )
             item["frontend_upload_id"] = result["frontend_upload_id"]
@@ -1054,7 +1054,7 @@ def create_delete_back_flow_page():
                                 item,
                                 output_folder,
                                 musics,
-                                file_index,
+                                orig_index,
                                 run_config,
                             )
                         item["steps"][step_key] = "successful"

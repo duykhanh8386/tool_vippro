@@ -1,10 +1,11 @@
+import copy
 import inspect
 import tempfile
 import unittest
 from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from nicegui import Client, ui
 from nicegui.page import page
@@ -187,6 +188,85 @@ class FlowMusicMatchingTests(unittest.IsolatedAsyncioTestCase):
                     h.validate.assert_called_once()
                     plan = module.build_balanced_music_plan(*build.call_args.args, **build.call_args.kwargs)
                     self.assertEqual(plan[0], track)
+
+    async def _check_queue_music_alignment(self, module, *, matching, pending_indexes=None):
+        async with self.flow_page(module, matching=matching) as h:
+            template = h.scope["videos_state"]["items"][0]
+            items = []
+            for index in range(5):
+                name = f"clip-{index} [video-{index}]"
+                video = h.root / "videos" / f"{name}.mp4"
+                video.touch()
+                (h.root / "music" / f"{name}.mp3").touch()
+                item = copy.deepcopy(template)
+                item.update(name=video.name, path=str(video))
+                items.append(item)
+            h.scope["videos_state"]["items"] = items
+            sequence = h.scope.get("STEP_SEQUENCE")
+            if sequence is None:
+                worker = inspect.getclosurevars(h.scope["run_parallel_queue"]).nonlocals["run_video_item"]
+                sequence = inspect.getclosurevars(worker).nonlocals["STEP_SEQUENCE"]
+            # Run the real queue and merge; replace every remote operation.
+            sequence[:] = [(key, label, fn if key == "merge" else AsyncMock())
+                           for key, label, fn in sequence]
+            planner = module.build_balanced_music_plan
+            expected = {}
+
+            def capture_plan(*args, **kwargs):
+                plan = planner(*args, **kwargs)
+                expected.update(plan)
+                return plan
+
+            with (
+                patch.object(module, "build_balanced_music_plan", side_effect=capture_plan),
+                patch.object(module, "mux_audio_into_video") as mux,
+                patch.object(add_audio_flow, "build_intermittent_audio", return_value=60) as intermittent,
+            ):
+                if pending_indexes is None:
+                    pending_indexes = list(range(len(items)))
+                    await h.process()
+                else:
+                    musics = list((h.root / "music").iterdir())
+                    plan = capture_plan(musics, items, randomize=True, match_by_name=matching)
+                    config = {"music_plan": plan, "overlay_png": "", "loop_transition": False}
+                    errors = []
+                    stats = await h.scope["run_parallel_queue"](
+                        [(index, items[index]) for index in pending_indexes],
+                        str(h.root / "output"), musics, config, errors,
+                    )
+                    self.assertEqual(errors, [])
+                    self.assertEqual(stats, {"finished": len(pending_indexes), "failed": 0})
+
+            rendered = {call.kwargs["video_file"]: call.kwargs for call in mux.call_args_list}
+            audio_sources = {call.kwargs["audio_out"]: call.kwargs["music_file"]
+                             for call in intermittent.call_args_list}
+            self.assertEqual(len(rendered), len(pending_indexes))
+            for index in pending_indexes:
+                item = items[index]
+                with self.subTest(index=index):
+                    self.assertEqual(item["steps"]["merge"], "successful")
+                    self.assertEqual(item["music_path"], str(expected[index]))
+                    self.assertEqual(item["music"], expected[index].name)
+                    actual_audio = rendered[item["path"]]["audio_file"]
+                    if module is add_audio_flow:
+                        actual_audio = audio_sources[actual_audio]
+                    self.assertEqual(actual_audio, str(expected[index]))
+                    if matching:
+                        self.assertEqual(expected[index].stem, Path(item["name"]).stem)
+
+    async def test_full_batch_keeps_music_with_its_video_in_both_modes_and_flows(self):
+        for module in (add_audio_flow, delete_back_flow):
+            for matching in (True, False):
+                with self.subTest(flow=module.__name__, matching=matching):
+                    await self._check_queue_music_alignment(module, matching=matching)
+
+    async def test_resumed_queue_preserves_original_indexes_with_gaps(self):
+        for module in (add_audio_flow, delete_back_flow):
+            for matching in (True, False):
+                with self.subTest(flow=module.__name__, matching=matching):
+                    await self._check_queue_music_alignment(
+                        module, matching=matching, pending_indexes=[1, 3, 4],
+                    )
 
     async def test_transition_restores_and_reaches_the_renderer_in_both_flows(self):
         for module in (add_audio_flow, delete_back_flow):
