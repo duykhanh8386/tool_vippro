@@ -193,7 +193,8 @@ def _release_music_output_path(path: Path) -> None:
 
 
 async def _render_delete_back_output(
-    item: dict, output_folder: str, music: Path, index: int, overlay_png: str | None
+    item: dict, output_folder: str, music: Path, index: int, overlay_png: str | None,
+    *, loop_transition: bool = False,
 ) -> None:
     """Mux the original, uninterrupted music; never create a 3s/7s track."""
     music_path = str(music)
@@ -219,6 +220,7 @@ async def _render_delete_back_output(
             video_out=video_out,
             duration=duration,
             overlay_png=overlay_png or None,
+            loop_transition=loop_transition,
         )
         item["render_audio_mode"] = ORIGINAL_AUDIO_RENDER_MODE
         if run_context is not None:
@@ -394,7 +396,7 @@ def create_delete_back_flow_page():
 
     ui_lifecycle = {"available": page_client is not None}
     paths_state = {"video_folder": "", "music_folder": "", "output_folder": ""}
-    options_state = {"match_music_by_name": False}
+    options_state = {"loop_transition": False, "match_music_by_name": False}
     selected_channel = {"id": None}
     videos_state = {"items": []}
     saved_status_map = {}
@@ -407,6 +409,7 @@ def create_delete_back_flow_page():
         "refresh_channel_display": None,
         "refresh_overlay": None,
         "match_switch": None,
+        "transition_switch": None,
         "process_btn": None,
         "stop_btn": None,
         "clear_btn": None,
@@ -519,6 +522,7 @@ def create_delete_back_flow_page():
                         "music_folder": paths_state["music_folder"],
                         "output_folder": paths_state["output_folder"],
                         "match_music_by_name": options_state["match_music_by_name"],
+                        "loop_transition": options_state["loop_transition"],
                         "selected_channel": selected_channel["id"],
                         "statuses": statuses,
                     },
@@ -539,6 +543,7 @@ def create_delete_back_flow_page():
             paths_state["music_folder"] = state.get("music_folder", "")
             paths_state["output_folder"] = state.get("output_folder", "")
             options_state["match_music_by_name"] = state.get("match_music_by_name", False)
+            options_state["loop_transition"] = bool(state.get("loop_transition", False))
             selected_channel["id"] = state.get("selected_channel")
             _replace_status_snapshot(saved_status_map, state.get("statuses", {}))
 
@@ -552,6 +557,8 @@ def create_delete_back_flow_page():
                         render()
                     if ui_refs["match_switch"]:
                         ui_refs["match_switch"].value = options_state["match_music_by_name"]
+                    if ui_refs["transition_switch"]:
+                        ui_refs["transition_switch"].value = options_state["loop_transition"]
                     if selected_channel["id"] and ui_refs["refresh_channel_display"]:
                         ui_refs["refresh_channel_display"]()
                     if ui_refs.get("refresh_overlay"):
@@ -836,7 +843,8 @@ def create_delete_back_flow_page():
         music = run_config["music_plan"][index]
 
         await _render_delete_back_output(
-            item, output_folder, music, index, run_config["overlay_png"]
+            item, output_folder, music, index, run_config["overlay_png"],
+            loop_transition=run_config["loop_transition"],
         )
 
     async def step_upload(item, output_folder, musics, index, run_config):
@@ -1211,6 +1219,7 @@ def create_delete_back_flow_page():
             "channel_id": selected_channel["id"],
             "channel_name": channel_snapshot.name or selected_channel["id"],
             "match_music_by_name": bool(options_state["match_music_by_name"]),
+            "loop_transition": bool(options_state["loop_transition"]),
             "music_plan": music_plan,
             "overlay_png": channel_snapshot.overlay_png or "",
         }
@@ -1348,6 +1357,7 @@ def create_delete_back_flow_page():
             paths_state["music_folder"] = ""
             paths_state["output_folder"] = ""
             options_state["match_music_by_name"] = False
+            options_state["loop_transition"] = False
             selected_channel["id"] = None
             videos_state["items"] = []
             saved_status_map.clear()
@@ -1355,6 +1365,8 @@ def create_delete_back_flow_page():
                 render()
             if ui_refs["match_switch"]:
                 ui_refs["match_switch"].value = False
+            if ui_refs["transition_switch"]:
+                ui_refs["transition_switch"].value = False
             if ui_refs["refresh_channel_display"]:
                 ui_refs["refresh_channel_display"]()
             if ui_refs.get("refresh_overlay"):
@@ -1569,6 +1581,25 @@ def create_delete_back_flow_page():
                 "trước khi chạy. Tắt: chọn nhạc ngẫu nhiên, cân bằng số lần sử dụng."
             )
             ui_refs["match_switch"] = match_switch
+
+        def on_transition_change(e):
+            if configuration_change_blocked():
+                safe_element_call(
+                    ui_refs.get("transition_switch"), "set_value",
+                    options_state["loop_transition"],
+                )
+                return
+            options_state["loop_transition"] = bool(e.value)
+            save_state()
+
+        ui_refs["transition_switch"] = ui.switch(
+            "Cross Dissolve giữa các lần lặp video",
+            value=options_state["loop_transition"],
+            on_change=on_transition_change,
+        ).tooltip(
+            "Mặc định tắt: lặp như cũ. Bật: chuyển cảnh chồng mờ khoảng 1 giây "
+            "tại điểm nối (rút ngắn cho clip ngắn). Không fade đen ở đầu/cuối."
+        )
 
         with ui.row().classes("w-full gap-2 mt-3"):
             ui_refs["process_btn"] = (

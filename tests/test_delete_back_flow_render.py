@@ -39,6 +39,7 @@ class DeleteBackFlowRenderTests(unittest.IsolatedAsyncioTestCase):
             video_out=video_out,
             duration=125.5,
             overlay_png="logo.png",
+            loop_transition=False,
         )
         self.assertEqual(item["audio_path"], str(music))
         self.assertEqual(item["music_path"], str(music))

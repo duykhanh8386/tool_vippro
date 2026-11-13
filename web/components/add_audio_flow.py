@@ -559,14 +559,14 @@ def create_add_audio_flow_page():
         page_client = None
     ui_lifecycle = {"available": page_client is not None}
     paths_state = {"video_folder": "", "music_folder": "", "output_folder": ""}
-    options_state = {"match_music_by_name": False, "audio_language": "en"}
+    options_state = {"loop_transition": False, "match_music_by_name": False, "audio_language": "en"}
     selected_channel = {"id": None}
     channels = get_channels_info()
     videos_state = {"items": []}
     saved_status_map = {}
     video_list_container = None
     suppress_autosave = {"value": False}
-    ui_refs = {"match_switch": None, "lang_input": None, "process_btn": None, "clear_btn": None, "refresh_channel_display": None, "refresh_overlay": None, "stop_btn": None}
+    ui_refs = {"match_switch": None, "transition_switch": None, "lang_input": None, "process_btn": None, "clear_btn": None, "refresh_channel_display": None, "refresh_overlay": None, "stop_btn": None}
     folder_selectors = {}
     progress_refs = {}
     processing = {"value": False}
@@ -641,7 +641,7 @@ def create_add_audio_flow_page():
                     entry[field] = it.get(field, "")
                 statuses[it["name"]] = entry
             _replace_status_snapshot(saved_status_map, statuses)
-            return state_manager.save_state("add_audio_flow", {"video_folder": paths_state["video_folder"], "music_folder": paths_state["music_folder"], "output_folder": paths_state["output_folder"], "match_music_by_name": options_state["match_music_by_name"], "audio_language": options_state["audio_language"], "selected_channel": selected_channel["id"], "statuses": statuses})
+            return state_manager.save_state("add_audio_flow", {"video_folder": paths_state["video_folder"], "music_folder": paths_state["music_folder"], "output_folder": paths_state["output_folder"], "match_music_by_name": options_state["match_music_by_name"], "loop_transition": options_state["loop_transition"], "audio_language": options_state["audio_language"], "selected_channel": selected_channel["id"], "statuses": statuses})
         except Exception as e:
             logger.error(f"Failed to save add_audio_flow state: {e}")
             return False
@@ -654,6 +654,7 @@ def create_add_audio_flow_page():
             paths_state["music_folder"] = state.get("music_folder", "")
             paths_state["output_folder"] = state.get("output_folder", "")
             options_state["match_music_by_name"] = state.get("match_music_by_name", False)
+            options_state["loop_transition"] = bool(state.get("loop_transition", False))
             options_state["audio_language"] = state.get("audio_language", "en")
             selected_channel["id"] = state.get("selected_channel")
             _replace_status_snapshot(saved_status_map, state.get("statuses", {}))
@@ -665,6 +666,8 @@ def create_add_audio_flow_page():
                         render()
                     if ui_refs["match_switch"]:
                         ui_refs["match_switch"].value = options_state["match_music_by_name"]
+                    if ui_refs["transition_switch"]:
+                        ui_refs["transition_switch"].value = options_state["loop_transition"]
                     if ui_refs["lang_input"]:
                         ui_refs["lang_input"].value = options_state["audio_language"]
                     if selected_channel["id"] and ui_refs["refresh_channel_display"]:
@@ -918,6 +921,7 @@ def create_add_audio_flow_page():
             video_out=video_out,
             duration=dur,
             overlay_png=overlay_png or None,
+            loop_transition=run_config["loop_transition"],
         )
         if run_context is not None:
             run_context.keep_path(audio_out)
@@ -1599,6 +1603,7 @@ def create_add_audio_flow_page():
         run_config = {
             "channel_id": selected_channel["id"],
             "match_music_by_name": bool(options_state["match_music_by_name"]),
+            "loop_transition": bool(options_state["loop_transition"]),
             "music_plan": music_plan,
             "audio_languages": audio_languages,
             "overlay_png": channel_snapshot.overlay_png or "",
@@ -1704,12 +1709,15 @@ def create_add_audio_flow_page():
             paths_state["music_folder"] = ""
             paths_state["output_folder"] = ""
             options_state["match_music_by_name"] = False
+            options_state["loop_transition"] = False
             videos_state["items"] = []
             saved_status_map.clear()
             for render in folder_selectors.values():
                 render()
             if ui_refs["match_switch"]:
                 ui_refs["match_switch"].value = False
+            if ui_refs["transition_switch"]:
+                ui_refs["transition_switch"].value = False
             refresh_video_list()
             ui.notify("Đã xóa tất cả input", type="info")
         finally:
@@ -1887,6 +1895,26 @@ def create_add_audio_flow_page():
             build_folder_selector("video_folder", "Folder video", "Chọn folder chứa video", "movie", on_after=load_videos)
             build_folder_selector("music_folder", "Folder nhạc", "Chọn folder chứa nhạc", "music_note", extra_render=render_music_switch)
             build_folder_selector("output_folder", "Folder output", "Chọn nơi lưu video đã ghép nhạc", "drive_folder_upload")
+
+        def on_transition_change(e):
+            if configuration_change_blocked():
+                safe_element_call(
+                    ui_refs.get("transition_switch"), "set_value",
+                    options_state["loop_transition"],
+                )
+                return
+            options_state["loop_transition"] = bool(e.value)
+            save_state()
+
+        ui_refs["transition_switch"] = ui.switch(
+            "Cross Dissolve giữa các lần lặp video",
+            value=options_state["loop_transition"],
+            on_change=on_transition_change,
+        ).tooltip(
+            "Mặc định tắt: lặp như cũ. Bật: chuyển cảnh chồng mờ khoảng 1 giây "
+            "tại điểm nối (rút ngắn cho clip ngắn). Không fade đen ở đầu/cuối."
+        )
+
         def on_lang_change(e=None):
             if configuration_change_blocked():
                 safe_element_call(

@@ -14,6 +14,7 @@ from src.task_runtime import (
     run_owned_process,
     wait_interruptibly,
 )
+from src.video_loop_transition import create_dissolve_loop_playlist
 
 
 FFPROBE_MAX_ATTEMPTS = 3
@@ -522,7 +523,7 @@ def build_intermittent_audio(music_file: str, audio_out: str, play_sec: float = 
 pass
 pass
 pass
-def mux_audio_into_video(video_file: str, audio_file: str, video_out: str, duration: float | None = None, video_bitrate: str | None = None, overlay_png: str | None = None) -> None:
+def mux_audio_into_video(video_file: str, audio_file: str, video_out: str, duration: float | None = None, video_bitrate: str | None = None, overlay_png: str | None = None, *, loop_transition: bool = False) -> None:
     """
     Nén clip gốc 1 lần rồi loop cho bằng `duration` và ghép `audio_file`.
 
@@ -532,6 +533,8 @@ def mux_audio_into_video(video_file: str, audio_file: str, video_out: str, durat
     sau đó loop-copy nên file dài 2-3 tiếng vẫn nhỏ và tạo nhanh.
 
     Audio thay thế hoàn toàn tiếng gốc.
+    Khi bật loop_transition, chỉ Cross Dissolve giữa các lần lặp;
+    không fade đen ở đầu hoặc cuối video.
     """
     dur = duration if duration is not None else get_video_duration(audio_file)
     if dur <= 0:
@@ -542,6 +545,7 @@ def mux_audio_into_video(video_file: str, audio_file: str, video_out: str, durat
     run_context = current_run_context()
     if run_context is not None:
         run_context.register_cleanup_path(compressed_clip)
+    transition_work = None
     try:
         def _compress_command(*, qsv: bool) -> list[str]:
             command = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-stats", "-y", "-i", video_file]
@@ -570,8 +574,20 @@ def mux_audio_into_video(video_file: str, audio_file: str, video_out: str, durat
                 raise
             logger.warning("QSV encode failed for {}; retrying with CPU libx264", video_file)
             run_owned_process(_compress_command(qsv=False), check=True)
+        video_input = ["-stream_loop", "-1", "-i", compressed_clip]
+        if loop_transition:
+            transition_work = tempfile.TemporaryDirectory(prefix="tuat-dissolve-")
+            playlist = create_dissolve_loop_playlist(
+                compressed_clip,
+                video_duration=get_video_duration(compressed_clip),
+                target_duration=dur,
+                work_dir=transition_work.name,
+                quality_args=_video_quality_args(qsv=False, video_bitrate=video_bitrate),
+            )
+            if playlist is not None:
+                video_input = ["-f", "concat", "-safe", "0", "-i", str(playlist)]
         base_cmd = [
-            "ffmpeg", "-hide_banner", "-loglevel", "error", "-stats", "-y", "-stream_loop", "-1", "-i", compressed_clip,
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-stats", "-y", *video_input,
             "-i", audio_file, "-map", "0:v:0", "-map", "1:a:0", "-t", f"{dur:.6f}",
         ]
         try:
@@ -594,6 +610,11 @@ def mux_audio_into_video(video_file: str, audio_file: str, video_out: str, durat
             check=True,
         )
     finally:
+        if transition_work is not None:
+            try:
+                transition_work.cleanup()
+            except OSError as exc:
+                logger.warning("Không xóa được clip transition tạm: {}", exc)
         try:
             if Path(compressed_clip).exists():
                 Path(compressed_clip).unlink()

@@ -15,7 +15,7 @@ from web.components import add_audio_flow, delete_back_flow
 
 class FlowMusicMatchingTests(unittest.IsolatedAsyncioTestCase):
     @asynccontextmanager
-    async def flow_page(self, module, *, matching=None, duplicate=False, checkpoint=False):
+    async def flow_page(self, module, *, matching=None, duplicate=False, checkpoint=False, transition=None):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
             videos, music, output = (root / name for name in ("videos", "music", "output"))
@@ -33,6 +33,8 @@ class FlowMusicMatchingTests(unittest.IsolatedAsyncioTestCase):
             }
             if matching is not None:
                 saved["match_music_by_name"] = matching
+            if transition is not None:
+                saved["loop_transition"] = transition
             if checkpoint:
                 saved["statuses"]["clip.mp4"] = {
                     "source_path": str(videos / "clip.mp4"),
@@ -78,9 +80,13 @@ class FlowMusicMatchingTests(unittest.IsolatedAsyncioTestCase):
                     switch = next(element for element in reversed(list(client.elements.values()))
                                   if isinstance(element, ui.switch) and not element.is_deleted
                                   and element.text == "Ghép nhạc trùng tên video")
+                    transition_switch = next(element for element in client.elements.values()
+                                             if isinstance(element, ui.switch) and not element.is_deleted
+                                             and element.text == "Cross Dissolve giữa các lần lặp video")
                     yield SimpleNamespace(
                         process=process, scope=scope, switch=switch, state=state,
                         notify=notify, validate=validate, root=root,
+                        transition_switch=transition_switch,
                     )
             finally:
                 client.delete()
@@ -147,6 +153,45 @@ class FlowMusicMatchingTests(unittest.IsolatedAsyncioTestCase):
                     item = h.scope["videos_state"]["items"][0]
                     self.assertEqual(item["music"], "checkpoint.mp3")
                     self.assertEqual(item["steps"]["merge"], "pending")
+
+    async def test_transition_defaults_off_and_persists_without_changing_music_mode(self):
+        for module in (add_audio_flow, delete_back_flow):
+            with self.subTest(flow=module.__name__):
+                async with self.flow_page(module, matching=True) as h:
+                    self.assertFalse(h.transition_switch.value)
+                    h.transition_switch.set_value(True)
+                    self.assertTrue(h.scope["options_state"]["loop_transition"])
+                    self.assertTrue(h.state.save_state.call_args.args[1]["loop_transition"])
+                    self.assertTrue(h.scope["options_state"]["match_music_by_name"])
+                    module._FLOW_RUN_GUARD.acquire()
+                    try:
+                        h.transition_switch.set_value(False)
+                        self.assertTrue(h.transition_switch.value)
+                        self.assertTrue(h.scope["options_state"]["loop_transition"])
+                    finally:
+                        module._FLOW_RUN_GUARD.release()
+
+    async def test_transition_restores_and_reaches_the_renderer_in_both_flows(self):
+        for module in (add_audio_flow, delete_back_flow):
+            with self.subTest(flow=module.__name__):
+                async with self.flow_page(module, transition=True, checkpoint=True) as h:
+                    self.assertTrue(h.transition_switch.value)
+                    item = h.scope["videos_state"]["items"][0]
+                    self.assertEqual(item["music"], "checkpoint.mp3")
+                    sequence = h.scope.get("STEP_SEQUENCE")
+                    if sequence is None:
+                        worker = inspect.getclosurevars(h.scope["run_parallel_queue"]).nonlocals["run_video_item"]
+                        sequence = inspect.getclosurevars(worker).nonlocals["STEP_SEQUENCE"]
+                    merge = next(step for key, _label, step in sequence if key == "merge")
+                    track = h.root / "music" / "CLIP.m4a"
+                    config = {"music_plan": {0: track}, "overlay_png": "", "loop_transition": True}
+                    with patch.object(module, "mux_audio_into_video") as mux:
+                        if module is add_audio_flow:
+                            with patch.object(module, "build_intermittent_audio", return_value=60):
+                                await merge(item, str(h.root / "output"), [track], 0, config)
+                        else:
+                            await merge(item, str(h.root / "output"), [track], 0, config)
+                    self.assertTrue(mux.call_args.kwargs["loop_transition"])
 
 
 if __name__ == "__main__":
