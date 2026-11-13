@@ -559,14 +559,14 @@ def create_add_audio_flow_page():
         page_client = None
     ui_lifecycle = {"available": page_client is not None}
     paths_state = {"video_folder": "", "music_folder": "", "output_folder": ""}
-    options_state = {"random_music": False, "audio_language": "en"}
+    options_state = {"match_music_by_name": False, "audio_language": "en"}
     selected_channel = {"id": None}
     channels = get_channels_info()
     videos_state = {"items": []}
     saved_status_map = {}
     video_list_container = None
     suppress_autosave = {"value": False}
-    ui_refs = {"random_switch": None, "lang_input": None, "process_btn": None, "clear_btn": None, "refresh_channel_display": None, "refresh_overlay": None, "stop_btn": None}
+    ui_refs = {"match_switch": None, "lang_input": None, "process_btn": None, "clear_btn": None, "refresh_channel_display": None, "refresh_overlay": None, "stop_btn": None}
     folder_selectors = {}
     progress_refs = {}
     processing = {"value": False}
@@ -641,7 +641,7 @@ def create_add_audio_flow_page():
                     entry[field] = it.get(field, "")
                 statuses[it["name"]] = entry
             _replace_status_snapshot(saved_status_map, statuses)
-            return state_manager.save_state("add_audio_flow", {"video_folder": paths_state["video_folder"], "music_folder": paths_state["music_folder"], "output_folder": paths_state["output_folder"], "random_music": options_state["random_music"], "audio_language": options_state["audio_language"], "selected_channel": selected_channel["id"], "statuses": statuses})
+            return state_manager.save_state("add_audio_flow", {"video_folder": paths_state["video_folder"], "music_folder": paths_state["music_folder"], "output_folder": paths_state["output_folder"], "match_music_by_name": options_state["match_music_by_name"], "audio_language": options_state["audio_language"], "selected_channel": selected_channel["id"], "statuses": statuses})
         except Exception as e:
             logger.error(f"Failed to save add_audio_flow state: {e}")
             return False
@@ -653,7 +653,7 @@ def create_add_audio_flow_page():
             paths_state["video_folder"] = state.get("video_folder", "")
             paths_state["music_folder"] = state.get("music_folder", "")
             paths_state["output_folder"] = state.get("output_folder", "")
-            options_state["random_music"] = state.get("random_music", False)
+            options_state["match_music_by_name"] = state.get("match_music_by_name", False)
             options_state["audio_language"] = state.get("audio_language", "en")
             selected_channel["id"] = state.get("selected_channel")
             _replace_status_snapshot(saved_status_map, state.get("statuses", {}))
@@ -663,8 +663,8 @@ def create_add_audio_flow_page():
                 try:
                     for render in folder_selectors.values():
                         render()
-                    if ui_refs["random_switch"]:
-                        ui_refs["random_switch"].value = options_state["random_music"]
+                    if ui_refs["match_switch"]:
+                        ui_refs["match_switch"].value = options_state["match_music_by_name"]
                     if ui_refs["lang_input"]:
                         ui_refs["lang_input"].value = options_state["audio_language"]
                     if selected_channel["id"] and ui_refs["refresh_channel_display"]:
@@ -1585,14 +1585,21 @@ def create_add_audio_flow_page():
         if not channel_snapshot:
             safe_notify("Không tìm thấy dữ liệu kênh đã chọn", type="negative")
             return
-        run_config = {
-            "channel_id": selected_channel["id"],
-            "random_music": bool(options_state["random_music"]),
-            "music_plan": build_balanced_music_plan(
+        try:
+            music_plan = build_balanced_music_plan(
                 musics,
                 items,
-                randomize=bool(options_state["random_music"]),
-            ),
+                randomize=True,
+                match_by_name=bool(options_state["match_music_by_name"]),
+            )
+        except ValueError as exc:
+            safe_notify(str(exc), type="warning")
+            return
+
+        run_config = {
+            "channel_id": selected_channel["id"],
+            "match_music_by_name": bool(options_state["match_music_by_name"]),
+            "music_plan": music_plan,
             "audio_languages": audio_languages,
             "overlay_png": channel_snapshot.overlay_png or "",
         }
@@ -1696,13 +1703,13 @@ def create_add_audio_flow_page():
             paths_state["video_folder"] = ""
             paths_state["music_folder"] = ""
             paths_state["output_folder"] = ""
-            options_state["random_music"] = False
+            options_state["match_music_by_name"] = False
             videos_state["items"] = []
             saved_status_map.clear()
             for render in folder_selectors.values():
                 render()
-            if ui_refs["random_switch"]:
-                ui_refs["random_switch"].value = False
+            if ui_refs["match_switch"]:
+                ui_refs["match_switch"].value = False
             refresh_video_list()
             ui.notify("Đã xóa tất cả input", type="info")
         finally:
@@ -1853,20 +1860,29 @@ def create_add_audio_flow_page():
                     ui.button(icon="close", on_click=clear_overlay).props("flat round dense size=sm color=grey").tooltip("Bỏ ảnh")
         ui_refs["refresh_overlay"] = refresh_overlay_display
         refresh_overlay_display()
-        def on_random_change(e=None):
+        def on_match_change(e):
             if configuration_change_blocked():
                 safe_element_call(
-                    ui_refs.get("random_switch"),
+                    ui_refs.get("match_switch"),
                     "set_value",
-                    options_state["random_music"],
+                    options_state["match_music_by_name"],
                 )
                 return
-            options_state["random_music"] = bool(e.value if e else False)
+            options_state["match_music_by_name"] = bool(e.value)
 
             save_state()
         def render_music_switch():
-            random_switch = ui.switch("Nhạc ngẫu nhiên", value=options_state["random_music"], on_change=on_random_change).props("dense size=sm").classes("text-sm"); random_switch.tooltip("Bật: trộn thứ tự nhạc nhưng cân bằng số lần sử dụng (chênh tối đa 1). Tắt: ghép lần lượt theo tên file.")
-            ui_refs["random_switch"] = random_switch
+            match_switch = ui.switch(
+                "Ghép nhạc trùng tên video",
+                value=options_state["match_music_by_name"],
+                on_change=on_match_change,
+            ).props("dense size=sm").classes("text-sm")
+            match_switch.tooltip(
+                "Bật: ghép video.mp4 với video.mp3 (không tính đuôi, "
+                "không phân biệt hoa/thường). Thiếu hoặc trùng nhạc sẽ báo lỗi "
+                "trước khi chạy. Tắt: chọn nhạc ngẫu nhiên, cân bằng số lần sử dụng."
+            )
+            ui_refs["match_switch"] = match_switch
         with ui.row().classes("w-full gap-3 flex-wrap items-stretch"):
             build_folder_selector("video_folder", "Folder video", "Chọn folder chứa video", "movie", on_after=load_videos)
             build_folder_selector("music_folder", "Folder nhạc", "Chọn folder chứa nhạc", "music_note", extra_render=render_music_switch)

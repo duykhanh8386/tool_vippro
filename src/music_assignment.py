@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import random
+import unicodedata
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -14,11 +15,50 @@ def _path_key(value: str | os.PathLike[str]) -> str:
     return os.path.normcase(os.path.abspath(os.fspath(value)))
 
 
+def build_name_matched_music_plan(
+    musics: Sequence[Path],
+    items: Sequence[Mapping[str, Any]],
+) -> dict[int, Path]:
+    """Match video stems, rejecting missing/ambiguous tracks before a run."""
+    tracks_by_stem: dict[str, list[Path]] = {}
+    for track in musics:
+        key = unicodedata.normalize("NFC", track.stem).casefold()
+        tracks_by_stem.setdefault(key, []).append(track)
+
+    assignments: dict[int, Path] = {}
+    errors = []
+    for index, item in enumerate(items):
+        # A resumed upload must keep the audio of the already-rendered video.
+        if item.get("steps", {}).get("merge") == "successful":
+            if item.get("music_path"):
+                assignments[index] = Path(item["music_path"])
+            continue
+
+        video = Path(item.get("name") or item.get("path") or "")
+        key = unicodedata.normalize("NFC", video.stem).casefold()
+        matches = tracks_by_stem.get(key, [])
+        if not matches:
+            errors.append(f"{video.name}: không có nhạc trùng tên")
+        elif len(matches) > 1:
+            names = ", ".join(track.name for track in matches)
+            errors.append(f"{video.name}: có nhiều file nhạc trùng tên ({names})")
+        else:
+            assignments[index] = matches[0]
+
+    if errors:
+        details = "; ".join(errors[:5])
+        if len(errors) > 5:
+            details += f"; và {len(errors) - 5} video khác"
+        raise ValueError(f"Không thể ghép nhạc theo tên: {details}")
+    return assignments
+
+
 def build_balanced_music_plan(
     musics: Sequence[Path],
     items: Sequence[Mapping[str, Any]],
     *,
     randomize: bool,
+    match_by_name: bool = False,
     rng: random.Random | None = None,
 ) -> dict[int, Path]:
     """Assign songs randomly while keeping their usage as even as possible.
@@ -26,6 +66,9 @@ def build_balanced_music_plan(
     Completed merge steps retain their original music so resuming a checkpoint
     cannot silently change an already-rendered video.
     """
+    if match_by_name:
+        return build_name_matched_music_plan(musics, items)
+
     tracks = list(musics)
     if not tracks:
         raise ValueError("At least one music file is required")

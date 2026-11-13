@@ -394,7 +394,7 @@ def create_delete_back_flow_page():
 
     ui_lifecycle = {"available": page_client is not None}
     paths_state = {"video_folder": "", "music_folder": "", "output_folder": ""}
-    options_state = {"random_music": False}
+    options_state = {"match_music_by_name": False}
     selected_channel = {"id": None}
     videos_state = {"items": []}
     saved_status_map = {}
@@ -406,7 +406,7 @@ def create_delete_back_flow_page():
     ui_refs = {
         "refresh_channel_display": None,
         "refresh_overlay": None,
-        "random_switch": None,
+        "match_switch": None,
         "process_btn": None,
         "stop_btn": None,
         "clear_btn": None,
@@ -518,7 +518,7 @@ def create_delete_back_flow_page():
                         "video_folder": paths_state["video_folder"],
                         "music_folder": paths_state["music_folder"],
                         "output_folder": paths_state["output_folder"],
-                        "random_music": options_state["random_music"],
+                        "match_music_by_name": options_state["match_music_by_name"],
                         "selected_channel": selected_channel["id"],
                         "statuses": statuses,
                     },
@@ -538,22 +538,27 @@ def create_delete_back_flow_page():
             paths_state["video_folder"] = state.get("video_folder", "")
             paths_state["music_folder"] = state.get("music_folder", "")
             paths_state["output_folder"] = state.get("output_folder", "")
-            options_state["random_music"] = state.get("random_music", False)
+            options_state["match_music_by_name"] = state.get("match_music_by_name", False)
             selected_channel["id"] = state.get("selected_channel")
             _replace_status_snapshot(saved_status_map, state.get("statuses", {}))
 
             def update_ui():
                 if not client_is_alive():
                     return
-                for render in folder_selectors.values():
-                    render()
-                if ui_refs["random_switch"]:
-                    ui_refs["random_switch"].value = options_state["random_music"]
-                if selected_channel["id"] and ui_refs["refresh_channel_display"]:
-                    ui_refs["refresh_channel_display"]()
-                if ui_refs.get("refresh_overlay"):
-                    ui_refs["refresh_overlay"]()
-                load_videos()
+                previous_suppression = suppress_autosave["value"]
+                suppress_autosave["value"] = True
+                try:
+                    for render in folder_selectors.values():
+                        render()
+                    if ui_refs["match_switch"]:
+                        ui_refs["match_switch"].value = options_state["match_music_by_name"]
+                    if selected_channel["id"] and ui_refs["refresh_channel_display"]:
+                        ui_refs["refresh_channel_display"]()
+                    if ui_refs.get("refresh_overlay"):
+                        ui_refs["refresh_overlay"]()
+                    load_videos()
+                finally:
+                    suppress_autosave["value"] = previous_suppression
 
             ui.timer(0.5, update_ui, once=True)
         except Exception as e:
@@ -1191,15 +1196,22 @@ def create_delete_back_flow_page():
         if not channel_snapshot:
             safe_notify("Không tìm thấy dữ liệu kênh đã chọn", type="negative")
             return
+        try:
+            music_plan = build_balanced_music_plan(
+                musics,
+                videos_state["items"],
+                randomize=True,
+                match_by_name=bool(options_state["match_music_by_name"]),
+            )
+        except ValueError as exc:
+            safe_notify(str(exc), type="warning")
+            return
+
         run_config = {
             "channel_id": selected_channel["id"],
             "channel_name": channel_snapshot.name or selected_channel["id"],
-            "random_music": bool(options_state["random_music"]),
-            "music_plan": build_balanced_music_plan(
-                musics,
-                videos_state["items"],
-                randomize=bool(options_state["random_music"]),
-            ),
+            "match_music_by_name": bool(options_state["match_music_by_name"]),
+            "music_plan": music_plan,
             "overlay_png": channel_snapshot.overlay_png or "",
         }
 
@@ -1335,14 +1347,14 @@ def create_delete_back_flow_page():
             paths_state["video_folder"] = ""
             paths_state["music_folder"] = ""
             paths_state["output_folder"] = ""
-            options_state["random_music"] = False
+            options_state["match_music_by_name"] = False
             selected_channel["id"] = None
             videos_state["items"] = []
             saved_status_map.clear()
             for render in folder_selectors.values():
                 render()
-            if ui_refs["random_switch"]:
-                ui_refs["random_switch"].value = False
+            if ui_refs["match_switch"]:
+                ui_refs["match_switch"].value = False
             if ui_refs["refresh_channel_display"]:
                 ui_refs["refresh_channel_display"]()
             if ui_refs.get("refresh_overlay"):
@@ -1523,12 +1535,12 @@ def create_delete_back_flow_page():
         ui_refs["refresh_overlay"] = refresh_overlay_display
         refresh_overlay_display()
 
-        def on_random_change(e):
+        def on_match_change(e):
             if configuration_change_blocked():
                 if hasattr(e, "sender"):
-                    e.sender.value = options_state["random_music"]
+                    e.sender.value = options_state["match_music_by_name"]
                 return
-            options_state["random_music"] = bool(e.value)
+            options_state["match_music_by_name"] = bool(e.value)
             save_state()
 
         with ui.row().classes("w-full gap-3 flex-wrap items-stretch mt-3"):
@@ -1546,16 +1558,17 @@ def create_delete_back_flow_page():
             )
 
         with ui.row().classes("mt-2 items-center"):
-            random_switch = ui.switch(
-                "Nhạc ngẫu nhiên",
-                value=options_state["random_music"],
-                on_change=on_random_change,
+            match_switch = ui.switch(
+                "Ghép nhạc trùng tên video",
+                value=options_state["match_music_by_name"],
+                on_change=on_match_change,
             )
-            random_switch.tooltip(
-                "Bật: trộn thứ tự nhạc nhưng cân bằng số lần sử dụng "
-                "(chênh tối đa 1). Tắt: ghép lần lượt theo tên file."
+            match_switch.tooltip(
+                "Bật: ghép video.mp4 với video.mp3 (không tính đuôi, "
+                "không phân biệt hoa/thường). Thiếu hoặc trùng nhạc sẽ báo lỗi "
+                "trước khi chạy. Tắt: chọn nhạc ngẫu nhiên, cân bằng số lần sử dụng."
             )
-            ui_refs["random_switch"] = random_switch
+            ui_refs["match_switch"] = match_switch
 
         with ui.row().classes("w-full gap-2 mt-3"):
             ui_refs["process_btn"] = (
