@@ -171,6 +171,23 @@ class FlowMusicMatchingTests(unittest.IsolatedAsyncioTestCase):
                     finally:
                         module._FLOW_RUN_GUARD.release()
 
+    async def test_both_flows_match_real_thai_filenames_with_different_unicode(self):
+        for module in (add_audio_flow, delete_back_flow):
+            with self.subTest(flow=module.__name__):
+                async with self.flow_page(module, matching=True) as h:
+                    track = h.root / "music" / "น้ำ [09BPAunBaEE].mp3"
+                    (h.root / "music" / "CLIP.m4a").rename(track)
+                    video = h.root / "videos" / "น\u0e4d\u0e49า\u200b [09BPAunBaEE].mp4"
+                    (h.root / "videos" / "clip.mp4").rename(video)
+                    item = h.scope["videos_state"]["items"][0]
+                    item.update(name=video.name, path=str(video))
+                    h.validate.side_effect = TaskStopped()
+                    with patch.object(module, "build_balanced_music_plan", wraps=module.build_balanced_music_plan) as build:
+                        await h.process()
+                    h.validate.assert_called_once()
+                    plan = module.build_balanced_music_plan(*build.call_args.args, **build.call_args.kwargs)
+                    self.assertEqual(plan[0], track)
+
     async def test_transition_restores_and_reaches_the_renderer_in_both_flows(self):
         for module in (add_audio_flow, delete_back_flow):
             with self.subTest(flow=module.__name__):

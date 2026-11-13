@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import random
+import re
 import unicodedata
 from collections import Counter
 from collections.abc import Mapping, Sequence
@@ -15,6 +16,21 @@ def _path_key(value: str | os.PathLike[str]) -> str:
     return os.path.normcase(os.path.abspath(os.fspath(value)))
 
 
+def _music_name_key(stem: str) -> str:
+    """Compare displayed names without discarding Thai tones or other accents."""
+    # Copy/pasted titles may contain zero-width separators, BOMs or bidi marks.
+    visible = "".join(ch for ch in stem if unicodedata.category(ch) != "Cf")
+    normalized = unicodedata.normalize("NFKC", visible).casefold()
+    # Thai SARA AM (ำ) decomposes to NIKHAHIT + SARA AA. The tone mark can
+    # precede or follow NIKHAHIT, so NFKC alone does not unify both spellings.
+    normalized = re.sub(
+        "\u0e4d([\u0e48-\u0e4b])\u0e32",
+        lambda match: match[1] + "\u0e4d\u0e32",
+        normalized,
+    )
+    return " ".join(normalized.split())
+
+
 def build_name_matched_music_plan(
     musics: Sequence[Path],
     items: Sequence[Mapping[str, Any]],
@@ -22,7 +38,7 @@ def build_name_matched_music_plan(
     """Match video stems, rejecting missing/ambiguous tracks before a run."""
     tracks_by_stem: dict[str, list[Path]] = {}
     for track in musics:
-        key = unicodedata.normalize("NFC", track.stem).casefold()
+        key = _music_name_key(track.stem)
         tracks_by_stem.setdefault(key, []).append(track)
 
     assignments: dict[int, Path] = {}
@@ -35,7 +51,7 @@ def build_name_matched_music_plan(
             continue
 
         video = Path(item.get("name") or item.get("path") or "")
-        key = unicodedata.normalize("NFC", video.stem).casefold()
+        key = _music_name_key(video.stem)
         matches = tracks_by_stem.get(key, [])
         if not matches:
             errors.append(f"{video.name}: không có nhạc trùng tên")

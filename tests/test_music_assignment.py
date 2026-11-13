@@ -148,6 +148,43 @@ class NameMatchedMusicPlanTests(unittest.TestCase):
         track = Path("music/video.ogg")
         self.assertEqual(self.plan([track], [{"path": "videos/video.mkv"}]), {0: track})
 
+    def test_thai_sara_am_matches_its_visually_equivalent_decomposed_form(self):
+        track = Path("music/กำ.mp3")
+        self.assertEqual(self.plan([track], [{"name": "ก\u0e4dา.mp4"}]), {0: track})
+
+    def test_thai_sara_am_with_tones_matches_either_combining_order(self):
+        for tone in ("\u0e48", "\u0e49", "\u0e4a", "\u0e4b"):
+            track = Path(f"music/น{tone}ำ.mp3")
+            for stem in (f"น\u0e4d{tone}า", f"น{tone}\u0e4dา"):
+                with self.subTest(tone=ord(tone), stem=stem):
+                    self.assertEqual(self.plan([track], [{"name": stem + ".mp4"}]), {0: track})
+
+    def test_pasted_thai_titles_ignore_invisible_format_characters(self):
+        track = Path("music/เพลงไทย [09BPAunBaEE].mp3")
+        video = "\ufeffเพลง\u200bไทย\u200e [09BPAunBaEE]\u2060.mp4"
+        self.assertEqual(self.plan([track], [{"name": video}]), {0: track})
+
+    def test_unicode_spaces_and_full_width_separators_are_normalized(self):
+        track = Path("music/เพลงไทย | Live.mp3")
+        video = "  เพลงไทย\u00a0｜\u2009 Live  .mp4"
+        self.assertEqual(self.plan([track], [{"name": video}]), {0: track})
+
+    def test_thai_tones_remain_significant(self):
+        track = Path("music/น้ำ.mp3")
+        for video in ("นำ.mp4", "น่ำ.mp4"):
+            with self.subTest(video=video):
+                with self.assertRaises(ValueError):
+                    self.plan([track], [{"name": video}])
+
+    def test_normalization_never_strips_vietnamese_accents(self):
+        with self.assertRaises(ValueError):
+            self.plan([Path("music/ma.mp3")], [{"name": "má.mp4"}])
+
+    def test_normalization_collisions_are_reported_instead_of_picking_a_track(self):
+        tracks = [Path("music/น้ำ.mp3"), Path("music/น\u0e4d\u0e49า.wav")]
+        with self.assertRaisesRegex(ValueError, "có nhiều file nhạc trùng tên"):
+            self.plan(tracks, [{"name": "น้ำ.mp4"}])
+
 
 if __name__ == "__main__":
     unittest.main()
