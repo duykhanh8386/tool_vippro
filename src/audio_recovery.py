@@ -30,6 +30,10 @@ from src.channel_store import channel_store
 from src.module.audio_module import update_audio_module
 from src.module.list_videos_module import list_videos_module
 from src.state_manager import state_manager
+from src.registry_lifecycle import (
+    DAY_SECONDS, registry_added_at, registry_expired,
+    registry_title, sync_registry_metadata, newest_registry_video_ids,
+)
 from src.video_scan_dates import (
     DEFAULT_SCAN_DATE_TYPE, _status_indicates_draft, normalize_scan_date_type,
     normalize_scan_start_date, scan_date_bounds, validate_scan_start_date, video_matches_scan_dates,
@@ -473,14 +477,21 @@ def _get_registered_video_scan_statuses(
             limit=50,
             page_token=page_token,
         )
+        titles = {}
         for video in videos:
             video_id = str(getattr(video, "id", "") or "").strip()
             if video_id not in remaining:
                 continue
+            title = getattr(video, "title", "")
+            if isinstance(title, str) and title.strip():
+                titles[video_id] = title.strip()
             matches_by_video_id[video_id] = _video_matches_recovery_scope(
                 video, video_scan_scope
             ) and video_matches_scan_dates(video, date_bounds, date_type=scan_date_type)
             remaining.discard(video_id)
+
+        if titles:
+            _cache_registry_titles(channel_id, titles)
 
         if not next_page_token or not remaining:
             break
@@ -494,6 +505,20 @@ def _get_registered_video_scan_statuses(
         page_token = clean_page_token
 
     return matches_by_video_id, remaining
+
+
+def _cache_registry_titles(channel_id: str, titles: dict[str, str]) -> None:
+    """Remember names from the visibility scan without extra network requests."""
+    with _STATE_LOCK:
+        state = _load_state()
+        metadata = (state.get("registry_metadata") or {}).get(channel_id, {})
+        changed = False
+        for video_id, title in titles.items():
+            if video_id in metadata and metadata[video_id].get("title") != title:
+                metadata[video_id]["title"] = title
+                changed = True
+        if changed:
+            state_manager.save_state(RECOVERY_STATE_NAME, state)
 
 
 def _default_state() -> dict:
@@ -572,6 +597,9 @@ def _load_state() -> dict:
     state["retry_cooldown_seconds"] = DEFAULT_RECOVERY_RETRY_COOLDOWN_SECONDS
     state["initial_grace_seconds"] = DEFAULT_INITIAL_RECOVERY_GRACE_SECONDS
     state["stale_processing_seconds"] = DEFAULT_STALE_PROCESSING_SECONDS
+    if sync_registry_metadata(state, time.time()):
+        if not state_manager.save_state(RECOVERY_STATE_NAME, state):
+            logger.error("Could not persist registry enrollment dates")
     return state
 
 
@@ -660,6 +688,7 @@ def _video_is_in_recovery_scope(state: dict, channel_id: str, video_id: str) -> 
         and isinstance(entries.get(clean_video), dict)
         and _channel_is_in_recovery_scope(state, clean_channel)
         and clean_video not in disabled.get(clean_channel, [])
+        and not registry_expired(state, clean_channel, clean_video, time.time())
     )
 
 
@@ -767,6 +796,8 @@ def register_audio_recovery(
                 updated_entry.pop("dubbed_next_check_at", None)
                 updated_entry.pop("dubbed_completed_at", None)
         videos[clean_video] = updated_entry
+        # Enrollment is a fixed window; re-registering or repairing cannot renew it.
+        sync_registry_metadata(state, time.time())
         # A new manual submission can enroll a previously removed video again.
         removed = _normalize_video_ids_by_channel(state.get("removed_video_ids"))
         remaining = [video for video in removed.get(clean_channel, []) if video != clean_video]
@@ -938,6 +969,7 @@ def clear_audio_recovery_registry() -> bool:
         _RECOVERY_CLEAR_GENERATION += 1
         state = _load_state()
         state["entries"] = {}
+        state["registry_metadata"] = {}
         state["channel_refresh_alerts"] = {}
         state["last_cycle_at"] = None
         state["last_cycle_result"] = {}
@@ -991,16 +1023,20 @@ def get_audio_recovery_registry_items() -> tuple[list[dict], list[dict]]:
     channels = []
     videos = []
     disabled_videos = _normalize_video_ids_by_channel(state.get("disabled_video_ids"))
+    now = time.time()
     for channel_id, entries in sorted((state.get("entries") or {}).items()):
         if not isinstance(entries, dict):
             continue
         channel_enabled = _channel_is_in_recovery_scope(state, channel_id)
         excluded = set(disabled_videos.get(channel_id, []))
         channel_videos = []
-        for video_id, entry in sorted(entries.items()):
+        for video_id in newest_registry_video_ids(state, channel_id, entries):
+            entry = entries[video_id]
             if not isinstance(entry, dict):
                 continue
-            video_enabled = video_id not in excluded
+            expired = registry_expired(state, channel_id, video_id, now)
+            video_enabled = video_id not in excluded and not expired
+            added_at = registry_added_at(state, channel_id, video_id)
             trackers_by_type = {
                 kind: entry.get(track_state_prefix(kind) + "_processing_observations")
                 for kind in audio_types
@@ -1023,6 +1059,11 @@ def get_audio_recovery_registry_items() -> tuple[list[dict], list[dict]]:
             channel_videos.append({
                 "channel_id": channel_id,
                 "video_id": video_id,
+                "title": state["registry_metadata"][channel_id][video_id].get("title") or registry_title(entry),
+                "added_at": added_at,
+                "age_days": max(0, int((now - added_at) / DAY_SECONDS)) if added_at else None,
+                "expired": expired,
+                "date_estimated": bool(state["registry_metadata"][channel_id][video_id].get("date_estimated")),
                 "languages": list(entry.get("languages") or []),
                 "description_complete": description_entry_complete(entry),
                 "audio_complete": registry_entry_complete(entry, audio_types),
@@ -1059,6 +1100,7 @@ def get_audio_recovery_registry_items() -> tuple[list[dict], list[dict]]:
             "completed_video_count": sum(video["audio_complete"] for video in channel_videos),
             "processing_warning_count": sum(len(video["processing_warnings"]) for video in channel_videos),
         })
+    videos.sort(key=lambda row: row["added_at"] or 0, reverse=True)
     return channels, videos
 
 
@@ -1136,6 +1178,7 @@ def _enabled_recovery_video_ids(channel_id: str, video_ids: Iterable[str]) -> li
         return [
             video_id for video_id in video_ids
             if video_id not in excluded and isinstance(entries.get(video_id), dict)
+            and not registry_expired(state, channel_id, video_id, time.time())
         ]
 
 
@@ -1157,6 +1200,9 @@ def set_audio_recovery_items_enabled(
         return False
     with _STATE_LOCK:
         state = _load_state()
+        if enabled and any(registry_expired(state, channel, video, time.time())
+                for channel, video_ids in clean_videos.items() for video in video_ids):
+            return False
         disabled_channels = set(state.get("disabled_channel_ids") or [])
         selected_channels = set(state.get("selected_channel_ids") or [])
         if enabled:
@@ -1245,6 +1291,7 @@ def remove_audio_recovery_items(
         for channel_id in empty_channels:
             alerts.pop(channel_id, None)
         state["channel_refresh_alerts"] = alerts
+        sync_registry_metadata(state, time.time())
         return state_manager.save_state(RECOVERY_STATE_NAME, state)
 
 
@@ -1819,7 +1866,9 @@ def _registry_pending_entries(state: dict, channel_id: str, now: float) -> dict:
     excluded = set((state.get("disabled_video_ids") or {}).get(channel_id, []))
     pending = {
         video_id: entry for video_id, entry in entries.items()
-        if isinstance(entry, dict) and video_id not in excluded and registry_work_due(entry, now, enabled_audio_types(state))
+        if isinstance(entry, dict) and video_id not in excluded
+        and not registry_expired(state, channel_id, video_id, now)
+        and registry_work_due(entry, now, enabled_audio_types(state))
     }
     return entries if len(pending) == len(entries) else pending
 
@@ -2611,7 +2660,9 @@ async def run_audio_recovery_cycle(
                         )
                         return
 
-                    video_ids = list(eligible_entries)
+                    video_ids = newest_registry_video_ids(
+                        current_state or state, channel_id, eligible_entries,
+                    )
                     channel_requires_refresh = False
                     try:
                         (

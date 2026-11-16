@@ -963,9 +963,9 @@ class AudioRecoveryCycleTests(unittest.IsolatedAsyncioTestCase):
                     patch("src.audio_recovery._monitor_failed_caption_tracks", caption_monitor),
                 ):
                     result = await run_audio_recovery_cycle(now=2000)
-                    self.assertEqual(query.call_args_list[0].args, (expected, "channel"))
+                    self.assertEqual(query.call_args_list[0].args, (list(reversed(expected)), "channel"))
                     self.assertTrue(all(call.args[0] in [[vid] for vid in expected] for call in query.call_args_list[1:]))
-                    self.assertEqual([call.kwargs["id_video"] for call in add.call_args_list], expected)
+                    self.assertEqual([call.kwargs["id_video"] for call in add.call_args_list], list(reversed(expected)))
                     delete.assert_not_called()
                     self.assertTrue(all(call.kwargs["audio_content_type"] == "descriptive" for call in add.call_args_list))
                     self.assertEqual(set(caption_monitor.await_args.kwargs["entries"]), set(expected))
@@ -1457,7 +1457,8 @@ class AudioRecoveryCycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("video", state["entries"]["channel"])
 
 
-    async def test_new_registration_scans_immediately_despite_legacy_grace_setting(self):
+    @patch("src.audio_recovery.time.time", return_value=1000)
+    async def test_new_registration_scans_immediately_despite_legacy_grace_setting(self, _clock):
         state = {
             "enabled": True,
             "retry_cooldown_seconds": 0,

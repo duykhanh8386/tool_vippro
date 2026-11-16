@@ -482,7 +482,7 @@ class AutoRegistryCycleTests(RegistryStorage, unittest.IsolatedAsyncioTestCase):
                                      "source": "AUDIO_TRACK_SOURCE_CREATOR", "audioContentTypeString": "descriptive",
                                      "status": "AUDIO_TRACK_STATUS_READY"} for vid in video_ids for language in ("en", "es")]}
 
-        for date_type, expected in (("auto", ["video-shared", "scheduled-video"]),
+        for date_type, expected in (("auto", ["scheduled-video", "video-shared"]),
                                     ("uploaded", ["video-other"]), ("published", ["video-shared"]),
                                     ("scheduled", ["scheduled-video"])):
             fresh = get_audio_recovery_state()
@@ -543,7 +543,7 @@ class AutoRegistryCycleTests(RegistryStorage, unittest.IsolatedAsyncioTestCase):
             patch("src.audio_recovery.update_audio_module._get_video_translation_payload", return_value={}) as scan,
         ):
             await run_audio_recovery_cycle(now=2000)
-        self.assertIn(("channel-a", ["video-shared", "video-other"]), seen)
+        self.assertIn(("channel-a", ["video-other", "video-shared"]), seen)
         self.assertEqual(
             [(call.args[1], call.args[0]) for call in scan.call_args_list],
             [("channel-a", ["video-other"]), ("channel-b", ["video-shared"])],
@@ -695,6 +695,9 @@ class AutoRegistryUiTests(RegistryStorage, unittest.TestCase):
 
     def setUp(self):
         super().setUp()
+        self.create_registry_ui()
+
+    def create_registry_ui(self):
         from nicegui import Client, ui
         from nicegui.page import page
         from web.components.auto_registry import create_auto_registry_content

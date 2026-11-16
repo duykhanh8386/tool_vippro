@@ -1,5 +1,8 @@
 """Bulk controls for the persistent automatic recovery registry."""
 
+import calendar
+import time
+from datetime import date, datetime
 from typing import Callable
 
 from loguru import logger
@@ -22,6 +25,7 @@ from src.audio_recovery import (
     set_audio_recovery_audio_types,
 )
 from src.audio_description_recovery import enabled_audio_types
+from src.registry_lifecycle import filter_registry_videos
 from src.utils import get_channels_info
 from src.video_scan_dates import scan_date_label, validate_scan_start_date
 from web.components.common import create_scan_date_input, create_scan_date_type_select
@@ -31,6 +35,59 @@ from web.theme import app_card, section_header
 def create_auto_registry_content(*, on_change: Callable[[], None] | None = None):
     tables = {}
     preference_sync = {"active": False}
+    filter_controls = {}
+    applied_filter = {"period": "all", "query": ""}
+
+    def filtered_videos(rows):
+        period = applied_filter["period"] or "all"
+        now = time.time()
+        options = {"query": applied_filter["query"] or "", "now": now}
+        if period.isdigit():
+            options["max_days"] = int(period)
+        elif period == "expired":
+            options["min_days"] = 20
+        elif period == "custom":
+            options.update(min_days=applied_filter.get("min_days"),
+                           max_days=applied_filter.get("max_days"),
+                           start_date=applied_filter.get("start_date") or "",
+                           end_date=applied_filter.get("end_date") or "")
+        elif period.startswith("year:"):
+            year = int(period.split(":")[1])
+            options.update(start_date=f"{year:04d}-01-01", end_date=f"{year:04d}-12-31")
+        elif period.startswith("month:"):
+            year, month = map(int, period.split(":")[1].split("-"))
+            options.update(start_date=f"{year:04d}-{month:02d}-01",
+                           end_date=f"{year:04d}-{month:02d}-{calendar.monthrange(year, month)[1]}")
+        return filter_registry_videos(rows, **options)
+
+    def change_filter(_event=None):
+        if "videos" not in tables:
+            return
+        custom = filter_controls["period"].value == "custom"
+        for key in ("min_days", "max_days", "start_date", "end_date"):
+            filter_controls[key].set_visibility(custom)
+        start = filter_controls["start_date"].value or ""
+        end = filter_controls["end_date"].value or ""
+        lower, upper = filter_controls["min_days"].value, filter_controls["max_days"].value
+        try:
+            if custom:
+                for value in (start, end):
+                    if value:
+                        date.fromisoformat(value)
+                if start and end and start > end:
+                    raise ValueError("Ngày bắt đầu phải trước ngày kết thúc")
+                if lower is not None and upper is not None and lower >= upper:
+                    raise ValueError("Số ngày tối thiểu phải nhỏ hơn giới hạn trên")
+                if any(value is not None and value < 0 for value in (lower, upper)):
+                    raise ValueError("Số ngày không được âm")
+        except ValueError as exc:
+            ui.notify(str(exc), type="warning")
+            return
+        applied_filter.update({key: filter_controls[key].value for key in
+            ("period", "query", "min_days", "max_days", "start_date", "end_date")})
+        # Hidden selections must never be included in a later bulk operation.
+        tables["videos"].selected = []
+        refresh()
 
     def refresh() -> None:
         try:
@@ -100,8 +157,13 @@ def create_auto_registry_content(*, on_change: Callable[[], None] | None = None)
                     + (item.get("dubbed_last_error") or "Đang chờ bổ sung/xác nhận audio ngôn ngữ")
                 ),
                 "status": "Active" if item["enabled"] else "Deactive",
+                "added_date": datetime.fromtimestamp(item["added_at"]).strftime("%d/%m/%Y %H:%M")
+                    if item.get("added_at") else "Không rõ",
+                "age_label": f'{item["age_days"]} ngày' + (" · mốc ước tính" if item.get("date_estimated") else "")
+                    if item.get("age_days") is not None else "Không rõ",
                 "inactive_reason": (
                     "" if item["enabled"]
+                    else "Đã hết hạn tự động 20 ngày" if item.get("expired")
                     else "Video đã Deactive" if not item["video_enabled"]
                     else "Auto Registry đang tắt" if not enabled
                     else "Kênh chưa được phép tự động quét" if not item["channel_enabled"]
@@ -116,6 +178,9 @@ def create_auto_registry_content(*, on_change: Callable[[], None] | None = None)
             }
             for item in video_items
         ]
+        total_videos = len(video_rows)
+        video_rows = filtered_videos(video_rows)
+        filter_controls["count"].set_text(f"Hiển thị {len(video_rows)}/{total_videos} video")
         for scope, rows in (("channels", channel_rows), ("videos", video_rows)):
             table = tables[scope]
             if table.rows != rows:
@@ -233,6 +298,9 @@ def create_auto_registry_content(*, on_change: Callable[[], None] | None = None)
         if not selected:
             ui.notify("Hãy tick chọn kênh hoặc video cần thay đổi.", type="info")
             return
+        if scope == "videos" and enabled and any(row.get("expired") for row in selected):
+            ui.notify("Video đã hết hạn 20 ngày không thể Active lại. Hãy bỏ chọn các video hết hạn.", type="warning")
+            return
         channel_ids = []
         video_ids_by_channel = {}
         if scope == "channels":
@@ -341,10 +409,40 @@ def create_auto_registry_content(*, on_change: Callable[[], None] | None = None)
             confirm_remove(scope, [row])
 
     def create_table(scope: str, columns: list[dict]) -> None:
+        if scope == "videos":
+            with ui.row().classes("w-full items-center gap-2 flex-wrap"):
+                filter_controls["query"] = ui.input("Tìm tên video, nhạc, ID hoặc tên kênh",
+                    on_change=change_filter).props("outlined dense clearable debounce=250").classes("w-full sm:w-80")
+                today = date.today()
+                periods = {"all": "Từ khi thêm âm · tất cả", "1": "24 giờ qua", "7": "7 ngày qua",
+                           "20": "20 ngày qua", "28": "28 ngày qua", "90": "90 ngày qua",
+                           "365": "365 ngày qua", "expired": "Từ 20 ngày trở lên", "custom": "Tùy chọn khác"}
+                for year in (today.year, today.year - 1):
+                    periods[f"year:{year}"] = str(year)
+                for offset in range(12):
+                    month_index = today.year * 12 + today.month - 1 - offset
+                    year, month = divmod(month_index, 12)
+                    periods[f"month:{year:04d}-{month + 1:02d}"] = f"Tháng {month + 1}/{year}"
+                filter_controls["period"] = ui.select(periods, value="all", label="Thời gian từ lúc thêm âm",
+                    on_change=change_filter).props("outlined dense").classes("w-64")
+                filter_controls["min_days"] = ui.number("Từ (ngày)", value=None, min=0,
+                    on_change=change_filter).props("outlined dense clearable").classes("w-36")
+                filter_controls["max_days"] = ui.number("Ít hơn (ngày)", value=None, min=0,
+                    on_change=change_filter).props("outlined dense clearable").classes("w-36")
+                filter_controls["start_date"] = ui.input("Thêm âm từ ngày", on_change=change_filter).props("type=date outlined dense clearable")
+                filter_controls["end_date"] = ui.input("Thêm âm đến ngày", on_change=change_filter).props("type=date outlined dense clearable")
+                for key in ("min_days", "max_days", "start_date", "end_date"):
+                    filter_controls[key].set_visibility(False)
+            with ui.row().classes("w-full items-center gap-2"):
+                ui.button("Chọn tất cả kết quả lọc", icon="select_all",
+                    on_click=lambda: select_filtered_videos()).props("flat no-caps")
+                ui.button("Bỏ chọn", on_click=lambda: clear_video_selection()).props("flat no-caps")
+                filter_controls["count"] = ui.label().classes("text-xs text-gray-500")
         with ui.row().classes("w-full items-center gap-2 flex-wrap"):
-            search = ui.input("Tìm theo ID hoặc tên kênh").props(
-                "outlined dense clearable"
-            ).classes("w-full sm:w-80")
+            if scope == "channels":
+                search = ui.input("Tìm theo ID hoặc tên kênh").props(
+                    "outlined dense clearable"
+                ).classes("w-full sm:w-80")
             deactivate = ui.button(
                 "Deactive",
                 icon="pause_circle_outline",
@@ -381,6 +479,9 @@ def create_auto_registry_content(*, on_change: Callable[[], None] | None = None)
             '{{ props.row.inactive_reason }}</q-tooltip>'
             '</q-badge></q-td>',
         )
+        if scope == "videos":
+            table.add_slot("body-cell-age_days",
+                '<q-td :props="props">{{ props.row.age_label }}</q-td>')
         channel_action = (
             '<q-btn flat dense no-caps '
             ':label="props.row.enabled ? \'Deactive\' : \'Active\'" '
@@ -406,7 +507,8 @@ def create_auto_registry_content(*, on_change: Callable[[], None] | None = None)
             'Chưa có mục nào trong Auto Registry hoặc không có kết quả phù hợp.'
             '</div>',
         )
-        search.bind_value_to(table, "filter", forward=lambda value: value or "")
+        if scope == "channels":
+            search.bind_value_to(table, "filter", forward=lambda value: value or "")
         deactivate.bind_enabled_from(table, "selected", backward=bool)
         activate.bind_enabled_from(table, "selected", backward=bool)
         remove_selected.bind_enabled_from(table, "selected", backward=bool)
@@ -414,6 +516,15 @@ def create_auto_registry_content(*, on_change: Callable[[], None] | None = None)
             table, "selected", backward=lambda rows: f"Đã chọn {len(rows)} mục"
         ).classes("text-xs text-gray-500")
         tables[scope] = table
+
+    def select_filtered_videos():
+        table = tables["videos"]
+        table.selected = list(table.rows)
+        table.update()
+
+    def clear_video_selection():
+        tables["videos"].selected = []
+        tables["videos"].update()
 
     with app_card():
         with section_header(
@@ -482,6 +593,9 @@ def create_auto_registry_content(*, on_change: Callable[[], None] | None = None)
             "được bỏ qua. Deactive video chỉ áp dụng cho ID đó. Trạng thái được lưu "
             "khi đóng và mở lại ứng dụng."
         ).classes("text-xs text-gray-500")
+        ui.label("Ưu tiên video mới thêm âm trước. Mỗi video được tự động nạp lại trong 20 ngày; "
+                 "hết hạn sẽ Deactive và vẫn giữ trong danh sách. Bộ lọc dưới đây chỉ lọc danh sách, "
+                 "không thay đổi phạm vi quét. Mục cũ thiếu ngày thêm âm được tính từ lần cập nhật này.").classes("text-xs text-gray-500")
         with ui.tabs().classes("w-full") as tabs:
             channel_tab = ui.tab("Theo ID kênh", icon="subscriptions")
             video_tab = ui.tab("Theo ID video", icon="smart_display")
@@ -499,6 +613,9 @@ def create_auto_registry_content(*, on_change: Callable[[], None] | None = None)
                 ])
             with ui.tab_panel(video_tab).classes("p-0 pt-3"):
                 create_table("videos", [
+                    {"name": "title", "label": "Tên video / nhạc", "field": "title"},
+                    {"name": "added_date", "label": "Ngày thêm âm", "field": "added_date", "sortable": False},
+                    {"name": "age_days", "label": "Số ngày đã thêm âm", "field": "age_days"},
                     {"name": "video_id", "label": "Video ID", "field": "video_id", "classes": "font-mono select-text"},
                     {"name": "channel_id", "label": "Channel ID", "field": "channel_id", "classes": "font-mono select-text"},
                     {"name": "name", "label": "Kênh", "field": "name"},
