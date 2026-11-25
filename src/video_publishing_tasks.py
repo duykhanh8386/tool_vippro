@@ -16,7 +16,10 @@ from src.publishing_browser import ChatGPTImageBrowser, StudioThumbnailBrowser, 
 from src.state_manager import state_manager
 from src.task_runtime import TaskStopped, bind_run_context, check_stopped, create_run_context
 from src.utils import get_channels_info
-from src.video_publishing import COPYRIGHT_LABELS, copyright_category, first_song, parse_chatgpt_cookies, plan_daily, schedule_timestamp
+from src.video_publishing import (
+    COPYRIGHT_LABELS, REFERENCE_SELECTION_VERSION, copyright_category, first_song,
+    parse_chatgpt_cookies, plan_daily, positive_seconds, schedule_timestamp,
+)
 from src.video_scan_dates import VIETNAM_TIMEZONE, _status_indicates_draft
 from src.video_title_matching import parse_manual_title_ids
 
@@ -267,6 +270,7 @@ class VideoPublishingController:
                 eligible_count += int(not reason)
                 rows.append({"video_id": video.id, "channel_id": channel_id, "old_title": video.title,
                              "old_description": video.description, "song": first_song(video.title, video.description),
+                             "duration_seconds": (positive_seconds(video.duration_ms) or 0) / 1000,
                              "copyright": category, "copyright_label": COPYRIGHT_LABELS[category],
                              "selected": not reason, "status": "skipped" if reason else "scanned", "detail": reason or "Sẵn sàng tìm tham chiếu."})
         if manual:
@@ -288,12 +292,27 @@ class VideoPublishingController:
             self._progress(f"{index}/{len(selected)} · {row['channel_id']} · {row['video_id']}")
             self._checkpoint(row, status="processing", detail="Đang kiểm tra video và tìm tham chiếu…")
             try:
-                self.module.require_eligible(row["channel_id"], row["video_id"], settings["categories"], publish_at=row.get("publish_at"))
-                if not row.get("reference"):
-                    found = reference.find(row["song"], exclude_ids=[entry["video_id"] for entry in self.rows])
+                current = self.module.require_eligible(row["channel_id"], row["video_id"], settings["categories"], publish_at=row.get("publish_at"))
+                duration_ms = positive_seconds(getattr(current, "duration_ms", None))
+                if duration_ms is not None:
+                    self._checkpoint(row, duration_seconds=duration_ms / 1000)
+                previous = row.get("reference") or {}
+                # Re-evaluate old previews using the new priority order. Keep a
+                # source stable once remote metadata/thumbnail updates began.
+                stale_selection = previous.get("selection_version") != REFERENCE_SELECTION_VERSION or (
+                    previous.get("selection") != "id" and previous.get("target_duration_seconds") != positive_seconds(row.get("duration_seconds")))
+                replace_preview = stale_selection and not (row.get("metadata_copied") or row.get("thumbnail_uploaded"))
+                if not previous or replace_preview:
+                    found = reference.find(row["song"], source_title=row["old_title"], duration_seconds=row.get("duration_seconds"),
+                                           exclude_ids=[entry["video_id"] for entry in self.rows])
+                    if previous and any(found.get(key) != previous.get(key) for key in ("video_id", "title", "description", "thumbnail")):
+                        with self.lock:
+                            row.pop("thumbnail_path", None)
+                            row.pop("conversation_url", None)
                     self._checkpoint(row, reference=found)
                 if action == "references":
-                    self._checkpoint(row, status="ready", detail="Đã tìm video tham chiếu; title và description sẽ chép nguyên văn.")
+                    method = row["reference"].get("selection_label", "Đã tìm video tham chiếu")
+                    self._checkpoint(row, status="ready", detail=method + "; title và description sẽ chép nguyên văn.")
                     continue
                 folder = output / row["channel_id"]
                 folder.mkdir(parents=True, exist_ok=True)

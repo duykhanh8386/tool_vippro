@@ -14,7 +14,7 @@ from src.module.model import Video
 from src.module.video_publishing_module import VideoPublishingModule
 from src.publishing_browser import video_search_results
 from src.task_runtime import create_run_context
-from src.video_publishing import copyright_category, first_song, parse_chatgpt_cookies, plan_daily, schedule_timestamp
+from src.video_publishing import REFERENCE_SELECTION_VERSION, copyright_category, first_song, parse_chatgpt_cookies, plan_daily, reference_search_query, reference_video_id, schedule_timestamp
 from src.video_publishing_tasks import STATE_KEY, VideoPublishingController
 from src.video_scan_dates import VIETNAM_TIMEZONE
 
@@ -94,6 +94,19 @@ class CopyrightTests(unittest.TestCase):
 
 
 class ReferenceAndCookieTests(unittest.TestCase):
+    def test_youtube_id_suffix_in_thai_mp4_filename(self):
+        name = "เจ็บกว่าเธอ – ดอน สอนระเบียบ ｜ Acoustic & Rock Version ｜ AC-Studio-Official [ZoHtnOPSE80]"
+        for suffix in ("", ".mp4", ".MP4", ".webm", "   "):
+            self.assertEqual(reference_video_id(name + suffix), "ZoHtnOPSE80")
+
+    def test_only_valid_ids_at_end_of_filename_are_recognized(self):
+        for title in ("Song [short]", "Song [ZoHtnOPSE80] more text", "Song [ZoHtnOPSE800]", "Song ZoHtnOPSE80", "Song [bad id here]"):
+            self.assertEqual(reference_video_id(title), "")
+
+    def test_search_query_omits_file_extension_and_source_id(self):
+        for title in ("Song.mp4", "Song [ZoHtnOPSE80].MP4", "Song [ZoHtnOPSE80]", "Song"):
+            self.assertEqual(reference_search_query(title), "Song")
+
     def test_first_track_timestamps_preserve_accents(self):
         self.assertEqual(first_song("Mix", "Tracklist\n00:00:00 Diante do Rei\n03:00 Outra"), "Diante do Rei")
         self.assertEqual(first_song("Mix", "[00:00] - Canção de Fé\n03:00 Outra"), "Canção de Fé")
@@ -241,6 +254,7 @@ class PublishingControllerTests(unittest.TestCase):
     def setUp(self):
         self.storage = MemoryState()
         self.module, self.listing, self.reference, self.image, self.thumbnail = Mock(), Mock(), Mock(), Mock(), Mock()
+        self.module.require_eligible.return_value = video()
         self.reference.find.return_value = dict(REFERENCE)
         self.listing.list_all_videos.return_value = ([], None)
         self.controller = VideoPublishingController(storage=self.storage, module=self.module, listing=self.listing,
@@ -297,6 +311,39 @@ class PublishingControllerTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.controller._check_schedule_conflicts()
         self.module.copy_metadata.assert_not_called()
+
+    def test_reference_selection_receives_original_filename_and_current_duration(self):
+        self.controller.rows = [row(old_title="Song [ZoHtnOPSE80].mp4", duration_seconds=99)]
+        self.module.require_eligible.return_value = video(duration_ms=61234)
+        self.controller._process(self.controller.settings, self.reference, None, "references")
+        self.reference.find.assert_called_once_with("First song", source_title="Song [ZoHtnOPSE80].mp4", duration_seconds=61.234, exclude_ids=[VIDEO])
+        self.assertEqual(self.controller.rows[0]["duration_seconds"], 61.234)
+
+    def test_old_preview_is_reselected_and_image_invalidated_only_if_source_changes(self):
+        self.controller.rows = [row(reference={**REFERENCE, "video_id": OTHER}, thumbnail_path="old.jpg", conversation_url="https://chatgpt.com/c/old")]
+        self.controller._process(self.controller.settings, self.reference, None, "references")
+        self.reference.find.assert_called_once()
+        self.assertNotIn("thumbnail_path", self.controller.rows[0])
+        self.assertNotIn("conversation_url", self.controller.rows[0])
+
+    def test_same_source_keeps_generated_image_when_upgrading_preview(self):
+        self.controller.rows = [row(reference=REFERENCE, thumbnail_path="keep.jpg", conversation_url="https://chatgpt.com/c/keep")]
+        self.controller._process(self.controller.settings, self.reference, None, "references")
+        self.assertEqual(self.controller.rows[0]["thumbnail_path"], "keep.jpg")
+
+    def test_new_preview_is_reused_until_current_duration_changes(self):
+        reference = {**REFERENCE, "selection_version": REFERENCE_SELECTION_VERSION, "selection": "duration", "target_duration_seconds": 60}
+        self.controller.rows = [row(reference=reference, duration_seconds=60)]
+        self.controller._process(self.controller.settings, self.reference, None, "references")
+        self.reference.find.assert_not_called()
+        self.module.require_eligible.return_value = video(duration_ms=61000)
+        self.controller._process(self.controller.settings, self.reference, None, "references")
+        self.reference.find.assert_called_once()
+
+    def test_partially_published_rows_keep_source_across_policy_update(self):
+        self.controller.rows = [row(reference=REFERENCE, metadata_copied=True)]
+        self.controller._process(self.controller.settings, self.reference, None, "references")
+        self.reference.find.assert_not_called()
 
     def test_unknown_existing_schedule_blocks_new_schedules(self):
         self.controller.rows = [row(publish_at=STAMP)]

@@ -56,10 +56,11 @@ def create_video_publishing_page():
     def export():
         stream = io.StringIO(newline="")
         writer = csv.writer(stream)
-        writer.writerow(["Channel ID", "Video ID", "Bản quyền", "Bài nhạc", "Video tham chiếu", "Title mới", "Description mới", "Thumbnail", "Lịch UTC+7", "Trạng thái", "Chi tiết"])
+        writer.writerow(["Channel ID", "Video ID", "Bản quyền", "Bài nhạc", "Video tham chiếu", "Cách chọn tham chiếu", "Độ lệch giây", "Title mới", "Description mới", "Thumbnail", "Lịch UTC+7", "Trạng thái", "Chi tiết"])
         for row in controller.snapshot()["rows"]:
             reference = row.get("reference") or {}
             values = [row["channel_id"], row["video_id"], row["copyright_label"], row["song"], reference.get("url", ""),
+                      reference.get("selection_label", ""), reference.get("duration_delta_seconds", ""),
                       reference.get("title", ""), reference.get("description", ""), row.get("thumbnail_path", ""),
                       row.get("publish_label", ""), STATUS_LABELS[row["status"]], row.get("detail", "")]
             writer.writerow(["'" + value if isinstance(value, str) and value.startswith(("=", "+", "-", "@")) else value for value in values])
@@ -75,6 +76,9 @@ def create_video_publishing_page():
             reference = row.get("reference") or {}
             if reference:
                 ui.link("Mở video tham chiếu", reference["url"], new_tab=True)
+                ui.label(reference.get("selection_label", "Đã chọn từ phiên trước")).classes("text-sm text-emerald-700")
+                if row.get("duration_seconds"):
+                    ui.label(f"Thời lượng video hiện tại: {row['duration_seconds']:g} giây").classes("text-xs text-gray-500")
                 ui.input("Title sẽ chép nguyên văn", value=reference["title"]).props("outlined readonly").classes("w-full")
                 ui.textarea("Description sẽ chép nguyên văn", value=reference["description"]).props("outlined readonly autogrow").classes("w-full")
                 ui.image(reference["thumbnail"]).classes("w-96 max-w-full")
@@ -120,6 +124,7 @@ def create_video_publishing_page():
             if data["revision"] != syncing["revision"]:
                 rows = [{**row, "status_label": STATUS_LABELS[row["status"]],
                          "reference_title": (row.get("reference") or {}).get("title", ""),
+                         "reference_method": (row.get("reference") or {}).get("selection_label", ""),
                          "reference_url": (row.get("reference") or {}).get("url", ""),
                          "publish_label": row.get("publish_label", "")} for row in data["rows"]]
                 table.rows = rows
@@ -179,7 +184,7 @@ def create_video_publishing_page():
                 fields["hour"] = ui.input("Giờ đăng (Việt Nam, UTC+7)", value=settings["hour"], on_change=lambda e: change("hour", e.value or "")).props("outlined type=time").classes("w-64")
                 buttons["plan"] = ui.button("Xem lịch dự kiến", icon="event", on_click=lambda: invoke(controller.plan)).props("outline")
         with app_card():
-            with section_header("Danh sách xử lý", "Bài nhạc đầu tiên được lấy từ mốc thời gian trong description; nếu không có, dùng title hiện tại để tìm kiếm."):
+            with section_header("Danh sách xử lý", "Ưu tiên ID ở cuối tên MP4/title → video tìm kiếm lệch thời lượng dưới 2 giây → kết quả tìm kiếm đầu tiên. Từ khóa lấy từ bài nhạc đầu tiên trong description, hoặc title nếu không có tracklist."):
                 buttons["select"] = ui.button("Chọn video phù hợp", icon="checklist", on_click=select_all).props("outline")
                 buttons["references"] = ui.button("Tìm video tham chiếu", icon="search", on_click=lambda: invoke(lambda: controller.start("references"))).props("outline")
                 buttons["run"] = ui.button("Tự động xử lý & lên lịch", icon="play_arrow", on_click=lambda: invoke(lambda: controller.start("run")))
@@ -189,6 +194,7 @@ def create_video_publishing_page():
             columns = [{"name": key, "label": label, "field": key, "align": "left"} for key, label in (
                 ("channel_id", "Kênh"), ("video_id", "Video ID"), ("old_title", "Title hiện tại"), ("copyright_label", "Bản quyền"),
                 ("song", "Bài nhạc tìm kiếm"), ("reference_title", "Title sẽ chép nguyên văn"), ("publish_label", "Ngày giờ UTC+7"),
+                ("reference_method", "Cách chọn tham chiếu"),
                 ("status_label", "Trạng thái"), ("detail", "Chi tiết"), ("action", "Xem tham chiếu"))]
             table = ui.table(columns=columns, rows=[], row_key="video_id", selection="multiple", on_select=select_rows, pagination=20).classes("w-full min-w-0").props('wrap-cells no-data-label="Chưa có video. Chọn kênh và bấm Quét video."')
             for key in ("old_title", "song", "reference_title", "detail"):

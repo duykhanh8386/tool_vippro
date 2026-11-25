@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 from collections import defaultdict
 from datetime import datetime, time, timedelta
@@ -16,6 +17,30 @@ COPYRIGHT_LABELS = {
     "checking": "Đang kiểm tra",
     "unknown": "Chưa xác định",
 }
+
+REFERENCE_SELECTION_VERSION = 2
+_SOURCE_ID_SUFFIX = re.compile(r"\[([A-Za-z0-9_-]{11})\]\s*(?:\.(?:mp4|m4v|mkv|mov|webm))?\s*$", re.I)
+
+
+def reference_video_id(title: str) -> str:
+    """Recognize a downloader's [YouTube ID] suffix, with or without .mp4."""
+    match = _SOURCE_ID_SUFFIX.search(str(title or "").strip())
+    return match[1] if match else ""
+
+
+def reference_search_query(query: str) -> str:
+    text = _SOURCE_ID_SUFFIX.sub("", str(query or "").strip()).strip()
+    return re.sub(r"\.(?:mp4|m4v|mkv|mov|webm)\s*$", "", text, flags=re.I).strip()
+
+
+def positive_seconds(value) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        seconds = float(value)
+        return seconds if math.isfinite(seconds) and seconds > 0 else None
+    except (TypeError, ValueError, OverflowError):
+        return None
 
 
 def restriction_details(payload: dict) -> dict:

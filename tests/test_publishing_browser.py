@@ -7,7 +7,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from src.publishing_browser import ChatGPTImageBrowser, PublishingBrowserError, StudioThumbnailBrowser
+from src.publishing_browser import ChatGPTImageBrowser, PublishingBrowserError, StudioThumbnailBrowser, YouTubeReferenceBrowser, search_result_duration
+from src.task_runtime import TaskStopped
 
 VIDEO = "Abc123_-XYZ"
 CHANNEL = "UC" + "a" * 22
@@ -22,6 +23,156 @@ def immediate_wait(callback, **_kwargs):
 
 def event(method, **params):
     return {"message": json.dumps({"message": {"method": method, "params": params}})}
+
+
+def source(identifier, seconds=60):
+    return {"video_id": identifier, "url": "https://www.youtube.com/watch?v=" + identifier,
+            "title": "Title " + identifier, "description": "Exact description\nSecond line", "duration_seconds": seconds,
+            "thumbnail": f"https://i.ytimg.com/vi/{identifier}/hqdefault.jpg"}
+
+
+def result(identifier, duration=None):
+    renderer = {"videoId": identifier}
+    if duration is not None:
+        renderer["lengthSeconds"] = duration
+    return {"videoRenderer": renderer}
+
+
+class ReferencePriorityTests(unittest.TestCase):
+    def setUp(self):
+        self.browser = YouTubeReferenceBrowser()
+        self.driver = Mock()
+        self.driver.execute_script.return_value = {"contents": [result(VIDEO, 90), result("Def123_-XYZ", 60)]}
+        self.patches = [patch.object(self.browser, "_browser", return_value=self.driver),
+                        patch("src.publishing_browser.wait_for", side_effect=immediate_wait)]
+        for item in self.patches:
+            item.start()
+            self.addCleanup(item.stop)
+
+    def test_filename_id_bypasses_search_and_duration_filter(self):
+        with patch.object(self.browser, "_read_reference", return_value=source("ZoHtnOPSE80", 900)) as read:
+            found = self.browser.find("Different song", source_title="เพลงไทย [ZoHtnOPSE80].mp4", duration_seconds=60)
+        self.assertEqual(found["selection"], "id")
+        self.assertEqual(found["video_id"], "ZoHtnOPSE80")
+        read.assert_called_once_with("ZoHtnOPSE80", "Different song")
+        self.driver.get.assert_not_called()
+
+    def test_explicit_id_outranks_general_search_exclusions(self):
+        with patch.object(self.browser, "_read_reference", return_value=source("ZoHtnOPSE80")):
+            found = self.browser.find("Song [ZoHtnOPSE80]", duration_seconds=60, exclude_ids=["ZoHtnOPSE80"])
+        self.assertEqual(found["selection"], "id")
+        self.driver.get.assert_not_called()
+
+    def test_original_title_id_outranks_id_in_search_query(self):
+        with patch.object(self.browser, "_read_reference", return_value=source("ZoHtnOPSE80")) as read:
+            self.browser.find("Song [Def123_-XYZ]", source_title="Original [ZoHtnOPSE80]", duration_seconds=60)
+        read.assert_called_once_with("ZoHtnOPSE80", "Song")
+
+    def test_unavailable_filename_id_falls_back_to_duration_match(self):
+        def read(identifier, _query):
+            if identifier == "ZoHtnOPSE80":
+                raise PublishingBrowserError("unavailable")
+            return source(identifier)
+
+        with patch.object(self.browser, "_read_reference", side_effect=read):
+            found = self.browser.find("Song [ZoHtnOPSE80].mp4", duration_seconds=60)
+        self.assertEqual(found["video_id"], "Def123_-XYZ")
+        self.assertEqual(found["selection"], "duration")
+        self.driver.get.assert_called_once_with("https://www.youtube.com/results?search_query=Song")
+
+    def test_later_duration_match_outranks_first_result(self):
+        with patch.object(self.browser, "_read_reference", return_value=source("Def123_-XYZ", 60)) as read:
+            found = self.browser.find("Song", duration_seconds=60)
+        self.assertEqual(found["video_id"], "Def123_-XYZ")
+        self.assertEqual(found["selection"], "duration")
+        self.assertEqual(found["duration_delta_seconds"], 0)
+        read.assert_called_once_with("Def123_-XYZ", "Song")
+
+    def test_smallest_delta_wins_with_search_order_breaking_ties(self):
+        self.driver.execute_script.return_value = {"contents": [result(VIDEO, 61.5), result("Def123_-XYZ", 60), result("Ghi123_-XYZ", 60)]}
+        with patch.object(self.browser, "_read_reference", side_effect=lambda identifier, query: source(identifier, 60)):
+            found = self.browser.find("Song", duration_seconds=60)
+        self.assertEqual(found["video_id"], "Def123_-XYZ")
+
+    def test_strict_two_second_boundary_with_fractional_target(self):
+        for duration, method in ((58, "first"), (58.001, "duration"), (61.999, "duration"), (62, "first")):
+            with self.subTest(duration=duration):
+                self.driver.execute_script.return_value = {"contents": [result(VIDEO, 90), result("Def123_-XYZ", duration)]}
+                with patch.object(self.browser, "_read_reference", side_effect=lambda identifier, query: source(identifier, duration if identifier == "Def123_-XYZ" else 90)):
+                    found = self.browser.find("Song", duration_seconds=60)
+                self.assertEqual(found["selection"], method)
+
+    def test_missing_target_duration_falls_back_to_first(self):
+        for duration in (None, 0, -1, float("nan"), float("inf")):
+            with self.subTest(duration=duration), patch.object(self.browser, "_read_reference", return_value=source(VIDEO, 90)) as read:
+                found = self.browser.find("Song", duration_seconds=duration)
+                self.assertEqual(found["selection"], "first")
+                read.assert_called_once_with(VIDEO, "Song")
+
+    def test_search_duration_is_verified_against_selected_video(self):
+        self.driver.execute_script.return_value = {"contents": [result(VIDEO, 60), result("Def123_-XYZ", 61)]}
+        with patch.object(self.browser, "_read_reference", side_effect=lambda identifier, query: source(identifier, 500 if identifier == VIDEO else 61)):
+            found = self.browser.find("Song", duration_seconds=60)
+        self.assertEqual(found["video_id"], "Def123_-XYZ")
+        self.assertEqual(found["duration_delta_seconds"], 1)
+
+    def test_missing_badge_uses_video_details_before_falling_back(self):
+        self.driver.execute_script.return_value = {"contents": [result(VIDEO, 90), result("Def123_-XYZ")]}
+        with patch.object(self.browser, "_read_reference", return_value=source("Def123_-XYZ", 60)):
+            found = self.browser.find("Song", duration_seconds=60)
+        self.assertEqual(found["video_id"], "Def123_-XYZ")
+        self.assertEqual(found["selection"], "duration")
+
+    def test_unreadable_match_falls_back_to_first_search_result(self):
+        def read(identifier, query):
+            if identifier == "Def123_-XYZ":
+                raise PublishingBrowserError("unavailable")
+            return source(identifier, 90)
+
+        with patch.object(self.browser, "_read_reference", side_effect=read):
+            found = self.browser.find("Song", duration_seconds=60)
+        self.assertEqual(found["video_id"], VIDEO)
+        self.assertEqual(found["selection"], "first")
+
+    def test_excluded_search_result_is_not_used_for_duration_or_fallback(self):
+        with patch.object(self.browser, "_read_reference", return_value=source(VIDEO, 90)) as read:
+            found = self.browser.find("Song", duration_seconds=60, exclude_ids=["Def123_-XYZ"])
+        self.assertEqual(found["video_id"], VIDEO)
+        self.assertEqual(found["selection"], "first")
+        read.assert_called_once_with(VIDEO, "Song")
+
+    def test_no_readable_first_result_raises_instead_of_choosing_random_video(self):
+        with patch.object(self.browser, "_read_reference", side_effect=PublishingBrowserError("unavailable")), self.assertRaises(PublishingBrowserError):
+            self.browser.find("Song", duration_seconds=60)
+
+    def test_stop_is_not_swallowed_by_fallback(self):
+        with patch.object(self.browser, "_read_reference", side_effect=TaskStopped), self.assertRaises(TaskStopped):
+            self.browser.find("Song [ZoHtnOPSE80]", duration_seconds=60)
+        self.driver.get.assert_not_called()
+
+    def test_read_reference_preserves_exact_metadata_and_duration(self):
+        data = {"videoId": VIDEO, "title": "เพลงไทย 🎵", "shortDescription": "Line 1\n\nLine 3", "lengthSeconds": "123",
+                "thumbnail": {"thumbnails": [{"url": "small", "width": 320}, {"url": "large", "width": 1280}]}}
+        self.driver.execute_script.return_value = {"videoDetails": data}
+        found = self.browser._read_reference(VIDEO, "Song")
+        self.assertEqual(found["title"], data["title"])
+        self.assertEqual(found["description"], data["shortDescription"])
+        self.assertEqual(found["thumbnail"], "large")
+        self.assertEqual(found["duration_seconds"], 123)
+        self.driver.get.assert_called_once_with("https://www.youtube.com/watch?v=" + VIDEO)
+
+    def test_wrong_video_details_and_unavailable_player_are_rejected(self):
+        for player in ({"videoDetails": {"videoId": "Def123_-XYZ"}}, {"playabilityStatus": {"status": "ERROR"}}):
+            self.driver.execute_script.return_value = player
+            with self.subTest(player=player), self.assertRaises(PublishingBrowserError):
+                self.browser._read_reference(VIDEO, "Song")
+
+    def test_duration_badges_support_hours_minutes_and_runs(self):
+        for renderer, expected in (({"lengthText": {"simpleText": "1:02:03"}}, 3723),
+                                   ({"lengthText": {"runs": [{"text": "12:34"}]}}, 754),
+                                   ({"lengthSeconds": "61.234"}, 61.234), ({"lengthText": {"simpleText": "LIVE"}}, None),
+                                   ({"lengthText": {"simpleText": "01:99"}}, None), ({}, None)):
+            self.assertEqual(search_result_duration(renderer), expected)
 
 
 class ThumbnailSaveTests(unittest.TestCase):

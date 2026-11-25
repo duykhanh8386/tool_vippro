@@ -19,7 +19,10 @@ from selenium.webdriver.common.by import By
 from src.cookie_utils import inject_cookies_via_cdp
 from src.task_runtime import check_stopped, run_owned_process, unregister_driver, wait_interruptibly
 from src.utils import create_driver, get_channels_info
-from src.video_publishing import parse_chatgpt_cookies
+from src.video_publishing import (
+    REFERENCE_SELECTION_VERSION, parse_chatgpt_cookies, positive_seconds,
+    reference_search_query, reference_video_id,
+)
 
 
 class PublishingBrowserError(ValueError):
@@ -57,21 +60,41 @@ def _new_driver(*, network_events=False):
     return driver
 
 
-def video_search_results(data):
+def video_search_candidates(data):
     """Read ordinary search results in display order; exclude ads and Shorts."""
     if isinstance(data, dict):
         if "videoRenderer" in data:
             renderer = data["videoRenderer"]
             identifier = renderer.get("videoId", "")
             if re.fullmatch(r"[A-Za-z0-9_-]{11}", identifier):
-                yield identifier
+                yield renderer
             return
         for key, child in data.items():
             if key not in {"adSlotRenderer", "adPlacements", "promotedSparklesWebRenderer", "reelShelfRenderer", "shortsLockupViewModel"}:
-                yield from video_search_results(child)
+                yield from video_search_candidates(child)
     elif isinstance(data, list):
         for child in data:
-            yield from video_search_results(child)
+            yield from video_search_candidates(child)
+
+
+def video_search_results(data):
+    for renderer in video_search_candidates(data):
+        yield renderer["videoId"]
+
+
+def search_result_duration(renderer):
+    seconds = positive_seconds(renderer.get("lengthSeconds"))
+    if seconds is not None:
+        return seconds
+    text = renderer.get("lengthText") or {}
+    if isinstance(text, dict):
+        text = text.get("simpleText") or "".join(item.get("text", "") for item in text.get("runs", []))
+    if not re.fullmatch(r"\d+(?::[0-5]\d){1,2}", str(text).strip()):
+        return None
+    seconds = 0
+    for component in str(text).strip().split(":"):
+        seconds = seconds * 60 + int(component)
+    return positive_seconds(seconds)
 
 
 class YouTubeReferenceBrowser:
@@ -110,20 +133,14 @@ class YouTubeReferenceBrowser:
             identifiers.append(identifier)
         return list(dict.fromkeys(identifiers))
 
-    def find(self, query, *, exclude_ids=()):
+    def _read_reference(self, identifier, query):
         driver = self._browser()
-        driver.get("https://www.youtube.com/results?search_query=" + quote(query))
-        data = wait_for(lambda: driver.execute_script("return window.ytInitialData"),
-                        message="Không đọc được tìm kiếm YouTube. Kiểm tra trang đồng ý cookie hoặc xác minh trong Chrome.")
-        identifiers = list(dict.fromkeys(video_search_results(data)))
-        identifier = next((item for item in identifiers if item not in set(exclude_ids)), None)
-        if not identifier:
-            raise PublishingBrowserError("Không tìm thấy video tham chiếu cho tên bài nhạc này.")
         driver.get("https://www.youtube.com/watch?v=" + identifier)
-        data = wait_for(lambda: driver.execute_script("return window.ytInitialPlayerResponse?.videoDetails"),
-                        message="Không đọc được title/description của video tham chiếu.")
+        player = wait_for(lambda: driver.execute_script("return window.ytInitialPlayerResponse"),
+                          message="Không đọc được title/description của video tham chiếu.")
+        data = player.get("videoDetails") or {}
         if data.get("videoId") != identifier:
-            raise PublishingBrowserError("YouTube trả về sai video tham chiếu; đã dừng dòng này.")
+            raise PublishingBrowserError("Không đọc được đúng video tham chiếu; video có thể không còn khả dụng.")
         title, description = data.get("title"), data.get("shortDescription")
         thumbnails = data.get("thumbnail", {}).get("thumbnails") or []
         if not isinstance(title, str) or not title or not isinstance(description, str) or not thumbnails:
@@ -132,7 +149,71 @@ class YouTubeReferenceBrowser:
             raise PublishingBrowserError("Metadata nguồn vượt giới hạn YouTube; không thể chép nguyên văn.")
         return {"video_id": identifier, "url": "https://www.youtube.com/watch?v=" + identifier,
                 "title": title, "description": description,
-                "thumbnail": max(thumbnails, key=lambda item: item.get("width", 0))["url"], "query": query}
+                "thumbnail": max(thumbnails, key=lambda item: item.get("width", 0))["url"], "query": query,
+                "duration_seconds": positive_seconds(data.get("lengthSeconds"))}
+
+    def find(self, query, *, source_title="", duration_seconds=None, exclude_ids=()):
+        """Prefer a filename ID, then a duration match (<2s), then rank one."""
+        excluded = set(exclude_ids)
+        preferred_id = reference_video_id(source_title) or reference_video_id(query)
+        query = reference_search_query(query) or reference_search_query(source_title)
+        target = positive_seconds(duration_seconds)
+        cache = {}
+
+        def read(identifier):
+            if identifier not in cache:
+                check_stopped()
+                try:
+                    cache[identifier] = self._read_reference(identifier, query)
+                except (PublishingBrowserError, WebDriverException):
+                    check_stopped()
+                    cache[identifier] = None
+            return cache[identifier]
+
+        def selected(found, method, label, seconds=None):
+            return {**found, "selection_version": REFERENCE_SELECTION_VERSION, "selection": method,
+                    "selection_label": label, "preferred_id": preferred_id,
+                    "target_duration_seconds": target,
+                    "duration_seconds": seconds if seconds is not None else found.get("duration_seconds"),
+                    "duration_delta_seconds": abs(seconds - target) if seconds is not None and target is not None else None}
+
+        # An explicit source ID outranks the general search exclusions too.
+        if preferred_id:
+            found = read(preferred_id)
+            if found:
+                return selected(found, "id", "ID cuối tên: " + preferred_id, found.get("duration_seconds"))
+        if not query:
+            raise PublishingBrowserError("Không có tên bài nhạc để tìm kiếm sau khi đọc ID cuối tên.")
+        driver = self._browser()
+        driver.get("https://www.youtube.com/results?search_query=" + quote(query))
+        data = wait_for(lambda: driver.execute_script("return window.ytInitialData"),
+                        message="Không đọc được tìm kiếm YouTube. Kiểm tra trang đồng ý cookie hoặc xác minh trong Chrome.")
+        candidates, seen = [], set(excluded)
+        for renderer in video_search_candidates(data):
+            identifier = renderer["videoId"]
+            if identifier not in seen:
+                seen.add(identifier)
+                candidates.append((identifier, search_result_duration(renderer)))
+        if not candidates:
+            raise PublishingBrowserError("Không tìm thấy video tham chiếu cho tên bài nhạc này.")
+        if target is not None:
+            matching = [(identifier, seconds) for identifier, seconds in candidates if seconds is not None and abs(seconds - target) < 2]
+            matching.sort(key=lambda candidate: abs(candidate[1] - target))
+            # An absent duration badge can still be resolved from videoDetails.
+            matching.extend((identifier, None) for identifier, seconds in candidates if seconds is None)
+            for identifier, seconds in matching:
+                found = read(identifier)
+                if not found:
+                    continue
+                seconds = positive_seconds(found.get("duration_seconds")) or seconds
+                if seconds is not None and abs(seconds - target) < 2:
+                    delta = abs(seconds - target)
+                    return selected(found, "duration", f"Khớp thời lượng (lệch {delta:.3f} giây)", seconds)
+        first_id, first_seconds = candidates[0]
+        found = read(first_id)
+        if not found:
+            raise PublishingBrowserError("Không đọc được metadata của kết quả tìm kiếm đầu tiên; chưa chọn video thay thế.")
+        return selected(found, "first", "Kết quả tìm kiếm đầu tiên", positive_seconds(found.get("duration_seconds")) or first_seconds)
 
     def close(self):
         close_driver(self.driver)
