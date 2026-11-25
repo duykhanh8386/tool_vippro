@@ -692,6 +692,8 @@ def create_drawer():
                     pass
                 with nav_item("/videos/titles", "Ghép & đổi tiêu đề", "o_drive_file_rename_outline"):
                     pass
+                with nav_item("/videos/publishing", "SEO, thumbnail & lên lịch", "o_event_available"):
+                    pass
                 with nav_item("/reup/delete-video", "Xóa - Back", "o_delete_sweep"):
                     pass
 

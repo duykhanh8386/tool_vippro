@@ -13,6 +13,7 @@ from src.youtube_auth import (
     sapisid_cookie_fingerprint,
     studio_authorization_header,
 )
+from src.video_publishing import copyright_check_status, restriction_details
 
 
 class YouTubeRequestError(RuntimeError):
@@ -200,6 +201,14 @@ class IModule(ABC):
             thumbnail=thumbnails[0].get("url", ""),
             video_status=video.get("status", ""),
             audio_language=str(audio_language).strip(),
+            privacy=video.get("privacy", ""),
+            draft_status=video.get("draftStatus", ""),
+            scheduled_publishing_details=video.get("scheduledPublishingDetails", ""),
+            visibility=video.get("visibility", ""),
+            time_created_seconds=video.get("timeCreatedSeconds", ""),
+            time_published_seconds=video.get("timePublishedSeconds", ""),
+            restriction_details=restriction_details(video),
+            copyright_check_status=copyright_check_status(video),
         )
 
         cookie = None

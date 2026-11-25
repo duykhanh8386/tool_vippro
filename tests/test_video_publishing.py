@@ -1,0 +1,357 @@
+"""Synthetic sessions only: never change real YouTube videos or call ChatGPT."""
+import copy
+import json
+import tempfile
+import unittest
+from datetime import datetime, timedelta
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
+
+import requests
+
+from src.module.model import Video
+from src.module.video_publishing_module import VideoPublishingModule
+from src.publishing_browser import video_search_results
+from src.task_runtime import create_run_context
+from src.video_publishing import copyright_category, first_song, parse_chatgpt_cookies, plan_daily, schedule_timestamp
+from src.video_publishing_tasks import STATE_KEY, VideoPublishingController
+from src.video_scan_dates import VIETNAM_TIMEZONE
+
+CHANNEL = "UC" + "a" * 22
+CHANNEL2 = "UC" + "b" * 22
+VIDEO = "Abc123_-XYZ"
+OTHER = "Def123_-XYZ"
+NOW = datetime(2099, 1, 1, tzinfo=VIETNAM_TIMEZONE)
+STAMP = int(datetime(2099, 1, 2, 18, tzinfo=VIETNAM_TIMEZONE).timestamp())
+REFERENCE = {"video_id": "Ghi123_-XYZ", "url": "https://www.youtube.com/watch?v=Ghi123_-XYZ",
+             "title": "Músicas Católicas 🎵", "description": "Primeira linha\n\n00:00 Canção de Fé\n#Música",
+             "thumbnail": "https://i.ytimg.com/vi/Ghi123_-XYZ/maxresdefault.jpg"}
+
+
+def video(identifier=VIDEO, **changes):
+    values = dict(id=identifier, channel_id=CHANNEL, title="Original", description="00:00 First song\n03:00 Second song",
+                  thumbnail="", duration_ms=60000, privacy="PRIVATE", copyright_check_status="COPYRIGHT_CHECK_NO_ISSUES",
+                  time_created_seconds=1000)
+    values.update(changes)
+    return Video(**values)
+
+
+def row(identifier=VIDEO, **changes):
+    values = dict(video_id=identifier, channel_id=CHANNEL, old_title="Original", old_description="old description",
+                  song="First song", copyright="clear", copyright_label="Không có vấn đề bản quyền", selected=True,
+                  status="scanned", detail="")
+    values.update(changes)
+    return values
+
+
+class MemoryState:
+    def __init__(self):
+        self.data, self.fail = {}, False
+
+    def load_state(self, key):
+        return copy.deepcopy(self.data.get(key))
+
+    def save_state(self, key, value):
+        if self.fail:
+            return False
+        self.data[key] = copy.deepcopy(value)
+        return True
+
+
+class CopyrightTests(unittest.TestCase):
+    def test_finished_check_is_not_claim_free(self):
+        self.assertEqual(copyright_category(video(copyright_check_status="CHECK_STATUS_COMPLETED")), "unknown")
+
+    def test_no_issues_is_clear(self):
+        self.assertEqual(copyright_category(video()), "clear")
+
+    def test_blocking_overrides_successful_precheck(self):
+        details = {"copyrightSummary": {"policy": "COPYRIGHT_POLICY_PARTIALLY_BLOCKED"}}
+        self.assertEqual(copyright_category(video(restriction_details=details)), "partial")
+        details["copyrightSummary"]["policy"] = "COPYRIGHT_POLICY_BLOCKED"
+        self.assertEqual(copyright_category(video(restriction_details=details)), "blocked")
+
+    def test_claim_ids_and_flags_override_clear_status(self):
+        for details in ({"claimDetails": {"claims": [{"claimId": "claim-1"}]}},
+                        {"copyrightSummary": {"hasCopyrightClaims": True}}):
+            self.assertEqual(copyright_category(video(restriction_details=details)), "limited")
+
+    def test_unrelated_none_and_false_do_not_prove_no_copyright(self):
+        item = video(copyright_check_status="", restriction_details={"statusDetails": {"ageRestriction": "NONE", "hasWarning": False}})
+        self.assertEqual(copyright_category(item), "unknown")
+
+    def test_explicit_no_claims_and_completed_empty_restrictions(self):
+        self.assertEqual(copyright_category(video(copyright_check_status="", restriction_details={"copyrightSummary": {"hasClaims": False}})), "clear")
+        self.assertEqual(copyright_category(video(copyright_check_status="CHECK_COMPLETED", restriction_details={"allRestrictions": {"restrictions": []}})), "clear")
+
+    def test_checking_overrides_stale_no_claims(self):
+        self.assertEqual(copyright_category(video(copyright_check_status="CHECK_STATUS_PENDING", restriction_details={"copyrightSummary": {"hasClaims": False}})), "checking")
+
+    def test_global_block_overrides_partial_block(self):
+        details = {"copyrightSummary": {"policy": "PARTIALLY_BLOCKED", "isBlockedWorldwide": True}}
+        self.assertEqual(copyright_category(video(restriction_details=details)), "blocked")
+
+
+class ReferenceAndCookieTests(unittest.TestCase):
+    def test_first_track_timestamps_preserve_accents(self):
+        self.assertEqual(first_song("Mix", "Tracklist\n00:00:00 Diante do Rei\n03:00 Outra"), "Diante do Rei")
+        self.assertEqual(first_song("Mix", "[00:00] - Canção de Fé\n03:00 Outra"), "Canção de Fé")
+        self.assertEqual(first_song("Mix", "1. Canção de Fé 00:00\n2. Outra 03:00"), "Canção de Fé")
+        self.assertEqual(first_song("Fallback title", "No chapters"), "Fallback title")
+
+    def test_search_ignores_ads_and_shorts(self):
+        data = {"contents": [{"adSlotRenderer": {"videoRenderer": {"videoId": OTHER}}},
+                             {"reelShelfRenderer": {"videoRenderer": {"videoId": OTHER}}},
+                             {"videoRenderer": {"videoId": VIDEO}}, {"videoRenderer": {"videoId": "bad"}}]}
+        self.assertEqual(list(video_search_results(data)), [VIDEO])
+
+    def test_header_cookie_preserves_equals_in_values(self):
+        cookies = parse_chatgpt_cookies("Cookie: __Secure-next-auth.session-token=abc==; other=value")
+        self.assertEqual(cookies[0]["value"], "abc==")
+        self.assertEqual(cookies[0]["domain"], ".chatgpt.com")
+
+    def test_json_cookie_filters_other_domains_and_keeps_host_only(self):
+        cookies = parse_chatgpt_cookies(json.dumps([
+            {"name": "session", "value": "secret", "domain": ".chatgpt.com", "expirationDate": 1234567890.5},
+            {"name": "__Host-csrf", "value": "csrf", "domain": "chatgpt.com"},
+            {"name": "evil", "value": "secret", "domain": "evilchatgpt.com"}]))
+        self.assertEqual(len(cookies), 2)
+        self.assertEqual(cookies[0]["expiry"], 1234567890)
+        self.assertNotIn("domain", cookies[1])
+
+    def test_invalid_cookie_errors_do_not_echo_secrets(self):
+        for text in ("", "{badsecret", "[]", "abcsecret", '{"cookies": "mysecret"}'):
+            with self.subTest(text=text), self.assertRaises(ValueError) as result:
+                parse_chatgpt_cookies(text)
+            self.assertNotIn("secret", str(result.exception))
+
+
+class DailyPlanTests(unittest.TestCase):
+    def test_daily_slots_are_independent_per_channel(self):
+        rows = [row(), row(OTHER), row("Ghi123_-XYZ", channel_id=CHANNEL2)]
+        result = plan_daily(rows, "2099-01-02", "18:00", now=NOW)
+        self.assertEqual([item["publish_at"] for item in result], [STAMP, STAMP + 86400, STAMP])
+
+    def test_any_existing_schedule_reserves_whole_day(self):
+        result = plan_daily([row()], "2099-01-02", "18:00", now=NOW, occupied={CHANNEL: [STAMP - 3600]})
+        self.assertEqual(result[0]["publish_at"], STAMP + 86400)
+
+    def test_saved_assignments_and_successes_do_not_shift_on_retry(self):
+        rows = [row(status="successful", selected=False, publish_at=STAMP), row(OTHER, publish_at=STAMP + 86400), row("Ghi123_-XYZ")]
+        result = plan_daily(rows, "2099-01-02", "18:00", now=NOW)
+        self.assertEqual([item["publish_at"] for item in result], [STAMP + 86400, STAMP + 172800])
+
+    def test_can_resume_future_assignments_after_initial_start_day(self):
+        result = plan_daily([row(publish_at=STAMP + 2 * 86400)], "2099-01-01", "18:00", now=NOW + timedelta(days=2))
+        self.assertEqual(result[0]["publish_at"], STAMP + 2 * 86400)
+
+    def test_schedule_timestamp_supports_studio_command_shape(self):
+        for details in ({"timeSec": str(STAMP)}, {"scheduledPublishing": {"set": {"timeSec": str(STAMP)}}}):
+            self.assertEqual(schedule_timestamp(video(scheduled_publishing_details=details)), STAMP)
+
+    def test_invalid_past_and_expired_plans_are_rejected(self):
+        for start, hour, rows in (("invalid", "18:00", [row()]), ("2098-01-01", "18:00", [row()]),
+                                  ("2099-01-02", "25:00", [row()]), ("2099-01-02", "18:00:01", [row()]),
+                                  ("2099-01-02", "18:00", [row(publish_at=NOW.timestamp() - 1)])):
+            with self.subTest(start=start, hour=hour), self.assertRaises(ValueError):
+                plan_daily(rows, start, hour, now=NOW)
+
+
+class PublishingModuleTests(unittest.TestCase):
+    def setUp(self):
+        self.module = VideoPublishingModule()
+        channel = SimpleNamespace(id=CHANNEL, role="OWNER", delegated_session_id="session", cookies=[], cookie_string=lambda: "cookie")
+        self.patches = [patch("src.module.video_publishing_module.get_channels_info", return_value=channel),
+                        patch("src.module.video_publishing_module.studio_authorization_header", return_value="hash"),
+                        patch.object(self.module, "_get_session_token", return_value="token"),
+                        patch("src.module.video_publishing_module.wait_interruptibly")]
+        for item in self.patches:
+            item.start()
+            self.addCleanup(item.stop)
+        self.response = Mock(status_code=200)
+        self.response.json.return_value = {}
+        self.post = patch("src.module.video_publishing_module.post_with_stop", return_value=self.response).start()
+        self.addCleanup(patch.stopall)
+
+    def copy_metadata(self):
+        return self.module.copy_metadata(CHANNEL, VIDEO, REFERENCE, expected_title="Original", expected_description="old description", categories=["clear"])
+
+    def test_metadata_copy_is_exact_and_read_back(self):
+        before = video(description="old description")
+        after = video(title=REFERENCE["title"], description=REFERENCE["description"])
+        with patch.object(self.module, "_get_video_info", side_effect=[before, after]):
+            self.copy_metadata()
+        payload = self.post.call_args.kwargs["json"]
+        self.assertEqual(payload["title"]["newTitle"], REFERENCE["title"])
+        self.assertEqual(payload["description"]["newDescription"], REFERENCE["description"])
+        self.assertNotIn("scheduledPublishing", payload)
+
+    def test_metadata_already_saved_does_not_submit_again(self):
+        after = video(title=REFERENCE["title"], description=REFERENCE["description"])
+        with patch.object(self.module, "_get_video_info", return_value=after):
+            self.copy_metadata()
+        self.post.assert_not_called()
+
+    def test_changed_original_and_foreign_channel_block_mutation(self):
+        for before in (video(title="Manual edit"), video(channel_id=CHANNEL2), video(privacy="PUBLIC"),
+                       video(copyright_check_status="CHECK_COMPLETED"), video(privacy="")):
+            with self.subTest(before=before), patch.object(self.module, "_get_video_info", return_value=before), self.assertRaises(ValueError):
+                self.copy_metadata()
+        self.post.assert_not_called()
+
+    def test_uncertain_network_response_reads_back_without_resubmitting(self):
+        after = video(title=REFERENCE["title"], description=REFERENCE["description"])
+        self.post.side_effect = requests.ConnectionError("disconnect")
+        with patch.object(self.module, "_get_video_info", side_effect=[video(description="old description"), after]):
+            self.copy_metadata()
+        self.assertEqual(self.post.call_count, 1)
+
+    def test_no_success_without_readback(self):
+        with patch.object(self.module, "_get_video_info", return_value=video(description="old description")), self.assertRaises(ValueError):
+            self.copy_metadata()
+        self.assertEqual(self.post.call_count, 1)
+
+    def test_schedule_wire_format_and_readback(self):
+        before = video(title=REFERENCE["title"], description=REFERENCE["description"])
+        after = video(title=REFERENCE["title"], description=REFERENCE["description"], scheduled_publishing_details={"publishTimeSeconds": str(STAMP)})
+        with patch.object(self.module, "_get_video_info", side_effect=[before, after]):
+            result = self.module.schedule(CHANNEL, VIDEO, STAMP, REFERENCE, categories=["clear"])
+        payload = self.post.call_args.kwargs["json"]
+        self.assertEqual(payload["scheduledPublishing"]["set"], {"timeSec": str(STAMP), "privacy": "PUBLIC"})
+        self.assertEqual(payload["privacyState"], {"newPrivacy": "PRIVATE"})
+        self.assertEqual(schedule_timestamp(result), STAMP)
+
+    def test_existing_schedule_is_idempotent_and_other_schedule_is_preserved(self):
+        before = video(title=REFERENCE["title"], description=REFERENCE["description"], scheduled_publishing_details={"publishTimeSeconds": STAMP})
+        with patch.object(self.module, "_get_video_info", return_value=before):
+            self.module.schedule(CHANNEL, VIDEO, STAMP, REFERENCE, categories=["clear"])
+            with self.assertRaises(ValueError):
+                self.module.schedule(CHANNEL, VIDEO, STAMP + 86400, REFERENCE, categories=["clear"])
+        self.post.assert_not_called()
+
+    def test_unreadable_existing_schedule_is_preserved(self):
+        before = video(scheduled_publishing_details={"unrecognizedScheduleShape": True})
+        with patch.object(self.module, "_get_video_info", return_value=before), self.assertRaises(ValueError):
+            self.copy_metadata()
+        self.post.assert_not_called()
+
+
+class PublishingControllerTests(unittest.TestCase):
+    def setUp(self):
+        self.storage = MemoryState()
+        self.module, self.listing, self.reference, self.image, self.thumbnail = Mock(), Mock(), Mock(), Mock(), Mock()
+        self.reference.find.return_value = dict(REFERENCE)
+        self.listing.list_all_videos.return_value = ([], None)
+        self.controller = VideoPublishingController(storage=self.storage, module=self.module, listing=self.listing,
+                reference_factory=lambda: self.reference, image_factory=lambda cookie: self.image, thumbnail_factory=lambda: self.thumbnail)
+        self.controller.settings.update(channel_ids=[CHANNEL], start_date="2099-01-02", hour="18:00")
+        self.controller.set_cookie("session=private-secret")
+
+    def test_cookie_never_saved_or_returned_in_snapshot(self):
+        self.controller.change_settings(hour="19:00")
+        self.assertNotIn("private-secret", json.dumps(self.storage.data))
+        self.assertNotIn("private-secret", json.dumps(self.controller.snapshot()))
+        self.assertTrue(self.controller.snapshot()["has_cookie"])
+
+    def test_scan_all_pages_deduplicates_drafts_filters_and_reserves_days(self):
+        claimed = video(OTHER, copyright_check_status="COPYRIGHT_CLAIMED")
+        scheduled = video("Ghi123_-XYZ", scheduled_publishing_details={"publishTimeSeconds": STAMP})
+        self.listing.list_all_videos.side_effect = [([video(), claimed], "next"), ([scheduled], None), ([video()], None)]
+        with patch("src.video_publishing_tasks.get_channels_info", return_value=[SimpleNamespace(id=CHANNEL)]):
+            self.controller._scan(self.controller.settings, self.reference)
+        rows = self.controller.rows
+        self.assertEqual(len(rows), 3)
+        self.assertEqual([item["video_id"] for item in rows if item["selected"]], [VIDEO])
+        self.assertEqual(self.controller.occupied[CHANNEL], [STAMP])
+        self.assertEqual(self.listing.list_all_videos.call_count, 3)
+
+    def test_scan_repeated_tokens_and_foreign_channel_fail(self):
+        for page in (([], "repeat"), ([video(channel_id=CHANNEL2)], None)):
+            with self.subTest(page=page), patch("src.video_publishing_tasks.get_channels_info", return_value=[SimpleNamespace(id=CHANNEL)]):
+                self.listing.list_all_videos.side_effect = None
+                self.listing.list_all_videos.return_value = page
+                with self.assertRaises(ValueError):
+                    self.controller._scan(self.controller.settings, self.reference)
+
+    def test_settings_validation_does_not_partially_change_schedule(self):
+        self.controller.rows = [row(thumbnail_uploaded=True)]
+        with self.assertRaises(ValueError):
+            self.controller.change_settings(hour="21:00")
+        self.assertEqual(self.controller.settings["hour"], "18:00")
+        for value in (None, 0, -1, 1.5, float("nan")):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                self.controller.change_settings(limit=value)
+
+    def test_reference_preview_makes_no_remote_mutations_or_image_requests(self):
+        self.controller.rows = [row()]
+        self.controller._process(self.controller.settings, self.reference, None, "references")
+        self.assertEqual(self.controller.rows[0]["reference"]["description"], REFERENCE["description"])
+        self.module.copy_metadata.assert_not_called()
+        self.module.schedule.assert_not_called()
+        self.image.generate.assert_not_called()
+
+    def test_schedule_conflicts_detected_before_processing(self):
+        self.controller.rows = [row(publish_at=STAMP)]
+        self.listing.list_all_videos.return_value = ([video(OTHER, scheduled_publishing_details={"publishTimeSeconds": STAMP - 3600})], None)
+        with self.assertRaises(ValueError):
+            self.controller._check_schedule_conflicts()
+        self.module.copy_metadata.assert_not_called()
+
+    def test_unknown_existing_schedule_blocks_new_schedules(self):
+        self.controller.rows = [row(publish_at=STAMP)]
+        self.listing.list_all_videos.return_value = ([video(OTHER, scheduled_publishing_details={"unrecognizedScheduleShape": True})], None)
+        with self.assertRaises(ValueError):
+            self.controller._check_schedule_conflicts()
+        self.module.schedule.assert_not_called()
+
+    def test_full_worker_checkpoints_and_resumes_without_regenerating(self):
+        with tempfile.TemporaryDirectory() as folder:
+            self.controller.settings["output_folder"] = folder
+            self.controller.rows = [row(publish_at=STAMP, publish_label="02/01/2099 18:00")]
+            thumb = Path(folder) / "thumbnail.jpg"
+            thumb.write_bytes(b"fake")
+            self.image.generate.side_effect = lambda *args, **kw: (kw["on_conversation"]("https://chatgpt.com/c/abc-123") or "generated")
+            self.module.schedule.side_effect = [ValueError("response pending"), None]
+            with patch("src.video_publishing_tasks.download_reference_image", return_value="reference.jpg"), patch("src.video_publishing_tasks.normalize_thumbnail", return_value=str(thumb)):
+                self.controller._worker("run", create_run_context("publishing-test"))
+                self.assertEqual(self.controller.rows[0]["status"], "error")
+                self.assertTrue(self.controller.rows[0]["thumbnail_uploaded"])
+                saved = self.storage.load_state(STATE_KEY)
+                self.assertIn("conversation_url", saved["rows"][0])
+                self.controller._worker("run", create_run_context("publishing-test-resume"))
+            self.assertEqual(self.controller.rows[0]["status"], "successful")
+            self.assertFalse(self.controller.rows[0]["selected"])
+            self.assertEqual(self.image.generate.call_count, 1)
+            self.assertEqual(self.reference.find.call_count, 1)
+            self.assertEqual(self.thumbnail.upload.call_count, 1)
+
+    def test_storage_failure_stops_before_remote_mutation(self):
+        self.controller.rows = [row(publish_at=STAMP)]
+        self.storage.fail = True
+        self.controller._worker("run", create_run_context("publishing-save-failure"))
+        self.module.copy_metadata.assert_not_called()
+        self.module.schedule.assert_not_called()
+
+    def test_reload_restores_checkpoints_but_requires_new_cookie(self):
+        self.controller.rows = [row(status="processing", publish_at=STAMP, reference=REFERENCE, thumbnail_uploaded=True)]
+        self.controller._save()
+        restored = VideoPublishingController(storage=self.storage)
+        self.assertEqual(restored.rows[0]["status"], "stopped")
+        self.assertEqual(restored.rows[0]["publish_at"], STAMP)
+        self.assertTrue(restored.rows[0]["thumbnail_uploaded"])
+        self.assertFalse(restored.snapshot()["has_cookie"])
+
+    def test_query_edit_invalidates_reference_before_remote_writes(self):
+        self.controller.rows = [row(reference=REFERENCE, thumbnail_path="old.jpg", conversation_url="https://chatgpt.com/c/abc")]
+        self.controller.set_song(VIDEO, "New song")
+        self.assertEqual(self.controller.rows[0]["song"], "New song")
+        self.assertNotIn("reference", self.controller.rows[0])
+        self.assertNotIn("thumbnail_path", self.controller.rows[0])
+        self.controller.rows[0]["metadata_copied"] = True
+        with self.assertRaises(ValueError):
+            self.controller.set_song(VIDEO, "Another song")
+
+
+if __name__ == "__main__":
+    unittest.main()

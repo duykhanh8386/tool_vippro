@@ -5,3 +5,4 @@ from .delete_back_flow import *
 from .delete_video import *
 from .studio import *
 from .video_titles import *
+from .video_publishing import *

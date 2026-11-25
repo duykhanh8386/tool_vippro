@@ -1,0 +1,403 @@
+"""Durable sequential SEO/thumbnail/schedule jobs, shared across UI sessions."""
+from __future__ import annotations
+
+import copy
+import re
+import threading
+from datetime import datetime, timedelta
+from pathlib import Path
+
+from src.audio_recovery import _is_currently_public_video
+from src.module.base import YouTubeRequestError
+from src.module.list_videos_module import list_videos_module
+from src.module.video_publishing_module import video_publishing_module
+from src.paths import get_data_dir
+from src.publishing_browser import ChatGPTImageBrowser, StudioThumbnailBrowser, YouTubeReferenceBrowser, download_reference_image, normalize_thumbnail
+from src.state_manager import state_manager
+from src.task_runtime import TaskStopped, bind_run_context, check_stopped, create_run_context
+from src.utils import get_channels_info
+from src.video_publishing import COPYRIGHT_LABELS, copyright_category, first_song, parse_chatgpt_cookies, plan_daily, schedule_timestamp
+from src.video_scan_dates import VIETNAM_TIMEZONE, _status_indicates_draft
+from src.video_title_matching import parse_manual_title_ids
+
+STATE_KEY = "video_publishing"
+STATUS_LABELS = {"scanned": "Đã quét", "ready": "Đã tìm tham chiếu", "processing": "Đang xử lý", "successful": "Đã lên lịch",
+                 "skipped": "Bỏ qua", "error": "Lỗi", "stopped": "Đã dừng"}
+
+
+def default_settings():
+    return {"channel_ids": [], "channel_links": "", "manual_ids": "", "categories": ["clear"], "scope": "unpublished",
+            "scan_all": True, "limit": 100, "start_date": (datetime.now(VIETNAM_TIMEZONE).date() + timedelta(days=1)).isoformat(),
+            "hour": "18:00", "order": "oldest", "image_prompt": "Vẽ lại thumbnail dựa trên ảnh tham chiếu, bố cục rõ ràng, chữ dễ đọc, phù hợp nội dung bài nhạc; tỷ lệ 16:9.",
+            "output_folder": ""}
+
+
+class VideoPublishingController:
+    def __init__(self, *, storage=None, module=None, listing=None, reference_factory=None, image_factory=None, thumbnail_factory=None):
+        self.storage = storage or state_manager
+        self.module = module or video_publishing_module
+        self.listing = listing or list_videos_module
+        self.reference_factory = reference_factory or YouTubeReferenceBrowser
+        self.image_factory = image_factory or ChatGPTImageBrowser
+        self.thumbnail_factory = thumbnail_factory or StudioThumbnailBrowser
+        self.lock = threading.RLock()
+        saved = self.storage.load_state(STATE_KEY) or {}
+        self.settings = {**default_settings(), **saved.get("settings", {})}
+        # Credentials never belong in persistent state, even from an older file.
+        self.settings.pop("cookie", None)
+        self.rows = saved.get("rows", [])
+        self.occupied = saved.get("occupied", {})
+        for row in self.rows:
+            if row.get("status") == "processing":
+                row.update(status="stopped", detail="Phiên trước bị ngắt; tiếp tục để đọc lại kết quả thực tế.")
+        self.message = saved.get("message", "Chọn kênh, quét trạng thái rồi tìm video tham chiếu.")
+        self.cookie = ""
+        self.busy = False
+        self.revision = 0
+        self.run = self.thread = None
+
+    def _save(self):
+        if not self.storage.save_state(STATE_KEY, {"settings": self.settings, "rows": self.rows,
+                                                   "occupied": self.occupied, "message": self.message}):
+            raise ValueError("Không lưu được tiến độ; đã dừng trước bước tiếp theo.")
+
+    def snapshot(self):
+        with self.lock:
+            return copy.deepcopy({"settings": self.settings, "rows": self.rows, "message": self.message,
+                                  "busy": self.busy, "revision": self.revision, "has_cookie": bool(self.cookie)})
+
+    def set_cookie(self, text):
+        with self.lock:
+            if self.busy:
+                raise ValueError("Chờ tác vụ kết thúc trước khi thay cookie.")
+            if text.strip():
+                parse_chatgpt_cookies(text)
+            self.cookie = text
+
+    def change_settings(self, **changes):
+        with self.lock:
+            if self.busy:
+                raise ValueError("Dừng tác vụ trước khi thay thiết lập.")
+            if any(key not in default_settings() for key in changes):
+                raise ValueError("Thiết lập không hợp lệ.")
+            changed = {key for key, value in changes.items() if self.settings.get(key) != value}
+            if not changed:
+                return
+            if changed & {"start_date", "hour"} and any(row.get("thumbnail_uploaded") and row.get("status") != "successful" for row in self.rows):
+                raise ValueError("Có video đang chờ xác nhận lịch. Tiếp tục xử lý hoặc quét lại trước khi đổi ngày giờ.")
+            if "limit" in changes:
+                try:
+                    value = float(changes["limit"])
+                    if not value.is_integer() or not 1 <= value <= 10000:
+                        raise ValueError()
+                    changes["limit"] = int(value)
+                except (ValueError, TypeError, OverflowError):
+                    raise ValueError("Số video mỗi kênh phải là số nguyên từ 1 đến 10000.") from None
+            if "scope" in changes and changes["scope"] not in {"unpublished", "draft", "private"}:
+                raise ValueError("Phạm vi quét không hợp lệ.")
+            if "order" in changes and changes["order"] not in {"oldest", "newest"}:
+                raise ValueError("Thứ tự đăng không hợp lệ.")
+            self.settings.update(changes)
+            if changed & {"channel_ids", "channel_links", "manual_ids", "categories", "scope", "scan_all", "limit", "order"}:
+                self.rows = []
+                self.occupied = {}
+                self.message = "Phạm vi đã đổi. Quét lại video."
+            elif changed & {"start_date", "hour"}:
+                for row in self.rows:
+                    if row.get("status") != "successful":
+                        row.pop("publish_at", None)
+                        row.pop("publish_label", None)
+            elif "image_prompt" in changed:
+                for row in self.rows:
+                    if row.get("status") != "successful" and not row.get("thumbnail_uploaded"):
+                        row.pop("thumbnail_path", None)
+                        row.pop("conversation_url", None)
+            self.revision += 1
+            self._save()
+
+    def select(self, video_ids):
+        with self.lock:
+            if self.busy:
+                return
+            selected = set(video_ids)
+            for row in self.rows:
+                row["selected"] = row["video_id"] in selected and row["status"] not in {"skipped", "successful"}
+            self.revision += 1
+            self._save()
+
+    def set_song(self, video_id, query):
+        with self.lock:
+            if self.busy:
+                raise ValueError("Dừng tác vụ trước khi đổi bài nhạc tìm kiếm.")
+            row = next((item for item in self.rows if item["video_id"] == video_id), None)
+            if not row or row["status"] in {"skipped", "successful"} or row.get("metadata_copied") or row.get("thumbnail_uploaded"):
+                raise ValueError("Chỉ sửa bài nhạc cho dòng chưa cập nhật lên YouTube.")
+            query = str(query or "").strip()
+            if not query:
+                raise ValueError("Tên bài nhạc tìm kiếm không được để trống.")
+            if query != row["song"]:
+                row.update(song=query, status="scanned", detail="Đã đổi từ khóa; sẽ tìm lại video tham chiếu.")
+                for key in ("reference", "conversation_url", "thumbnail_path"):
+                    row.pop(key, None)
+                self._checkpoint()
+
+    def _checkpoint(self, row=None, **changes):
+        check_stopped()
+        with self.lock:
+            if row is not None:
+                row.update(changes)
+            self.revision += 1
+            self._save()
+
+    def _progress(self, message):
+        with self.lock:
+            self.message = message
+
+    def plan(self):
+        with self.lock:
+            if self.busy:
+                raise ValueError("Chờ tác vụ kết thúc để xem lịch.")
+            self._assign_plan()
+
+    def _assign_plan(self):
+        plan = plan_daily(self.rows, self.settings["start_date"], self.settings["hour"], occupied=self.occupied)
+        by_id = {(row["channel_id"], row["video_id"]): row for row in self.rows}
+        for slot in plan:
+            by_id[slot["channel_id"], slot["video_id"]].update(slot)
+        self._checkpoint()
+        return plan
+
+    def start(self, action):
+        if action not in {"scan", "references", "run"}:
+            raise ValueError("Tác vụ không hợp lệ.")
+        with self.lock:
+            if self.busy:
+                raise ValueError("Tác vụ đang chạy.")
+            if action == "scan":
+                if not self.settings["channel_ids"] and not self.settings["channel_links"].strip():
+                    raise ValueError("Chọn kênh hoặc dán link kênh đã kết nối trong tool.")
+                categories = set(self.settings["categories"])
+                if not categories or not categories <= {"clear", "limited", "partial", "blocked"}:
+                    raise ValueError("Chọn ít nhất một trạng thái bản quyền đã xác định.")
+                if self.settings["manual_ids"].strip():
+                    parse_manual_title_ids(self.settings["manual_ids"])
+            else:
+                if not any(row.get("selected") for row in self.rows):
+                    raise ValueError("Chọn ít nhất một video hợp lệ trong bảng.")
+                if action == "run":
+                    if not self.settings["image_prompt"].strip():
+                        raise ValueError("Nhập prompt chung để vẽ thumbnail.")
+                    parse_chatgpt_cookies(self.cookie)
+                    self._assign_plan()
+            self.busy = True
+            self.revision += 1
+            self.run = create_run_context("video_publishing")
+            self.thread = threading.Thread(target=self._worker, args=(action, self.run), daemon=True, name="video-publishing")
+            self.thread.start()
+
+    def stop(self):
+        with self.lock:
+            run = self.run
+            self.message = "Đang dừng; tiến độ đã lưu sẽ được dùng khi tiếp tục."
+        if run:
+            run.request_stop()
+
+    @staticmethod
+    def _error(exc):
+        return str(exc) if isinstance(exc, (ValueError, YouTubeRequestError)) else "Không hoàn tất do lỗi kết nối/trình duyệt. Kiểm tra Chrome và phiên đăng nhập rồi tiếp tục."
+
+    def _scan(self, settings, reference):
+        channels = list(settings["channel_ids"])
+        if settings["channel_links"].strip():
+            channels = reference.resolve_channels(settings["channel_links"])
+        connected = {channel.id for channel in get_channels_info() or []}
+        if not channels or any(channel not in connected for channel in channels):
+            raise ValueError("Link kênh phải là kênh đã đăng nhập trong mục Tài khoản & kênh.")
+        manual = parse_manual_title_ids(settings["manual_ids"]) if settings["manual_ids"].strip() else []
+        manual_set = set(manual)
+        rows, occupied = [], {}
+        for channel_id in dict.fromkeys(channels):
+            self._progress(f"Đang quét kênh {channel_id}…")
+            seen, tokens, videos = set(), set(), []
+            # Include explicit draft listing; not every Studio account returns
+            # drafts in the unfiltered list. Always read every page for occupancy.
+            for draft_only in (False, True):
+                token = None
+                tokens.clear()
+                while True:
+                    check_stopped()
+                    page, next_token = self.listing.list_all_videos(channel_id, limit=100, page_token=token, draft_only=draft_only)
+                    for video in page:
+                        if not re.fullmatch(r"[A-Za-z0-9_-]{11}", video.id) or video.channel_id != channel_id:
+                            raise ValueError("YouTube trả về video không thuộc kênh đang quét.")
+                        if video.id not in seen:
+                            seen.add(video.id)
+                            videos.append(video)
+                    self._progress(f"Kênh {channel_id} · đã đọc {len(videos)} video…")
+                    if not next_token:
+                        break
+                    if next_token in tokens:
+                        raise ValueError("YouTube trả về phân trang lặp; đã dừng quét.")
+                    tokens.add(next_token)
+                    token = next_token
+            occupied[channel_id] = [stamp for video in videos if (stamp := schedule_timestamp(video))]
+            if manual:
+                videos = [video for video in videos if video.id in manual_set]
+                videos.sort(key=lambda video: manual.index(video.id))
+            else:
+                from src.video_scan_dates import _timestamp
+
+                videos.sort(key=lambda video: _timestamp(video.time_created_seconds) or 0, reverse=settings["order"] == "newest")
+            eligible_count = 0
+            for video in videos:
+                category = copyright_category(video)
+                reason = ""
+                if _is_currently_public_video(video):
+                    reason = "Video đã công khai."
+                elif video.scheduled_publishing_details:
+                    reason = "Video đã có lịch đăng; giữ lịch hiện tại."
+                elif settings["scope"] == "draft" and not _status_indicates_draft(video.draft_status):
+                    reason = "Không phải bản nháp."
+                elif settings["scope"] == "private" and ("PRIVATE" not in str(video.privacy).upper() or _status_indicates_draft(video.draft_status)):
+                    reason = "Không phải video riêng tư đã hoàn tất."
+                elif category not in settings["categories"]:
+                    reason = COPYRIGHT_LABELS[category] + "; không nằm trong bộ lọc."
+                if not reason and not settings["scan_all"] and eligible_count >= int(settings["limit"]):
+                    continue
+                eligible_count += int(not reason)
+                rows.append({"video_id": video.id, "channel_id": channel_id, "old_title": video.title,
+                             "old_description": video.description, "song": first_song(video.title, video.description),
+                             "copyright": category, "copyright_label": COPYRIGHT_LABELS[category],
+                             "selected": not reason, "status": "skipped" if reason else "scanned", "detail": reason or "Sẵn sàng tìm tham chiếu."})
+        if manual:
+            found = {row["video_id"] for row in rows}
+            missing = manual_set - found
+            if missing:
+                raise ValueError("Không tìm thấy Video ID trong các kênh đã chọn: " + ", ".join(sorted(missing)))
+        with self.lock:
+            self.rows, self.occupied = rows, occupied
+            self.message = f"Đã quét {len(rows)} video · {sum(row['selected'] for row in rows)} phù hợp bộ lọc."
+            self._checkpoint()
+
+    def _process(self, settings, reference, image, action):
+        selected = [row for row in self.rows if row.get("selected") and row["status"] not in {"successful", "skipped"}]
+        thumbnail = self.thumbnail_factory() if action == "run" else None
+        output = Path(settings["output_folder"]).expanduser() if settings["output_folder"].strip() else get_data_dir() / "publishing_thumbnails"
+        for index, row in enumerate(selected, 1):
+            check_stopped()
+            self._progress(f"{index}/{len(selected)} · {row['channel_id']} · {row['video_id']}")
+            self._checkpoint(row, status="processing", detail="Đang kiểm tra video và tìm tham chiếu…")
+            try:
+                self.module.require_eligible(row["channel_id"], row["video_id"], settings["categories"], publish_at=row.get("publish_at"))
+                if not row.get("reference"):
+                    found = reference.find(row["song"], exclude_ids=[entry["video_id"] for entry in self.rows])
+                    self._checkpoint(row, reference=found)
+                if action == "references":
+                    self._checkpoint(row, status="ready", detail="Đã tìm video tham chiếu; title và description sẽ chép nguyên văn.")
+                    continue
+                folder = output / row["channel_id"]
+                folder.mkdir(parents=True, exist_ok=True)
+                base = folder / row["video_id"]
+                if not row.get("thumbnail_path") or not Path(row["thumbnail_path"]).is_file():
+                    reference_path = download_reference_image(row["reference"]["thumbnail"], base.with_suffix(".reference.jpg"))
+                    self._checkpoint(row, detail="Đang yêu cầu ChatGPT vẽ lại thumbnail…")
+                    raw = image.generate(reference_path, settings["image_prompt"], row["reference"], base.with_suffix(".generated"),
+                                         conversation_url=row.get("conversation_url", ""),
+                                         on_conversation=lambda url, row=row: self._checkpoint(row, conversation_url=url))
+                    path = normalize_thumbnail(raw, base.with_suffix(".jpg"))
+                    self._checkpoint(row, thumbnail_path=path)
+                self.module.copy_metadata(row["channel_id"], row["video_id"], row["reference"],
+                                          expected_title=row["old_title"], expected_description=row["old_description"],
+                                          categories=settings["categories"], publish_at=row["publish_at"])
+                self._checkpoint(row, metadata_copied=True, detail="Đã xác nhận title/description. Đang tải thumbnail…")
+                if not row.get("thumbnail_uploaded"):
+                    self.module.require_eligible(row["channel_id"], row["video_id"], settings["categories"], publish_at=row["publish_at"])
+                    thumbnail.upload(row["channel_id"], row["video_id"], row["thumbnail_path"])
+                    self._checkpoint(row, thumbnail_uploaded=True)
+                self._checkpoint(row, detail="Đang đặt lịch và đọc lại kết quả…")
+                self.module.schedule(row["channel_id"], row["video_id"], row["publish_at"], row["reference"], categories=settings["categories"])
+                self._checkpoint(row, status="successful", selected=False, detail="Đã xác nhận metadata và lịch đăng trên YouTube.")
+            except TaskStopped:
+                raise
+            except Exception as exc:
+                self._checkpoint(row, status="error", detail=self._error(exc))
+                if isinstance(exc, YouTubeRequestError) and exc.status_code in {401, 403}:
+                    raise
+        successes = sum(row["status"] == "successful" for row in self.rows)
+        failed = sum(row["status"] == "error" for row in self.rows)
+        self._progress(f"Hoàn tất lượt xử lý · {successes} đã lên lịch · {failed} lỗi." if action == "run" else f"Đã tìm tham chiếu · {failed} lỗi. Kiểm tra bảng trước khi chạy.")
+
+    def _check_schedule_conflicts(self):
+        """Detect schedules added since the preview before any remote mutation."""
+        selected = [row for row in self.rows if row.get("selected") and row.get("publish_at")]
+        for channel_id in dict.fromkeys(row["channel_id"] for row in selected):
+            self._progress(f"Đang kiểm tra lại lịch hiện có trên kênh {channel_id}…")
+            token, tokens = None, set()
+            while True:
+                page, next_token = self.listing.list_all_videos(channel_id, limit=100, page_token=token)
+                for video in page:
+                    if video.channel_id != channel_id:
+                        raise ValueError("YouTube trả về lịch của kênh khác.")
+                    stamp = schedule_timestamp(video)
+                    if video.scheduled_publishing_details and stamp is None:
+                        raise ValueError("Có video đã lên lịch nhưng chưa đọc được ngày giờ. Kiểm tra Studio trước khi đặt thêm lịch.")
+                    if not stamp:
+                        continue
+                    day = datetime.fromtimestamp(stamp, VIETNAM_TIMEZONE).date()
+                    if any(row["channel_id"] == channel_id and row["video_id"] != video.id
+                           and datetime.fromtimestamp(row["publish_at"], VIETNAM_TIMEZONE).date() == day for row in selected):
+                        raise ValueError("Kênh đã có video khác được lên lịch vào ngày dự kiến sau lần quét. Quét lại để cập nhật ngày trống.")
+                if not next_token:
+                    break
+                if next_token in tokens:
+                    raise ValueError("YouTube trả về phân trang lịch bị lặp.")
+                tokens.add(next_token)
+                token = next_token
+
+    def _worker(self, action, run):
+        reference = image = None
+        try:
+            with bind_run_context(run):
+                settings = copy.deepcopy(self.settings)
+                reference = self.reference_factory()
+                image = self.image_factory(self.cookie) if action == "run" else None
+                if action == "scan":
+                    self._scan(settings, reference)
+                else:
+                    if action == "run":
+                        self._check_schedule_conflicts()
+                    self._process(settings, reference, image, action)
+        except TaskStopped:
+            self._progress("Đã dừng; có thể tiếp tục các dòng chưa xong.")
+        except Exception as exc:
+            self._progress(self._error(exc))
+        finally:
+            for adapter in (image, reference):
+                if adapter:
+                    try:
+                        adapter.close()
+                    except Exception:
+                        pass
+            with self.lock:
+                for row in self.rows:
+                    if row["status"] == "processing":
+                        row.update(status="stopped", detail="Tiếp tục để đọc lại kết quả đã gửi.")
+                self.busy, self.run = False, None
+                self.revision += 1
+                try:
+                    self._save()
+                except ValueError as exc:
+                    self.message = str(exc)
+            run.cleanup()
+
+
+_controller = None
+_controller_lock = threading.Lock()
+
+
+def get_video_publishing_controller():
+    global _controller
+    with _controller_lock:
+        if _controller is None:
+            _controller = VideoPublishingController()
+        return _controller

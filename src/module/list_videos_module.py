@@ -6,6 +6,7 @@ from src.module.model import Video, VideoType
 from src.utils import get_channels_info
 from src.task_runtime import check_stopped, post_with_stop
 from src.youtube_auth import studio_authorization_header
+from src.video_publishing import restriction_details
 class ListVideosModule(IModule):
     """Public wrapper around IModule._list_videos for use in UI pages."""
     pass
@@ -68,6 +69,7 @@ class ListVideosModule(IModule):
             operands[:] = [operand for operand in operands if "videoOriginIs" not in operand]
         if draft_only:
             payload["filter"]["and"]["operands"].insert(1, {"isDraft": {}})
+        payload["mask"].update({"copyrightSummary": {"all": True}, "claimDetails": {"all": True}})
         headers = {"origin": "https://studio.youtube.com", "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36", "cookie": cookie_string, "content-type": "application/json", "authorization": studio_authorization_header(channel_info.cookies)}
         if page_token:
             payload["pageToken"] = page_token
@@ -104,6 +106,7 @@ class ListVideosModule(IModule):
                         visibility=item.get("visibility", ""),
                         time_created_seconds=item.get("timeCreatedSeconds", ""),
                         time_published_seconds=item.get("timePublishedSeconds", ""),
+                        restriction_details=restriction_details(item),
                     )
                 )
             except Exception as exc:
