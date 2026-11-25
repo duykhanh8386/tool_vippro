@@ -1,11 +1,15 @@
 """UI for copying reference metadata, generating thumbnails and daily scheduling."""
 import csv
 import io
+from collections import Counter
 
 from nicegui import context, ui
 
 from src.utils import get_channels_info
-from src.video_publishing import COPYRIGHT_LABELS
+from src.video_publishing import (
+    COPYRIGHT_LABELS, VIDEO_SCOPE_LABELS, publishing_row_disabled_reason,
+    publishing_row_matches, publishing_row_selectable,
+)
 from src.video_publishing_tasks import STATUS_LABELS, get_video_publishing_controller
 from web.components.common import create_channel_selection, select_directory
 from web.theme import app_card, page_header, page_shell, section_header
@@ -17,6 +21,7 @@ def create_video_publishing_page():
     settings = controller.snapshot()["settings"]
     fields, buttons = {}, {}
     syncing = {"active": False, "revision": -1}
+    visible = {"ids": []}
 
     def invoke(callback):
         try:
@@ -45,21 +50,20 @@ def create_video_publishing_page():
         if folder:
             change("output_folder", folder)
 
-    def select_rows(_event):
+    def select_rows(event):
         if not syncing["active"]:
-            invoke(lambda: controller.select(row["video_id"] for row in table.selected))
+            invoke(lambda: controller.select((row["video_id"] for row in event.selection), within_ids=visible["ids"]))
 
     def select_all():
-        invoke(lambda: controller.select(row["video_id"] for row in controller.snapshot()["rows"]
-                                         if row["status"] not in {"skipped", "successful"}))
+        invoke(controller.select_filtered)
 
     def export():
         stream = io.StringIO(newline="")
         writer = csv.writer(stream)
-        writer.writerow(["Channel ID", "Video ID", "Bản quyền", "Bài nhạc", "Video tham chiếu", "Cách chọn tham chiếu", "Độ lệch giây", "Title mới", "Description mới", "Thumbnail", "Lịch UTC+7", "Trạng thái", "Chi tiết"])
+        writer.writerow(["Channel ID", "Video ID", "Loại video", "Bản quyền", "Bài nhạc", "Video tham chiếu", "Cách chọn tham chiếu", "Độ lệch giây", "Title mới", "Description mới", "Thumbnail", "Lịch UTC+7", "Trạng thái", "Chi tiết"])
         for row in controller.snapshot()["rows"]:
             reference = row.get("reference") or {}
-            values = [row["channel_id"], row["video_id"], row["copyright_label"], row["song"], reference.get("url", ""),
+            values = [row["channel_id"], row["video_id"], row.get("visibility_label", "Cần quét lại loại video"), row["copyright_label"], row["song"], reference.get("url", ""),
                       reference.get("selection_label", ""), reference.get("duration_delta_seconds", ""),
                       reference.get("title", ""), reference.get("description", ""), row.get("thumbnail_path", ""),
                       row.get("publish_label", ""), STATUS_LABELS[row["status"]], row.get("detail", "")]
@@ -73,6 +77,7 @@ def create_video_publishing_page():
         with ui.dialog() as dialog, ui.card().classes("w-[900px] max-w-full"):
             ui.label(row["old_title"]).classes("text-lg font-semibold break-words")
             ui.label(f"{row['channel_id']} · {row['video_id']}").classes("text-xs text-gray-500")
+            ui.label(f"Loại video: {row.get('visibility_label', 'Cần quét lại')} · {row['copyright_label']}").classes("text-sm")
             reference = row.get("reference") or {}
             if reference:
                 ui.link("Mở video tham chiếu", reference["url"], new_tab=True)
@@ -105,28 +110,57 @@ def create_video_publishing_page():
         syncing["active"] = True
         try:
             busy = data["busy"]
+            config = data["settings"]
+            copyright_counts = Counter(row["copyright"] for row in data["rows"])
+            type_counts = Counter(row.get("visibility_type", "unknown") for row in data["rows"])
+            scope_counts = {**type_counts, "all": len(data["rows"]),
+                            "unpublished": sum(type_counts[key] for key in ("draft", "private", "unlisted"))}
+            for key, options in (
+                ("categories", {kind: f"{label} ({copyright_counts[kind]})" for kind, label in COPYRIGHT_LABELS.items()}),
+                ("scope", {kind: f"{label} ({scope_counts.get(kind, 0)})" for kind, label in VIDEO_SCOPE_LABELS.items()}),
+            ):
+                if fields[key].options != options:
+                    fields[key].set_options(options)
             for key, field in fields.items():
-                if field.value != data["settings"][key]:
-                    field.set_value(data["settings"][key])
+                if field.value != config[key]:
+                    field.set_value(config[key])
                 field.set_enabled(not busy)
-            fields["limit"].set_enabled(not busy and not data["settings"]["scan_all"])
+            fields["limit"].set_enabled(not busy and not config["scan_all"])
+            from_links = config["channel_source"] == "links"
+            fields["channel_links"].set_visibility(from_links)
+            channel_picker.set_visibility(not from_links)
+            source_status.set_text("Nguồn quét: các link kênh đã dán." if from_links else f"Nguồn quét: {len(config['channel_ids'])} thẻ kênh đã chọn.")
             cookie_field.set_enabled(not busy)
             for key, button in buttons.items():
                 button.set_enabled(not busy)
             buttons["stop"].set_enabled(busy)
-            chosen = sum(bool(row.get("selected")) for row in data["rows"])
+            chosen = sum(bool(row.get("selected")) and publishing_row_selectable(row) for row in data["rows"])
+            filtered = [row for row in data["rows"] if publishing_row_matches(row, scope=config["scope"], categories=config["categories"])]
+            selectable_count = sum(publishing_row_selectable(row) for row in filtered)
+            shown_selected = sum(bool(row.get("selected")) for row in filtered)
+            buttons["scan"].set_enabled(not busy and bool(config["channel_links"].strip() if from_links else config["channel_ids"]))
+            buttons["select"].set_enabled(not busy and selectable_count > 0)
+            buttons["deselect"].set_enabled(not busy and shown_selected > 0)
+            buttons["clear_selection"].set_enabled(not busy and chosen > 0)
             for key in ("references", "plan", "run"):
                 buttons[key].set_enabled(not busy and chosen > 0)
             message.set_text(data["message"])
-            summary.set_text(f"{len(data['rows'])} video · {chosen} đã chọn · {sum(row['status'] == 'successful' for row in data['rows'])} đã lên lịch")
+            summary.set_text(f"{len(data['rows'])} đã quét · {len(filtered)} trong bộ lọc · {selectable_count} có thể tích chọn · {chosen} đã chọn toàn bộ ({chosen - shown_selected} ngoài bộ lọc) · {sum(row['status'] == 'successful' for row in data['rows'])} đã lên lịch")
+            rescan_hint.set_visibility(any("visibility_type" not in row for row in data["rows"]))
             cookie_status.set_text("Đã nạp cookie cho phiên này" if data["has_cookie"] else "Chưa nạp cookie ChatGPT")
-            table.selection = None if busy else "multiple"
+            selection = None if busy else "multiple"
+            if table.selection != selection:
+                table.selection = selection
+            visible["ids"] = [row["video_id"] for row in filtered]
             if data["revision"] != syncing["revision"]:
                 rows = [{**row, "status_label": STATUS_LABELS[row["status"]],
+                         "visibility_label": row.get("visibility_label", "Cần quét lại loại video"),
+                         "can_select": not busy and publishing_row_selectable(row),
+                         "disabled_reason": "Tác vụ đang chạy." if busy else publishing_row_disabled_reason(row),
                          "reference_title": (row.get("reference") or {}).get("title", ""),
                          "reference_method": (row.get("reference") or {}).get("selection_label", ""),
                          "reference_url": (row.get("reference") or {}).get("url", ""),
-                         "publish_label": row.get("publish_label", "")} for row in data["rows"]]
+                         "publish_label": row.get("publish_label", "")} for row in filtered]
                 table.rows = rows
                 table.selected = [row for row in rows if row.get("selected")]
                 table.update()
@@ -137,30 +171,32 @@ def create_video_publishing_page():
     with page_shell(), ui.column().classes("w-full min-w-0 gap-6"):
         with page_header("SEO, thumbnail & lên lịch", "Chép nguyên title/description từ video tìm kiếm, vẽ lại thumbnail bằng ChatGPT và đăng mỗi ngày một video trên từng kênh.", eyebrow="TÁC VỤ VIDEO"):
             buttons["export"] = ui.button("Xuất CSV", icon="download", on_click=export).props("outline")
-        create_channel_selection(get_channels_info() or [], choose_channels, multi_select=True,
-                                 initial_selected_ids=settings["channel_ids"],
-                                 can_change_selection=lambda: not controller.snapshot()["busy"])
+        with app_card():
+            with section_header("Nguồn kênh để quét", "Chọn rõ một nguồn trước khi quét."):
+                pass
+            fields["channel_source"] = ui.toggle({"selected": "Kênh đã chọn", "links": "Link kênh"}, value=settings["channel_source"],
+                                                  on_change=lambda e: change("channel_source", e.value))
+            source_status = ui.label().classes("text-sm text-emerald-700")
+        with ui.column().classes("w-full") as channel_picker:
+            create_channel_selection(get_channels_info() or [], choose_channels, multi_select=True,
+                                     initial_selected_ids=settings["channel_ids"],
+                                     can_change_selection=lambda: not controller.snapshot()["busy"] and controller.snapshot()["settings"]["channel_source"] == "selected")
         with app_card():
             with section_header("Quét video trong Studio", "Chỉ xử lý video chưa công khai; giữ các lịch đã đặt trên kênh."):
                 buttons["scan"] = ui.button("Quét video", icon="manage_search", on_click=lambda: invoke(lambda: controller.start("scan")))
-            fields["channel_links"] = ui.textarea("Link kênh YouTube (tùy chọn)", value=settings["channel_links"],
-                                                  placeholder="Mỗi dòng một link /channel/UC… hoặc /@tenkenh. Để trống để dùng kênh đã chọn phía trên.",
+            fields["channel_links"] = ui.textarea("Link kênh YouTube", value=settings["channel_links"],
+                                                  placeholder="Mỗi dòng một link /channel/UC… hoặc /@tenkenh. Dùng khi Nguồn kênh được đặt là Link kênh.",
                                                   on_change=lambda e: change("channel_links", e.value or "")).props("outlined autogrow").classes("w-full")
             fields["manual_ids"] = ui.textarea("Link video / Video ID (tùy chọn)", value=settings["manual_ids"],
                                                placeholder="Mỗi dòng một link hoặc ID của video đã có trong Studio. Để trống để quét cả kênh.",
                                                on_change=lambda e: change("manual_ids", e.value or "")).props("outlined autogrow").classes("w-full")
-            fields["categories"] = ui.select({key: label for key, label in COPYRIGHT_LABELS.items() if key not in {"unknown", "checking"}},
-                                             multiple=True, label="Trạng thái bản quyền được chọn", value=settings["categories"],
-                                             on_change=lambda e: change("categories", list(e.value or []))).props("outlined use-chips").classes("w-full")
             with ui.row().classes("w-full gap-3 items-center flex-wrap"):
-                fields["scope"] = ui.select({"unpublished": "Mọi video chưa công khai", "draft": "Chỉ bản nháp", "private": "Chỉ riêng tư (không phải nháp)"},
-                                            label="Phạm vi", value=settings["scope"], on_change=lambda e: change("scope", e.value)).props("outlined").classes("w-72")
                 fields["order"] = ui.select({"oldest": "Cũ trước", "newest": "Mới trước"}, label="Thứ tự đăng", value=settings["order"],
                                             on_change=lambda e: change("order", e.value)).props("outlined").classes("w-44")
-                fields["scan_all"] = ui.switch("Quét hết video phù hợp", value=settings["scan_all"], on_change=lambda e: change("scan_all", e.value))
+                fields["scan_all"] = ui.switch("Quét hết video", value=settings["scan_all"], on_change=lambda e: change("scan_all", e.value))
                 fields["limit"] = ui.number("Số video mỗi kênh", value=settings["limit"], min=1, max=10000, step=1,
                                             on_change=lambda e: change("limit", e.value)).props("outlined").classes("w-44")
-            ui.label("Video chưa xác định bản quyền hoặc đang kiểm tra sẽ bị bỏ qua. Trạng thái không có khiếu nại tại thời điểm quét không bảo đảm video sẽ không bị khiếu nại sau này.").classes("text-xs text-gray-500")
+            ui.label("Sau khi quét, lọc theo loại video và trạng thái bản quyền trong Danh sách xử lý để chọn video lên lịch.").classes("text-xs text-gray-500")
         with app_card():
             with section_header("ChatGPT vẽ thumbnail", "Tải thumbnail của video tham chiếu lên ChatGPT rồi vẽ lại theo prompt chung."):
                 pass
@@ -185,18 +221,31 @@ def create_video_publishing_page():
                 buttons["plan"] = ui.button("Xem lịch dự kiến", icon="event", on_click=lambda: invoke(controller.plan)).props("outline")
         with app_card():
             with section_header("Danh sách xử lý", "Ưu tiên ID ở cuối tên MP4/title → video tìm kiếm lệch thời lượng dưới 2 giây → kết quả tìm kiếm đầu tiên. Từ khóa lấy từ bài nhạc đầu tiên trong description, hoặc title nếu không có tracklist."):
-                buttons["select"] = ui.button("Chọn video phù hợp", icon="checklist", on_click=select_all).props("outline")
+                buttons["select"] = ui.button("Chọn tất cả trong bộ lọc", icon="checklist", on_click=select_all).props("outline")
+                buttons["deselect"] = ui.button("Bỏ chọn trong bộ lọc", icon="remove_done", on_click=lambda: invoke(lambda: controller.select_filtered(selected=False))).props("outline")
+                buttons["clear_selection"] = ui.button("Bỏ chọn tất cả", icon="clear_all", on_click=lambda: invoke(lambda: controller.select([]))).props("flat")
                 buttons["references"] = ui.button("Tìm video tham chiếu", icon="search", on_click=lambda: invoke(lambda: controller.start("references"))).props("outline")
                 buttons["run"] = ui.button("Tự động xử lý & lên lịch", icon="play_arrow", on_click=lambda: invoke(lambda: controller.start("run")))
                 buttons["stop"] = ui.button("Dừng", icon="stop", on_click=lambda: invoke(controller.stop)).props("outline color=negative")
+            with ui.row().classes("w-full gap-3 items-end flex-wrap"):
+                fields["scope"] = ui.select(VIDEO_SCOPE_LABELS, label="Lọc loại video đã quét", value=settings["scope"],
+                                            on_change=lambda e: change("scope", e.value)).props("outlined").classes("w-96 max-w-full")
+                fields["categories"] = ui.select(COPYRIGHT_LABELS, multiple=True, clearable=True, label="Lọc trạng thái bản quyền (trống = tất cả)",
+                                                 value=settings["categories"], on_change=lambda e: change("categories", list(e.value or []))).props("outlined use-chips").classes("flex-1 min-w-64")
+            ui.label("Đổi bộ lọc không cần quét lại và giữ các video đã chọn. Bạn có thể chọn nhiều nhóm rồi lên lịch một lượt. Video đã công khai, đã lên lịch hoặc chưa đọc được trạng thái có checkbox khóa kèm lý do.").classes("text-xs text-gray-500")
+            rescan_hint = ui.label("Danh sách lưu từ bản cũ chưa có loại video. Bấm Quét video lại một lần để dùng bộ lọc và checkbox mới.").classes("text-sm text-amber-700")
             message = ui.label().classes("text-sm text-emerald-700 break-words")
             summary = ui.label().classes("text-xs text-gray-500")
             columns = [{"name": key, "label": label, "field": key, "align": "left"} for key, label in (
-                ("channel_id", "Kênh"), ("video_id", "Video ID"), ("old_title", "Title hiện tại"), ("copyright_label", "Bản quyền"),
+                ("channel_id", "Kênh"), ("video_id", "Video ID"), ("old_title", "Title hiện tại"), ("visibility_label", "Loại video"), ("copyright_label", "Bản quyền"),
                 ("song", "Bài nhạc tìm kiếm"), ("reference_title", "Title sẽ chép nguyên văn"), ("publish_label", "Ngày giờ UTC+7"),
                 ("reference_method", "Cách chọn tham chiếu"),
                 ("status_label", "Trạng thái"), ("detail", "Chi tiết"), ("action", "Xem tham chiếu"))]
             table = ui.table(columns=columns, rows=[], row_key="video_id", selection="multiple", on_select=select_rows, pagination=20).classes("w-full min-w-0").props('wrap-cells no-data-label="Chưa có video. Chọn kênh và bấm Quét video."')
+            table.props('no-data-label="Không có video trong bộ lọc này. Đổi loại video / trạng thái bản quyền hoặc quét lại."')
+            table.add_slot("body-selection", '<q-checkbox v-model="props.selected" :disable="!props.row.can_select" dense><q-tooltip v-if="props.row.disabled_reason">{{props.row.disabled_reason}}</q-tooltip></q-checkbox>')
+            table.add_slot("header-selection", '<q-btn flat dense icon="done_all" @click="$parent.$emit(\'select_visible\')" aria-label="Chọn tất cả trong bộ lọc"><q-tooltip>Chọn video có thể lên lịch trong bộ lọc này</q-tooltip></q-btn>')
+            table.on("select_visible", select_all)
             for key in ("old_title", "song", "reference_title", "detail"):
                 table.add_slot(f"body-cell-{key}", f'<q-td :props="props" style="min-width:180px;max-width:300px;white-space:normal;overflow-wrap:anywhere">{{{{props.row.{key}}}}}</q-td>')
             table.add_slot("body-cell-action", '<q-td :props="props"><q-btn flat dense icon="visibility" @click="$parent.$emit(\'view_reference\', props.row.video_id)" aria-label="Xem dữ liệu tham chiếu" /></q-td>')

@@ -7,7 +7,6 @@ import threading
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from src.audio_recovery import _is_currently_public_video
 from src.module.base import YouTubeRequestError
 from src.module.list_videos_module import list_videos_module
 from src.module.video_publishing_module import video_publishing_module
@@ -18,9 +17,11 @@ from src.task_runtime import TaskStopped, bind_run_context, check_stopped, creat
 from src.utils import get_channels_info
 from src.video_publishing import (
     COPYRIGHT_LABELS, REFERENCE_SELECTION_VERSION, copyright_category, first_song,
-    parse_chatgpt_cookies, plan_daily, positive_seconds, schedule_timestamp,
+    VIDEO_SCOPE_LABELS, VIDEO_TYPE_LABELS, parse_chatgpt_cookies, plan_daily, positive_seconds,
+    publishing_row_disabled_reason, publishing_row_matches, publishing_row_selectable,
+    publishing_video_type, schedule_timestamp,
 )
-from src.video_scan_dates import VIETNAM_TIMEZONE, _status_indicates_draft
+from src.video_scan_dates import VIETNAM_TIMEZONE
 from src.video_title_matching import parse_manual_title_ids
 
 STATE_KEY = "video_publishing"
@@ -29,7 +30,7 @@ STATUS_LABELS = {"scanned": "Đã quét", "ready": "Đã tìm tham chiếu", "pr
 
 
 def default_settings():
-    return {"channel_ids": [], "channel_links": "", "manual_ids": "", "categories": ["clear"], "scope": "unpublished",
+    return {"channel_source": "selected", "channel_ids": [], "channel_links": "", "manual_ids": "", "categories": ["clear"], "scope": "unpublished",
             "scan_all": True, "limit": 100, "start_date": (datetime.now(VIETNAM_TIMEZONE).date() + timedelta(days=1)).isoformat(),
             "hour": "18:00", "order": "oldest", "image_prompt": "Vẽ lại thumbnail dựa trên ảnh tham chiếu, bố cục rõ ràng, chữ dễ đọc, phù hợp nội dung bài nhạc; tỷ lệ 16:9.",
             "output_folder": ""}
@@ -46,6 +47,8 @@ class VideoPublishingController:
         self.lock = threading.RLock()
         saved = self.storage.load_state(STATE_KEY) or {}
         self.settings = {**default_settings(), **saved.get("settings", {})}
+        if "channel_source" not in saved.get("settings", {}):
+            self.settings["channel_source"] = "links" if self.settings["channel_links"].strip() else "selected"
         # Credentials never belong in persistent state, even from an older file.
         self.settings.pop("cookie", None)
         self.rows = saved.get("rows", [])
@@ -53,7 +56,11 @@ class VideoPublishingController:
         for row in self.rows:
             if row.get("status") == "processing":
                 row.update(status="stopped", detail="Phiên trước bị ngắt; tiếp tục để đọc lại kết quả thực tế.")
+            if not publishing_row_selectable(row):
+                row["selected"] = False
         self.message = saved.get("message", "Chọn kênh, quét trạng thái rồi tìm video tham chiếu.")
+        if any("visibility_type" not in row for row in self.rows):
+            self.message = "Danh sách lưu từ bản cũ chưa có loại video. Quét lại một lần rồi lọc và tích chọn từng nhóm."
         self.cookie = ""
         self.busy = False
         self.revision = 0
@@ -96,15 +103,21 @@ class VideoPublishingController:
                     changes["limit"] = int(value)
                 except (ValueError, TypeError, OverflowError):
                     raise ValueError("Số video mỗi kênh phải là số nguyên từ 1 đến 10000.") from None
-            if "scope" in changes and changes["scope"] not in {"unpublished", "draft", "private"}:
+            if "scope" in changes and changes["scope"] not in VIDEO_SCOPE_LABELS:
                 raise ValueError("Phạm vi quét không hợp lệ.")
+            if "channel_source" in changes and changes["channel_source"] not in {"selected", "links"}:
+                raise ValueError("Chọn nguồn kênh từ thẻ đã chọn hoặc từ link.")
+            if "categories" in changes and (not isinstance(changes["categories"], list) or not set(changes["categories"]) <= set(COPYRIGHT_LABELS)):
+                raise ValueError("Bộ lọc bản quyền không hợp lệ.")
             if "order" in changes and changes["order"] not in {"oldest", "newest"}:
                 raise ValueError("Thứ tự đăng không hợp lệ.")
             self.settings.update(changes)
-            if changed & {"channel_ids", "channel_links", "manual_ids", "categories", "scope", "scan_all", "limit", "order"}:
+            if changed & {"channel_source", "channel_ids", "channel_links", "manual_ids", "scan_all", "limit", "order"}:
                 self.rows = []
                 self.occupied = {}
                 self.message = "Phạm vi đã đổi. Quét lại video."
+            elif changed & {"categories", "scope"}:
+                self.message = "Đã đổi bộ lọc hiển thị; các video đã chọn được giữ nguyên."
             elif changed & {"start_date", "hour"}:
                 for row in self.rows:
                     if row.get("status") != "successful":
@@ -118,15 +131,22 @@ class VideoPublishingController:
             self.revision += 1
             self._save()
 
-    def select(self, video_ids):
+    def select(self, video_ids, *, within_ids=None):
         with self.lock:
             if self.busy:
                 return
             selected = set(video_ids)
+            within = set(within_ids) if within_ids is not None else None
             for row in self.rows:
-                row["selected"] = row["video_id"] in selected and row["status"] not in {"skipped", "successful"}
+                if within is None or row["video_id"] in within:
+                    row["selected"] = row["video_id"] in selected and publishing_row_selectable(row)
             self.revision += 1
             self._save()
+
+    def select_filtered(self, *, selected=True):
+        with self.lock:
+            visible = [row for row in self.rows if publishing_row_matches(row, scope=self.settings["scope"], categories=self.settings["categories"])]
+            self.select((row["video_id"] for row in visible if selected), within_ids=[row["video_id"] for row in visible])
 
     def set_song(self, video_id, query):
         with self.lock:
@@ -177,15 +197,14 @@ class VideoPublishingController:
             if self.busy:
                 raise ValueError("Tác vụ đang chạy.")
             if action == "scan":
-                if not self.settings["channel_ids"] and not self.settings["channel_links"].strip():
-                    raise ValueError("Chọn kênh hoặc dán link kênh đã kết nối trong tool.")
-                categories = set(self.settings["categories"])
-                if not categories or not categories <= {"clear", "limited", "partial", "blocked"}:
-                    raise ValueError("Chọn ít nhất một trạng thái bản quyền đã xác định.")
+                if self.settings["channel_source"] == "links" and not self.settings["channel_links"].strip():
+                    raise ValueError("Đang chọn nguồn Link kênh. Dán link kênh trước khi quét.")
+                if self.settings["channel_source"] == "selected" and not self.settings["channel_ids"]:
+                    raise ValueError("Đang chọn nguồn Kênh đã chọn. Chọn ít nhất một thẻ kênh trước khi quét.")
                 if self.settings["manual_ids"].strip():
                     parse_manual_title_ids(self.settings["manual_ids"])
             else:
-                if not any(row.get("selected") for row in self.rows):
+                if not any(row.get("selected") and publishing_row_selectable(row) for row in self.rows):
                     raise ValueError("Chọn ít nhất một video hợp lệ trong bảng.")
                 if action == "run":
                     if not self.settings["image_prompt"].strip():
@@ -211,7 +230,7 @@ class VideoPublishingController:
 
     def _scan(self, settings, reference):
         channels = list(settings["channel_ids"])
-        if settings["channel_links"].strip():
+        if settings["channel_source"] == "links":
             channels = reference.resolve_channels(settings["channel_links"])
         connected = {channel.id for channel in get_channels_info() or []}
         if not channels or any(channel not in connected for channel in channels):
@@ -251,28 +270,20 @@ class VideoPublishingController:
                 from src.video_scan_dates import _timestamp
 
                 videos.sort(key=lambda video: _timestamp(video.time_created_seconds) or 0, reverse=settings["order"] == "newest")
-            eligible_count = 0
+            if not manual and not settings["scan_all"]:
+                videos = videos[:int(settings["limit"])]
             for video in videos:
                 category = copyright_category(video)
-                reason = ""
-                if _is_currently_public_video(video):
-                    reason = "Video đã công khai."
-                elif video.scheduled_publishing_details:
-                    reason = "Video đã có lịch đăng; giữ lịch hiện tại."
-                elif settings["scope"] == "draft" and not _status_indicates_draft(video.draft_status):
-                    reason = "Không phải bản nháp."
-                elif settings["scope"] == "private" and ("PRIVATE" not in str(video.privacy).upper() or _status_indicates_draft(video.draft_status)):
-                    reason = "Không phải video riêng tư đã hoàn tất."
-                elif category not in settings["categories"]:
-                    reason = COPYRIGHT_LABELS[category] + "; không nằm trong bộ lọc."
-                if not reason and not settings["scan_all"] and eligible_count >= int(settings["limit"]):
-                    continue
-                eligible_count += int(not reason)
-                rows.append({"video_id": video.id, "channel_id": channel_id, "old_title": video.title,
-                             "old_description": video.description, "song": first_song(video.title, video.description),
-                             "duration_seconds": (positive_seconds(video.duration_ms) or 0) / 1000,
-                             "copyright": category, "copyright_label": COPYRIGHT_LABELS[category],
-                             "selected": not reason, "status": "skipped" if reason else "scanned", "detail": reason or "Sẵn sàng tìm tham chiếu."})
+                kind = publishing_video_type(video)
+                row = {"video_id": video.id, "channel_id": channel_id, "old_title": video.title,
+                       "old_description": video.description, "song": first_song(video.title, video.description),
+                       "duration_seconds": (positive_seconds(video.duration_ms) or 0) / 1000,
+                       "copyright": category, "copyright_label": COPYRIGHT_LABELS[category],
+                       "visibility_type": kind, "visibility_label": VIDEO_TYPE_LABELS[kind], "selected": False, "status": "scanned"}
+                reason = publishing_row_disabled_reason(row)
+                row.update(availability_reason=reason, status="skipped" if reason else "scanned",
+                           detail=reason or "Tích chọn dòng này hoặc chọn hàng loạt theo bộ lọc để xử lý.")
+                rows.append(row)
         if manual:
             found = {row["video_id"] for row in rows}
             missing = manual_set - found
@@ -280,11 +291,11 @@ class VideoPublishingController:
                 raise ValueError("Không tìm thấy Video ID trong các kênh đã chọn: " + ", ".join(sorted(missing)))
         with self.lock:
             self.rows, self.occupied = rows, occupied
-            self.message = f"Đã quét {len(rows)} video · {sum(row['selected'] for row in rows)} phù hợp bộ lọc."
+            self.message = f"Đã quét {len(rows)} video · {sum(publishing_row_selectable(row) for row in rows)} có thể chọn lên lịch. Lọc loại video bên dưới rồi tích chọn."
             self._checkpoint()
 
     def _process(self, settings, reference, image, action):
-        selected = [row for row in self.rows if row.get("selected") and row["status"] not in {"successful", "skipped"}]
+        selected = [row for row in self.rows if row.get("selected") and publishing_row_selectable(row)]
         thumbnail = self.thumbnail_factory() if action == "run" else None
         output = Path(settings["output_folder"]).expanduser() if settings["output_folder"].strip() else get_data_dir() / "publishing_thumbnails"
         for index, row in enumerate(selected, 1):
@@ -292,7 +303,10 @@ class VideoPublishingController:
             self._progress(f"{index}/{len(selected)} · {row['channel_id']} · {row['video_id']}")
             self._checkpoint(row, status="processing", detail="Đang kiểm tra video và tìm tham chiếu…")
             try:
-                current = self.module.require_eligible(row["channel_id"], row["video_id"], settings["categories"], publish_at=row.get("publish_at"))
+                # Each explicit row selection authorizes that row's scanned
+                # copyright type, independently of the current display filter.
+                categories = [row["copyright"]]
+                current = self.module.require_eligible(row["channel_id"], row["video_id"], categories, publish_at=row.get("publish_at"))
                 duration_ms = positive_seconds(getattr(current, "duration_ms", None))
                 if duration_ms is not None:
                     self._checkpoint(row, duration_seconds=duration_ms / 1000)
@@ -327,14 +341,14 @@ class VideoPublishingController:
                     self._checkpoint(row, thumbnail_path=path)
                 self.module.copy_metadata(row["channel_id"], row["video_id"], row["reference"],
                                           expected_title=row["old_title"], expected_description=row["old_description"],
-                                          categories=settings["categories"], publish_at=row["publish_at"])
+                                          categories=categories, publish_at=row["publish_at"])
                 self._checkpoint(row, metadata_copied=True, detail="Đã xác nhận title/description. Đang tải thumbnail…")
                 if not row.get("thumbnail_uploaded"):
-                    self.module.require_eligible(row["channel_id"], row["video_id"], settings["categories"], publish_at=row["publish_at"])
+                    self.module.require_eligible(row["channel_id"], row["video_id"], categories, publish_at=row["publish_at"])
                     thumbnail.upload(row["channel_id"], row["video_id"], row["thumbnail_path"])
                     self._checkpoint(row, thumbnail_uploaded=True)
                 self._checkpoint(row, detail="Đang đặt lịch và đọc lại kết quả…")
-                self.module.schedule(row["channel_id"], row["video_id"], row["publish_at"], row["reference"], categories=settings["categories"])
+                self.module.schedule(row["channel_id"], row["video_id"], row["publish_at"], row["reference"], categories=categories)
                 self._checkpoint(row, status="successful", selected=False, detail="Đã xác nhận metadata và lịch đăng trên YouTube.")
             except TaskStopped:
                 raise

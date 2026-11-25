@@ -7,7 +7,7 @@ import re
 from collections import defaultdict
 from datetime import datetime, time, timedelta
 
-from src.video_scan_dates import VIETNAM_TIMEZONE, _timestamp
+from src.video_scan_dates import VIETNAM_TIMEZONE, _status_indicates_draft, _timestamp
 
 COPYRIGHT_LABELS = {
     "clear": "Không có vấn đề bản quyền",
@@ -17,6 +17,53 @@ COPYRIGHT_LABELS = {
     "checking": "Đang kiểm tra",
     "unknown": "Chưa xác định",
 }
+VIDEO_TYPE_LABELS = {
+    "draft": "Bản nháp", "private": "Riêng tư", "unlisted": "Không công khai",
+    "scheduled": "Đã lên lịch", "public": "Đã công khai", "unknown": "Chưa đọc được loại video",
+}
+VIDEO_SCOPE_LABELS = {"all": "Tất cả loại video", "unpublished": "Chưa công khai (nháp / riêng tư / không công khai)", **VIDEO_TYPE_LABELS}
+SELECTABLE_COPYRIGHT_TYPES = {"clear", "limited", "partial", "blocked"}
+
+
+def publishing_video_type(video) -> str:
+    if getattr(video, "scheduled_publishing_details", None):
+        return "scheduled"
+    if _status_indicates_draft(getattr(video, "draft_status", None)) or _status_indicates_draft(getattr(video, "video_status", None)):
+        return "draft"
+    privacy = str(getattr(video, "privacy", "") or "").upper()
+    for kind in ("private", "unlisted", "public"):
+        if privacy == kind.upper() or privacy.endswith("_" + kind.upper()):
+            return kind
+    return "unknown"
+
+
+def publishing_row_matches(row, *, scope="all", categories=()) -> bool:
+    kind = row.get("visibility_type", "unknown")
+    in_scope = scope == "all" or (scope == "unpublished" and kind in {"draft", "private", "unlisted"}) or scope == kind
+    return in_scope and (not categories or row.get("copyright") in categories)
+
+
+def publishing_row_disabled_reason(row) -> str:
+    if row.get("status") == "successful":
+        return "Đã hoàn tất lên lịch."
+    if row.get("availability_reason"):
+        return row["availability_reason"]
+    if row.get("status") == "skipped":
+        return row.get("detail") or "Quét lại để đọc loại video và lý do không thể chọn."
+    kind = row.get("visibility_type")
+    if kind == "public":
+        return "Video đã công khai; không thể lên lịch lần đầu."
+    if kind == "scheduled":
+        return "Video đã có lịch đăng; giữ lịch hiện tại."
+    if kind == "unknown":
+        return "Chưa đọc được loại video; quét lại trước khi chọn."
+    if row.get("copyright") not in SELECTABLE_COPYRIGHT_TYPES:
+        return COPYRIGHT_LABELS.get(row.get("copyright"), "Chưa xác định bản quyền") + "; quét lại để kiểm tra."
+    return ""
+
+
+def publishing_row_selectable(row) -> bool:
+    return not publishing_row_disabled_reason(row)
 
 REFERENCE_SELECTION_VERSION = 2
 _SOURCE_ID_SUFFIX = re.compile(r"\[([A-Za-z0-9_-]{11})\]\s*(?:\.(?:mp4|m4v|mkv|mov|webm))?\s*$", re.I)

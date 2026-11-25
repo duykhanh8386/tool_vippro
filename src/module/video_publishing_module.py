@@ -22,7 +22,7 @@ class VideoPublishingModule(VideoTitleModule):
         video = self.read_video(channel_id, video_id)
         category = copyright_category(video)
         if category not in set(categories) or category in {"unknown", "checking"}:
-            raise ValueError("Trạng thái bản quyền hiện tại không còn nằm trong bộ lọc. Quét lại video này.")
+            raise ValueError("Trạng thái bản quyền đã thay đổi so với lúc chọn video. Quét lại video này.")
         existing = schedule_timestamp(video)
         if video.scheduled_publishing_details and existing is None:
             raise ValueError("Video có lịch đăng nhưng chưa đọc được thời gian; giữ nguyên lịch hiện tại.")

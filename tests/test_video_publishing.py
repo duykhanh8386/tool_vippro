@@ -14,7 +14,11 @@ from src.module.model import Video
 from src.module.video_publishing_module import VideoPublishingModule
 from src.publishing_browser import video_search_results
 from src.task_runtime import create_run_context
-from src.video_publishing import REFERENCE_SELECTION_VERSION, copyright_category, first_song, parse_chatgpt_cookies, plan_daily, reference_search_query, reference_video_id, schedule_timestamp
+from src.video_publishing import (
+    REFERENCE_SELECTION_VERSION, copyright_category, first_song, parse_chatgpt_cookies, plan_daily,
+    publishing_row_matches, publishing_row_selectable, publishing_video_type,
+    reference_search_query, reference_video_id, schedule_timestamp,
+)
 from src.video_publishing_tasks import STATE_KEY, VideoPublishingController
 from src.video_scan_dates import VIETNAM_TIMEZONE
 
@@ -71,6 +75,29 @@ class CopyrightTests(unittest.TestCase):
         self.assertEqual(copyright_category(video(restriction_details=details)), "partial")
         details["copyrightSummary"]["policy"] = "COPYRIGHT_POLICY_BLOCKED"
         self.assertEqual(copyright_category(video(restriction_details=details)), "blocked")
+
+
+class VideoTypeSelectionTests(unittest.TestCase):
+    def test_studio_visibility_and_draft_status_are_separate(self):
+        for item, expected in ((video(privacy="PUBLIC", draft_status="DRAFT_STATUS_DRAFT"), "draft"),
+                               (video(video_status="VIDEO_STATUS_DRAFT"), "draft"),
+                               (video(), "private"), (video(privacy="VIDEO_PRIVACY_UNLISTED"), "unlisted"),
+                               (video(privacy="PUBLIC"), "public"),
+                               (video(privacy="PUBLIC", scheduled_publishing_details={"publishTimeSeconds": STAMP}), "scheduled"),
+                               (video(privacy=""), "unknown")):
+            self.assertEqual(publishing_video_type(item), expected)
+
+    def test_filtering_is_independent_from_selectability(self):
+        item = row(visibility_type="private", copyright="partial")
+        self.assertFalse(publishing_row_matches(item, scope="draft", categories=["clear"]))
+        self.assertTrue(publishing_row_selectable(item))
+        self.assertTrue(publishing_row_matches(item, scope="private", categories=["partial"]))
+        self.assertTrue(publishing_row_matches(item, scope="unpublished", categories=[]))
+
+    def test_public_scheduled_and_unknown_rows_cannot_be_selected(self):
+        for changes in ({"visibility_type": "public"}, {"visibility_type": "scheduled"}, {"visibility_type": "unknown"},
+                        {"copyright": "unknown"}, {"copyright": "checking"}, {"status": "successful"}):
+            self.assertFalse(publishing_row_selectable(row(**changes)))
 
     def test_claim_ids_and_flags_override_clear_status(self):
         for details in ({"claimDetails": {"claims": [{"claimId": "claim-1"}]}},
@@ -276,6 +303,10 @@ class PublishingControllerTests(unittest.TestCase):
             self.controller._scan(self.controller.settings, self.reference)
         rows = self.controller.rows
         self.assertEqual(len(rows), 3)
+        self.assertEqual([item["video_id"] for item in rows if item["selected"]], [])
+        self.assertEqual(rows[0]["visibility_type"], "private")
+        self.assertEqual(rows[1]["status"], "scanned")
+        self.controller.select_filtered()
         self.assertEqual([item["video_id"] for item in rows if item["selected"]], [VIDEO])
         self.assertEqual(self.controller.occupied[CHANNEL], [STAMP])
         self.assertEqual(self.listing.list_all_videos.call_count, 3)
@@ -287,6 +318,69 @@ class PublishingControllerTests(unittest.TestCase):
                 self.listing.list_all_videos.return_value = page
                 with self.assertRaises(ValueError):
                     self.controller._scan(self.controller.settings, self.reference)
+
+    def test_only_explicit_channel_source_is_used_even_when_both_inputs_exist(self):
+        self.controller.settings.update(channel_ids=[CHANNEL], channel_links="https://www.youtube.com/channel/" + CHANNEL2)
+        self.reference.resolve_channels.return_value = [CHANNEL2]
+        with patch("src.video_publishing_tasks.get_channels_info", return_value=[SimpleNamespace(id=CHANNEL), SimpleNamespace(id=CHANNEL2)]):
+            self.controller._scan(self.controller.settings, self.reference)
+            self.reference.resolve_channels.assert_not_called()
+            self.assertEqual(self.listing.list_all_videos.call_args.args[0], CHANNEL)
+            self.controller.change_settings(channel_source="links")
+            self.controller._scan(self.controller.settings, self.reference)
+            self.reference.resolve_channels.assert_called_once()
+            self.assertEqual(self.listing.list_all_videos.call_args.args[0], CHANNEL2)
+
+    def test_legacy_channel_link_priority_is_restored_as_explicit_link_mode(self):
+        self.storage.data[STATE_KEY] = {"settings": {"channel_ids": [CHANNEL], "channel_links": "https://youtube.com/@music"}, "rows": []}
+        restored = VideoPublishingController(storage=self.storage)
+        self.assertEqual(restored.settings["channel_source"], "links")
+
+    def test_empty_selected_source_does_not_fall_back_to_other_source(self):
+        self.controller.settings.update(channel_source="selected", channel_ids=[], channel_links="https://youtube.com/@music")
+        with self.assertRaises(ValueError):
+            self.controller.start("scan")
+        self.controller.settings.update(channel_source="links", channel_ids=[CHANNEL], channel_links="")
+        with self.assertRaises(ValueError):
+            self.controller.start("scan")
+
+    def test_changing_type_filter_keeps_scan_and_accumulates_selections(self):
+        self.controller.rows = [row(visibility_type="private"), row(OTHER, visibility_type="draft", copyright="partial")]
+        self.controller.select_filtered()
+        self.assertTrue(self.controller.rows[0]["selected"])
+        self.controller.change_settings(scope="draft", categories=["partial"])
+        self.assertEqual(len(self.controller.rows), 2)
+        self.controller.select_filtered()
+        self.assertTrue(all(item["selected"] for item in self.controller.rows))
+        self.controller.select_filtered(selected=False)
+        self.assertTrue(self.controller.rows[0]["selected"])
+        self.assertFalse(self.controller.rows[1]["selected"])
+
+    def test_manual_checkbox_changes_only_visible_rows_and_rejects_disabled_rows(self):
+        self.controller.rows = [row(visibility_type="private", selected=True), row(OTHER, visibility_type="private", selected=False),
+                                row("Ghi123_-XYZ", visibility_type="public", selected=False)]
+        self.controller.select([OTHER, "Ghi123_-XYZ"], within_ids=[OTHER, "Ghi123_-XYZ"])
+        self.assertEqual([item["video_id"] for item in self.controller.rows if item["selected"]], [VIDEO, OTHER])
+        self.controller.select([], within_ids=[OTHER])
+        self.assertTrue(self.controller.rows[0]["selected"])
+        self.assertFalse(self.controller.rows[1]["selected"])
+
+    def test_draft_filter_does_not_permanently_skip_private_or_claimed_videos(self):
+        self.controller.settings.update(scope="draft", categories=["clear"])
+        self.listing.list_all_videos.return_value = ([video(), video(OTHER, copyright_check_status="COPYRIGHT_CLAIMED")], None)
+        with patch("src.video_publishing_tasks.get_channels_info", return_value=[SimpleNamespace(id=CHANNEL)]):
+            self.controller._scan(self.controller.settings, self.reference)
+        self.assertEqual([item["status"] for item in self.controller.rows], ["scanned", "scanned"])
+        self.controller.change_settings(scope="private", categories=["limited"])
+        self.controller.select_filtered()
+        self.assertEqual([item["video_id"] for item in self.controller.rows if item["selected"]], [OTHER])
+
+    def test_selected_rows_are_processed_using_their_type_not_current_display_filter(self):
+        self.controller.rows = [row(copyright="partial", visibility_type="private")]
+        self.controller.settings.update(scope="draft", categories=["clear"])
+        self.controller._process(self.controller.settings, self.reference, None, "references")
+        self.module.require_eligible.assert_called_once_with(CHANNEL, VIDEO, ["partial"], publish_at=None)
+        self.assertIn("reference", self.controller.rows[0])
 
     def test_settings_validation_does_not_partially_change_schedule(self):
         self.controller.rows = [row(thumbnail_uploaded=True)]
