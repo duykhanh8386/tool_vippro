@@ -474,16 +474,25 @@ class PublishingControllerTests(unittest.TestCase):
         self.controller.rows = [row(status="waiting_session", reference=reference, duration_seconds=60, publish_at=STAMP,
                                     conversation_url="https://chatgpt.com/c/keep")]
         self.reference.find.side_effect = ValueError("Search temporarily unavailable")
-        with tempfile.TemporaryDirectory() as folder, patch("src.video_publishing_tasks.download_reference_image", return_value="reference.jpg"), \
+        with tempfile.TemporaryDirectory() as folder, patch("src.video_publishing_tasks.download_reference_image", return_value="reference.jpg") as download, \
                 patch("src.video_publishing_tasks.normalize_thumbnail", return_value="thumbnail.jpg"):
             self.controller.settings["output_folder"] = folder
             self.controller._worker("run", create_run_context("publishing-resume-source"))
         self.reference.find.assert_not_called()
+        download.assert_not_called()
         self.image.generate.assert_called_once()
         self.assertEqual(self.image.generate.call_args.kwargs["conversation_url"], "https://chatgpt.com/c/keep")
         self.assertEqual(self.controller.rows[0]["reference"], reference)
         self.assertEqual(self.controller.rows[0]["status"], "successful")
         self.module.schedule.assert_called_once()
+
+    def test_progress_reports_which_chatgpt_step_is_running(self):
+        self.controller.rows = [row()]
+        self.controller._image_progress(self.controller.rows[0], "Downloading completed image")
+        snapshot = self.controller.snapshot()
+        self.assertEqual(snapshot["rows"][0]["detail"], "Downloading completed image")
+        self.assertEqual(snapshot["rows"][0]["status"], "processing")
+        self.assertEqual(snapshot["chatgpt_status"], "Downloading completed image")
 
     def test_storage_failure_stops_before_remote_mutation(self):
         self.controller.rows = [row(publish_at=STAMP)]

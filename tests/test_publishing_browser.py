@@ -276,6 +276,35 @@ class ThumbnailSaveTests(unittest.TestCase):
 
 
 class ChatGPTResumeTests(unittest.TestCase):
+    def test_modern_gallery_downloads_with_hidden_composer_and_no_assistant_article(self):
+        driver, image, hidden_stop = Mock(), Mock(), Mock()
+        driver.window_handles = ["chatgpt-window"]
+        driver.title = "Thumbnail conversation"
+        driver.current_url = "https://chatgpt.com/c/abc-123"
+        image.is_displayed.return_value = True
+        image.get_attribute.return_value = "blob:https://chatgpt.com/generated-image"
+        hidden_stop.is_displayed.return_value = False
+        def find(_by, selector):
+            if "generated-image-preview" in selector:
+                return [image]
+            if "stop-button" in selector:
+                return [hidden_stop]
+            return []
+        driver.find_elements.side_effect = find
+        driver.execute_script.return_value = True
+        driver.execute_async_script.return_value = {"data": "data:image/png;base64," + base64.b64encode(b"generated-bytes").decode()}
+        browser = ChatGPTImageBrowser()
+        browser.driver = driver
+        self.addCleanup(browser.close)
+        progress = Mock()
+        with tempfile.TemporaryDirectory() as folder, patch("src.publishing_browser.wait_for", side_effect=immediate_wait):
+            output = Path(folder) / "generated.png"
+            browser.generate("unused.jpg", "draw", {}, output, conversation_url=driver.current_url, on_progress=progress)
+            self.assertEqual(output.read_bytes(), b"generated-bytes")
+        driver.get.assert_not_called()
+        self.assertTrue(any("đang tải ảnh" in call.args[0] for call in progress.call_args_list))
+        self.assertFalse(any("execCommand" in call.args[0] for call in driver.execute_script.call_args_list))
+
     def test_existing_conversation_downloads_image_without_new_prompt(self):
         driver, message, image, editor = Mock(), Mock(), Mock(), Mock()
         editor.is_displayed.return_value = True

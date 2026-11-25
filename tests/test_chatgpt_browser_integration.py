@@ -31,8 +31,8 @@ PAGE = r"""<!doctype html><title>Just a moment...</title>
     <button aria-label="Add files and more" type="button">+</button>
     <button type="submit" aria-label="Send message" disabled>Send</button>
   </form>
-  <section id="messages"></section>
 </main>
+<section id="messages"></section>
 <script>
 window.submissions = []; window.uploads = []; window.cameraUploads = 0; window.clicks = 0;
 document.addEventListener('click', () => window.clicks++);
@@ -51,8 +51,10 @@ form.onsubmit = event => {
     event.preventDefault(); window.submissions.push(editor.innerText);
     history.pushState({}, '', '/c/local-fixture');
     document.querySelector('#messages').innerHTML =
-        '<article data-message-author-role="assistant">Image created<img src="' + generated + '"></article>';
+        '<div data-testid="generated-image-gallery"><button data-testid="generated-image-preview" aria-label="Generated image 1"><img src="' + generated + '"></button></div>';
     editor.innerText = ''; updateSend();
+    // The image viewer hides the composer/account and uses no assistant article.
+    document.querySelector('main').hidden = true;
 };
 window.finishManualLogin = () => { document.title = 'ChatGPT'; document.querySelector('main').hidden = false; };
 </script>""".replace("__IMAGE__", IMAGE)

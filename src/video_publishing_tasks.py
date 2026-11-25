@@ -107,6 +107,10 @@ class VideoPublishingController:
         self._checkpoint(row, status="processing" if state == "ready" else "waiting_session",
                          detail="Phiên ChatGPT sẵn sàng; đang tiếp tục xử lý thumbnail…" if state == "ready" else message)
 
+    def _image_progress(self, row, message):
+        self._session_progress(message)
+        self._checkpoint(row, status="processing", detail=message)
+
     def prepare_chatgpt_session(self):
         with self.lock:
             if self.busy or self.session_busy:
@@ -402,14 +406,19 @@ class VideoPublishingController:
                     folder = output / row["channel_id"]
                     folder.mkdir(parents=True, exist_ok=True)
                     base = folder / row["video_id"]
-                    reference_path = download_reference_image(row["reference"]["thumbnail"], base.with_suffix(".reference.jpg"))
+                    reference_path = str(base.with_suffix(".reference.jpg"))
+                    if not row.get("conversation_url"):
+                        self._checkpoint(row, detail="Đang tải ảnh tham chiếu và chuyển sang JPEG…")
+                        reference_path = download_reference_image(row["reference"]["thumbnail"], reference_path)
                     self._checkpoint(row, detail="Đang yêu cầu ChatGPT vẽ lại thumbnail…")
                     if image is None:
                         image = self._image_session()
                     raw = image.generate(reference_path, settings["image_prompt"], row["reference"], base.with_suffix(".generated"),
                                          conversation_url=row.get("conversation_url", ""),
                                          on_conversation=lambda url, row=row: self._remember_conversation(row, url),
-                                         on_state=lambda state, message, row=row: self._image_session_state(row, state, message))
+                                         on_state=lambda state, message, row=row: self._image_session_state(row, state, message),
+                                         on_progress=lambda message, row=row: self._image_progress(row, message))
+                    self._checkpoint(row, detail="Đã tải ảnh ChatGPT; đang chuẩn hóa thumbnail JPEG 1280×720…")
                     path = normalize_thumbnail(raw, base.with_suffix(".jpg"))
                     self._checkpoint(row, thumbnail_path=path)
                 self.module.copy_metadata(row["channel_id"], row["video_id"], row["reference"],
@@ -481,7 +490,7 @@ class VideoPublishingController:
                             image = self._image_session()
                             self._progress("Đang kiểm tra phiên ChatGPT trước khi xử lý danh sách…")
                             try:
-                                image.ensure_ready(wait_for_user=True, on_status=self._session_progress,
+                                image.ensure_ready(wait_for_user=True, on_status=self._session_progress, allow_image_result=True,
                                                    on_state=lambda state, message: self._image_session_state(pending_images[0], state, message))
                             except ChatGPTSessionNeedsAction as exc:
                                 self._checkpoint(pending_images[0], status="waiting_session", detail=str(exc))

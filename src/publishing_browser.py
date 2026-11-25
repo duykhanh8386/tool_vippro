@@ -11,6 +11,7 @@ import atexit
 import json
 import re
 import subprocess
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -276,24 +277,34 @@ class YouTubeReferenceBrowser:
 
 
 def download_reference_image(url, destination):
+    """Decode YouTube's response into a real JPEG before attaching it to chat."""
     import requests
 
     host = (urlparse(url).hostname or "").lower()
     if urlparse(url).scheme != "https" or not (host == "ytimg.com" or host.endswith(".ytimg.com")):
         raise PublishingBrowserError("Thumbnail tham chiếu không phải URL ảnh YouTube hợp lệ.")
     check_stopped()
-    with requests.get(url, timeout=(15, 45), stream=True, allow_redirects=False) as response:
-        if response.status_code != 200 or not response.headers.get("Content-Type", "").startswith("image/"):
-            raise PublishingBrowserError("Không tải được ảnh thumbnail tham chiếu.")
-        chunks, size = [], 0
-        for chunk in response.iter_content(65536):
-            check_stopped()
-            size += len(chunk)
-            if size > 20 * 1024 * 1024:
-                raise PublishingBrowserError("Ảnh tham chiếu lớn hơn 20 MB.")
-            chunks.append(chunk)
-        Path(destination).write_bytes(b"".join(chunks))
-    return str(destination)
+    destination = Path(destination)
+    source = None
+    try:
+        with requests.get(url, timeout=(15, 45), stream=True, allow_redirects=False) as response:
+            if response.status_code != 200 or not response.headers.get("Content-Type", "").startswith("image/"):
+                raise PublishingBrowserError("Không tải được ảnh thumbnail tham chiếu.")
+            # A .jpg URL can return AVIF or WebP. Renaming those bytes to .jpg
+            # does not make them a JPEG and causes ChatGPT upload errors.
+            with tempfile.NamedTemporaryFile(dir=destination.parent, suffix=".download", delete=False) as stream:
+                source = Path(stream.name)
+                size = 0
+                for chunk in response.iter_content(65536):
+                    check_stopped()
+                    size += len(chunk)
+                    if size > 20 * 1024 * 1024:
+                        raise PublishingBrowserError("Ảnh tham chiếu lớn hơn 20 MB.")
+                    stream.write(chunk)
+        return normalize_thumbnail(source, destination)
+    finally:
+        if source is not None:
+            source.unlink(missing_ok=True)
 
 
 def normalize_thumbnail(source, destination):
@@ -301,13 +312,13 @@ def normalize_thumbnail(source, destination):
     try:
         run_owned_process(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(source),
                            "-vf", "scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720,setsar=1",
-                           "-frames:v", "1", "-q:v", "3", "-update", "1", str(destination)],
+                           "-frames:v", "1", "-pix_fmt", "yuvj420p", "-q:v", "3", "-update", "1", str(destination)],
                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     except (OSError, subprocess.CalledProcessError):
         raise PublishingBrowserError("Không chuyển được ảnh sang JPEG 1280×720. Kiểm tra FFmpeg của tool.") from None
     path = Path(destination)
-    if not path.is_file() or not 0 < path.stat().st_size <= 2 * 1024 * 1024:
-        raise PublishingBrowserError("Thumbnail đầu ra phải nhỏ hơn 2 MB.")
+    if not path.is_file() or not 0 < path.stat().st_size <= 2 * 1024 * 1024 or not path.read_bytes().startswith(b"\xff\xd8\xff"):
+        raise PublishingBrowserError("Thumbnail đầu ra phải là JPEG hợp lệ và nhỏ hơn 2 MB.")
     return str(path)
 
 
@@ -419,8 +430,20 @@ class ChatGPTImageBrowser:
         if state == "closed":
             raise ChatGPTSessionNeedsAction("Cửa sổ phiên ChatGPT đã đóng. Bấm Mở / kiểm tra phiên để mở lại phiên đã lưu.", reason=state)
 
+    @staticmethod
+    def _completed_gallery_image(driver):
+        # Chat/Work no longer wraps image turns in article/author-role nodes.
+        # These markers identify generated results, excluding user attachments.
+        images = driver.find_elements(By.CSS_SELECTOR, "[data-testid='generated-image-preview'] img, [data-testid='generated-image-gallery'] img")
+        for node in reversed(images):
+            if node.is_displayed() and driver.execute_script(
+                "return arguments[0].complete && arguments[0].naturalWidth >= 512 && arguments[0].naturalHeight >= 256", node
+            ):
+                return node.get_attribute("src")
+        return None
+
     def ensure_ready(self, *, on_status=lambda message: None, timeout=None,
-                     wait_for_user=False, on_state=lambda state, message: None):
+                     wait_for_user=False, on_state=lambda state, message: None, allow_image_result=False):
         with self.lock:
             on_status("Đang kiểm tra phiên ChatGPT đã lưu…")
             driver = self._browser()
@@ -430,6 +453,10 @@ class ChatGPTImageBrowser:
             while time.monotonic() < deadline:
                 check_stopped()
                 state = self._state(driver)
+                if state == "loading" and allow_image_result and self._completed_gallery_image(driver):
+                    # Opening the generated-image viewer hides the composer.
+                    # That must not prevent a saved result from being retrieved.
+                    state = "ready"
                 check_stopped()
                 if not wait_for_user or state == "closed":
                     self._raise_for_state(state)
@@ -450,13 +477,13 @@ class ChatGPTImageBrowser:
             raise ChatGPTSessionNeedsAction("Hết thời gian chờ phiên ChatGPT sẵn sàng. Tool đã dừng lượt xử lý và giữ cửa sổ; hoàn tất đăng nhập/xác minh rồi bấm Tự động SEO, tạo thumbnail & lên lịch để tiếp tục.", reason=state)
 
     def generate(self, reference_image, prompt, reference, destination, *, conversation_url="",
-                 on_conversation=lambda url: None, on_state=lambda state, message: None):
+                 on_conversation=lambda url: None, on_state=lambda state, message: None, on_progress=lambda message: None):
         with self.lock:
             self._submission_started = False
             try:
-                self.ensure_ready(wait_for_user=True, on_state=on_state)
+                self.ensure_ready(wait_for_user=True, on_state=on_state, allow_image_result=True)
                 return self._generate(reference_image, prompt, reference, destination,
-                                      conversation_url=conversation_url, on_conversation=on_conversation, on_state=on_state)
+                                      conversation_url=conversation_url, on_conversation=on_conversation, on_state=on_state, on_progress=on_progress)
             except (ChatGPTSessionNeedsAction, TaskStopped):
                 self._remember_submitted_conversation(on_conversation)
                 raise
@@ -477,17 +504,18 @@ class ChatGPTImageBrowser:
             on_conversation(url)
 
     def _generate(self, reference_image, prompt, reference, destination, *, conversation_url="",
-                  on_conversation=lambda url: None, on_state=lambda state, message: None):
+                  on_conversation=lambda url: None, on_state=lambda state, message: None, on_progress=lambda message: None):
         driver = self._browser()
         # Resume an already submitted image request without creating it twice.
         valid_conversation = bool(re.fullmatch(r"https://chatgpt\.com/c/[A-Za-z0-9-]+", conversation_url or ""))
         target = conversation_url if valid_conversation else "https://chatgpt.com/"
         if str(driver.current_url).rstrip("/") != target.rstrip("/"):
             driver.get(target)
-        self.ensure_ready(wait_for_user=True, on_state=on_state)
-        editor = wait_for(lambda: self._editor(driver),
-                          timeout=30, message="Không tìm được ô nhập ChatGPT. Kiểm tra phiên đã mở trước khi chạy tiếp.")
+        self.ensure_ready(wait_for_user=True, on_state=on_state, allow_image_result=valid_conversation)
         if not valid_conversation:
+            editor = wait_for(lambda: self._editor(driver),
+                              timeout=30, message="Không tìm được ô nhập ChatGPT. Kiểm tra phiên đã mở trước khi chạy tiếp.")
+            on_progress("Đang đính kèm ảnh tham chiếu JPEG vào ChatGPT…")
             inputs = driver.find_elements(By.CSS_SELECTOR, "input[type=file]")
             if not inputs:
                 buttons = driver.find_elements(By.CSS_SELECTOR, "[data-testid='composer-plus-btn'], button[aria-label='Add files and more']")
@@ -529,6 +557,7 @@ class ChatGPTImageBrowser:
                              and node.get_attribute("aria-disabled") != "true"), None)
 
             button = wait_for(send_button, timeout=120, message="Ảnh đính kèm hoặc prompt chưa sẵn sàng để gửi ChatGPT.")
+            on_progress("Đang gửi prompt và ảnh tham chiếu tới ChatGPT…")
             check_stopped()
             self._submission_started = True
             button.click()
@@ -536,9 +565,17 @@ class ChatGPTImageBrowser:
                            timeout=90, message="Chưa xác nhận được cuộc trò chuyện ChatGPT; kiểm tra Chrome trước khi chạy lại.")
             on_conversation(url)
 
+        on_progress("Đang chờ ChatGPT hoàn tất ảnh thumbnail (tối đa 10 phút)…")
         def generated_image():
-            if self._state(driver) != "ready":
-                self.ensure_ready(wait_for_user=True, on_state=on_state)
+            state = self._state(driver)
+            if state in {"verification", "login", "closed"}:
+                self.ensure_ready(wait_for_user=True, on_state=on_state, allow_image_result=True)
+            stops = driver.find_elements(By.CSS_SELECTOR, "[data-testid='stop-button'], button[aria-label='Stop generating'], button[aria-label='Stop streaming'], button[aria-label='Stop'], button[aria-label='Dừng tạo']")
+            if any(node.is_displayed() and node.is_enabled() for node in stops):
+                return None
+            image_url = self._completed_gallery_image(driver)
+            if image_url:
+                return image_url
             messages = driver.find_elements(By.CSS_SELECTOR, "article[data-turn='assistant']")
             if not messages:
                 messages = driver.find_elements(By.CSS_SELECTOR, "[data-message-author-role='assistant']")
@@ -550,8 +587,6 @@ class ChatGPTImageBrowser:
                 raise ChatGPTSessionNeedsAction("Tài khoản ChatGPT đã hết lượt tạo ảnh. Lượt xử lý đã dừng; tiếp tục khi tài khoản có thể tạo ảnh lại.", reason="quota")
             if any(marker in text for marker in ("unable to generate", "không thể tạo ảnh")):
                 raise PublishingBrowserError("ChatGPT chưa tạo được ảnh hoặc đã hết lượt. Kiểm tra cuộc trò chuyện trước khi tiếp tục.")
-            if driver.find_elements(By.CSS_SELECTOR, "[data-testid='stop-button']"):
-                return None
             images = message.find_elements(By.CSS_SELECTOR, "img")
             for node in reversed(images):
                 if driver.execute_script("return arguments[0].complete && arguments[0].naturalWidth >= 512 && arguments[0].naturalHeight >= 256", node):
@@ -560,6 +595,7 @@ class ChatGPTImageBrowser:
 
         image_url = wait_for(generated_image, timeout=600,
                              message="Chưa nhận được ảnh từ ChatGPT sau 10 phút. Giữ lại link hội thoại để thử lấy ảnh tiếp.")
+        on_progress("Đã tìm thấy ảnh thumbnail; đang tải ảnh từ ChatGPT về máy…")
         parsed = urlparse(image_url)
         host = (parsed.hostname or "").lower()
         if not image_url.startswith(("blob:https://chatgpt.com/", "data:image/")) and not (
