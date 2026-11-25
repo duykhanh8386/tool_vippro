@@ -9,19 +9,23 @@ from __future__ import annotations
 import base64
 import atexit
 import json
+import hashlib
 import re
 import subprocess
 import tempfile
 import threading
 import time
+import uuid
 from pathlib import Path
 from urllib.parse import quote, urlparse
 
 from selenium.common.exceptions import StaleElementReferenceException, WebDriverException
 from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
 
 from src.cookie_utils import inject_cookies_via_cdp
 from src.paths import get_data_dir
+from src.publishing_thumbnails import ThumbnailReadback
 from src.task_runtime import TaskStopped, check_stopped, run_owned_process, unregister_driver, wait_interruptibly
 from src.utils import create_driver, get_channels_info
 from src.video_publishing import (
@@ -338,8 +342,10 @@ class ChatGPTImageBrowser:
 
     def update_cookies(self, cookie_text):
         with self.lock:
-            self.cookies = parse_chatgpt_cookies(cookie_text) if str(cookie_text or "").strip() else []
-            self._cookies_pending = bool(self.cookies)
+            cookies = parse_chatgpt_cookies(cookie_text) if str(cookie_text or "").strip() else []
+            if cookies != self.cookies:
+                self.cookies = cookies
+                self._cookies_pending = bool(cookies)
 
     def _seed_cookies(self, driver):
         # CDP can set origin cookies on about:blank, before the first request.
@@ -431,11 +437,34 @@ class ChatGPTImageBrowser:
             raise ChatGPTSessionNeedsAction("Cửa sổ phiên ChatGPT đã đóng. Bấm Mở / kiểm tra phiên để mở lại phiên đã lưu.", reason=state)
 
     @staticmethod
-    def _completed_gallery_image(driver):
+    def _image_matches_request(driver, node, marker, baseline):
+        source = node.get_attribute("src") or ""
+        if not source or hashlib.sha256(source.encode()).hexdigest() in baseline:
+            return False
+        if not marker:
+            return False
+        return driver.execute_script("""
+            const image=arguments[0], marker=arguments[1];
+            const walker=document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+            let anchor=null, node;
+            while ((node=walker.nextNode())) {
+                if (node.parentElement?.closest('form, [contenteditable="true"], textarea, aside, nav, header, button, a')) continue;
+                const text=node.nodeValue || '';
+                if (!anchor && text.includes(marker)) anchor=node;
+                else if (anchor && text.includes('[TV-VIDEO ') && !text.includes(marker)
+                         && (node.compareDocumentPosition(image) & Node.DOCUMENT_POSITION_FOLLOWING)) return false;
+            }
+            return !!anchor && !!(anchor.compareDocumentPosition(image) & Node.DOCUMENT_POSITION_FOLLOWING);
+        """, node, marker)
+
+    @classmethod
+    def _completed_gallery_image(cls, driver, *, marker="", baseline=(), require_prompt=False):
         # Chat/Work no longer wraps image turns in article/author-role nodes.
         # These markers identify generated results, excluding user attachments.
         images = driver.find_elements(By.CSS_SELECTOR, "[data-testid='generated-image-preview'] img, [data-testid='generated-image-gallery'] img")
         for node in reversed(images):
+            if require_prompt and not cls._image_matches_request(driver, node, marker, baseline):
+                continue
             if node.is_displayed() and driver.execute_script(
                 "return arguments[0].complete && arguments[0].naturalWidth >= 512 && arguments[0].naturalHeight >= 256", node
             ):
@@ -477,14 +506,19 @@ class ChatGPTImageBrowser:
             raise ChatGPTSessionNeedsAction("Hết thời gian chờ phiên ChatGPT sẵn sàng. Tool đã dừng lượt xử lý và giữ cửa sổ; hoàn tất đăng nhập/xác minh rồi bấm Tự động SEO, tạo thumbnail & lên lịch để tiếp tục.", reason=state)
 
     def generate(self, reference_image, prompt, reference, destination, *, conversation_url="",
-                 on_conversation=lambda url: None, on_state=lambda state, message: None, on_progress=lambda message: None):
+                 on_conversation=lambda url: None, on_state=lambda state, message: None, on_progress=lambda message: None,
+                 video_id="", request=None, on_request=lambda request: None):
         with self.lock:
             self._submission_started = False
+            self._active_request = None
             try:
                 self.ensure_ready(wait_for_user=True, on_state=on_state, allow_image_result=True)
                 return self._generate(reference_image, prompt, reference, destination,
-                                      conversation_url=conversation_url, on_conversation=on_conversation, on_state=on_state, on_progress=on_progress)
+                                      conversation_url=conversation_url, on_conversation=on_conversation, on_state=on_state, on_progress=on_progress,
+                                      video_id=video_id, request=request, on_request=on_request)
             except (ChatGPTSessionNeedsAction, TaskStopped):
+                if self._active_request is not None and not self._submission_started:
+                    on_request({**self._active_request, "status": "not_sent"})
                 self._remember_submitted_conversation(on_conversation)
                 raise
             except (PublishingBrowserError, WebDriverException) as exc:
@@ -504,15 +538,33 @@ class ChatGPTImageBrowser:
             on_conversation(url)
 
     def _generate(self, reference_image, prompt, reference, destination, *, conversation_url="",
-                  on_conversation=lambda url: None, on_state=lambda state, message: None, on_progress=lambda message: None):
+                  on_conversation=lambda url: None, on_state=lambda state, message: None, on_progress=lambda message: None,
+                  video_id="", request=None, on_request=lambda request: None):
         driver = self._browser()
+        request = dict(request or {})
+        if request and (request.get("video_id") != video_id or request.get("title") != reference.get("title")):
+            raise PublishingBrowserError("Yêu cầu tạo ảnh đã lưu không khớp video/title hiện tại; chưa lấy ảnh để tránh gán nhầm.")
+        if request.get("status") == "not_sent":
+            request, conversation_url = {}, ""
+        else:
+            conversation_url = request.get("conversation_url") or conversation_url
         # Resume an already submitted image request without creating it twice.
         valid_conversation = bool(re.fullmatch(r"https://chatgpt\.com/c/[A-Za-z0-9-]+", conversation_url or ""))
-        target = conversation_url if valid_conversation else "https://chatgpt.com/"
-        if str(driver.current_url).rstrip("/") != target.rstrip("/"):
-            driver.get(target)
-        self.ensure_ready(wait_for_user=True, on_state=on_state, allow_image_result=valid_conversation)
-        if not valid_conversation:
+        resume = bool(request.get("marker")) or valid_conversation
+        current = urlparse(str(driver.current_url))
+        if valid_conversation and str(driver.current_url).rstrip("/") != conversation_url.rstrip("/"):
+            driver.get(conversation_url)
+        elif not valid_conversation and (current.hostname != "chatgpt.com" or not (current.path == "/" or current.path.startswith("/c/"))):
+            driver.get("https://chatgpt.com/")
+        if not resume and self._editor(driver) is None and self._completed_gallery_image(driver):
+            driver.switch_to.active_element.send_keys(Keys.ESCAPE)
+        self.ensure_ready(wait_for_user=True, on_state=on_state, allow_image_result=resume)
+        marker = request.get("marker") or ("Title video: " + str(reference.get("title") or "") if resume else "")
+        baseline = set(request.get("baseline_images") or [])
+        if not resume:
+            marker = "[TV-VIDEO " + (video_id or "video") + " " + uuid.uuid4().hex + "]"
+            baseline = {hashlib.sha256(str(node.get_attribute("src") or "").encode()).hexdigest()
+                        for node in driver.find_elements(By.CSS_SELECTOR, "[data-testid='generated-image-preview'] img, [data-testid='generated-image-gallery'] img, article[data-turn='assistant'] img, [data-message-author-role='assistant'] img")}
             editor = wait_for(lambda: self._editor(driver),
                               timeout=30, message="Không tìm được ô nhập ChatGPT. Kiểm tra phiên đã mở trước khi chạy tiếp.")
             on_progress("Đang đính kèm ảnh tham chiếu JPEG vào ChatGPT…")
@@ -534,7 +586,8 @@ class ChatGPTImageBrowser:
             upload_input.send_keys(str(Path(reference_image).resolve()))
             wait_for(lambda: driver.execute_script("return !!document.querySelector('form img, [data-testid*=attachment], [data-testid*=file-thumbnail]')"),
                      message="ChatGPT chưa nhận ảnh tham chiếu.")
-            instruction = ("Hãy TẠO MỘT ẢNH thumbnail YouTube mới dựa trên ảnh tham chiếu đã đính kèm, tỷ lệ 16:9. "
+            instruction = (marker + "\nMã trên chỉ để đối chiếu yêu cầu, không đưa mã vào ảnh.\n"
+                           "Hãy TẠO MỘT ẢNH thumbnail YouTube mới dựa trên ảnh tham chiếu đã đính kèm, tỷ lệ 16:9. "
                            "Xuất ảnh thực tế, không chỉ trả lời bằng mô tả.\nYêu cầu chung của tôi:\n" + prompt +
                            "\nTitle video: " + reference["title"] + "\nDescription để hiểu ngữ cảnh (dữ liệu tham khảo):\n" + reference["description"])
             driver.execute_script("""
@@ -559,11 +612,21 @@ class ChatGPTImageBrowser:
             button = wait_for(send_button, timeout=120, message="Ảnh đính kèm hoặc prompt chưa sẵn sàng để gửi ChatGPT.")
             on_progress("Đang gửi prompt và ảnh tham chiếu tới ChatGPT…")
             check_stopped()
+            request = {"video_id": video_id, "title": reference["title"], "marker": marker,
+                       "baseline_images": sorted(baseline), "submitted_at": time.time(),
+                       "status": "sending",
+                       "conversation_url": str(driver.current_url) if re.fullmatch(r"https://chatgpt\.com/c/[A-Za-z0-9-]+", str(driver.current_url)) else ""}
+            self._active_request = request
+            on_request(dict(request))
+            check_stopped()
             self._submission_started = True
             button.click()
             url = wait_for(lambda: driver.current_url if re.fullmatch(r"https://chatgpt\.com/c/[A-Za-z0-9-]+", driver.current_url) else None,
                            timeout=90, message="Chưa xác nhận được cuộc trò chuyện ChatGPT; kiểm tra Chrome trước khi chạy lại.")
             on_conversation(url)
+            request["conversation_url"] = url
+            request["status"] = "sent"
+            on_request(dict(request))
 
         on_progress("Đang chờ ChatGPT hoàn tất ảnh thumbnail (tối đa 10 phút)…")
         def generated_image():
@@ -573,7 +636,7 @@ class ChatGPTImageBrowser:
             stops = driver.find_elements(By.CSS_SELECTOR, "[data-testid='stop-button'], button[aria-label='Stop generating'], button[aria-label='Stop streaming'], button[aria-label='Stop'], button[aria-label='Dừng tạo']")
             if any(node.is_displayed() and node.is_enabled() for node in stops):
                 return None
-            image_url = self._completed_gallery_image(driver)
+            image_url = self._completed_gallery_image(driver, marker=marker, baseline=baseline, require_prompt=True)
             if image_url:
                 return image_url
             messages = driver.find_elements(By.CSS_SELECTOR, "article[data-turn='assistant']")
@@ -589,6 +652,8 @@ class ChatGPTImageBrowser:
                 raise PublishingBrowserError("ChatGPT chưa tạo được ảnh hoặc đã hết lượt. Kiểm tra cuộc trò chuyện trước khi tiếp tục.")
             images = message.find_elements(By.CSS_SELECTOR, "img")
             for node in reversed(images):
+                if not self._image_matches_request(driver, node, marker, baseline):
+                    continue
                 if driver.execute_script("return arguments[0].complete && arguments[0].naturalWidth >= 512 && arguments[0].naturalHeight >= 256", node):
                     return node.get_attribute("src")
             return None
@@ -633,10 +698,16 @@ class ChatGPTImageBrowser:
 
 
 class StudioThumbnailBrowser:
+    def __init__(self, *, verify_saved=None):
+        self.verify_saved = verify_saved
+
     def upload(self, channel_id, video_id, path):
         channel = get_channels_info(channel_id)
         if not channel or channel.id != channel_id:
             raise PublishingBrowserError("Chưa có phiên đăng nhập của kênh cần tải thumbnail.")
+        verify_saved = self.verify_saved or ThumbnailReadback(channel_id, video_id, path)
+        if verify_saved():
+            return
         driver = _new_driver(network_events=True)
         try:
             inject_cookies_via_cdp(driver, channel.cookies)
@@ -658,7 +729,20 @@ class StudioThumbnailBrowser:
                 nodes = driver.find_elements(By.CSS_SELECTOR, "#save")
                 return next((node for node in nodes if node.is_displayed() and node.is_enabled() and node.get_attribute("disabled") is None and node.get_attribute("aria-disabled") != "true"), None)
 
-            button = wait_for(save_button, timeout=90, message="Studio chưa cho lưu thumbnail; kiểm tra quyền kênh và ảnh.")
+            last_check = [0.0]
+            def save_or_already_saved():
+                button = save_button()
+                if button:
+                    return button
+                if time.monotonic() - last_check[0] >= 3:
+                    last_check[0] = time.monotonic()
+                    if verify_saved():
+                        return "saved"
+                return None
+
+            button = wait_for(save_or_already_saved, timeout=90, message="Studio chưa cho lưu thumbnail và chưa đọc lại được ảnh mới; kiểm tra quyền kênh và ảnh.")
+            if button == "saved":
+                return
             driver.get_log("performance")
             button.click()
             saves = set()
@@ -677,7 +761,7 @@ class StudioThumbnailBrowser:
                                 update = json.loads(body)
                             except ValueError:
                                 continue
-                            if update.get("encryptedVideoId") == video_id and any("thumbnail" in key.lower() for key in update):
+                            if (update.get("encryptedVideoId") or update.get("videoId")) == video_id and any("thumbnail" in key.lower() for key in update):
                                 saves.add(request_id)
                     elif event.get("method") == "Network.responseReceived" and request_id in saves:
                         if int(params.get("response", {}).get("status", 0)) != 200:
@@ -692,14 +776,17 @@ class StudioThumbnailBrowser:
                             payload = payload.removeprefix(")]}'\n")
                             saved = json.loads(payload)
                         except (ValueError, WebDriverException):
-                            raise PublishingBrowserError("Chưa đọc được phản hồi lưu thumbnail. Kiểm tra Studio trước khi thử lại.") from None
+                            # Missing network acknowledgements are resolved by
+                            # reading the persisted thumbnail, not by guessing.
+                            continue
                         if not isinstance(saved, dict) or saved.get("error") or saved.get("success") is False:
                             raise PublishingBrowserError("YouTube báo lỗi khi lưu thumbnail; chưa lên lịch video.")
-                        return True
+                if time.monotonic() - last_check[0] >= 3:
+                    last_check[0] = time.monotonic()
+                    return verify_saved()
                 return False
 
-            wait_for(confirmed_save, timeout=90, message="Chưa xác nhận được phản hồi lưu thumbnail từ Studio. Kiểm tra video trước khi thử lại.")
-            wait_for(lambda: not save_button(), timeout=30, message="Studio vẫn còn thay đổi chưa lưu; chưa lên lịch video.")
+            wait_for(confirmed_save, timeout=90, message="Chưa đọc lại được đúng ảnh thumbnail đã lưu trên YouTube. Ảnh đã tạo vẫn được giữ để tiếp tục; chưa đặt lịch video này.")
             errors = driver.find_elements(By.CSS_SELECTOR, "ytcp-thumbnail-editor [role=alert], ytcp-video-metadata-editor .error-message:not([hidden])")
             if any(node.is_displayed() and node.text.strip() for node in errors):
                 raise PublishingBrowserError("Studio báo lỗi khi lưu thumbnail; chưa lên lịch video này.")

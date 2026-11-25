@@ -72,6 +72,7 @@ class Video:
     time_published_seconds: object = ""
     audio_language: str = ""
     restriction_details: dict = field(default_factory=dict)
+    thumbnail_details: dict = field(default_factory=dict)
 
 
 class AuthSignal(Enum):

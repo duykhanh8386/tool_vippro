@@ -199,6 +199,7 @@ class IModule(ABC):
             channel_id=video.get("channelId", ""),
             duration_ms=video.get("videoDurationMs", 0),
             thumbnail=thumbnails[0].get("url", ""),
+            thumbnail_details=video.get("thumbnailDetails") or {},
             video_status=video.get("status", ""),
             audio_language=str(audio_language).strip(),
             privacy=video.get("privacy", ""),

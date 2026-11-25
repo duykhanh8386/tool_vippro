@@ -19,7 +19,7 @@ from src.video_publishing import (
     COPYRIGHT_LABELS, PUBLISHING_SCAN_SCHEMA_VERSION, REFERENCE_SELECTION_VERSION, copyright_category, first_song,
     VIDEO_SCOPE_LABELS, VIDEO_TYPE_LABELS, parse_chatgpt_cookies, plan_daily, positive_seconds,
     publishing_row_disabled_reason, publishing_row_matches, publishing_row_selectable,
-    publishing_video_type, schedule_timestamp,
+    publishing_video_type, schedule_timestamp, thumbnail_file_stem,
 )
 from src.video_scan_dates import VIETNAM_TIMEZONE
 from src.video_title_matching import parse_manual_title_ids
@@ -183,6 +183,7 @@ class VideoPublishingController:
                     if row.get("status") != "successful" and not row.get("thumbnail_uploaded"):
                         row.pop("thumbnail_path", None)
                         row.pop("conversation_url", None)
+                        row.pop("image_request", None)
             self.revision += 1
             self._save()
 
@@ -215,7 +216,7 @@ class VideoPublishingController:
                 raise ValueError("Tên bài nhạc tìm kiếm không được để trống.")
             if query != row["song"]:
                 row.update(song=query, status="scanned", detail="Đã đổi từ khóa; sẽ tìm lại video tham chiếu.")
-                for key in ("reference", "conversation_url", "thumbnail_path"):
+                for key in ("reference", "conversation_url", "thumbnail_path", "image_request"):
                     row.pop(key, None)
                 self._checkpoint()
 
@@ -232,6 +233,14 @@ class VideoPublishingController:
         # this local receipt must still succeed so a retry resumes that request.
         with self.lock:
             row["conversation_url"] = url
+            self.revision += 1
+            self._save()
+
+    def _remember_image_request(self, row, request):
+        with self.lock:
+            row["image_request"] = copy.deepcopy(request)
+            if request.get("conversation_url"):
+                row["conversation_url"] = request["conversation_url"]
             self.revision += 1
             self._save()
 
@@ -397,38 +406,45 @@ class VideoPublishingController:
                         with self.lock:
                             row.pop("thumbnail_path", None)
                             row.pop("conversation_url", None)
+                            row.pop("image_request", None)
                     self._checkpoint(row, reference=found)
                 if action == "references":
                     method = row["reference"].get("selection_label", "Đã tìm video tham chiếu")
                     self._checkpoint(row, status="ready", detail=method + "; title và description sẽ chép nguyên văn.")
                     continue
                 if not row.get("thumbnail_path") or not Path(row["thumbnail_path"]).is_file():
+                    if image is None:
+                        image = self._image_session()
+                    image.ensure_ready(wait_for_user=True, allow_image_result=True,
+                                       on_state=lambda state, message, row=row: self._image_session_state(row, state, message))
                     folder = output / row["channel_id"]
                     folder.mkdir(parents=True, exist_ok=True)
-                    base = folder / row["video_id"]
-                    reference_path = str(base.with_suffix(".reference.jpg"))
-                    if not row.get("conversation_url"):
+                    base = str(folder / thumbnail_file_stem(row["reference"]["title"], row["video_id"]))
+                    reference_path = base + ".reference.jpg"
+                    if not row.get("conversation_url") and not row.get("image_request"):
                         self._checkpoint(row, detail="Đang tải ảnh tham chiếu và chuyển sang JPEG…")
                         reference_path = download_reference_image(row["reference"]["thumbnail"], reference_path)
                     self._checkpoint(row, detail="Đang yêu cầu ChatGPT vẽ lại thumbnail…")
-                    if image is None:
-                        image = self._image_session()
-                    raw = image.generate(reference_path, settings["image_prompt"], row["reference"], base.with_suffix(".generated"),
+                    raw = image.generate(reference_path, settings["image_prompt"], row["reference"], base + ".generated",
                                          conversation_url=row.get("conversation_url", ""),
+                                         video_id=row["video_id"], request=row.get("image_request"),
+                                         on_request=lambda request, row=row: self._remember_image_request(row, request),
                                          on_conversation=lambda url, row=row: self._remember_conversation(row, url),
                                          on_state=lambda state, message, row=row: self._image_session_state(row, state, message),
                                          on_progress=lambda message, row=row: self._image_progress(row, message))
                     self._checkpoint(row, detail="Đã tải ảnh ChatGPT; đang chuẩn hóa thumbnail JPEG 1280×720…")
-                    path = normalize_thumbnail(raw, base.with_suffix(".jpg"))
+                    path = normalize_thumbnail(raw, base + ".jpg")
                     self._checkpoint(row, thumbnail_path=path)
-                self.module.copy_metadata(row["channel_id"], row["video_id"], row["reference"],
-                                          expected_title=row["old_title"], expected_description=row["old_description"],
-                                          categories=categories, publish_at=row["publish_at"])
-                self._checkpoint(row, metadata_copied=True, detail="Đã xác nhận title/description. Đang tải thumbnail…")
                 if not row.get("thumbnail_uploaded"):
+                    self._checkpoint(row, detail="Đang tải thumbnail và đọc lại ảnh đã lưu trên YouTube…")
                     self.module.require_eligible(row["channel_id"], row["video_id"], categories, publish_at=row["publish_at"])
                     thumbnail.upload(row["channel_id"], row["video_id"], row["thumbnail_path"])
                     self._checkpoint(row, thumbnail_uploaded=True)
+                self._checkpoint(row, detail="Đã xác nhận thumbnail. Đang chép title/description và đọc lại…")
+                self.module.copy_metadata(row["channel_id"], row["video_id"], row["reference"],
+                                          expected_title=row["old_title"], expected_description=row["old_description"],
+                                          categories=categories, publish_at=row["publish_at"])
+                self._checkpoint(row, metadata_copied=True)
                 self._checkpoint(row, detail="Đang đặt lịch và đọc lại kết quả…")
                 self.module.schedule(row["channel_id"], row["video_id"], row["publish_at"], row["reference"], categories=categories)
                 self._checkpoint(row, status="successful", selected=False, detail="Đã xác nhận metadata và lịch đăng trên YouTube.")
@@ -484,17 +500,6 @@ class VideoPublishingController:
                 else:
                     if action == "run":
                         self._check_schedule_conflicts()
-                        pending_images = [row for row in self.rows if row.get("selected") and publishing_row_selectable(row)
-                                          and (not row.get("thumbnail_path") or not Path(row["thumbnail_path"]).is_file())]
-                        if pending_images:
-                            image = self._image_session()
-                            self._progress("Đang kiểm tra phiên ChatGPT trước khi xử lý danh sách…")
-                            try:
-                                image.ensure_ready(wait_for_user=True, on_status=self._session_progress, allow_image_result=True,
-                                                   on_state=lambda state, message: self._image_session_state(pending_images[0], state, message))
-                            except ChatGPTSessionNeedsAction as exc:
-                                self._checkpoint(pending_images[0], status="waiting_session", detail=str(exc))
-                                raise
                     self._process(settings, reference, image, action)
         except ChatGPTSessionNeedsAction as exc:
             self._session_progress(str(exc))

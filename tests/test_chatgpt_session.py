@@ -69,6 +69,14 @@ class ChatGPTSessionTests(unittest.TestCase):
         self.assertEqual(self.driver.execute_cdp_cmd.call_count, calls)
         self.driver.delete_all_cookies.assert_not_called()
 
+    def test_importing_the_same_cookie_again_does_not_reload_the_working_session(self):
+        self.browser._browser()
+        calls = self.driver.execute_cdp_cmd.call_count
+        self.browser.update_cookies("session=secret")
+        self.browser._browser()
+        self.driver.get.assert_called_once()
+        self.assertEqual(self.driver.execute_cdp_cmd.call_count, calls)
+
     def test_cloudflare_pauses_and_keeps_the_same_window_available(self):
         self.driver.title = "Just a moment..."
         with self.assertRaises(ChatGPTSessionNeedsAction) as error:

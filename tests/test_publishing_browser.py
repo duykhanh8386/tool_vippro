@@ -228,6 +228,7 @@ class ThumbnailSaveTests(unittest.TestCase):
             return {"body": json.dumps({} if body is None else body)}
 
         driver.execute_cdp_cmd.side_effect = response
+        driver.verify_saved = lambda: state["saved"]
 
         def find(_by, selector):
             if selector == "ytcp-video-metadata-editor":
@@ -249,7 +250,7 @@ class ThumbnailSaveTests(unittest.TestCase):
                 patch("src.publishing_browser.wait_for", side_effect=immediate_wait):
             path = Path(folder) / "thumbnail.jpg"
             path.write_bytes(b"fake-image")
-            StudioThumbnailBrowser().upload(CHANNEL, VIDEO, path)
+            StudioThumbnailBrowser(verify_saved=driver.verify_saved).upload(CHANNEL, VIDEO, path)
 
     def test_thumbnail_success_requires_own_metadata_request_and_response(self):
         driver, upload = self.setup_browser()
@@ -273,6 +274,38 @@ class ThumbnailSaveTests(unittest.TestCase):
                 with self.assertRaises(PublishingBrowserError):
                     self.upload(driver)
                 driver.execute_cdp_cmd.assert_not_called()
+
+    def test_readback_confirms_save_when_network_event_is_missing(self):
+        driver, _ = self.setup_browser()
+        driver.get_log.side_effect = [[], [], []]
+        driver.verify_saved = Mock(side_effect=[False, True])
+        self.upload(driver)
+        driver.execute_cdp_cmd.assert_not_called()
+
+    def test_success_acknowledgement_without_saved_image_does_not_confirm(self):
+        driver, _ = self.setup_browser()
+        driver.verify_saved = lambda: False
+        with self.assertRaises(PublishingBrowserError):
+            self.upload(driver)
+
+    def test_already_saved_image_is_not_uploaded_twice(self):
+        driver, upload = self.setup_browser()
+        driver.verify_saved = lambda: True
+        self.upload(driver)
+        upload.send_keys.assert_not_called()
+        driver.get.assert_not_called()
+
+    def test_auto_saved_thumbnail_does_not_require_an_enabled_save_button(self):
+        driver, _ = self.setup_browser()
+        driver.verify_saved = Mock(side_effect=[False, True])
+        driver.get_log.side_effect = [[], []]
+        old_find = driver.find_elements.side_effect
+        def find(by, selector):
+            if selector == "#save":
+                return []
+            return old_find(by, selector)
+        driver.find_elements.side_effect = find
+        self.upload(driver)
 
 
 class ChatGPTResumeTests(unittest.TestCase):
@@ -333,7 +366,7 @@ class ChatGPTResumeTests(unittest.TestCase):
             self.assertEqual(result.read_bytes(), b"generated-bytes")
         driver.get.assert_called_once_with("https://chatgpt.com/c/abc-123")
         # The only script is the natural-size image check, never prompt insertion.
-        self.assertEqual(driver.execute_script.call_count, 1)
+        self.assertEqual(driver.execute_script.call_count, 2)
 
 
 if __name__ == "__main__":

@@ -18,7 +18,7 @@ from src.publishing_browser import ChatGPTSessionNeedsAction
 from src.video_publishing import (
     REFERENCE_SELECTION_VERSION, copyright_category, first_song, parse_chatgpt_cookies, plan_daily,
     publishing_row_matches, publishing_row_selectable, publishing_video_type,
-    reference_search_query, reference_video_id, schedule_timestamp,
+    reference_search_query, reference_video_id, schedule_timestamp, thumbnail_file_stem,
 )
 from src.video_publishing_tasks import STATE_KEY, VideoPublishingController
 from src.video_scan_dates import VIETNAM_TIMEZONE
@@ -296,6 +296,38 @@ class PublishingControllerTests(unittest.TestCase):
         self.assertNotIn("private-secret", json.dumps(self.controller.snapshot()))
         self.assertTrue(self.controller.snapshot()["has_cookie"])
 
+    def test_saved_thumbnail_is_completed_before_next_video_needs_chatgpt(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "thumb.jpg"
+            path.write_bytes(b"saved")
+            self.controller.rows = [row(reference=REFERENCE, thumbnail_path=str(path), publish_at=STAMP), row(OTHER, publish_at=STAMP+86400)]
+            self.image.ensure_ready.side_effect = ChatGPTSessionNeedsAction("Verify next image", reason="verification")
+            timeline = Mock()
+            timeline.attach_mock(self.thumbnail.upload, "thumbnail")
+            timeline.attach_mock(self.module.copy_metadata, "metadata")
+            timeline.attach_mock(self.module.schedule, "schedule")
+            self.controller._worker("run", create_run_context("publishing-saved-image-first"))
+        self.assertEqual([item[0] for item in timeline.mock_calls], ["thumbnail", "metadata", "schedule"])
+        self.assertEqual([item["status"] for item in self.controller.rows], ["successful", "waiting_session"])
+        self.image.generate.assert_not_called()
+
+    def test_thumbnail_name_keeps_title_and_video_identity(self):
+        stem = thumbnail_file_stem('เพลงไทย 1.2 / Live: Music?', VIDEO)
+        self.assertTrue(stem.startswith('เพลงไทย 1.2 _ Live_ Music_'))
+        self.assertTrue(stem.endswith('['+VIDEO+']'))
+        self.assertNotEqual(stem, thumbnail_file_stem('เพลงไทย 1.2 / Live: Music?', OTHER))
+        self.assertTrue(thumbnail_file_stem('CON.test', VIDEO).startswith('_CON.test'))
+
+    def test_request_receipt_stays_bound_to_its_video_and_is_cleared_on_prompt_change(self):
+        self.controller.rows = [row(), row(OTHER)]
+        receipt = {"video_id":VIDEO,"title":"Song","marker":"[TV-VIDEO first]","baseline_images":["old-image-hash"]}
+        self.controller._remember_image_request(self.controller.rows[0], receipt)
+        restored = self.storage.load_state(STATE_KEY)["rows"]
+        self.assertEqual(restored[0]["image_request"], receipt)
+        self.assertNotIn("image_request", restored[1])
+        self.controller.change_settings(image_prompt="A new image prompt")
+        self.assertNotIn("image_request", self.controller.rows[0])
+
     def test_scan_all_pages_deduplicates_drafts_filters_and_reserves_days(self):
         claimed = video(OTHER, copyright_check_status="COPYRIGHT_CLAIMED")
         scheduled = video("Ghi123_-XYZ", scheduled_publishing_details={"publishTimeSeconds": STAMP})
@@ -507,7 +539,7 @@ class PublishingControllerTests(unittest.TestCase):
         self.controller._worker("run", create_run_context("publishing-auth-pause"))
         self.assertEqual([item["status"] for item in self.controller.rows], ["waiting_session", "scanned"])
         self.image.generate.assert_not_called()
-        self.reference.find.assert_not_called()
+        self.reference.find.assert_called_once()
         self.module.copy_metadata.assert_not_called()
         self.image.close.assert_not_called()
         self.assertIs(self.controller.image_session, self.image)

@@ -7,6 +7,7 @@ import os
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -15,7 +16,7 @@ from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 
 from src.publishing_browser import ChatGPTImageBrowser
-from src.task_runtime import bind_run_context, create_run_context
+from src.task_runtime import TaskStopped, bind_run_context, create_run_context
 
 
 IMAGE = "data:image/svg+xml;base64," + base64.b64encode(
@@ -50,13 +51,18 @@ editor.addEventListener('input', updateSend);
 form.onsubmit = event => {
     event.preventDefault(); window.submissions.push(editor.innerText);
     history.pushState({}, '', '/c/local-fixture');
-    document.querySelector('#messages').innerHTML =
-        '<div data-testid="generated-image-gallery"><button data-testid="generated-image-preview" aria-label="Generated image 1"><img src="' + generated + '"></button></div>';
+    const message=document.createElement('div'); message.textContent=editor.innerText;
+    document.querySelector('#messages').append(message);
+    const result=generated.split(',')[0]+','+btoa(atob(generated.split(',')[1]).replace('</svg>', '<!--request-'+window.submissions.length+'--></svg>'));
+    document.querySelector('#messages').insertAdjacentHTML('beforeend',
+        '<div data-testid="generated-image-gallery"><button data-testid="generated-image-preview" aria-label="Generated image"><img src="' + result + '"></button></div>');
     editor.innerText = ''; updateSend();
     // The image viewer hides the composer/account and uses no assistant article.
     document.querySelector('main').hidden = true;
 };
 window.finishManualLogin = () => { document.title = 'ChatGPT'; document.querySelector('main').hidden = false; };
+document.addEventListener('keydown', event=>{if(event.key==='Escape')document.querySelector('main').hidden=false;});
+document.querySelector('#messages').innerHTML='<div data-testid="generated-image-gallery"><button data-testid="generated-image-preview"><img src="'+generated+'"></button></div>';
 </script>""".replace("__IMAGE__", IMAGE)
 
 
@@ -117,7 +123,7 @@ class ChatGPTComposerBrowserTests(unittest.TestCase):
             output = Path(folder) / "generated.svg"
             run = create_run_context("local-composer-test")
             waiting, manual_done = threading.Event(), threading.Event()
-            errors, receipts, states = [], [], []
+            errors, receipts, states, requests = [], [], [], []
 
             def state_changed(state, message):
                 states.append(state)
@@ -130,7 +136,7 @@ class ChatGPTComposerBrowserTests(unittest.TestCase):
                 try:
                     with bind_run_context(run):
                         browser.generate(reference, "Draw a blue thumbnail", {"title": "Local song", "description": "Local description"}, output,
-                                         on_state=state_changed, on_conversation=receipts.append)
+                                         on_state=state_changed, on_conversation=receipts.append, video_id="Abc123_-XYZ", on_request=requests.append)
                 except Exception as exc:
                     errors.append(exc)
 
@@ -159,8 +165,30 @@ class ChatGPTComposerBrowserTests(unittest.TestCase):
                 self.assertIn("Title video: Local song", result["prompts"][0])
                 # Resuming a saved receipt reads the image without a second send.
                 browser.generate(reference, "Draw a blue thumbnail", {"title": "Local song", "description": "Local description"}, output,
-                                 conversation_url=receipts[0])
+                                 conversation_url=receipts[0], video_id="Abc123_-XYZ", request=requests[-1])
                 self.assertEqual(driver.execute_script("return window.submissions.length"), 1)
+                first_bytes=output.read_bytes()
+                with patch.object(browser.driver, 'get', wraps=browser.driver.get) as navigate:
+                    second=Path(folder)/'second.svg'
+                    browser.generate(reference, "Draw second", {"title":"Second song","description":"Second"}, second,
+                                     video_id="Def123_-XYZ", on_request=requests.append)
+                    navigate.assert_not_called()
+                self.assertNotEqual(first_bytes, second.read_bytes())
+                self.assertEqual(driver.execute_script("return window.submissions.length"), 2)
+                browser.generate(reference, "Draw blue", {"title":"Local song","description":"Local description"}, output,
+                                 video_id="Abc123_-XYZ", request=requests[1])
+                self.assertEqual(output.read_bytes(), first_bytes)
+                self.assertEqual(driver.execute_script("return window.submissions.length"), 2)
+                self.assertIsNone(browser._completed_gallery_image(browser.driver, marker="[TV-VIDEO not-sent]", require_prompt=True))
+                stopped_requests=[]
+                def stop_before_click(request):
+                    stopped_requests.append(request)
+                    run.request_stop()
+                with bind_run_context(run), self.assertRaises(TaskStopped):
+                    browser.generate(reference, "Cancelled", {"title":"Cancelled song","description":""}, output,
+                                     video_id="Ghi123_-XYZ", on_request=stop_before_click)
+                self.assertEqual(stopped_requests[-1]["status"], "not_sent")
+                self.assertEqual(driver.execute_script("return window.submissions.length"), 2)
             finally:
                 manual_done.set()
                 run.request_stop()

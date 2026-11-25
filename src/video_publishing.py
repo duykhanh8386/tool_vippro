@@ -67,6 +67,20 @@ def publishing_row_selectable(row) -> bool:
     return not publishing_row_disabled_reason(row)
 
 REFERENCE_SELECTION_VERSION = 2
+
+
+def thumbnail_file_stem(title, video_id):
+    if not re.fullmatch(r"[A-Za-z0-9_-]{11}", str(video_id)):
+        raise ValueError("Video ID không hợp lệ để lưu thumbnail.")
+    text = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", str(title or "")).strip(" .") or "Thumbnail"
+    if text.split(".", 1)[0].upper() in {"CON", "PRN", "AUX", "NUL", *("COM" + str(n) for n in range(1, 10)), *("LPT" + str(n) for n in range(1, 10))}:
+        text = "_" + text
+    while len(text.encode("utf-16-le")) > 160:
+        text = text[:-1]
+    text = text.rstrip(" .") or "Thumbnail"
+    return text + " [" + video_id + "]"
+
+
 _SOURCE_ID_SUFFIX = re.compile(r"\[([A-Za-z0-9_-]{11})\]\s*(?:\.(?:mp4|m4v|mkv|mov|webm))?\s*$", re.I)
 
 
