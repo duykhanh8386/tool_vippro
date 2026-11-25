@@ -468,6 +468,23 @@ class PublishingControllerTests(unittest.TestCase):
             self.assertEqual(self.reference.find.call_count, 1)
             self.assertEqual(self.thumbnail.upload.call_count, 1)
 
+    def test_resume_after_chatgpt_pause_reuses_valid_source_without_searching_again(self):
+        reference = {**REFERENCE, "selection_version": REFERENCE_SELECTION_VERSION,
+                     "selection": "first", "target_duration_seconds": 60}
+        self.controller.rows = [row(status="waiting_session", reference=reference, duration_seconds=60, publish_at=STAMP,
+                                    conversation_url="https://chatgpt.com/c/keep")]
+        self.reference.find.side_effect = ValueError("Search temporarily unavailable")
+        with tempfile.TemporaryDirectory() as folder, patch("src.video_publishing_tasks.download_reference_image", return_value="reference.jpg"), \
+                patch("src.video_publishing_tasks.normalize_thumbnail", return_value="thumbnail.jpg"):
+            self.controller.settings["output_folder"] = folder
+            self.controller._worker("run", create_run_context("publishing-resume-source"))
+        self.reference.find.assert_not_called()
+        self.image.generate.assert_called_once()
+        self.assertEqual(self.image.generate.call_args.kwargs["conversation_url"], "https://chatgpt.com/c/keep")
+        self.assertEqual(self.controller.rows[0]["reference"], reference)
+        self.assertEqual(self.controller.rows[0]["status"], "successful")
+        self.module.schedule.assert_called_once()
+
     def test_storage_failure_stops_before_remote_mutation(self):
         self.controller.rows = [row(publish_at=STAMP)]
         self.storage.fail = True

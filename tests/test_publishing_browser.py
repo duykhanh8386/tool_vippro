@@ -7,7 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from src.publishing_browser import ChatGPTImageBrowser, PublishingBrowserError, StudioThumbnailBrowser, YouTubeReferenceBrowser, search_result_duration
+from src.publishing_browser import ChatGPTImageBrowser, PublishingBrowserError, StudioThumbnailBrowser, YouTubeReferenceBrowser, loaded_search_results, search_result_duration, wait_for
 from src.task_runtime import TaskStopped
 
 VIDEO = "Abc123_-XYZ"
@@ -160,6 +160,37 @@ class ReferencePriorityTests(unittest.TestCase):
         self.assertEqual(found["thumbnail"], "large")
         self.assertEqual(found["duration_seconds"], 123)
         self.driver.get.assert_called_once_with("https://www.youtube.com/watch?v=" + VIDEO)
+
+    def test_partial_initial_data_is_polled_until_video_results_are_ready(self):
+        self.driver.execute_script.side_effect = [{"responseContext": {}}, {"candidates": [], "empty": False},
+                                                  {"contents": [result(VIDEO, 90), result("Def123_-XYZ", 60)]}]
+        with patch("src.publishing_browser.wait_for", side_effect=wait_for), \
+                patch("src.publishing_browser.wait_interruptibly") as pause, \
+                patch.object(self.browser, "_read_reference", return_value=source("Def123_-XYZ", 60)):
+            found = self.browser.find("0805939256", duration_seconds=60)
+        self.assertEqual(found["selection"], "duration")
+        self.assertEqual(found["video_id"], "Def123_-XYZ")
+        pause.assert_called_once_with(0.5)
+
+    def test_rendered_search_rows_work_when_initial_data_has_no_video_renderers(self):
+        self.driver.execute_script.side_effect = [{"responseContext": {}},
+                                                  {"candidates": [{"videoId": VIDEO, "lengthText": {"simpleText": "1:00"}}]}]
+        with patch.object(self.browser, "_read_reference", return_value=source(VIDEO, 60)):
+            found = self.browser.find("0805939256", duration_seconds=60)
+        self.assertEqual(found["selection"], "duration")
+        self.assertEqual(found["video_id"], VIDEO)
+
+    def test_loading_search_does_not_count_as_empty_results(self):
+        self.driver.execute_script.side_effect = [{"responseContext": {}}, {"candidates": [], "empty": False}]
+        self.assertIsNone(loaded_search_results(self.driver))
+
+    def test_explicit_empty_search_and_consent_are_reported_separately(self):
+        self.driver.execute_script.side_effect = [{}, {"candidates": [], "empty": True}]
+        with self.assertRaisesRegex(PublishingBrowserError, "Kết quả YouTube không có"):
+            self.browser.find("0805939256")
+        self.driver.execute_script.side_effect = [{}, {"candidates": [], "blocked": True}]
+        with self.assertRaisesRegex(PublishingBrowserError, "đồng ý cookie hoặc xác minh"):
+            self.browser.find("0805939256")
 
     def test_wrong_video_details_and_unavailable_player_are_rejected(self):
         for player in ({"videoDetails": {"videoId": "Def123_-XYZ"}}, {"playabilityStatus": {"status": "ERROR"}}):

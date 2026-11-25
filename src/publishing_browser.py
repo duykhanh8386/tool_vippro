@@ -112,6 +112,46 @@ def search_result_duration(renderer):
     return positive_seconds(seconds)
 
 
+def loaded_search_results(driver):
+    """Wait for actual search rows, not just YouTube's early response object."""
+    data = driver.execute_script("return window.ytInitialData")
+    candidates = list(video_search_candidates(data))
+    if candidates:
+        return {"candidates": candidates}
+    # ytInitialData can exist before results arrive. Also read rendered rows
+    # when the visible UI is available but the initial response is incomplete.
+    page = driver.execute_script("""
+        const videos = [];
+        for (const row of document.querySelectorAll('ytd-search ytd-video-renderer')) {
+            if (row.closest('ytd-ad-slot-renderer, ytd-in-feed-ad-layout-renderer, ytd-promoted-sparkles-web-renderer, ytd-reel-shelf-renderer')) continue;
+            const anchor = row.querySelector('a#video-title[href], a#thumbnail[href]');
+            if (!anchor) continue;
+            const url = new URL(anchor.href, location.href);
+            if (url.origin !== location.origin || url.pathname !== '/watch') continue;
+            const videoId = url.searchParams.get('v');
+            if (!/^[A-Za-z0-9_-]{11}$/.test(videoId || '')) continue;
+            const badge = row.querySelector('ytd-thumbnail-overlay-time-status-renderer');
+            videos.push({videoId, lengthText: {simpleText: badge?.textContent?.trim() || ''}});
+        }
+        const empty = Array.from(document.querySelectorAll('ytd-search ytd-message-renderer'))
+            .some(node => node.getClientRects().length && node.textContent.trim());
+        const blocked = location.hostname === 'consent.youtube.com' || location.pathname.startsWith('/sorry')
+            || Array.from(document.querySelectorAll('form[action*="consent.youtube.com"], iframe[src*="recaptcha"]'))
+                .some(node => node.getClientRects().length && getComputedStyle(node).visibility !== 'hidden');
+        return {candidates: videos, empty, blocked};
+    """)
+    if not isinstance(page, dict):
+        return None
+    if page.get("blocked"):
+        raise PublishingBrowserError("YouTube đang yêu cầu đồng ý cookie hoặc xác minh trong cửa sổ tìm kiếm; chưa đọc được kết quả tham chiếu.")
+    rows = page.get("candidates")
+    if isinstance(rows, list):
+        rows = [row for row in rows if isinstance(row, dict) and re.fullmatch(r"[A-Za-z0-9_-]{11}", str(row.get("videoId", "")))]
+        if rows:
+            return {"candidates": rows}
+    return {"candidates": []} if page.get("empty") else None
+
+
 class YouTubeReferenceBrowser:
     def __init__(self):
         self.driver = None
@@ -201,16 +241,16 @@ class YouTubeReferenceBrowser:
             raise PublishingBrowserError("Không có tên bài nhạc để tìm kiếm sau khi đọc ID cuối tên.")
         driver = self._browser()
         driver.get("https://www.youtube.com/results?search_query=" + quote(query))
-        data = wait_for(lambda: driver.execute_script("return window.ytInitialData"),
-                        message="Không đọc được tìm kiếm YouTube. Kiểm tra trang đồng ý cookie hoặc xác minh trong Chrome.")
+        results = wait_for(lambda: loaded_search_results(driver), timeout=45,
+                           message="YouTube chưa tải xong danh sách kết quả tìm kiếm. Chưa thể kết luận không có video; kiểm tra cửa sổ YouTube rồi tìm lại tham chiếu.")
         candidates, seen = [], set(excluded)
-        for renderer in video_search_candidates(data):
+        for renderer in results["candidates"]:
             identifier = renderer["videoId"]
             if identifier not in seen:
                 seen.add(identifier)
                 candidates.append((identifier, search_result_duration(renderer)))
         if not candidates:
-            raise PublishingBrowserError("Không tìm thấy video tham chiếu cho tên bài nhạc này.")
+            raise PublishingBrowserError("Kết quả YouTube không có video tham chiếu ngoài danh sách đang xử lý. Kiểm tra lại bài nhạc tìm kiếm.")
         if target is not None:
             matching = [(identifier, seconds) for identifier, seconds in candidates if seconds is not None and abs(seconds - target) < 2]
             matching.sort(key=lambda candidate: abs(candidate[1] - target))
@@ -407,7 +447,7 @@ class ChatGPTImageBrowser:
                 if state == "ready":
                     return driver
                 wait_interruptibly(0.5)
-            raise ChatGPTSessionNeedsAction("Hết thời gian chờ phiên ChatGPT sẵn sàng. Tool đã dừng lượt xử lý và giữ cửa sổ; hoàn tất đăng nhập/xác minh rồi bấm Tự động xử lý & lên lịch để tiếp tục.", reason=state)
+            raise ChatGPTSessionNeedsAction("Hết thời gian chờ phiên ChatGPT sẵn sàng. Tool đã dừng lượt xử lý và giữ cửa sổ; hoàn tất đăng nhập/xác minh rồi bấm Tự động SEO, tạo thumbnail & lên lịch để tiếp tục.", reason=state)
 
     def generate(self, reference_image, prompt, reference, destination, *, conversation_url="",
                  on_conversation=lambda url: None, on_state=lambda state, message: None):

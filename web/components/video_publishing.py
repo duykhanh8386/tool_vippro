@@ -158,7 +158,7 @@ def create_video_publishing_page():
             buttons["select"].set_enabled(not busy and selectable_count > 0)
             buttons["deselect"].set_enabled(not busy and shown_selected > 0)
             buttons["clear_selection"].set_enabled(not busy and chosen > 0)
-            for key in ("references", "plan", "run"):
+            for key in ("plan", "run"):
                 buttons[key].set_enabled(not busy and chosen > 0)
             message.set_text(data["message"])
             summary.set_text(f"{len(data['rows'])} đã quét · {len(filtered)} trong bộ lọc · {selectable_count} có thể tích chọn · {chosen} đã chọn toàn bộ ({chosen - shown_selected} ngoài bộ lọc) · {sum(row['status'] == 'successful' for row in data['rows'])} đã lên lịch")
@@ -243,8 +243,7 @@ def create_video_publishing_page():
                 buttons["select"] = ui.button("Chọn tất cả trong bộ lọc", icon="checklist", on_click=select_all).props("outline")
                 buttons["deselect"] = ui.button("Bỏ chọn trong bộ lọc", icon="remove_done", on_click=lambda: invoke(lambda: controller.select_filtered(selected=False))).props("outline")
                 buttons["clear_selection"] = ui.button("Bỏ chọn tất cả", icon="clear_all", on_click=lambda: invoke(lambda: controller.select([]))).props("flat")
-                buttons["references"] = ui.button("Tìm video tham chiếu", icon="search", on_click=lambda: invoke(lambda: controller.start("references"))).props("outline")
-                buttons["run"] = ui.button("Tự động xử lý & lên lịch", icon="play_arrow", on_click=lambda: invoke(lambda: controller.start("run")))
+                buttons["run"] = ui.button("Tự động SEO, tạo thumbnail & lên lịch", icon="play_arrow", on_click=lambda: invoke(lambda: controller.start("run")))
                 buttons["stop"] = ui.button("Dừng", icon="stop", on_click=lambda: invoke(controller.stop)).props("outline color=negative")
             with ui.row().classes("w-full gap-3 items-end flex-wrap"):
                 fields["scope"] = ui.select(VIDEO_SCOPE_LABELS, label="Lọc loại video đã quét", value=settings["scope"],

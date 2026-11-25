@@ -80,10 +80,10 @@ class PublishingPageSelectionTests(unittest.TestCase):
                 self.refresh()
         self.assertTrue(self.controller.rows[0]["selected"])
         self.assertEqual([item["video_id"] for item in self.table.selected], [identifier])
-        self.assertTrue(self.button("Tự động xử lý & lên lịch").enabled)
+        self.assertTrue(self.button("Tự động SEO, tạo thumbnail & lên lịch").enabled)
         self.checkbox(identifier, checked=False)
         self.assertFalse(self.controller.rows[0]["selected"])
-        self.assertFalse(self.button("Tự động xử lý & lên lịch").enabled)
+        self.assertFalse(self.button("Tự động SEO, tạo thumbnail & lên lịch").enabled)
 
     def test_filter_changes_and_checkbox_events_preserve_other_selected_types(self):
         first, second = (item["video_id"] for item in self.controller.rows[:2])
@@ -152,7 +152,7 @@ class PublishingPageSelectionTests(unittest.TestCase):
     def test_session_can_be_prepared_before_selecting_any_video(self):
         self.assertTrue(self.button("Mở / kiểm tra phiên").enabled)
         self.assertTrue(self.button("Đóng cửa sổ phiên").enabled)
-        self.assertFalse(self.button("Tự động xử lý & lên lịch").enabled)
+        self.assertFalse(self.button("Tự động SEO, tạo thumbnail & lên lịch").enabled)
 
     def test_session_preparation_disables_actions_but_not_as_a_running_batch(self):
         self.controller.session_busy = True
