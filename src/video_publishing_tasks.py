@@ -16,7 +16,7 @@ from src.state_manager import state_manager
 from src.task_runtime import TaskStopped, bind_run_context, check_stopped, create_run_context
 from src.utils import get_channels_info
 from src.video_publishing import (
-    COPYRIGHT_LABELS, REFERENCE_SELECTION_VERSION, copyright_category, first_song,
+    COPYRIGHT_LABELS, PUBLISHING_SCAN_SCHEMA_VERSION, REFERENCE_SELECTION_VERSION, copyright_category, first_song,
     VIDEO_SCOPE_LABELS, VIDEO_TYPE_LABELS, parse_chatgpt_cookies, plan_daily, positive_seconds,
     publishing_row_disabled_reason, publishing_row_matches, publishing_row_selectable,
     publishing_video_type, schedule_timestamp,
@@ -59,8 +59,8 @@ class VideoPublishingController:
             if not publishing_row_selectable(row):
                 row["selected"] = False
         self.message = saved.get("message", "Chọn kênh, quét trạng thái rồi tìm video tham chiếu.")
-        if any("visibility_type" not in row for row in self.rows):
-            self.message = "Danh sách lưu từ bản cũ chưa có loại video. Quét lại một lần rồi lọc và tích chọn từng nhóm."
+        if any(row.get("classification_version") != PUBLISHING_SCAN_SCHEMA_VERSION for row in self.rows):
+            self.message = "Danh sách cũ chưa được kiểm tra bằng cách nhận diện bản nháp mới. Quét lại một lần để cập nhật đúng loại video."
         self.cookie = ""
         self.busy = False
         self.revision = 0
@@ -74,7 +74,8 @@ class VideoPublishingController:
     def snapshot(self):
         with self.lock:
             return copy.deepcopy({"settings": self.settings, "rows": self.rows, "message": self.message,
-                                  "busy": self.busy, "revision": self.revision, "has_cookie": bool(self.cookie)})
+                                  "busy": self.busy, "revision": self.revision, "has_cookie": bool(self.cookie),
+                                  "needs_rescan": any(row.get("classification_version") != PUBLISHING_SCAN_SCHEMA_VERSION for row in self.rows)})
 
     def set_cookie(self, text):
         with self.lock:
@@ -240,7 +241,7 @@ class VideoPublishingController:
         rows, occupied = [], {}
         for channel_id in dict.fromkeys(channels):
             self._progress(f"Đang quét kênh {channel_id}…")
-            seen, tokens, videos = set(), set(), []
+            seen, tokens, videos = {}, set(), []
             # Include explicit draft listing; not every Studio account returns
             # drafts in the unfiltered list. Always read every page for occupancy.
             for draft_only in (False, True):
@@ -253,8 +254,17 @@ class VideoPublishingController:
                         if not re.fullmatch(r"[A-Za-z0-9_-]{11}", video.id) or video.channel_id != channel_id:
                             raise ValueError("YouTube trả về video không thuộc kênh đang quét.")
                         if video.id not in seen:
-                            seen.add(video.id)
+                            seen[video.id] = video
                             videos.append(video)
+                        elif draft_only:
+                            # Draft-specific responses may supply draftStatus
+                            # missing in the broad list. Merge that evidence;
+                            # dropping duplicates here used to lose draft rows.
+                            previous = seen[video.id]
+                            if video.draft_status is not None and video.draft_status != "" and video.draft_status != {}:
+                                previous.draft_status = copy.deepcopy(video.draft_status)
+                            if video.privacy:
+                                previous.privacy = video.privacy
                     self._progress(f"Kênh {channel_id} · đã đọc {len(videos)} video…")
                     if not next_token:
                         break
@@ -279,6 +289,7 @@ class VideoPublishingController:
                        "old_description": video.description, "song": first_song(video.title, video.description),
                        "duration_seconds": (positive_seconds(video.duration_ms) or 0) / 1000,
                        "copyright": category, "copyright_label": COPYRIGHT_LABELS[category],
+                       "classification_version": PUBLISHING_SCAN_SCHEMA_VERSION, "draft_status": copy.deepcopy(video.draft_status),
                        "visibility_type": kind, "visibility_label": VIDEO_TYPE_LABELS[kind], "selected": False, "status": "scanned"}
                 reason = publishing_row_disabled_reason(row)
                 row.update(availability_reason=reason, status="skipped" if reason else "scanned",

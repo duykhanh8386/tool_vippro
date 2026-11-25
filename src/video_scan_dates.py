@@ -39,6 +39,14 @@ def _status_indicates_draft(value: object) -> bool:
         marker in normalized for marker in ("NOTDRAFT", "NONDRAFT", "STATUSNONE", "PUBLISHED")
     ):
         return False
+    # Studio's live response uses DRAFT_STATUS_PUBLIC for unfinished uploads
+    # whose intended publication privacy is public. PUBLIC here describes the
+    # draft's target, not an already-published video. NONE is the non-draft enum.
+    if normalized in {
+        "DRAFTSTATUSPUBLIC", "DRAFTSTATUSPRIVATE", "DRAFTSTATUSUNLISTED",
+        "VIDEODRAFTSTATUSPUBLIC", "VIDEODRAFTSTATUSPRIVATE", "VIDEODRAFTSTATUSUNLISTED",
+    }:
+        return True
     return normalized in {"1", "TRUE", "DRAFT"} or normalized.endswith(("STATUSDRAFT", "STATEDRAFT"))
 
 

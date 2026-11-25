@@ -23,13 +23,14 @@ VIDEO_TYPE_LABELS = {
 }
 VIDEO_SCOPE_LABELS = {"all": "Tất cả loại video", "unpublished": "Chưa công khai (nháp / riêng tư / không công khai)", **VIDEO_TYPE_LABELS}
 SELECTABLE_COPYRIGHT_TYPES = {"clear", "limited", "partial", "blocked"}
+PUBLISHING_SCAN_SCHEMA_VERSION = 2
 
 
 def publishing_video_type(video) -> str:
-    if getattr(video, "scheduled_publishing_details", None):
-        return "scheduled"
     if _status_indicates_draft(getattr(video, "draft_status", None)) or _status_indicates_draft(getattr(video, "video_status", None)):
         return "draft"
+    if getattr(video, "scheduled_publishing_details", None):
+        return "scheduled"
     privacy = str(getattr(video, "privacy", "") or "").upper()
     for kind in ("private", "unlisted", "public"):
         if privacy == kind.upper() or privacy.endswith("_" + kind.upper()):

@@ -111,7 +111,7 @@ def create_video_publishing_page():
         try:
             busy = data["busy"]
             config = data["settings"]
-            copyright_counts = Counter(row["copyright"] for row in data["rows"])
+            copyright_counts = Counter(row["copyright"] for row in data["rows"] if publishing_row_matches(row, scope=config["scope"]))
             type_counts = Counter(row.get("visibility_type", "unknown") for row in data["rows"])
             scope_counts = {**type_counts, "all": len(data["rows"]),
                             "unpublished": sum(type_counts[key] for key in ("draft", "private", "unlisted"))}
@@ -146,7 +146,7 @@ def create_video_publishing_page():
                 buttons[key].set_enabled(not busy and chosen > 0)
             message.set_text(data["message"])
             summary.set_text(f"{len(data['rows'])} đã quét · {len(filtered)} trong bộ lọc · {selectable_count} có thể tích chọn · {chosen} đã chọn toàn bộ ({chosen - shown_selected} ngoài bộ lọc) · {sum(row['status'] == 'successful' for row in data['rows'])} đã lên lịch")
-            rescan_hint.set_visibility(any("visibility_type" not in row for row in data["rows"]))
+            rescan_hint.set_visibility(data["needs_rescan"])
             cookie_status.set_text("Đã nạp cookie cho phiên này" if data["has_cookie"] else "Chưa nạp cookie ChatGPT")
             selection = None if busy else "multiple"
             if table.selection != selection:
@@ -232,8 +232,8 @@ def create_video_publishing_page():
                                             on_change=lambda e: change("scope", e.value)).props("outlined").classes("w-96 max-w-full")
                 fields["categories"] = ui.select(COPYRIGHT_LABELS, multiple=True, clearable=True, label="Lọc trạng thái bản quyền (trống = tất cả)",
                                                  value=settings["categories"], on_change=lambda e: change("categories", list(e.value or []))).props("outlined use-chips").classes("flex-1 min-w-64")
-            ui.label("Đổi bộ lọc không cần quét lại và giữ các video đã chọn. Bạn có thể chọn nhiều nhóm rồi lên lịch một lượt. Video đã công khai, đã lên lịch hoặc chưa đọc được trạng thái có checkbox khóa kèm lý do.").classes("text-xs text-gray-500")
-            rescan_hint = ui.label("Danh sách lưu từ bản cũ chưa có loại video. Bấm Quét video lại một lần để dùng bộ lọc và checkbox mới.").classes("text-sm text-amber-700")
+            ui.label("Bảng áp dụng đồng thời loại video và bản quyền. Xóa bộ lọc bản quyền để thấy đủ video thuộc loại đã chọn. Đổi bộ lọc vẫn giữ các video đã chọn; video bị khóa checkbox có lý do tại từng dòng.").classes("text-xs text-gray-500")
+            rescan_hint = ui.label("Danh sách cũ chưa được kiểm tra bằng cách nhận diện bản nháp mới. Bấm Quét video lại một lần để cập nhật đúng loại video.").classes("text-sm text-amber-700")
             message = ui.label().classes("text-sm text-emerald-700 break-words")
             summary = ui.label().classes("text-xs text-gray-500")
             columns = [{"name": key, "label": label, "field": key, "align": "left"} for key, label in (

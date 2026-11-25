@@ -11,7 +11,9 @@ Mở tác vụ **SEO, thumbnail & lên lịch** trong menu của Tuất Videos (
 
 Tool giữ nguyên lịch đã có và không lên lịch lại video đã công khai. Các video này vẫn xem được qua bộ lọc, nhưng checkbox khóa và hiện lý do. Video đang kiểm tra bản quyền hoặc chưa đọc được trạng thái/loại video cũng có lý do rõ ràng; cần quét lại khi dữ liệu sẵn sàng. Một video riêng tư không bị đánh dấu bỏ qua chỉ vì đang xem bộ lọc Bản nháp. Các video đã chọn được xử lý theo loại bản quyền ở thời điểm chọn, kể cả khi sau đó bạn đổi bộ lọc hiển thị. Hoàn thành kiểm tra bản quyền đơn thuần không được coi là xác nhận video không có khiếu nại.
 
-Sau khi cập nhật từ phiên bản chưa lưu loại video, bấm **Quét video** lại một lần để điền loại video cho danh sách cũ, rồi chọn bộ lọc và tích checkbox.
+Sau khi cập nhật cách nhận diện bản nháp, bấm **Quét video** lại một lần để cập nhật loại video của danh sách đã lưu, rồi chọn bộ lọc và tích checkbox. Số lượng ở bộ lọc loại video là tổng loại đã quét; bảng còn áp dụng bộ lọc bản quyền. Ví dụ có 39 bản nháp nhưng chỉ 2 bản không có vấn đề bản quyền thì chọn nhóm này chỉ hiện 2; xóa bộ lọc bản quyền để xem đủ 39.
+
+Studio có thể trả `draftStatus=DRAFT_STATUS_PUBLIC` cùng `privacy=VIDEO_PRIVACY_PRIVATE` cho một bản nháp dự định công khai. Tool nhận diện từ trạng thái nháp và kết quả truy vấn bản nháp, giữ lại bằng chứng bổ sung khi gộp các lượt quét trùng ID. `DRAFT_STATUS_NONE` vẫn là video không còn ở trạng thái nháp; không suy ra mọi video riêng tư đều là bản nháp.
 
 Tiến độ, nguồn tham chiếu, hội thoại tạo ảnh, đường dẫn thumbnail và từng bước đã xong được lưu qua SQLite. Bấm **Dừng** rồi chạy tiếp các dòng đã chọn để tiếp tục. Khi một yêu cầu đã được gửi nhưng mất phản hồi, tool đọc kết quả trước khi gửi lại. Nếu đã lưu hội thoại ChatGPT, tool quay lại lấy ảnh trong hội thoại đó. Đổi prompt sẽ xóa kết quả ảnh chưa tải lên để có thể tạo lại.
 

@@ -86,6 +86,11 @@ class ListVideosModule(IModule):
                 if not copyright_status:
                     not_mon = prechecks.get("videoUploadChecksNotMonetized", {})
                     copyright_status = not_mon.get("copyrightCheck", {}).get("checkStatus", "")
+                draft_status = item.get("draftStatus", "")
+                # Use filtered membership only when the status is absent,
+                # preserving explicit false/NONE after a concurrent save.
+                if draft_only and (draft_status is None or draft_status == "" or draft_status == {}):
+                    draft_status = {"isDraft": True}
                 videos.append(
                     Video(
                         id=item.get("videoId", ""),
@@ -99,7 +104,7 @@ class ListVideosModule(IModule):
                         privacy=item.get("privacy", ""),
                         video_status=item.get("status", ""),
                         copyright_check_status=copyright_status,
-                        draft_status=item.get("draftStatus", ""),
+                        draft_status=draft_status,
                         scheduled_publishing_details=item.get(
                             "scheduledPublishingDetails", ""
                         ),
