@@ -112,6 +112,51 @@ class ChatGPTSessionTests(unittest.TestCase):
         self.assertEqual(error.exception.reason, "login")
         self.driver.quit.assert_not_called()
 
+    def test_chat_work_composer_without_old_id_is_recognized(self):
+        editor, account = Mock(), Mock()
+        def elements(_by, selector):
+            if "form [contenteditable='true'][role='textbox']" in selector:
+                return [editor]
+            if "accounts-profile-button" in selector:
+                return [account]
+            return []
+        self.driver.find_elements.side_effect = elements
+        self.assertIs(self.browser.ensure_ready(), self.driver)
+        self.assertIs(self.browser._editor(self.driver), editor)
+
+    def test_active_job_waits_for_manual_verification_then_continues_in_same_window(self):
+        progress = Mock()
+        with patch.object(self.browser, "_state", side_effect=["verification", "login", "loading", "ready"]), \
+                patch("src.publishing_browser.wait_interruptibly") as pause:
+            self.assertIs(self.browser.ensure_ready(wait_for_user=True, on_state=progress), self.driver)
+        self.assertEqual([call.args[0] for call in progress.call_args_list], ["verification", "login", "loading", "ready"])
+        self.assertEqual(pause.call_count, 3)
+        self.factory.assert_called_once()
+        self.driver.get.assert_called_once()
+        self.driver.quit.assert_not_called()
+
+    def test_stop_during_manual_verification_never_submits_prompt(self):
+        run = create_run_context("chatgpt-stop-waiting")
+        self.addCleanup(run.cleanup)
+        def stopped(_seconds):
+            run.request_stop()
+        with bind_run_context(run), patch.object(self.browser, "_state", return_value="verification"), \
+                patch("src.publishing_browser.wait_interruptibly", side_effect=stopped), \
+                patch.object(self.browser, "_generate") as generate, self.assertRaises(TaskStopped):
+            self.browser.generate("ref.jpg", "prompt", {}, "out.jpg")
+        generate.assert_not_called()
+        self.driver.quit.assert_not_called()
+
+    def test_waiting_times_out_without_clicking_challenge_or_submitting(self):
+        with patch.object(self.browser, "_state", return_value="verification"), \
+                patch("src.publishing_browser.time.monotonic", side_effect=[0, 0, 601]), \
+                patch("src.publishing_browser.wait_interruptibly"), self.assertRaises(ChatGPTSessionNeedsAction) as error:
+            self.browser.ensure_ready(wait_for_user=True)
+        self.assertEqual(error.exception.reason, "verification")
+        self.driver.find_elements.assert_not_called()
+        self.driver.execute_script.assert_not_called()
+        self.driver.quit.assert_not_called()
+
     def test_hidden_background_challenge_frame_does_not_block_ready_account(self):
         editor, account, background = Mock(), Mock(), Mock()
         editor.is_displayed.return_value = account.is_displayed.return_value = True

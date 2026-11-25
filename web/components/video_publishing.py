@@ -224,7 +224,7 @@ def create_video_publishing_page():
                 buttons["clear_cookie"] = ui.button("Bỏ cookie nhập tay", icon="clear", on_click=lambda: invoke(lambda: controller.set_cookie(""))).props("flat")
             cookie_status = ui.label().classes("text-xs text-gray-500")
             session_status = ui.label().classes("text-sm text-emerald-700 break-words")
-            ui.label("Chrome lưu phiên riêng trên máy để dùng lại. Bạn có thể nạp cookie hoặc đăng nhập trong phiên này. Nếu cần xác minh, tool dừng cả lượt xử lý và giữ cửa sổ để bạn hoàn tất thủ công, rồi kiểm tra phiên và chạy tiếp. Ô cookie không được lưu vào cấu hình; Bỏ cookie nhập tay không đăng xuất phiên Chrome đã lưu.").classes("text-xs text-gray-500")
+            ui.label("Chrome lưu phiên riêng trên máy để dùng lại. Bạn có thể nạp cookie hoặc đăng nhập trong phiên này. Khi tác vụ đang chạy, tool chờ tối đa 10 phút để bạn đăng nhập/xác minh thủ công và tự tiếp tục gửi prompt khi sẵn sàng; bấm Dừng để hủy chờ. Ô cookie không được lưu vào cấu hình; Bỏ cookie nhập tay không đăng xuất phiên Chrome đã lưu.").classes("text-xs text-gray-500")
             fields["image_prompt"] = ui.textarea("Prompt chung vẽ lại thumbnail", value=settings["image_prompt"],
                                                  on_change=lambda e: change("image_prompt", e.value or "")).props("outlined autogrow").classes("w-full")
             with ui.row().classes("w-full gap-3 items-end"):

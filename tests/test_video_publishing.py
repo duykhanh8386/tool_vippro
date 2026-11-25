@@ -500,6 +500,46 @@ class PublishingControllerTests(unittest.TestCase):
         self.module.schedule.assert_not_called()
         self.image.close.assert_not_called()
 
+    def test_waiting_session_stays_active_and_continues_same_video_when_ready(self):
+        self.controller.rows = [row(publish_at=STAMP)]
+        self.controller.busy = True
+        observed = []
+        def ready(**kwargs):
+            self.assertTrue(kwargs["wait_for_user"])
+            kwargs["on_state"]("verification", "Waiting for manual verification")
+            snapshot = self.controller.snapshot()
+            observed.append((snapshot["busy"], snapshot["rows"][0]["status"]))
+            self.image.generate.assert_not_called()
+            kwargs["on_state"]("ready", "Ready")
+        self.image.ensure_ready.side_effect = ready
+        with tempfile.TemporaryDirectory() as folder, patch("src.video_publishing_tasks.download_reference_image", return_value="reference.jpg"), \
+                patch("src.video_publishing_tasks.normalize_thumbnail", return_value="thumbnail.jpg"):
+            self.controller.settings["output_folder"] = folder
+            self.controller._worker("run", create_run_context("publishing-auto-resume"))
+        self.assertEqual(observed, [(True, "waiting_session")])
+        self.image.generate.assert_called_once()
+        self.module.schedule.assert_called_once()
+        self.assertEqual(self.controller.rows[0]["status"], "successful")
+        self.image.close.assert_not_called()
+
+    def test_stop_while_waiting_marks_row_stopped_and_does_not_touch_later_videos(self):
+        self.controller.rows = [row(publish_at=STAMP), row(OTHER, publish_at=STAMP + 86400)]
+        self.controller.busy = True
+        run = create_run_context("publishing-cancel-auth-wait")
+        self.controller.run = run
+        def stop(**kwargs):
+            kwargs["on_state"]("verification", "Waiting")
+            self.controller.stop()
+            run.checkpoint()
+        self.image.ensure_ready.side_effect = stop
+        self.controller._worker("run", run)
+        self.assertEqual([item["status"] for item in self.controller.rows], ["stopped", "scanned"])
+        self.assertFalse(self.controller.busy)
+        self.image.generate.assert_not_called()
+        self.module.copy_metadata.assert_not_called()
+        self.module.schedule.assert_not_called()
+        self.image.close.assert_not_called()
+
     def test_same_image_session_is_reused_for_separate_preparations_and_runs(self):
         factory = Mock(return_value=self.image)
         self.controller.image_factory = factory
@@ -548,13 +588,16 @@ class PublishingControllerTests(unittest.TestCase):
         self.assertEqual(self.storage.load_state(STATE_KEY)["rows"][0]["conversation_url"], "https://chatgpt.com/c/accepted-request")
 
     def test_reload_restores_checkpoints_but_requires_new_cookie(self):
-        self.controller.rows = [row(status="processing", publish_at=STAMP, reference=REFERENCE, thumbnail_uploaded=True)]
-        self.controller._save()
-        restored = VideoPublishingController(storage=self.storage)
-        self.assertEqual(restored.rows[0]["status"], "stopped")
-        self.assertEqual(restored.rows[0]["publish_at"], STAMP)
-        self.assertTrue(restored.rows[0]["thumbnail_uploaded"])
-        self.assertFalse(restored.snapshot()["has_cookie"])
+        for status in ("processing", "waiting_session"):
+            with self.subTest(status=status):
+                self.controller.rows = [row(status=status, publish_at=STAMP, reference=REFERENCE, thumbnail_uploaded=True)]
+                self.controller._save()
+                restored = VideoPublishingController(storage=self.storage)
+                self.assertEqual(restored.rows[0]["status"], "stopped")
+                self.assertEqual(restored.rows[0]["publish_at"], STAMP)
+                self.assertTrue(restored.rows[0]["thumbnail_uploaded"])
+                self.assertFalse(restored.snapshot()["has_cookie"])
+                self.assertFalse(restored.busy)
 
     def test_query_edit_invalidates_reference_before_remote_writes(self):
         self.controller.rows = [row(reference=REFERENCE, thumbnail_path="old.jpg", conversation_url="https://chatgpt.com/c/abc")]

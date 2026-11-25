@@ -34,7 +34,7 @@ class PublishingBrowserError(ValueError):
 
 
 class ChatGPTSessionNeedsAction(PublishingBrowserError):
-    """Pause the whole batch while the user restores this same browser session."""
+    """End the batch when this browser session cannot be restored in time."""
 
     def __init__(self, message, *, reason="session"):
         super().__init__(message)
@@ -272,6 +272,11 @@ def normalize_thumbnail(source, destination):
 
 
 class ChatGPTImageBrowser:
+    EDITOR_SELECTORS = (
+        "#prompt-textarea",
+        "form [contenteditable='true'][role='textbox'], form textarea, [contenteditable='true'][role='textbox'][aria-label='Ask ChatGPT']",
+    )
+
     def __init__(self, cookie_text="", *, profile_dir=None):
         self.cookies = parse_chatgpt_cookies(cookie_text) if str(cookie_text or "").strip() else []
         self._cookies_pending = bool(self.cookies)
@@ -334,8 +339,18 @@ class ChatGPTImageBrowser:
                 raise ChatGPTSessionNeedsAction("Chrome chưa mở được ChatGPT. Giữ cửa sổ này để kiểm tra kết nối rồi bấm Mở / kiểm tra phiên.", reason="browser") from None
         return self.driver
 
-    @staticmethod
-    def _state(driver):
+    @classmethod
+    def _editor(cls, driver):
+        # The current Chat/Work composer has no prompt-textarea id. Keep the
+        # older selector, then look within the composer instead of sidebar UI.
+        for selector in cls.EDITOR_SELECTORS:
+            for node in driver.find_elements(By.CSS_SELECTOR, selector):
+                if node.is_displayed() and node.is_enabled():
+                    return node
+        return None
+
+    @classmethod
+    def _state(cls, driver):
         try:
             title = str(driver.title or "").lower()
             if any(marker in title for marker in ("just a moment", "verify you are human", "security verification")):
@@ -343,7 +358,7 @@ class ChatGPTImageBrowser:
             challenges = driver.find_elements(By.CSS_SELECTOR, "iframe[src*='challenges.cloudflare.com'], #challenge-running, #challenge-stage, #cf-challenge-running")
             if any(node.is_displayed() for node in challenges):
                 return "verification"
-            editor = next((node for node in driver.find_elements(By.CSS_SELECTOR, "#prompt-textarea") if node.is_displayed()), None)
+            editor = cls._editor(driver)
             account = driver.find_elements(By.CSS_SELECTOR, "[data-testid='accounts-profile-button'], [data-testid='profile-button'], button[aria-label*='profile'], button[aria-label*='Profile']")
             if editor is not None and any(node.is_displayed() for node in account):
                 return "ready"
@@ -364,28 +379,44 @@ class ChatGPTImageBrowser:
         if state == "closed":
             raise ChatGPTSessionNeedsAction("Cửa sổ phiên ChatGPT đã đóng. Bấm Mở / kiểm tra phiên để mở lại phiên đã lưu.", reason=state)
 
-    def ensure_ready(self, *, on_status=lambda message: None, timeout=30):
+    def ensure_ready(self, *, on_status=lambda message: None, timeout=None,
+                     wait_for_user=False, on_state=lambda state, message: None):
         with self.lock:
             on_status("Đang kiểm tra phiên ChatGPT đã lưu…")
             driver = self._browser()
-            deadline = time.monotonic() + timeout
+            deadline = time.monotonic() + (timeout if timeout is not None else (600 if wait_for_user else 30))
+            previous_state = None
+            state = "loading"
             while time.monotonic() < deadline:
                 check_stopped()
                 state = self._state(driver)
-                self._raise_for_state(state)
+                check_stopped()
+                if not wait_for_user or state == "closed":
+                    self._raise_for_state(state)
+                messages = {
+                    "ready": "Phiên ChatGPT đã đăng nhập và sẵn sàng.",
+                    "verification": "Đang chờ bạn xác minh Cloudflare trong cửa sổ ChatGPT đã mở. Xác minh xong tool tự tiếp tục gửi prompt; bấm Dừng để hủy chờ.",
+                    "login": "Đang chờ bạn đăng nhập trong cửa sổ ChatGPT đã mở. Đăng nhập xong tool tự tiếp tục; bấm Dừng để hủy chờ.",
+                    "loading": "Đang chờ ô nhập và tài khoản ChatGPT sẵn sàng; tool tự tiếp tục khi tải xong. Bấm Dừng để hủy chờ.",
+                }
+                if state != previous_state:
+                    message = messages[state]
+                    on_status(message)
+                    on_state(state, message)
+                    previous_state = state
                 if state == "ready":
-                    on_status("Phiên ChatGPT đã đăng nhập và sẵn sàng.")
                     return driver
                 wait_interruptibly(0.5)
-            raise ChatGPTSessionNeedsAction("Phiên ChatGPT chưa sẵn sàng. Kiểm tra đăng nhập/xác minh trong cửa sổ đang mở; tool giữ phiên và dừng lượt xử lý tại đây.", reason="loading")
+            raise ChatGPTSessionNeedsAction("Hết thời gian chờ phiên ChatGPT sẵn sàng. Tool đã dừng lượt xử lý và giữ cửa sổ; hoàn tất đăng nhập/xác minh rồi bấm Tự động xử lý & lên lịch để tiếp tục.", reason=state)
 
-    def generate(self, reference_image, prompt, reference, destination, *, conversation_url="", on_conversation=lambda url: None):
+    def generate(self, reference_image, prompt, reference, destination, *, conversation_url="",
+                 on_conversation=lambda url: None, on_state=lambda state, message: None):
         with self.lock:
             self._submission_started = False
             try:
-                self.ensure_ready()
+                self.ensure_ready(wait_for_user=True, on_state=on_state)
                 return self._generate(reference_image, prompt, reference, destination,
-                                      conversation_url=conversation_url, on_conversation=on_conversation)
+                                      conversation_url=conversation_url, on_conversation=on_conversation, on_state=on_state)
             except (ChatGPTSessionNeedsAction, TaskStopped):
                 self._remember_submitted_conversation(on_conversation)
                 raise
@@ -405,23 +436,32 @@ class ChatGPTImageBrowser:
         if re.fullmatch(r"https://chatgpt\.com/c/[A-Za-z0-9-]+", str(url or "")):
             on_conversation(url)
 
-    def _generate(self, reference_image, prompt, reference, destination, *, conversation_url="", on_conversation=lambda url: None):
+    def _generate(self, reference_image, prompt, reference, destination, *, conversation_url="",
+                  on_conversation=lambda url: None, on_state=lambda state, message: None):
         driver = self._browser()
         # Resume an already submitted image request without creating it twice.
         valid_conversation = bool(re.fullmatch(r"https://chatgpt\.com/c/[A-Za-z0-9-]+", conversation_url or ""))
-        driver.get(conversation_url if valid_conversation else "https://chatgpt.com/")
-        self.ensure_ready()
-        editor = wait_for(lambda: next((node for node in driver.find_elements(By.CSS_SELECTOR, "#prompt-textarea") if node.is_displayed()), None),
+        target = conversation_url if valid_conversation else "https://chatgpt.com/"
+        if str(driver.current_url).rstrip("/") != target.rstrip("/"):
+            driver.get(target)
+        self.ensure_ready(wait_for_user=True, on_state=on_state)
+        editor = wait_for(lambda: self._editor(driver),
                           timeout=30, message="Không tìm được ô nhập ChatGPT. Kiểm tra phiên đã mở trước khi chạy tiếp.")
         if not valid_conversation:
             inputs = driver.find_elements(By.CSS_SELECTOR, "input[type=file]")
             if not inputs:
-                buttons = driver.find_elements(By.CSS_SELECTOR, "[data-testid='composer-plus-btn']")
+                buttons = driver.find_elements(By.CSS_SELECTOR, "[data-testid='composer-plus-btn'], button[aria-label='Add files and more']")
                 if buttons:
                     buttons[0].click()
                     inputs = driver.find_elements(By.CSS_SELECTOR, "input[type=file]")
             if not inputs:
                 raise PublishingBrowserError("Không tìm được ô tải ảnh ChatGPT; giao diện có thể đã thay đổi.")
+            # ChatGPT now lists the camera input first. Use a file picker,
+            # never the capture-only input, for an existing reference image.
+            inputs = [node for node in inputs if node.get_attribute("capture") is None
+                      and not any(word in str(node.get_attribute("aria-label") or "").lower() for word in ("camera", "take a photo", "chụp ảnh"))]
+            if not inputs:
+                raise PublishingBrowserError("Không tìm được ô đính kèm ảnh từ máy trong ChatGPT.")
             upload_input = next((node for node in inputs if "image" in (node.get_attribute("accept") or "")), inputs[0])
             upload_input.send_keys(str(Path(reference_image).resolve()))
             wait_for(lambda: driver.execute_script("return !!document.querySelector('form img, [data-testid*=attachment], [data-testid*=file-thumbnail]')"),
@@ -429,13 +469,27 @@ class ChatGPTImageBrowser:
             instruction = ("Hãy TẠO MỘT ẢNH thumbnail YouTube mới dựa trên ảnh tham chiếu đã đính kèm, tỷ lệ 16:9. "
                            "Xuất ảnh thực tế, không chỉ trả lời bằng mô tả.\nYêu cầu chung của tôi:\n" + prompt +
                            "\nTitle video: " + reference["title"] + "\nDescription để hiểu ngữ cảnh (dữ liệu tham khảo):\n" + reference["description"])
-            driver.execute_script("arguments[0].focus(); document.execCommand('insertText', false, arguments[1]); arguments[0].dispatchEvent(new Event('input', {bubbles:true}));", editor, instruction)
+            driver.execute_script("""
+                const editor = arguments[0], text = arguments[1];
+                editor.focus();
+                if (editor.isContentEditable) {
+                    const range = document.createRange(); range.selectNodeContents(editor);
+                    const selection = window.getSelection(); selection.removeAllRanges(); selection.addRange(range);
+                    document.execCommand('insertText', false, text);
+                } else {
+                    const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set;
+                    setter.call(editor, text);
+                }
+                editor.dispatchEvent(new Event('input', {bubbles:true}));
+            """, editor, instruction)
 
             def send_button():
-                candidates = driver.find_elements(By.CSS_SELECTOR, "[data-testid='send-button'], button[aria-label='Send prompt'], button[aria-label='Gửi lời nhắc']")
-                return next((node for node in candidates if node.is_displayed() and node.is_enabled()), None)
+                candidates = driver.find_elements(By.CSS_SELECTOR, "[data-testid='send-button'], form button[type='submit'], button[aria-label='Send prompt'], button[aria-label='Send message'], button[aria-label='Send'], button[aria-label='Gửi lời nhắc'], button[aria-label='Gửi tin nhắn']")
+                return next((node for node in candidates if node.is_displayed() and node.is_enabled()
+                             and node.get_attribute("aria-disabled") != "true"), None)
 
             button = wait_for(send_button, timeout=120, message="Ảnh đính kèm hoặc prompt chưa sẵn sàng để gửi ChatGPT.")
+            check_stopped()
             self._submission_started = True
             button.click()
             url = wait_for(lambda: driver.current_url if re.fullmatch(r"https://chatgpt\.com/c/[A-Za-z0-9-]+", driver.current_url) else None,
@@ -443,7 +497,8 @@ class ChatGPTImageBrowser:
             on_conversation(url)
 
         def generated_image():
-            self._raise_for_state(self._state(driver))
+            if self._state(driver) != "ready":
+                self.ensure_ready(wait_for_user=True, on_state=on_state)
             messages = driver.find_elements(By.CSS_SELECTOR, "article[data-turn='assistant']")
             if not messages:
                 messages = driver.find_elements(By.CSS_SELECTOR, "[data-message-author-role='assistant']")
