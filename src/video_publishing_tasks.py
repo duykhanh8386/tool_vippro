@@ -11,7 +11,7 @@ from src.module.base import YouTubeRequestError
 from src.module.list_videos_module import list_videos_module
 from src.module.video_publishing_module import video_publishing_module
 from src.paths import get_data_dir
-from src.publishing_browser import ChatGPTImageBrowser, StudioThumbnailBrowser, YouTubeReferenceBrowser, download_reference_image, normalize_thumbnail
+from src.publishing_browser import ChatGPTImageBrowser, ChatGPTSessionNeedsAction, StudioThumbnailBrowser, YouTubeReferenceBrowser, download_reference_image, normalize_thumbnail
 from src.state_manager import state_manager
 from src.task_runtime import TaskStopped, bind_run_context, check_stopped, create_run_context
 from src.utils import get_channels_info
@@ -26,7 +26,7 @@ from src.video_title_matching import parse_manual_title_ids
 
 STATE_KEY = "video_publishing"
 STATUS_LABELS = {"scanned": "Đã quét", "ready": "Đã tìm tham chiếu", "processing": "Đang xử lý", "successful": "Đã lên lịch",
-                 "skipped": "Bỏ qua", "error": "Lỗi", "stopped": "Đã dừng"}
+                 "skipped": "Bỏ qua", "error": "Lỗi", "stopped": "Đã dừng", "waiting_session": "Chờ phiên ChatGPT"}
 
 
 def default_settings():
@@ -62,6 +62,9 @@ class VideoPublishingController:
         if any(row.get("classification_version") != PUBLISHING_SCAN_SCHEMA_VERSION for row in self.rows):
             self.message = "Danh sách cũ chưa được kiểm tra bằng cách nhận diện bản nháp mới. Quét lại một lần để cập nhật đúng loại video."
         self.cookie = ""
+        self.image_session = None
+        self.session_busy = False
+        self.chatgpt_status = "Chưa kiểm tra phiên ChatGPT."
         self.busy = False
         self.revision = 0
         self.run = self.thread = None
@@ -75,19 +78,61 @@ class VideoPublishingController:
         with self.lock:
             return copy.deepcopy({"settings": self.settings, "rows": self.rows, "message": self.message,
                                   "busy": self.busy, "revision": self.revision, "has_cookie": bool(self.cookie),
+                                  "session_busy": self.session_busy, "chatgpt_status": self.chatgpt_status,
                                   "needs_rescan": any(row.get("classification_version") != PUBLISHING_SCAN_SCHEMA_VERSION for row in self.rows)})
 
     def set_cookie(self, text):
         with self.lock:
-            if self.busy:
+            if self.busy or self.session_busy:
                 raise ValueError("Chờ tác vụ kết thúc trước khi thay cookie.")
             if text.strip():
                 parse_chatgpt_cookies(text)
             self.cookie = text
+            if self.image_session is not None:
+                self.image_session.update_cookies(text)
+            self.chatgpt_status = "Đã nhận cookie; bấm Mở / kiểm tra phiên để xác nhận đăng nhập." if text.strip() else "Đã bỏ cookie nhập tay; có thể dùng phiên Chrome đã lưu."
+
+    def _image_session(self):
+        with self.lock:
+            if self.image_session is None:
+                self.image_session = self.image_factory(self.cookie)
+            return self.image_session
+
+    def _session_progress(self, message):
+        with self.lock:
+            self.chatgpt_status = message
+
+    def prepare_chatgpt_session(self):
+        with self.lock:
+            if self.busy or self.session_busy:
+                raise ValueError("Chờ tác vụ hiện tại kết thúc trước khi kiểm tra phiên ChatGPT.")
+            self.session_busy = True
+        try:
+            self._image_session().ensure_ready(on_status=self._session_progress)
+            self._session_progress("Phiên ChatGPT đã đăng nhập và sẵn sàng.")
+        except ChatGPTSessionNeedsAction as exc:
+            self._session_progress(str(exc))
+            raise
+        finally:
+            with self.lock:
+                self.session_busy = False
+
+    def close_chatgpt_session(self):
+        with self.lock:
+            if self.busy or self.session_busy:
+                raise ValueError("Dừng tác vụ trước khi đóng cửa sổ phiên ChatGPT.")
+            self.session_busy = True
+        try:
+            if self.image_session is not None:
+                self.image_session.close()
+            self._session_progress("Đã đóng cửa sổ. Phiên đăng nhập vẫn được Chrome lưu riêng cho tool.")
+        finally:
+            with self.lock:
+                self.session_busy = False
 
     def change_settings(self, **changes):
         with self.lock:
-            if self.busy:
+            if self.busy or self.session_busy:
                 raise ValueError("Dừng tác vụ trước khi thay thiết lập.")
             if any(key not in default_settings() for key in changes):
                 raise ValueError("Thiết lập không hợp lệ.")
@@ -173,6 +218,14 @@ class VideoPublishingController:
             self.revision += 1
             self._save()
 
+    def _remember_conversation(self, row, url):
+        # A Stop may arrive immediately after ChatGPT accepts a prompt. Saving
+        # this local receipt must still succeed so a retry resumes that request.
+        with self.lock:
+            row["conversation_url"] = url
+            self.revision += 1
+            self._save()
+
     def _progress(self, message):
         with self.lock:
             self.message = message
@@ -195,7 +248,7 @@ class VideoPublishingController:
         if action not in {"scan", "references", "run"}:
             raise ValueError("Tác vụ không hợp lệ.")
         with self.lock:
-            if self.busy:
+            if self.busy or self.session_busy:
                 raise ValueError("Tác vụ đang chạy.")
             if action == "scan":
                 if self.settings["channel_source"] == "links" and not self.settings["channel_links"].strip():
@@ -210,7 +263,8 @@ class VideoPublishingController:
                 if action == "run":
                     if not self.settings["image_prompt"].strip():
                         raise ValueError("Nhập prompt chung để vẽ thumbnail.")
-                    parse_chatgpt_cookies(self.cookie)
+                    if self.cookie.strip():
+                        parse_chatgpt_cookies(self.cookie)
                     self._assign_plan()
             self.busy = True
             self.revision += 1
@@ -339,15 +393,17 @@ class VideoPublishingController:
                     method = row["reference"].get("selection_label", "Đã tìm video tham chiếu")
                     self._checkpoint(row, status="ready", detail=method + "; title và description sẽ chép nguyên văn.")
                     continue
-                folder = output / row["channel_id"]
-                folder.mkdir(parents=True, exist_ok=True)
-                base = folder / row["video_id"]
                 if not row.get("thumbnail_path") or not Path(row["thumbnail_path"]).is_file():
+                    folder = output / row["channel_id"]
+                    folder.mkdir(parents=True, exist_ok=True)
+                    base = folder / row["video_id"]
                     reference_path = download_reference_image(row["reference"]["thumbnail"], base.with_suffix(".reference.jpg"))
                     self._checkpoint(row, detail="Đang yêu cầu ChatGPT vẽ lại thumbnail…")
+                    if image is None:
+                        image = self._image_session()
                     raw = image.generate(reference_path, settings["image_prompt"], row["reference"], base.with_suffix(".generated"),
                                          conversation_url=row.get("conversation_url", ""),
-                                         on_conversation=lambda url, row=row: self._checkpoint(row, conversation_url=url))
+                                         on_conversation=lambda url, row=row: self._remember_conversation(row, url))
                     path = normalize_thumbnail(raw, base.with_suffix(".jpg"))
                     self._checkpoint(row, thumbnail_path=path)
                 self.module.copy_metadata(row["channel_id"], row["video_id"], row["reference"],
@@ -361,6 +417,10 @@ class VideoPublishingController:
                 self._checkpoint(row, detail="Đang đặt lịch và đọc lại kết quả…")
                 self.module.schedule(row["channel_id"], row["video_id"], row["publish_at"], row["reference"], categories=categories)
                 self._checkpoint(row, status="successful", selected=False, detail="Đã xác nhận metadata và lịch đăng trên YouTube.")
+            except ChatGPTSessionNeedsAction as exc:
+                self._session_progress(str(exc))
+                self._checkpoint(row, status="waiting_session", detail=str(exc))
+                raise
             except TaskStopped:
                 raise
             except Exception as exc:
@@ -404,19 +464,33 @@ class VideoPublishingController:
             with bind_run_context(run):
                 settings = copy.deepcopy(self.settings)
                 reference = self.reference_factory()
-                image = self.image_factory(self.cookie) if action == "run" else None
                 if action == "scan":
                     self._scan(settings, reference)
                 else:
                     if action == "run":
                         self._check_schedule_conflicts()
+                        pending_images = [row for row in self.rows if row.get("selected") and publishing_row_selectable(row)
+                                          and (not row.get("thumbnail_path") or not Path(row["thumbnail_path"]).is_file())]
+                        if pending_images:
+                            image = self._image_session()
+                            self._progress("Đang kiểm tra phiên ChatGPT trước khi xử lý danh sách…")
+                            try:
+                                image.ensure_ready(on_status=self._session_progress)
+                            except ChatGPTSessionNeedsAction as exc:
+                                self._checkpoint(pending_images[0], status="waiting_session", detail=str(exc))
+                                raise
                     self._process(settings, reference, image, action)
+        except ChatGPTSessionNeedsAction as exc:
+            self._session_progress(str(exc))
+            self._progress("Đã dừng lượt xử lý để khôi phục phiên ChatGPT. " + str(exc))
         except TaskStopped:
             self._progress("Đã dừng; có thể tiếp tục các dòng chưa xong.")
         except Exception as exc:
             self._progress(self._error(exc))
         finally:
-            for adapter in (image, reference):
+            # The ChatGPT browser belongs to the app. Keep it open for manual
+            # verification and reuse; only per-run reference browsers close.
+            for adapter in (reference,):
                 if adapter:
                     try:
                         adapter.close()

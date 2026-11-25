@@ -264,7 +264,9 @@ class ChatGPTResumeTests(unittest.TestCase):
         driver.execute_async_script.return_value = {"data": "data:image/png;base64," + base64.b64encode(b"generated-bytes").decode()}
         browser = ChatGPTImageBrowser("session=secret")
         browser.driver = driver
-        with tempfile.TemporaryDirectory() as folder, patch("src.publishing_browser.wait_for", side_effect=immediate_wait):
+        browser._cookies_pending = False
+        with tempfile.TemporaryDirectory() as folder, patch("src.publishing_browser.wait_for", side_effect=immediate_wait), \
+                patch.object(browser, "ensure_ready", return_value=driver):
             result = Path(folder) / "generated.png"
             browser.generate("reference.jpg", "draw thumbnail", {"title": "Song", "description": "Desc"}, result,
                              conversation_url="https://chatgpt.com/c/abc-123")

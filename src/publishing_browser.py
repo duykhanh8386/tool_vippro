@@ -1,14 +1,17 @@
 """Browser adapters for YouTube references, ChatGPT images and Studio thumbnails.
 
-ChatGPT uses its visible web UI. No private conversation API or stored tokens.
+ChatGPT uses its visible UI and a dedicated saved Chrome profile. Manual
+cookies are imported before navigation; no private conversation API is used.
 Reference: https://www.selenium.dev/documentation/webdriver/interactions/cookies/
 """
 from __future__ import annotations
 
 import base64
+import atexit
 import json
 import re
 import subprocess
+import threading
 import time
 from pathlib import Path
 from urllib.parse import quote, urlparse
@@ -17,7 +20,8 @@ from selenium.common.exceptions import StaleElementReferenceException, WebDriver
 from selenium.webdriver.common.by import By
 
 from src.cookie_utils import inject_cookies_via_cdp
-from src.task_runtime import check_stopped, run_owned_process, unregister_driver, wait_interruptibly
+from src.paths import get_data_dir
+from src.task_runtime import TaskStopped, check_stopped, run_owned_process, unregister_driver, wait_interruptibly
 from src.utils import create_driver, get_channels_info
 from src.video_publishing import (
     REFERENCE_SELECTION_VERSION, parse_chatgpt_cookies, positive_seconds,
@@ -27,6 +31,14 @@ from src.video_publishing import (
 
 class PublishingBrowserError(ValueError):
     pass
+
+
+class ChatGPTSessionNeedsAction(PublishingBrowserError):
+    """Pause the whole batch while the user restores this same browser session."""
+
+    def __init__(self, message, *, reason="session"):
+        super().__init__(message)
+        self.reason = reason
 
 
 def wait_for(callback, timeout=60, message="Trang chưa sẵn sàng; kiểm tra Chrome và thử lại."):
@@ -53,8 +65,11 @@ def close_driver(driver):
             unregister_driver(driver)
 
 
-def _new_driver(*, network_events=False):
-    driver = create_driver(enable_performance_log=network_events)
+def _new_driver(*, network_events=False, profile_dir=None):
+    options = {"enable_performance_log": network_events}
+    if profile_dir is not None:
+        options["user_data_dir"] = profile_dir
+    driver = create_driver(**options)
     driver.set_page_load_timeout(60)
     driver.set_script_timeout(60)
     return driver
@@ -257,33 +272,148 @@ def normalize_thumbnail(source, destination):
 
 
 class ChatGPTImageBrowser:
-    def __init__(self, cookie_text):
-        self.cookies = parse_chatgpt_cookies(cookie_text)
+    def __init__(self, cookie_text="", *, profile_dir=None):
+        self.cookies = parse_chatgpt_cookies(cookie_text) if str(cookie_text or "").strip() else []
+        self._cookies_pending = bool(self.cookies)
+        self.profile_dir = Path(profile_dir) if profile_dir is not None else None
         self.driver = None
+        self.lock = threading.RLock()
+        atexit.register(self.close)
 
-    def _browser(self):
-        if self.driver is None:
-            driver = self.driver = _new_driver()
-            driver.get("https://chatgpt.com/")
+    def update_cookies(self, cookie_text):
+        with self.lock:
+            self.cookies = parse_chatgpt_cookies(cookie_text) if str(cookie_text or "").strip() else []
+            self._cookies_pending = bool(self.cookies)
+
+    def _seed_cookies(self, driver):
+        # CDP can set origin cookies on about:blank, before the first request.
+        # Navigating first exposed a new unauthenticated browser to a challenge.
+        try:
+            driver.execute_cdp_cmd("Network.enable", {})
             for cookie in self.cookies:
                 check_stopped()
-                try:
-                    driver.add_cookie(cookie)
-                except WebDriverException:
-                    raise PublishingBrowserError("Không nạp được cookie ChatGPT. Dán lại JSON cookie từ chatgpt.com.") from None
+                fields = {key: value for key, value in cookie.items() if key != "expiry"}
+                fields["url"] = "https://chatgpt.com/"
+                if "expiry" in cookie:
+                    fields["expires"] = cookie["expiry"]
+                result = driver.execute_cdp_cmd("Network.setCookie", fields)
+                if isinstance(result, dict) and result.get("success") is False:
+                    raise ChatGPTSessionNeedsAction("Không nạp được cookie ChatGPT. Dán lại cookie từ chatgpt.com hoặc đăng nhập trong phiên đã mở.", reason="cookie")
+        except WebDriverException:
+            raise ChatGPTSessionNeedsAction("Không nạp được cookie ChatGPT. Kiểm tra lại cookie hoặc đăng nhập trong phiên đã mở.", reason="cookie") from None
+        self._cookies_pending = False
+
+    def _browser(self):
+        if self.driver is not None:
+            try:
+                if not self.driver.window_handles:
+                    close_driver(self.driver)
+                    self.driver = None
+            except WebDriverException:
+                close_driver(self.driver)
+                self.driver = None
+        created = self.driver is None
+        if self.driver is None:
+            profile = self.profile_dir or get_data_dir() / "chatgpt-browser-profile"
+            try:
+                driver = self.driver = _new_driver(profile_dir=profile)
+                # This is an app-owned session, not a batch-owned browser. Job
+                # cleanup/Stop must leave it available for manual verification.
+                unregister_driver(driver)
+            except Exception:
+                check_stopped()
+                raise ChatGPTSessionNeedsAction("Không mở được phiên ChatGPT đã lưu. Kiểm tra Chrome; nếu một bản tool khác đang giữ phiên này, đóng phiên của bản đó rồi thử lại.", reason="browser") from None
+        driver = self.driver
+        imported = self._cookies_pending
+        if imported:
+            self._seed_cookies(driver)
+        if created or imported:
+            try:
+                driver.get("https://chatgpt.com/")
+            except WebDriverException:
+                raise ChatGPTSessionNeedsAction("Chrome chưa mở được ChatGPT. Giữ cửa sổ này để kiểm tra kết nối rồi bấm Mở / kiểm tra phiên.", reason="browser") from None
         return self.driver
 
+    @staticmethod
+    def _state(driver):
+        try:
+            title = str(driver.title or "").lower()
+            if any(marker in title for marker in ("just a moment", "verify you are human", "security verification")):
+                return "verification"
+            challenges = driver.find_elements(By.CSS_SELECTOR, "iframe[src*='challenges.cloudflare.com'], #challenge-running, #challenge-stage, #cf-challenge-running")
+            if any(node.is_displayed() for node in challenges):
+                return "verification"
+            editor = next((node for node in driver.find_elements(By.CSS_SELECTOR, "#prompt-textarea") if node.is_displayed()), None)
+            account = driver.find_elements(By.CSS_SELECTOR, "[data-testid='accounts-profile-button'], [data-testid='profile-button'], button[aria-label*='profile'], button[aria-label*='Profile']")
+            if editor is not None and any(node.is_displayed() for node in account):
+                return "ready"
+            if driver.find_elements(By.CSS_SELECTOR, "[data-testid='login-button'], [data-testid='signup-button']") or "/auth/login" in str(driver.current_url):
+                return "login"
+            return "loading"
+        except StaleElementReferenceException:
+            return "loading"
+        except WebDriverException:
+            return "closed"
+
+    @staticmethod
+    def _raise_for_state(state):
+        if state == "verification":
+            raise ChatGPTSessionNeedsAction("ChatGPT đang yêu cầu xác minh Cloudflare. Hoàn tất xác minh thủ công trong cửa sổ phiên đã mở, rồi bấm Mở / kiểm tra phiên và chạy tiếp. Tool giữ nguyên phiên này.", reason=state)
+        if state == "login":
+            raise ChatGPTSessionNeedsAction("Phiên ChatGPT cần đăng nhập. Đăng nhập trong cửa sổ phiên đã mở hoặc nạp cookie mới, rồi kiểm tra phiên và chạy tiếp.", reason=state)
+        if state == "closed":
+            raise ChatGPTSessionNeedsAction("Cửa sổ phiên ChatGPT đã đóng. Bấm Mở / kiểm tra phiên để mở lại phiên đã lưu.", reason=state)
+
+    def ensure_ready(self, *, on_status=lambda message: None, timeout=30):
+        with self.lock:
+            on_status("Đang kiểm tra phiên ChatGPT đã lưu…")
+            driver = self._browser()
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                check_stopped()
+                state = self._state(driver)
+                self._raise_for_state(state)
+                if state == "ready":
+                    on_status("Phiên ChatGPT đã đăng nhập và sẵn sàng.")
+                    return driver
+                wait_interruptibly(0.5)
+            raise ChatGPTSessionNeedsAction("Phiên ChatGPT chưa sẵn sàng. Kiểm tra đăng nhập/xác minh trong cửa sổ đang mở; tool giữ phiên và dừng lượt xử lý tại đây.", reason="loading")
+
     def generate(self, reference_image, prompt, reference, destination, *, conversation_url="", on_conversation=lambda url: None):
+        with self.lock:
+            self._submission_started = False
+            try:
+                self.ensure_ready()
+                return self._generate(reference_image, prompt, reference, destination,
+                                      conversation_url=conversation_url, on_conversation=on_conversation)
+            except (ChatGPTSessionNeedsAction, TaskStopped):
+                self._remember_submitted_conversation(on_conversation)
+                raise
+            except (PublishingBrowserError, WebDriverException) as exc:
+                self._remember_submitted_conversation(on_conversation)
+                check_stopped()
+                message = str(exc) if isinstance(exc, PublishingBrowserError) else "Mất kết nối với cửa sổ ChatGPT. Kiểm tra phiên đã mở rồi chạy tiếp."
+                raise ChatGPTSessionNeedsAction(message, reason="browser") from None
+
+    def _remember_submitted_conversation(self, on_conversation):
+        if not self._submission_started or self.driver is None:
+            return
+        try:
+            url = self.driver.current_url
+        except WebDriverException:
+            return
+        if re.fullmatch(r"https://chatgpt\.com/c/[A-Za-z0-9-]+", str(url or "")):
+            on_conversation(url)
+
+    def _generate(self, reference_image, prompt, reference, destination, *, conversation_url="", on_conversation=lambda url: None):
         driver = self._browser()
         # Resume an already submitted image request without creating it twice.
         valid_conversation = bool(re.fullmatch(r"https://chatgpt\.com/c/[A-Za-z0-9-]+", conversation_url or ""))
         driver.get(conversation_url if valid_conversation else "https://chatgpt.com/")
+        self.ensure_ready()
         editor = wait_for(lambda: next((node for node in driver.find_elements(By.CSS_SELECTOR, "#prompt-textarea") if node.is_displayed()), None),
-                          timeout=90, message="Phiên ChatGPT chưa sẵn sàng. Cookie có thể hết hạn; hoàn tất đăng nhập/xác minh trong Chrome rồi thử lại.")
+                          timeout=30, message="Không tìm được ô nhập ChatGPT. Kiểm tra phiên đã mở trước khi chạy tiếp.")
         if not valid_conversation:
-            # A composer exists for guests too. Require signed-in account controls.
-            wait_for(lambda: driver.find_elements(By.CSS_SELECTOR, "[data-testid='accounts-profile-button'], [data-testid='profile-button'], button[aria-label*='profile'], button[aria-label*='Profile']"),
-                     timeout=30, message="Chưa xác nhận được tài khoản ChatGPT đã đăng nhập. Kiểm tra cookie trong Chrome.")
             inputs = driver.find_elements(By.CSS_SELECTOR, "input[type=file]")
             if not inputs:
                 buttons = driver.find_elements(By.CSS_SELECTOR, "[data-testid='composer-plus-btn']")
@@ -305,12 +435,15 @@ class ChatGPTImageBrowser:
                 candidates = driver.find_elements(By.CSS_SELECTOR, "[data-testid='send-button'], button[aria-label='Send prompt'], button[aria-label='Gửi lời nhắc']")
                 return next((node for node in candidates if node.is_displayed() and node.is_enabled()), None)
 
-            wait_for(send_button, timeout=120, message="Ảnh đính kèm hoặc prompt chưa sẵn sàng để gửi ChatGPT.").click()
+            button = wait_for(send_button, timeout=120, message="Ảnh đính kèm hoặc prompt chưa sẵn sàng để gửi ChatGPT.")
+            self._submission_started = True
+            button.click()
             url = wait_for(lambda: driver.current_url if re.fullmatch(r"https://chatgpt\.com/c/[A-Za-z0-9-]+", driver.current_url) else None,
                            timeout=90, message="Chưa xác nhận được cuộc trò chuyện ChatGPT; kiểm tra Chrome trước khi chạy lại.")
             on_conversation(url)
 
         def generated_image():
+            self._raise_for_state(self._state(driver))
             messages = driver.find_elements(By.CSS_SELECTOR, "article[data-turn='assistant']")
             if not messages:
                 messages = driver.find_elements(By.CSS_SELECTOR, "[data-message-author-role='assistant']")
@@ -318,7 +451,9 @@ class ChatGPTImageBrowser:
                 return None
             message = messages[-1]
             text = message.text.lower()
-            if any(marker in text for marker in ("image generation limit", "reached your limit", "unable to generate", "hết lượt tạo ảnh", "không thể tạo ảnh")):
+            if any(marker in text for marker in ("image generation limit", "reached your limit", "hết lượt tạo ảnh")):
+                raise ChatGPTSessionNeedsAction("Tài khoản ChatGPT đã hết lượt tạo ảnh. Lượt xử lý đã dừng; tiếp tục khi tài khoản có thể tạo ảnh lại.", reason="quota")
+            if any(marker in text for marker in ("unable to generate", "không thể tạo ảnh")):
                 raise PublishingBrowserError("ChatGPT chưa tạo được ảnh hoặc đã hết lượt. Kiểm tra cuộc trò chuyện trước khi tiếp tục.")
             if driver.find_elements(By.CSS_SELECTOR, "[data-testid='stop-button']"):
                 return None
@@ -363,6 +498,7 @@ class ChatGPTImageBrowser:
         close_driver(self.driver)
         self.driver = None
         self.cookies.clear()
+        self._cookies_pending = False
 
 
 class StudioThumbnailBrowser:

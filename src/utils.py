@@ -714,7 +714,7 @@ def _driver_major_version(driver_path: Path) -> int | None:
 
 
 pass
-def create_driver(enable_performance_log: bool = False, *, start_offscreen: bool = False):
+def create_driver(enable_performance_log: bool = False, *, start_offscreen: bool = False, user_data_dir: str | Path | None = None):
     options = webdriver.ChromeOptions()
     options.add_argument("--disable-blink-features=AutomationControlled")
     options.add_experimental_option("excludeSwitches", ["enable-automation"])
@@ -722,6 +722,10 @@ def create_driver(enable_performance_log: bool = False, *, start_offscreen: bool
     options.add_argument("--log-level=3")
     options.add_argument("--disable-gpu")
     options.add_argument("--disable-notifications")
+    if user_data_dir is not None:
+        profile_dir = Path(user_data_dir).resolve()
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        options.add_argument(f"--user-data-dir={profile_dir}")
     if start_offscreen:
         options.add_argument("--no-first-run")
         options.add_argument("--disable-infobars")

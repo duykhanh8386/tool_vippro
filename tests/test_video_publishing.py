@@ -14,6 +14,7 @@ from src.module.model import Video
 from src.module.video_publishing_module import VideoPublishingModule
 from src.publishing_browser import video_search_results
 from src.task_runtime import create_run_context
+from src.publishing_browser import ChatGPTSessionNeedsAction
 from src.video_publishing import (
     REFERENCE_SELECTION_VERSION, copyright_category, first_song, parse_chatgpt_cookies, plan_daily,
     publishing_row_matches, publishing_row_selectable, publishing_video_type,
@@ -473,6 +474,78 @@ class PublishingControllerTests(unittest.TestCase):
         self.controller._worker("run", create_run_context("publishing-save-failure"))
         self.module.copy_metadata.assert_not_called()
         self.module.schedule.assert_not_called()
+
+    def test_session_preflight_pauses_whole_batch_without_touching_later_rows(self):
+        self.controller.rows = [row(publish_at=STAMP), row(OTHER, publish_at=STAMP + 86400)]
+        self.image.ensure_ready.side_effect = ChatGPTSessionNeedsAction("Verify in existing window", reason="verification")
+        self.controller._worker("run", create_run_context("publishing-auth-pause"))
+        self.assertEqual([item["status"] for item in self.controller.rows], ["waiting_session", "scanned"])
+        self.image.generate.assert_not_called()
+        self.reference.find.assert_not_called()
+        self.module.copy_metadata.assert_not_called()
+        self.image.close.assert_not_called()
+        self.assertIs(self.controller.image_session, self.image)
+        self.assertFalse(self.controller.busy)
+
+    def test_mid_generation_auth_problem_pauses_instead_of_processing_next_video(self):
+        self.controller.rows = [row(publish_at=STAMP), row(OTHER, publish_at=STAMP + 86400)]
+        self.image.generate.side_effect = ChatGPTSessionNeedsAction("Verify existing session", reason="verification")
+        with tempfile.TemporaryDirectory() as folder, patch("src.video_publishing_tasks.download_reference_image", return_value="fake.jpg"):
+            self.controller.settings["output_folder"] = folder
+            self.controller._worker("run", create_run_context("publishing-auth-mid-image"))
+        self.assertEqual([item["status"] for item in self.controller.rows], ["waiting_session", "scanned"])
+        self.assertEqual(self.reference.find.call_count, 1)
+        self.assertEqual(self.image.generate.call_count, 1)
+        self.module.copy_metadata.assert_not_called()
+        self.module.schedule.assert_not_called()
+        self.image.close.assert_not_called()
+
+    def test_same_image_session_is_reused_for_separate_preparations_and_runs(self):
+        factory = Mock(return_value=self.image)
+        self.controller.image_factory = factory
+        self.controller.prepare_chatgpt_session()
+        self.controller.prepare_chatgpt_session()
+        self.controller.rows = [row(publish_at=STAMP)]
+        self.image.ensure_ready.side_effect = ChatGPTSessionNeedsAction("needs login", reason="login")
+        self.controller._worker("run", create_run_context("publishing-reuse-image-session"))
+        factory.assert_called_once_with("session=private-secret")
+        self.image.close.assert_not_called()
+        self.assertIs(self.controller.image_session, self.image)
+
+    def test_cookie_update_is_queued_on_same_session_without_saving_secret(self):
+        self.controller.prepare_chatgpt_session()
+        self.controller.set_cookie("session=updated-secret")
+        self.image.update_cookies.assert_called_once_with("session=updated-secret")
+        self.controller._save()
+        self.assertNotIn("updated-secret", json.dumps(self.storage.data))
+        self.assertNotIn("updated-secret", json.dumps(self.controller.snapshot()))
+
+    def test_all_prepared_thumbnails_need_no_chatgpt_session(self):
+        with tempfile.TemporaryDirectory() as folder:
+            thumb = Path(folder) / "thumbnail.jpg"
+            thumb.write_bytes(b"fake")
+            self.controller.rows = [row(reference=REFERENCE, publish_at=STAMP, metadata_copied=True, thumbnail_uploaded=True, thumbnail_path=str(thumb))]
+            self.controller._worker("run", create_run_context("publishing-existing-thumbnail"))
+        self.image.ensure_ready.assert_not_called()
+        self.image.generate.assert_not_called()
+        self.assertEqual(self.controller.rows[0]["status"], "successful")
+
+    def test_preparation_and_browser_close_are_blocked_during_batch(self):
+        self.controller.busy = True
+        with self.assertRaises(ValueError):
+            self.controller.prepare_chatgpt_session()
+        with self.assertRaises(ValueError):
+            self.controller.close_chatgpt_session()
+
+    def test_conversation_receipt_can_be_saved_after_stop_request(self):
+        run = create_run_context("publishing-stopped-conversation-receipt")
+        self.addCleanup(run.cleanup)
+        self.controller.rows = [row()]
+        run.request_stop()
+        from src.task_runtime import bind_run_context
+        with bind_run_context(run):
+            self.controller._remember_conversation(self.controller.rows[0], "https://chatgpt.com/c/accepted-request")
+        self.assertEqual(self.storage.load_state(STATE_KEY)["rows"][0]["conversation_url"], "https://chatgpt.com/c/accepted-request")
 
     def test_reload_restores_checkpoints_but_requires_new_cookie(self):
         self.controller.rows = [row(status="processing", publish_at=STAMP, reference=REFERENCE, thumbnail_uploaded=True)]

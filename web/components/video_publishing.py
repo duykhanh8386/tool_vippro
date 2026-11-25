@@ -1,6 +1,7 @@
 """UI for copying reference metadata, generating thumbnails and daily scheduling."""
 import csv
 import io
+import asyncio
 from collections import Counter
 
 from nicegui import context, ui
@@ -43,7 +44,21 @@ def create_video_publishing_page():
     def set_cookie():
         if invoke(lambda: controller.set_cookie(cookie_field.value or "")):
             cookie_field.set_value("")
-            ui.notify("Đã nạp cookie cho phiên chạy hiện tại.", type="positive")
+            ui.notify("Đã nhận cookie. Bấm Mở / kiểm tra phiên để xác nhận đăng nhập ChatGPT.", type="positive")
+
+    async def session_action(action):
+        try:
+            await asyncio.to_thread(action)
+        except ValueError as exc:
+            ui.notify(str(exc), type="warning")
+        finally:
+            refresh()
+
+    async def prepare_session():
+        await session_action(controller.prepare_chatgpt_session)
+
+    async def close_session():
+        await session_action(controller.close_chatgpt_session)
 
     def choose_folder():
         folder = select_directory(initial_dir=fields["output_folder"].value or None, title="Chọn thư mục lưu thumbnail")
@@ -109,7 +124,8 @@ def create_video_publishing_page():
         data = controller.snapshot()
         syncing["active"] = True
         try:
-            busy = data["busy"]
+            job_busy = data["busy"]
+            busy = job_busy or data["session_busy"]
             config = data["settings"]
             copyright_counts = Counter(row["copyright"] for row in data["rows"] if publishing_row_matches(row, scope=config["scope"]))
             type_counts = Counter(row.get("visibility_type", "unknown") for row in data["rows"])
@@ -133,7 +149,7 @@ def create_video_publishing_page():
             cookie_field.set_enabled(not busy)
             for key, button in buttons.items():
                 button.set_enabled(not busy)
-            buttons["stop"].set_enabled(busy)
+            buttons["stop"].set_enabled(job_busy)
             chosen = sum(bool(row.get("selected")) and publishing_row_selectable(row) for row in data["rows"])
             filtered = [row for row in data["rows"] if publishing_row_matches(row, scope=config["scope"], categories=config["categories"])]
             selectable_count = sum(publishing_row_selectable(row) for row in filtered)
@@ -147,7 +163,8 @@ def create_video_publishing_page():
             message.set_text(data["message"])
             summary.set_text(f"{len(data['rows'])} đã quét · {len(filtered)} trong bộ lọc · {selectable_count} có thể tích chọn · {chosen} đã chọn toàn bộ ({chosen - shown_selected} ngoài bộ lọc) · {sum(row['status'] == 'successful' for row in data['rows'])} đã lên lịch")
             rescan_hint.set_visibility(data["needs_rescan"])
-            cookie_status.set_text("Đã nạp cookie cho phiên này" if data["has_cookie"] else "Chưa nạp cookie ChatGPT")
+            cookie_status.set_text("Đã nhận cookie nhập tay." if data["has_cookie"] else "Có thể dùng phiên Chrome đã lưu hoặc đăng nhập trực tiếp.")
+            session_status.set_text(data["chatgpt_status"])
             selection = None if busy else "multiple"
             if table.selection != selection:
                 table.selection = selection
@@ -180,7 +197,7 @@ def create_video_publishing_page():
         with ui.column().classes("w-full") as channel_picker:
             create_channel_selection(get_channels_info() or [], choose_channels, multi_select=True,
                                      initial_selected_ids=settings["channel_ids"],
-                                     can_change_selection=lambda: not controller.snapshot()["busy"] and controller.snapshot()["settings"]["channel_source"] == "selected")
+                                     can_change_selection=lambda: not (controller.snapshot()["busy"] or controller.snapshot()["session_busy"]) and controller.snapshot()["settings"]["channel_source"] == "selected")
         with app_card():
             with section_header("Quét video trong Studio", "Chỉ xử lý video chưa công khai; giữ các lịch đã đặt trên kênh."):
                 buttons["scan"] = ui.button("Quét video", icon="manage_search", on_click=lambda: invoke(lambda: controller.start("scan")))
@@ -198,14 +215,16 @@ def create_video_publishing_page():
                                             on_change=lambda e: change("limit", e.value)).props("outlined").classes("w-44")
             ui.label("Sau khi quét, lọc theo loại video và trạng thái bản quyền trong Danh sách xử lý để chọn video lên lịch.").classes("text-xs text-gray-500")
         with app_card():
-            with section_header("ChatGPT vẽ thumbnail", "Tải thumbnail của video tham chiếu lên ChatGPT rồi vẽ lại theo prompt chung."):
-                pass
+            with section_header("ChatGPT vẽ thumbnail", "Dùng lại một phiên Chrome riêng của tool cho các lượt chạy."):
+                buttons["session"] = ui.button("Mở / kiểm tra phiên", icon="open_in_browser", on_click=prepare_session).props("outline")
+                buttons["close_session"] = ui.button("Đóng cửa sổ phiên", icon="close", on_click=close_session).props("flat")
             with ui.row().classes("w-full gap-3 items-end"):
-                cookie_field = ui.input("Cookie ChatGPT (JSON hoặc Cookie header)", password=True, password_toggle_button=True).props("outlined autocomplete=off").classes("flex-1 min-w-0")
+                cookie_field = ui.input("Cookie ChatGPT tùy chọn (JSON hoặc Cookie header)", password=True, password_toggle_button=True).props("outlined autocomplete=off").classes("flex-1 min-w-0")
                 buttons["cookie"] = ui.button("Nạp cookie", icon="key", on_click=set_cookie).props("outline")
-                buttons["clear_cookie"] = ui.button("Xóa cookie", icon="clear", on_click=lambda: invoke(lambda: controller.set_cookie(""))).props("flat")
+                buttons["clear_cookie"] = ui.button("Bỏ cookie nhập tay", icon="clear", on_click=lambda: invoke(lambda: controller.set_cookie(""))).props("flat")
             cookie_status = ui.label().classes("text-xs text-gray-500")
-            ui.label("Cookie chỉ giữ trong bộ nhớ đến khi đóng tool. Nếu ChatGPT yêu cầu đăng nhập hoặc xác minh, hoàn tất trong cửa sổ Chrome do tool mở.").classes("text-xs text-gray-500")
+            session_status = ui.label().classes("text-sm text-emerald-700 break-words")
+            ui.label("Chrome lưu phiên riêng trên máy để dùng lại. Bạn có thể nạp cookie hoặc đăng nhập trong phiên này. Nếu cần xác minh, tool dừng cả lượt xử lý và giữ cửa sổ để bạn hoàn tất thủ công, rồi kiểm tra phiên và chạy tiếp. Ô cookie không được lưu vào cấu hình; Bỏ cookie nhập tay không đăng xuất phiên Chrome đã lưu.").classes("text-xs text-gray-500")
             fields["image_prompt"] = ui.textarea("Prompt chung vẽ lại thumbnail", value=settings["image_prompt"],
                                                  on_change=lambda e: change("image_prompt", e.value or "")).props("outlined autogrow").classes("w-full")
             with ui.row().classes("w-full gap-3 items-end"):
