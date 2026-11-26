@@ -64,6 +64,8 @@ class ListVideosModule(IModule):
     "publicShorts": {"all": True}, "podcastRssMetadata": {"all": True}, "videoLinkageShortsAttribution": {"all": True}, "alteredContentSettings": {"all": True}, "superfansOnly": {"all": True}, "tvfilmMetadata": {"all": True}, "videoCreatorExperiment": {"all": True}, "responseStatus": {"all": True}, "statusDetails": {"all": True}, "description": True, "titleFormattedString": {"all": True}, "descriptionDetails": {"all": True}, "descriptionFormattedString": {"all": True}, "titleDetails": {"all": True},
     "videoDurationMs": True, "publicMetrics": {"all": True}, "audienceRestriction": {"all": True}, "releaseInfo": {"all": True}, "privateMetrics": {"dislikeCount": True}, "monetization": {"all": True}, "selfCertification": {"all": True}, "allRestrictions": {"all": True}, "mfkSettings": {"all": True}, "inlineEditProcessingStatus": True, "videoPrechecks": {"all": True}, "videoStreamUrl": True, "thumbnailEditorState": {"all": True}, "videoResolutions": {"all": True},
     "shorts": {"all": True}, "scheduledPublishingDetails": {"all": True}, "visibility": {"all": True}, "privateShare": {"all": True}, "sponsorsOnly": {"all": True}, "unlistedExpired": True, "videoTrailers": {"all": True}, "remix": {"isSource": True}, "isPaygated": True}, "context": {"client": {"clientName": 62, "clientVersion": "1.20260520.00.00", "hl": "vi", "gl": "VN", "experimentsToken": "", "utcOffsetMinutes": 420, "userInterfaceTheme": "USER_INTERFACE_THEME_DARK", "screenWidthPoints": 1920, "screenHeightPoints": 150, "screenPixelDensity": 1, "screenDensityFloat": 1}, "request": {"returnLogEntry": True, "internalExperimentFlags": [], "eats": self.EATS, "sessionInfo": {"token": session_token}, "consistencyTokenJars": []}, "user": {"onBehalfOfUser": channel_info.delegated_session_id, "delegationContext": {"externalChannelId": channel_info.id, "roleType": {"channelRoleType": channel_info.role}}, "serializedDelegationContext": ""}, "clickTracking": {"visualElement": {"veType": 31_402}}, "clientScreenNonce": self.CLIENT_SCREEN_NONCE}}
+        payload["context"] = self._current_studio_context(channel_info, session_token, base_context=payload["context"])
+        payload["mask"]["scheduledCreatorVisibility"] = {"all": True}
         if include_all_origins:
             operands = payload["filter"]["and"]["operands"]
             operands[:] = [operand for operand in operands if "videoOriginIs" not in operand]
@@ -71,6 +73,7 @@ class ListVideosModule(IModule):
             payload["filter"]["and"]["operands"].insert(1, {"isDraft": {}})
         payload["mask"].update({"copyrightSummary": {"all": True}, "claimDetails": {"all": True}})
         headers = {"origin": "https://studio.youtube.com", "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36", "cookie": cookie_string, "content-type": "application/json", "authorization": studio_authorization_header(channel_info.cookies)}
+        headers["user-agent"] = payload["context"]["client"].get("userAgent") or headers["user-agent"]
         if page_token:
             payload["pageToken"] = page_token
         url = "https://studio.youtube.com/youtubei/v1/creator/list_creator_videos?alt=json"
@@ -108,6 +111,7 @@ class ListVideosModule(IModule):
                         scheduled_publishing_details=item.get(
                             "scheduledPublishingDetails", ""
                         ),
+                        scheduled_creator_visibility=item.get("scheduledCreatorVisibility", ""),
                         visibility=item.get("visibility", ""),
                         time_created_seconds=item.get("timeCreatedSeconds", ""),
                         time_published_seconds=item.get("timePublishedSeconds", ""),

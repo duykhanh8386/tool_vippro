@@ -74,6 +74,7 @@ class Video:
     restriction_details: dict = field(default_factory=dict)
     thumbnail_details: dict = field(default_factory=dict)
     thumbnail_editor_state: dict = field(default_factory=dict)
+    scheduled_creator_visibility: object = ""
 
 
 class AuthSignal(Enum):

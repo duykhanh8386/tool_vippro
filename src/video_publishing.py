@@ -26,10 +26,30 @@ SELECTABLE_COPYRIGHT_TYPES = {"clear", "limited", "partial", "blocked"}
 PUBLISHING_SCAN_SCHEMA_VERSION = 2
 
 
+def _schedule_sources(video):
+    def meaningful(value):
+        if isinstance(value, dict):
+            return any(meaningful(child) for key,child in value.items() if key not in {"privacy","targetPrivacy","newPrivacy"})
+        if isinstance(value,list):
+            return any(meaningful(child) for child in value)
+        return value not in (None,False,0,"","0")
+    for value in (getattr(video, "scheduled_publishing_details", None), getattr(video, "scheduled_creator_visibility", None)):
+        if isinstance(value, dict) and any(value.get(key) is False for key in ("isScheduled", "scheduled")):
+            continue
+        if isinstance(value, str) and any(marker in value.upper() for marker in ("UNSPECIFIED", "_NONE")):
+            continue
+        if meaningful(value):
+            yield value
+
+
+def has_schedule_info(video):
+    return any(True for _ in _schedule_sources(video))
+
+
 def publishing_video_type(video) -> str:
     if _status_indicates_draft(getattr(video, "draft_status", None)) or _status_indicates_draft(getattr(video, "video_status", None)):
         return "draft"
-    if getattr(video, "scheduled_publishing_details", None):
+    if has_schedule_info(video):
         return "scheduled"
     privacy = str(getattr(video, "privacy", "") or "").upper()
     for kind in ("private", "unlisted", "public"):
@@ -224,18 +244,19 @@ def parse_chatgpt_cookies(text: str) -> list[dict]:
 
 
 def schedule_timestamp(video) -> float | None:
-    details = getattr(video, "scheduled_publishing_details", None)
-    if isinstance(details, dict):
+    if not has_schedule_info(video):
+        return None
+    for candidate in _schedule_sources(video):
         # Studio has returned both its publication object and the metadata
         # command shape for scheduledPublishingDetails across client versions.
-        stamp = _timestamp(details.get("timeSec"))
-        nested = details.get("scheduledPublishing") or details.get("set")
+        stamp = _timestamp(candidate)
+        nested = (candidate.get("scheduledPublishing") or candidate.get("set") or candidate.get("scheduledCreatorVisibility")) if isinstance(candidate, dict) else None
         if isinstance(nested, dict):
             nested = nested.get("set", nested)
             stamp = stamp or _timestamp(nested.get("timeSec")) or _timestamp(nested)
         if stamp:
             return stamp
-    return _timestamp(details) or (_timestamp(getattr(video, "time_published_seconds", None)) if details else None)
+    return _timestamp(getattr(video, "time_published_seconds", None))
 
 
 def plan_daily(rows: list[dict], start_date: str, hour: str, *, occupied=None, now=None) -> list[dict]:

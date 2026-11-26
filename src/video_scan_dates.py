@@ -55,7 +55,8 @@ def _timestamp(value: object, *, depth: int = 0) -> float | None:
         return None
     if isinstance(value, Mapping):
         for key in (
-            "seconds", "secondsSinceEpoch", "publishTimeSeconds", "scheduledPublishTimeSeconds",
+            "seconds", "secondsSinceEpoch", "timeSec", "timeSeconds", "timeMs", "publishTimeSeconds", "publishTimeSec", "publishTimeMs", "scheduledPublishTimeSeconds",
+            "scheduledPublishTimeSec", "scheduledPublishTimeMs", "scheduledTimeSeconds", "scheduledTimeSec", "scheduledTimeMs",
             "scheduledPublishingTimeSeconds", "scheduledPublishTime", "scheduledPublishingTime",
             "publishTime", "publishAt", "scheduledTime", "timestamp", "time", "value",
         ):
@@ -85,7 +86,7 @@ def _video_timestamp(video: object, date_type: str) -> float | None:
     is_draft = _status_indicates_draft(_video_value(video, "draft_status")) or _status_indicates_draft(
         _video_value(video, "video_status")
     )
-    schedule = _video_value(video, "scheduled_publishing_details")
+    schedule = _video_value(video, "scheduled_publishing_details") or _video_value(video, "scheduled_creator_visibility")
     if date_type == "auto":
         privacy = str(_video_value(video, "privacy") or "").upper()
         if is_draft:

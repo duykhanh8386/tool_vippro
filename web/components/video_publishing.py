@@ -161,7 +161,8 @@ def create_video_publishing_page():
             for key in ("plan", "run"):
                 buttons[key].set_enabled(not busy and chosen > 0)
             message.set_text(data["message"])
-            summary.set_text(f"{len(data['rows'])} đã quét · {len(filtered)} trong bộ lọc · {selectable_count} có thể tích chọn · {chosen} đã chọn toàn bộ ({chosen - shown_selected} ngoài bộ lọc) · {sum(row['status'] == 'successful' for row in data['rows'])} đã lên lịch")
+            scheduled_count=sum(row.get("visibility_type")=="scheduled" or row["status"]=="successful" for row in data["rows"])
+            summary.set_text(f"{len(data['rows'])} đã quét · {len(filtered)} trong bộ lọc · {selectable_count} có thể tích chọn · {chosen} đã chọn toàn bộ ({chosen - shown_selected} ngoài bộ lọc) · {scheduled_count} video có lịch · {sum(row['status'] == 'successful' for row in data['rows'])} hoàn tất tác vụ")
             rescan_hint.set_visibility(data["needs_rescan"])
             cookie_status.set_text("Đã nhận cookie nhập tay." if data["has_cookie"] else "Có thể dùng phiên Chrome đã lưu hoặc đăng nhập trực tiếp.")
             session_status.set_text(data["chatgpt_status"])

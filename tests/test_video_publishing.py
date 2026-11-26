@@ -341,6 +341,9 @@ class PublishingControllerTests(unittest.TestCase):
         self.storage = MemoryState()
         self.module, self.listing, self.reference, self.image, self.thumbnail = Mock(), Mock(), Mock(), Mock(), Mock()
         self.module.require_eligible.return_value = video()
+        self.module.read_video.side_effect = lambda channel_id,video_id:video(video_id,channel_id=channel_id)
+        self.thumbnail.upload.return_value = {"playlist_id":"PL-first","playlist_title":"First playlist"}
+        self.thumbnail.assign_first_playlist.return_value = {"playlist_id":"PL-first","playlist_title":"First playlist"}
         self.reference.find.return_value = dict(REFERENCE)
         self.listing.list_all_videos.return_value = ([], None)
         self.controller = VideoPublishingController(storage=self.storage, module=self.module, listing=self.listing,
@@ -493,8 +496,8 @@ class PublishingControllerTests(unittest.TestCase):
     def test_schedule_conflicts_detected_before_processing(self):
         self.controller.rows = [row(publish_at=STAMP)]
         self.listing.list_all_videos.return_value = ([video(OTHER, scheduled_publishing_details={"publishTimeSeconds": STAMP - 3600})], None)
-        with self.assertRaises(ValueError):
-            self.controller._check_schedule_conflicts()
+        self.controller._check_schedule_conflicts()
+        self.assertEqual(self.controller.rows[0]["publish_at"],STAMP+86400)
         self.module.copy_metadata.assert_not_called()
 
     def test_reference_selection_receives_original_filename_and_current_duration(self):
@@ -533,9 +536,54 @@ class PublishingControllerTests(unittest.TestCase):
     def test_unknown_existing_schedule_blocks_new_schedules(self):
         self.controller.rows = [row(publish_at=STAMP)]
         self.listing.list_all_videos.return_value = ([video(OTHER, scheduled_publishing_details={"unrecognizedScheduleShape": True})], None)
+        self.module.read_video.side_effect = lambda channel_id,video_id:video(video_id,channel_id=channel_id,scheduled_publishing_details={"unrecognizedScheduleShape":True})
         with self.assertRaises(ValueError):
             self.controller._check_schedule_conflicts()
         self.module.schedule.assert_not_called()
+
+    def test_unreadable_list_schedule_is_refreshed_and_existing_schedule_is_preserved(self):
+        self.controller.rows=[row(publish_at=STAMP),row(OTHER,publish_at=STAMP+86400)]
+        self.listing.list_all_videos.return_value=([video(scheduled_publishing_details={"unknown":True}),video(OTHER)],None)
+        self.module.read_video.side_effect=lambda channel_id,identifier:video(identifier,channel_id=channel_id,
+            scheduled_publishing_details={"scheduledTimeSeconds":str(STAMP)} if identifier==VIDEO else "")
+        self.controller._check_schedule_conflicts()
+        self.assertFalse(self.controller.rows[0]["selected"])
+        self.assertEqual(self.controller.rows[0]["visibility_type"],"scheduled")
+        self.assertEqual(self.controller.rows[0]["publish_at"],STAMP)
+        self.assertEqual(self.controller.rows[1]["publish_at"],STAMP+86400)
+        self.module.schedule.assert_not_called()
+
+    def test_stale_unknown_schedule_that_is_absent_on_refresh_does_not_block(self):
+        self.controller.rows=[row(publish_at=STAMP)]
+        self.listing.list_all_videos.return_value=([video(OTHER,scheduled_publishing_details={"unknown":True})],None)
+        self.controller._check_schedule_conflicts()
+        self.assertEqual(self.controller.rows[0]["publish_at"],STAMP)
+        self.assertTrue(self.controller.rows[0]["selected"])
+
+    def test_new_schedule_field_names_and_explicit_unscheduled_flags(self):
+        for key in ("scheduledTimeSeconds","scheduledTimeSec","scheduledPublishTimeSec"):
+            self.assertEqual(schedule_timestamp(video(scheduled_publishing_details={key:str(STAMP)})),STAMP)
+        self.assertEqual(schedule_timestamp(video(scheduled_creator_visibility={"time":{"seconds":str(STAMP)}})),STAMP)
+        self.assertIsNone(schedule_timestamp(video(scheduled_publishing_details={"isScheduled":False},time_published_seconds=STAMP)))
+        self.assertIsNone(schedule_timestamp(video(scheduled_publishing_details={"publishTimeSeconds":"0","privacy":"PUBLIC"})))
+        self.assertEqual(schedule_timestamp(video(scheduled_publishing_details={"isScheduled":False,"timeSec":STAMP},
+                                                 scheduled_creator_visibility={"timeSec":STAMP+86400})),STAMP+86400)
+
+    def test_playlist_is_added_before_metadata_and_kept_when_retrying(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path=Path(folder)/"thumb.jpg";path.write_bytes(b"cached")
+            self.controller.rows=[row(reference=REFERENCE,thumbnail_path=str(path),thumbnail_uploaded=True,publish_at=STAMP)]
+            order=Mock()
+            order.attach_mock(self.thumbnail.assign_first_playlist,"playlist")
+            order.attach_mock(self.module.copy_metadata,"metadata")
+            order.attach_mock(self.module.schedule,"schedule")
+            self.module.schedule.side_effect=[ValueError("pending"),None]
+            self.controller._worker("run",create_run_context("playlist-first-attempt"))
+            self.assertTrue(self.controller.rows[0]["playlist_assigned"])
+            self.controller._worker("run",create_run_context("playlist-resume"))
+        self.assertEqual([call[0] for call in order.mock_calls], ["playlist","metadata","schedule","metadata","schedule"])
+        self.thumbnail.assign_first_playlist.assert_called_once()
+        self.image.generate.assert_not_called()
 
     def test_full_worker_checkpoints_and_resumes_without_regenerating(self):
         with tempfile.TemporaryDirectory() as folder:

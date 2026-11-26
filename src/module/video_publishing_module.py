@@ -4,7 +4,6 @@ Schedule wire format: https://github.com/yusufusta/ytstudio/blob/master/ytstudio
 Mutations are confirmed by reading the video back, including uncertain responses.
 """
 from datetime import datetime, timezone
-from copy import deepcopy
 import unicodedata
 
 import requests
@@ -14,7 +13,7 @@ from src.module.base import YouTubeRequestError, _response_json_or_error, studio
 from src.module.video_title_module import VideoTitleModule
 from src.task_runtime import check_stopped, post_with_stop, wait_interruptibly
 from src.utils import get_channels_info
-from src.video_publishing import copyright_category, schedule_timestamp
+from src.video_publishing import copyright_category, has_schedule_info, schedule_timestamp
 from src.video_scan_dates import _status_indicates_draft
 from src.youtube_auth import studio_authorization_header
 
@@ -38,7 +37,7 @@ class VideoPublishingModule(VideoTitleModule):
         if category not in set(categories) or category in {"unknown", "checking"}:
             raise ValueError("Trạng thái bản quyền đã thay đổi so với lúc chọn video. Quét lại video này.")
         existing = schedule_timestamp(video)
-        if video.scheduled_publishing_details and existing is None:
+        if has_schedule_info(video) and existing is None:
             raise ValueError("Video có lịch đăng nhưng chưa đọc được thời gian; giữ nguyên lịch hiện tại.")
         if existing and (not publish_at or abs(existing - publish_at) > 1):
             raise ValueError("Video đã có lịch đăng khác; quét lại để giữ lịch đã đặt.")
@@ -53,21 +52,7 @@ class VideoPublishingModule(VideoTitleModule):
         if not channel or channel.id != channel_id:
             raise ValueError("Không tìm thấy phiên kênh. Load lại kênh trước khi tiếp tục.")
         token = self._get_session_token(channel)
-        context = self._build_context(channel.id, channel.role, channel.delegated_session_id,
-                                      extra_request_fields={"sessionInfo": {"token": token}})
-        captured = getattr(channel, "studio_context", {}) or {}
-        captured_id = (captured.get("user", {}).get("delegationContext") or {}).get("externalChannelId")
-        if captured_id and captured_id != channel_id:
-            raise ValueError("Phiên Studio thuộc kênh khác; chưa gửi thay đổi.")
-        for name in ("client", "user", "clientScreenNonce"):
-            if captured.get(name):
-                context[name] = ({**context[name], **deepcopy(captured[name])}
-                                 if isinstance(context.get(name), dict) and isinstance(captured[name], dict)
-                                 else deepcopy(captured[name]))
-        if isinstance(captured.get("request"), dict):
-            context["request"] = deepcopy(captured["request"])
-            context["request"].pop("reauthRequestInfo", None)
-            context["request"]["sessionInfo"] = {"token": token}
+        context = self._current_studio_context(channel, token)
         payload = {"encryptedVideoId": video_id, "context": context,
                    "delegationContext": dict(context["user"]["delegationContext"]),
                    "videoReadMask": {"videoId": True, "channelId": True, "title": True, "description": True,

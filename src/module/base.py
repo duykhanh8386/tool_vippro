@@ -82,6 +82,7 @@ def studio_video_from_payload(video):
         video_status=video.get("status", ""), audio_language=str(audio_language).strip(),
         privacy=video.get("privacy", ""), draft_status=video.get("draftStatus", ""),
         scheduled_publishing_details=video.get("scheduledPublishingDetails", ""),
+        scheduled_creator_visibility=video.get("scheduledCreatorVisibility", ""),
         visibility=video.get("visibility", ""), time_created_seconds=video.get("timeCreatedSeconds", ""),
         time_published_seconds=video.get("timePublishedSeconds", ""),
         restriction_details=restriction_details(video), copyright_check_status=copyright_check_status(video),
@@ -198,7 +199,12 @@ class IModule(ABC):
     "titleFormattedString": {"all": True}, "viewCountIsHidden": True, "autoChapterSettings": {"all": True}, "autoPlacesMentionedSettings": {"all": True}, "videoArtworkEditorState": {"all": True}, "learningConceptSettings": {"all": True}, "videoEditorProject": {"all": True}, "originalFilename": True, "timeCreatedSeconds": True,
 
     "videoResolutions": {"all": True}, "watchUrl": True, "publicShorts": {"all": True}, "publicMetrics": {"all": True}, "academicLearning": {"all": True}, "manualPlacesMentionedPlaces": {"all": True}, "autoProductsSettings": {"all": True},
-    "videoAutoSummarySettings": {"all": True}, "issues": {"all": True}}, "criticalRead": bool(critical_read)}; response = post_with_stop(url=url, headers=headers, json=payload)
+    "videoAutoSummarySettings": {"all": True}, "issues": {"all": True}}, "criticalRead": bool(critical_read)}
+        if critical_read:
+            payload["context"] = self._current_studio_context(channel_info, session_token, base_context=payload["context"])
+            payload["mask"]["scheduledCreatorVisibility"] = {"all": True}
+            headers["user-agent"] = payload["context"]["client"].get("userAgent") or headers["user-agent"]
+        response = post_with_stop(url=url, headers=headers, json=payload)
         res = _response_json_or_error(response, "video status check")
         videos = res.get("videos")
         if not isinstance(videos, list) or not videos or not isinstance(videos[0], dict):
@@ -210,6 +216,24 @@ class IModule(ABC):
         return studio_video_from_payload(videos[0])
 
         cookie = None
+    def _current_studio_context(self, channel, token, *, base_context=None):
+        context = deepcopy(base_context) if base_context is not None else self._build_context(
+            channel.id, channel.role, channel.delegated_session_id, extra_request_fields={"sessionInfo":{"token":token}})
+        captured = getattr(channel, "studio_context", {}) or {}
+        captured_id = (captured.get("user", {}).get("delegationContext") or {}).get("externalChannelId")
+        if captured_id and captured_id != channel.id:
+            raise ValueError("Phiên Studio thuộc kênh khác; chưa gửi yêu cầu.")
+        for name in ("client", "user", "clientScreenNonce"):
+            if captured.get(name):
+                context[name] = ({**context[name], **deepcopy(captured[name])}
+                                 if isinstance(context.get(name), dict) and isinstance(captured[name], dict)
+                                 else deepcopy(captured[name]))
+        if isinstance(captured.get("request"), dict):
+            context["request"] = deepcopy(captured["request"])
+        context.setdefault("request", {}).pop("reauthRequestInfo", None)
+        context["request"]["sessionInfo"] = {"token":token}
+        return context
+
     def _build_context(self, channel_id: str, role: str, delegated_session_id: str, *, client_version: str="1.20260311.03.00", hl: str="en", theme: str="USER_INTERFACE_THEME_DARK", screen_width: int=1920, screen_height: int=945, include_on_behalf_of_user: bool=True, extra_request_fields: dict | None=None) -> dict:
         """Build the standard YouTube Studio API context payload."""
         user_block = {"delegationContext": {"externalChannelId": channel_id, "roleType": {"channelRoleType": role}}, "serializedDelegationContext": ""}

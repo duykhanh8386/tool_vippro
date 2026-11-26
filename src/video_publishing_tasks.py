@@ -17,7 +17,7 @@ from src.task_runtime import TaskStopped, bind_run_context, check_stopped, creat
 from src.utils import get_channels_info
 from src.video_publishing import (
     COPYRIGHT_LABELS, PUBLISHING_SCAN_SCHEMA_VERSION, REFERENCE_SELECTION_VERSION, copyright_category, first_song,
-    VIDEO_SCOPE_LABELS, VIDEO_TYPE_LABELS, parse_chatgpt_cookies, plan_daily, positive_seconds,
+    VIDEO_SCOPE_LABELS, VIDEO_TYPE_LABELS, has_schedule_info, parse_chatgpt_cookies, plan_daily, positive_seconds,
     publishing_row_disabled_reason, publishing_row_matches, publishing_row_selectable,
     publishing_video_type, schedule_timestamp, thumbnail_file_stem,
 )
@@ -244,6 +244,12 @@ class VideoPublishingController:
             self.revision += 1
             self._save()
 
+    def _remember_thumbnail_saved(self, row):
+        with self.lock:
+            row["thumbnail_uploaded"] = True
+            self.revision += 1
+            self._save()
+
     def _progress(self, message):
         with self.lock:
             self.message = message
@@ -344,6 +350,7 @@ class VideoPublishingController:
                         raise ValueError("YouTube trả về phân trang lặp; đã dừng quét.")
                     tokens.add(next_token)
                     token = next_token
+            videos = [self._resolve_schedule(video) for video in videos]
             occupied[channel_id] = [stamp for video in videos if (stamp := schedule_timestamp(video))]
             if manual:
                 videos = [video for video in videos if video.id in manual_set]
@@ -363,6 +370,8 @@ class VideoPublishingController:
                        "copyright": category, "copyright_label": COPYRIGHT_LABELS[category],
                        "classification_version": PUBLISHING_SCAN_SCHEMA_VERSION, "draft_status": copy.deepcopy(video.draft_status),
                        "visibility_type": kind, "visibility_label": VIDEO_TYPE_LABELS[kind], "selected": False, "status": "scanned"}
+                if stamp := schedule_timestamp(video):
+                    row.update(publish_at=int(stamp),publish_label=datetime.fromtimestamp(stamp,VIETNAM_TIMEZONE).strftime("%d/%m/%Y %H:%M"))
                 reason = publishing_row_disabled_reason(row)
                 row.update(availability_reason=reason, status="skipped" if reason else "scanned",
                            detail=reason or "Tích chọn dòng này hoặc chọn hàng loạt theo bộ lọc để xử lý.")
@@ -438,9 +447,19 @@ class VideoPublishingController:
                 if not row.get("thumbnail_uploaded"):
                     self._checkpoint(row, detail="Đang tải thumbnail và đọc lại ảnh đã lưu trên YouTube…")
                     self.module.require_eligible(row["channel_id"], row["video_id"], categories, publish_at=row["publish_at"])
-                    thumbnail.upload(row["channel_id"], row["video_id"], row["thumbnail_path"])
+                    playlist = thumbnail.upload(row["channel_id"], row["video_id"], row["thumbnail_path"], ensure_playlist=True,
+                                                on_saved=lambda row=row:self._remember_thumbnail_saved(row))
                     self._checkpoint(row, thumbnail_uploaded=True)
-                self._checkpoint(row, detail="Đã xác nhận thumbnail. Đang chép title/description và đọc lại…")
+                elif not row.get("playlist_assigned"):
+                    self._checkpoint(row,detail="Đang chọn và lưu danh sách phát đầu tiên…")
+                    playlist = thumbnail.assign_first_playlist(row["channel_id"],row["video_id"])
+                else:
+                    playlist = None
+                if not row.get("playlist_assigned"):
+                    if not isinstance(playlist,dict) or not playlist.get("playlist_id"):
+                        raise ValueError("Chưa xác nhận được danh sách phát đầu tiên; chưa đặt lịch video này.")
+                    self._checkpoint(row,playlist_assigned=True,**playlist)
+                self._checkpoint(row, detail="Đã xác nhận thumbnail và danh sách phát. Đang chép title/description…")
                 self.module.copy_metadata(row["channel_id"], row["video_id"], row["reference"],
                                           expected_title=row["old_title"], expected_description=row["old_description"],
                                           categories=categories, publish_at=row["publish_at"])
@@ -465,29 +484,60 @@ class VideoPublishingController:
     def _check_schedule_conflicts(self):
         """Detect schedules added since the preview before any remote mutation."""
         selected = [row for row in self.rows if row.get("selected") and row.get("publish_at")]
+        occupied = copy.deepcopy(self.occupied)
+        remote_pending = {}
         for channel_id in dict.fromkeys(row["channel_id"] for row in selected):
             self._progress(f"Đang kiểm tra lại lịch hiện có trên kênh {channel_id}…")
-            token, tokens = None, set()
+            token, tokens, seen = None, set(), {}
             while True:
                 page, next_token = self.listing.list_all_videos(channel_id, limit=100, page_token=token)
                 for video in page:
                     if video.channel_id != channel_id:
                         raise ValueError("YouTube trả về lịch của kênh khác.")
-                    stamp = schedule_timestamp(video)
-                    if video.scheduled_publishing_details and stamp is None:
-                        raise ValueError("Có video đã lên lịch nhưng chưa đọc được ngày giờ. Kiểm tra Studio trước khi đặt thêm lịch.")
-                    if not stamp:
-                        continue
-                    day = datetime.fromtimestamp(stamp, VIETNAM_TIMEZONE).date()
-                    if any(row["channel_id"] == channel_id and row["video_id"] != video.id
-                           and datetime.fromtimestamp(row["publish_at"], VIETNAM_TIMEZONE).date() == day for row in selected):
-                        raise ValueError("Kênh đã có video khác được lên lịch vào ngày dự kiến sau lần quét. Quét lại để cập nhật ngày trống.")
+                    seen[video.id] = self._resolve_schedule(video)
                 if not next_token:
                     break
                 if next_token in tokens:
                     raise ValueError("YouTube trả về phân trang lịch bị lặp.")
                 tokens.add(next_token)
                 token = next_token
+            for row in [item for item in selected if item["channel_id"] == channel_id]:
+                current = self.module.read_video(channel_id, row["video_id"])
+                if current.id != row["video_id"] or current.channel_id != channel_id:
+                    raise ValueError("Video đọc lại không thuộc đúng kênh; chưa đặt lịch.")
+                current = self._resolve_schedule(current)
+                seen[current.id] = current
+                kind = publishing_video_type(current)
+                stamp = schedule_timestamp(current)
+                if kind in {"scheduled", "public"}:
+                    changes = dict(selected=False, visibility_type=kind, visibility_label=VIDEO_TYPE_LABELS[kind], status="skipped",
+                                   availability_reason="Video đã có lịch đăng; giữ lịch hiện tại." if kind=="scheduled" else "Video đã công khai; giữ trạng thái hiện tại.",
+                                   detail="Đã đọc lại trạng thái trên YouTube; không đặt lại lịch video này.")
+                    if stamp:
+                        changes.update(publish_at=int(stamp),publish_label=datetime.fromtimestamp(stamp,VIETNAM_TIMEZONE).strftime("%d/%m/%Y %H:%M"))
+                    self._checkpoint(row,**changes)
+                elif stamp:
+                    remote_pending[row["video_id"]] = int(stamp)
+            occupied[channel_id] = [stamp for video in seen.values() if (stamp:=schedule_timestamp(video))]
+        with self.lock:
+            self.occupied = occupied
+            for row in selected:
+                if row.get("selected"):
+                    row.pop("publish_at",None)
+                    row.pop("publish_label",None)
+                    if row["video_id"] in remote_pending:
+                        row["publish_at"] = remote_pending[row["video_id"]]
+            self._assign_plan()
+
+    def _resolve_schedule(self, video):
+        if not has_schedule_info(video) or schedule_timestamp(video) is not None:
+            return video
+        current = self.module.read_video(video.channel_id, video.id)
+        if current.id != video.id or current.channel_id != video.channel_id:
+            raise ValueError("Video đọc lại không thuộc đúng kênh; chưa xác nhận lịch.")
+        if has_schedule_info(current) and schedule_timestamp(current) is None:
+            raise ValueError("Video " + video.id + " có thông tin lịch nhưng chưa đọc được ngày giờ sau khi tải lại từ Studio; chưa đặt thêm lịch cho kênh này.")
+        return current
 
     def _worker(self, action, run):
         reference = image = None

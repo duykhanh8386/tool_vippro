@@ -24,19 +24,38 @@ CHANNEL = "UC" + "a" * 22
 STAMP = 4070998800
 PAGE = '''<!doctype html><ytcp-video-metadata-editor><ytcp-thumbnail-editor>
 <input type="file" accept="image/jpeg" hidden></ytcp-thumbnail-editor>
+<ytcp-video-metadata-playlists><ytcp-dropdown-trigger role="button" style="display:block">Playlists</ytcp-dropdown-trigger></ytcp-video-metadata-playlists>
 <button id="save" disabled>Save</button></ytcp-video-metadata-editor><script>
 const file=document.querySelector('input'),save=document.querySelector('#save');
-file.onchange=()=>save.disabled=false;
+let thumbnailDirty=false;const assigned=__PLAYLISTS__;
+file.onchange=()=>{thumbnailDirty=true;save.disabled=false;};
 save.onclick=async()=>{
+ const body={encryptedVideoId:'Abc123_-XYZ'};
+ if(thumbnailDirty) body.thumbnail={customThumbnail:{externalImageId:'IM-upload'}};
+ const playlists=Array.from(document.querySelectorAll('ytcp-checkbox-lit')).filter(e=>e.querySelector('[role=checkbox]').getAttribute('aria-checked')==='true').map(e=>e.getAttribute('test-id'));
+ if(JSON.stringify(playlists)!==JSON.stringify(assigned))body.playlists=playlists;
  await fetch('/youtubei/v1/video_manager/metadata_update',{method:'POST',headers:{'Content-Type':'application/json'},
- body:JSON.stringify({encryptedVideoId:'Abc123_-XYZ',thumbnail:{customThumbnail:{externalImageId:'IM-upload'}}})});
- save.disabled=true;
-};</script>'''
+ body:JSON.stringify(body)});
+ thumbnailDirty=false;save.disabled=true;
+};</script>
+<ytcp-playlist-dialog style="display:none"><div id="playlists-list">
+<label><ytcp-checkbox-lit test-id="PL-first"><div role="checkbox" aria-checked="false" aria-disabled="false">Check</div></ytcp-checkbox-lit><span class="label-text">First playlist</span></label>
+<label><ytcp-checkbox-lit test-id="PL-existing"><div role="checkbox" aria-checked="true" aria-disabled="false">Check</div></ytcp-checkbox-lit><span class="label-text">Existing playlist</span></label>
+</div><ytcp-button class="done-button" role="button">Done</ytcp-button></ytcp-playlist-dialog><script>
+const dialog=document.querySelector('ytcp-playlist-dialog');
+document.querySelector('ytcp-dropdown-trigger').onclick=()=>dialog.style.display='block';
+for(const checkbox of document.querySelectorAll('[role=checkbox]')){
+ const id=checkbox.closest('ytcp-checkbox-lit').getAttribute('test-id');
+ checkbox.setAttribute('aria-checked',assigned.includes(id)?'true':'false');
+ checkbox.onclick=()=>checkbox.setAttribute('aria-checked',checkbox.getAttribute('aria-checked')==='true'?'false':'true');
+}
+document.querySelector('.done-button').onclick=()=>{dialog.style.display='none';save.disabled=false;};
+</script>'''
 
 
 class StudioFixture(BaseHTTPRequestHandler):
     def do_GET(self):
-        payload = PAGE.encode()
+        payload = PAGE.replace('__PLAYLISTS__',json.dumps(self.server.playlists)).encode()
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(payload)))
@@ -53,6 +72,9 @@ class StudioFixture(BaseHTTPRequestHandler):
             self.server.steps.append("metadata")
             state["title"] = data["title"]["newTitle"]
             state["description"] = data["description"]["newDescription"]
+        if "playlists" in data:
+            self.server.steps.append("playlist")
+            self.server.playlists=data["playlists"]
         if "scheduledPublishing" in data:
             self.server.steps.append("schedule")
             state["scheduledPublishingDetails"] = {"publishTimeSeconds":data["scheduledPublishing"]["set"]["timeSec"]}
@@ -102,6 +124,7 @@ class StudioPublishingBrowserTests(unittest.TestCase):
                             "thumbnailEditorState":{"customThumbnail":{"externalImageId":"IM-old"},"defaultStill":False},
                             "videoPrechecks":{"videoUploadChecksNotMonetized":{"copyrightCheck":{"checkStatus":"COPYRIGHT_CHECK_NO_ISSUES"}}}}
             server.steps = []
+            server.playlists=["PL-existing"]
             worker = threading.Thread(target=server.serve_forever,daemon=True)
             worker.start()
             origin = f"http://127.0.0.1:{server.server_port}"
@@ -127,7 +150,8 @@ class StudioPublishingBrowserTests(unittest.TestCase):
                     with patch("src.publishing_browser._new_driver",return_value=adapter), \
                             patch("src.publishing_browser.get_channels_info",return_value=channel), \
                             patch("src.publishing_browser.inject_cookies_via_cdp"):
-                        StudioThumbnailBrowser(verify_saved=verifier).upload(CHANNEL,VIDEO,image)
+                        playlist=StudioThumbnailBrowser(verify_saved=verifier).upload(CHANNEL,VIDEO,image,ensure_playlist=True)
+                        self.assertEqual(playlist["playlist_id"],"PL-first")
                     self.assertEqual(verifier.confirmed_asset_id,"IM-upload")
                 module = VideoPublishingModule()
                 reference={"title":"New song title","description":"Line one\nLine two"}
@@ -142,7 +166,8 @@ class StudioPublishingBrowserTests(unittest.TestCase):
                         patch.object(module,"_get_video_info",side_effect=lambda *_args:studio_video_from_payload(server.video)):
                     module.copy_metadata(CHANNEL,VIDEO,reference,expected_title="Original",expected_description="Old description",categories=["clear"])
                     module.schedule(CHANNEL,VIDEO,STAMP,reference,categories=["clear"])
-                self.assertEqual(server.steps,["thumbnail","metadata","schedule"])
+                self.assertEqual(server.steps,["thumbnail","playlist","metadata","schedule"])
+                self.assertEqual(server.playlists,["PL-first","PL-existing"])
                 self.assertEqual(server.video["title"],reference["title"])
                 self.assertEqual(server.video["description"],reference["description"])
                 self.assertEqual(server.video["scheduledPublishingDetails"]["publishTimeSeconds"],str(STAMP))
