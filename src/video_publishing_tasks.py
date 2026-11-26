@@ -11,13 +11,15 @@ from src.module.base import YouTubeRequestError
 from src.module.list_videos_module import list_videos_module
 from src.module.video_publishing_module import video_publishing_module
 from src.paths import get_data_dir
-from src.publishing_browser import ChatGPTImageBrowser, ChatGPTSessionNeedsAction, StudioThumbnailBrowser, YouTubeReferenceBrowser, download_reference_image, normalize_thumbnail
+from src import gpt_service
+from src.phoma_image_generator import IMAGE_MODELS, PhomaImageGenerator, parse_access_token
+from src.publishing_browser import ChatGPTSessionNeedsAction, StudioThumbnailBrowser, YouTubeReferenceBrowser, download_reference_image, normalize_thumbnail
 from src.state_manager import state_manager
 from src.task_runtime import TaskStopped, bind_run_context, check_stopped, create_run_context
 from src.utils import get_channels_info
 from src.video_publishing import (
     COPYRIGHT_LABELS, PUBLISHING_SCAN_SCHEMA_VERSION, REFERENCE_SELECTION_VERSION, copyright_category, first_song,
-    VIDEO_SCOPE_LABELS, VIDEO_TYPE_LABELS, has_schedule_info, parse_chatgpt_cookies, plan_daily, positive_seconds,
+    VIDEO_SCOPE_LABELS, VIDEO_TYPE_LABELS, has_schedule_info, plan_daily, positive_seconds,
     publishing_row_disabled_reason, publishing_row_matches, publishing_row_selectable,
     publishing_video_type, schedule_timestamp, thumbnail_file_stem,
 )
@@ -33,7 +35,7 @@ def default_settings():
     return {"channel_source": "selected", "channel_ids": [], "channel_links": "", "manual_ids": "", "categories": ["clear"], "scope": "unpublished",
             "scan_all": True, "limit": 100, "start_date": (datetime.now(VIETNAM_TIMEZONE).date() + timedelta(days=1)).isoformat(),
             "hour": "18:00", "order": "oldest", "image_prompt": "Vẽ lại thumbnail dựa trên ảnh tham chiếu, bố cục rõ ràng, chữ dễ đọc, phù hợp nội dung bài nhạc; tỷ lệ 16:9.",
-            "output_folder": ""}
+            "output_folder": "", "image_model": "gpt-image-2", "image_cleanup": False}
 
 
 class VideoPublishingController:
@@ -42,7 +44,7 @@ class VideoPublishingController:
         self.module = module or video_publishing_module
         self.listing = listing or list_videos_module
         self.reference_factory = reference_factory or YouTubeReferenceBrowser
-        self.image_factory = image_factory or ChatGPTImageBrowser
+        self.image_factory = image_factory or PhomaImageGenerator
         self.thumbnail_factory = thumbnail_factory or StudioThumbnailBrowser
         self.lock = threading.RLock()
         saved = self.storage.load_state(STATE_KEY) or {}
@@ -51,6 +53,7 @@ class VideoPublishingController:
             self.settings["channel_source"] = "links" if self.settings["channel_links"].strip() else "selected"
         # Credentials never belong in persistent state, even from an older file.
         self.settings.pop("cookie", None)
+        self.settings.pop("session_text", None)
         self.rows = saved.get("rows", [])
         self.occupied = saved.get("occupied", {})
         for row in self.rows:
@@ -61,7 +64,7 @@ class VideoPublishingController:
         self.message = saved.get("message", "Chọn kênh, quét trạng thái rồi tìm video tham chiếu.")
         if any(row.get("classification_version") != PUBLISHING_SCAN_SCHEMA_VERSION for row in self.rows):
             self.message = "Danh sách cũ chưa được kiểm tra bằng cách nhận diện bản nháp mới. Quét lại một lần để cập nhật đúng loại video."
-        self.cookie = ""
+        self.session_text = ""
         self.image_session = None
         self.session_busy = False
         self.chatgpt_status = "Chưa kiểm tra phiên ChatGPT."
@@ -77,26 +80,47 @@ class VideoPublishingController:
     def snapshot(self):
         with self.lock:
             return copy.deepcopy({"settings": self.settings, "rows": self.rows, "message": self.message,
-                                  "busy": self.busy, "revision": self.revision, "has_cookie": bool(self.cookie),
+                                  "busy": self.busy, "revision": self.revision, "has_session": bool(self.session_text),
                                   "session_busy": self.session_busy, "chatgpt_status": self.chatgpt_status,
                                   "needs_rescan": any(row.get("classification_version") != PUBLISHING_SCAN_SCHEMA_VERSION for row in self.rows)})
 
-    def set_cookie(self, text):
+    def set_session(self, text):
         with self.lock:
             if self.busy or self.session_busy:
-                raise ValueError("Chờ tác vụ kết thúc trước khi thay cookie.")
+                raise ValueError("Chờ tác vụ kết thúc trước khi thay session.")
             if text.strip():
-                parse_chatgpt_cookies(text)
-            self.cookie = text
+                parse_access_token(text)
+            self.session_text = text
             if self.image_session is not None:
-                self.image_session.update_cookies(text)
-            self.chatgpt_status = "Đã nhận cookie; bấm Mở / kiểm tra phiên để xác nhận đăng nhập." if text.strip() else "Đã bỏ cookie nhập tay; có thể dùng phiên Chrome đã lưu."
+                self.image_session.update_session(text)
+            self.chatgpt_status = "Đã nhận session; bấm Kiểm tra tài khoản để lưu và xác nhận." if text.strip() else "Dùng tài khoản GPT đã chọn và lưu trên máy."
 
     def _image_session(self):
         with self.lock:
             if self.image_session is None:
-                self.image_session = self.image_factory(self.cookie)
+                self.image_session = self.image_factory(self.session_text)
             return self.image_session
+
+    def gpt_account_action(self, action, **arguments):
+        if action not in {"accounts", "select", "remove", "replace", "rename"}:
+            raise ValueError("Thao tác tài khoản GPT không hợp lệ.")
+        with self.lock:
+            if self.busy or self.session_busy:
+                raise ValueError("Dừng tác vụ trước khi thay tài khoản GPT.")
+            self.session_busy = True
+        try:
+            result = gpt_service.call(action, **arguments)
+            if action != "accounts":
+                with self.lock:
+                    self.session_text = ""
+                    if self.image_session is not None:
+                        self.image_session.close()
+                    self.image_session = None
+                    self.chatgpt_status = "Đã cập nhật tài khoản GPT; kiểm tra trước khi chạy."
+            return result
+        finally:
+            with self.lock:
+                self.session_busy = False
 
     def _session_progress(self, message):
         with self.lock:
@@ -118,6 +142,8 @@ class VideoPublishingController:
             self.session_busy = True
         try:
             self._image_session().ensure_ready(on_status=self._session_progress)
+            with self.lock:
+                self.session_text = ""
             self._session_progress("Phiên ChatGPT đã đăng nhập và sẵn sàng.")
         except ChatGPTSessionNeedsAction as exc:
             self._session_progress(str(exc))
@@ -129,12 +155,12 @@ class VideoPublishingController:
     def close_chatgpt_session(self):
         with self.lock:
             if self.busy or self.session_busy:
-                raise ValueError("Dừng tác vụ trước khi đóng cửa sổ phiên ChatGPT.")
+                raise ValueError("Dừng tác vụ trước khi bỏ phiên xử lý GPT.")
             self.session_busy = True
         try:
             if self.image_session is not None:
                 self.image_session.close()
-            self._session_progress("Đã đóng cửa sổ. Phiên đăng nhập vẫn được Chrome lưu riêng cho tool.")
+            self._session_progress("Đã bỏ phiên xử lý hiện tại; tài khoản GPT vẫn được lưu trên máy.")
         finally:
             with self.lock:
                 self.session_busy = False
@@ -166,6 +192,10 @@ class VideoPublishingController:
                 raise ValueError("Bộ lọc bản quyền không hợp lệ.")
             if "order" in changes and changes["order"] not in {"oldest", "newest"}:
                 raise ValueError("Thứ tự đăng không hợp lệ.")
+            if "image_model" in changes and changes["image_model"] not in IMAGE_MODELS:
+                raise ValueError("Model tạo ảnh không hợp lệ.")
+            if "image_cleanup" in changes and not isinstance(changes["image_cleanup"], bool):
+                raise ValueError("Tùy chọn ẩn hội thoại không hợp lệ.")
             self.settings.update(changes)
             if changed & {"channel_source", "channel_ids", "channel_links", "manual_ids", "scan_all", "limit", "order"}:
                 self.rows = []
@@ -178,7 +208,7 @@ class VideoPublishingController:
                     if row.get("status") != "successful":
                         row.pop("publish_at", None)
                         row.pop("publish_label", None)
-            elif "image_prompt" in changed:
+            elif changed & {"image_prompt", "image_model"}:
                 for row in self.rows:
                     if row.get("status") != "successful" and not row.get("thumbnail_uploaded"):
                         row.pop("thumbnail_path", None)
@@ -186,6 +216,17 @@ class VideoPublishingController:
                         row.pop("image_request", None)
             self.revision += 1
             self._save()
+
+    def reset_images(self):
+        with self.lock:
+            if self.busy or self.session_busy:
+                raise ValueError("Dừng tác vụ trước khi tạo lại ảnh.")
+            for row in self.rows:
+                if row.get("selected") and publishing_row_selectable(row) and not row.get("thumbnail_uploaded"):
+                    for key in ("thumbnail_path", "conversation_url", "image_request"):
+                        row.pop(key, None)
+                    row.update(status="scanned", detail="Sẽ gửi yêu cầu tạo ảnh mới bằng phoma.")
+            self._checkpoint()
 
     def select(self, video_ids, *, within_ids=None):
         with self.lock:
@@ -287,8 +328,8 @@ class VideoPublishingController:
                 if action == "run":
                     if not self.settings["image_prompt"].strip():
                         raise ValueError("Nhập prompt chung để vẽ thumbnail.")
-                    if self.cookie.strip():
-                        parse_chatgpt_cookies(self.cookie)
+                    if self.session_text.strip():
+                        parse_access_token(self.session_text)
                     self._assign_plan()
             self.busy = True
             self.revision += 1
@@ -440,7 +481,8 @@ class VideoPublishingController:
                                          on_request=lambda request, row=row: self._remember_image_request(row, request),
                                          on_conversation=lambda url, row=row: self._remember_conversation(row, url),
                                          on_state=lambda state, message, row=row: self._image_session_state(row, state, message),
-                                         on_progress=lambda message, row=row: self._image_progress(row, message))
+                                         on_progress=lambda message, row=row: self._image_progress(row, message),
+                                         model=settings["image_model"], cleanup=settings["image_cleanup"])
                     self._checkpoint(row, detail="Đã tải ảnh ChatGPT; đang chuẩn hóa thumbnail JPEG 1280×720…")
                     path = normalize_thumbnail(raw, base + ".jpg")
                     self._checkpoint(row, thumbnail_path=path)
@@ -559,8 +601,7 @@ class VideoPublishingController:
         except Exception as exc:
             self._progress(self._error(exc))
         finally:
-            # The ChatGPT browser belongs to the app. Keep it open for manual
-            # verification and reuse; only per-run reference browsers close.
+            # The image adapter is app-owned; only per-run reference browsers close.
             for adapter in (reference,):
                 if adapter:
                     try:

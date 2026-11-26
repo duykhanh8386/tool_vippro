@@ -1,10 +1,12 @@
 # RECOVERED: reconstructed from CPython 3.12 bytecode
 import inspect
+import ipaddress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, Optional, Type, Union
 
 from fastapi import Request
+from fastapi.responses import PlainTextResponse
 from loguru import logger
 from nicegui import ui
 
@@ -19,6 +21,7 @@ class Route:
     requires_auth: bool = False
     is_async: bool = False
     params: Optional[Dict[str, Type]] = None
+    local_only: bool = False
 
 
 class RouterManager:
@@ -37,6 +40,7 @@ class RouterManager:
         path: str,
         title: str,
         params: Optional[Dict[str, Type]] = None,
+        local_only: bool = False,
     ):
         def decorator(view_func: Callable):
             is_async = inspect.iscoroutinefunction(view_func)
@@ -46,6 +50,7 @@ class RouterManager:
                 title=title,
                 is_async=is_async,
                 params=params or {},
+                local_only=local_only,
             )
             return view_func
 
@@ -60,6 +65,8 @@ class RouterManager:
             if route.is_async:
                 @ui.page(route.path)
                 async def async_route_handler(request: Request, route=route):
+                    if route.local_only and not self.is_local_request(request):
+                        return PlainTextResponse("Local access only", status_code=403)
                     if (
                         route.path not in self.NOT_AUTH_PATH
                         and not self.is_authenticated()
@@ -79,6 +86,8 @@ class RouterManager:
             else:
                 @ui.page(route.path)
                 def sync_route_handler(request: Request, route=route):
+                    if route.local_only and not self.is_local_request(request):
+                        return PlainTextResponse("Local access only", status_code=403)
                     if (
                         route.path not in self.NOT_AUTH_PATH
                         and not self.is_authenticated()
@@ -90,6 +99,13 @@ class RouterManager:
                         for param in route.params
                     }
                     return route.view_func(**kwargs)
+
+    @staticmethod
+    def is_local_request(request: Request) -> bool:
+        try:
+            return bool(request.client and ipaddress.ip_address(request.client.host).is_loopback)
+        except ValueError:
+            return False
 
     def is_authenticated(self) -> bool:
         """Check if user has a valid license."""

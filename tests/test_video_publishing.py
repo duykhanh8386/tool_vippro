@@ -347,15 +347,15 @@ class PublishingControllerTests(unittest.TestCase):
         self.reference.find.return_value = dict(REFERENCE)
         self.listing.list_all_videos.return_value = ([], None)
         self.controller = VideoPublishingController(storage=self.storage, module=self.module, listing=self.listing,
-                reference_factory=lambda: self.reference, image_factory=lambda cookie: self.image, thumbnail_factory=lambda: self.thumbnail)
+                reference_factory=lambda: self.reference, image_factory=lambda session: self.image, thumbnail_factory=lambda: self.thumbnail)
         self.controller.settings.update(channel_ids=[CHANNEL], start_date="2099-01-02", hour="18:00")
-        self.controller.set_cookie("session=private-secret")
+        self.controller.set_session('{"accessToken":"private-secret"}')
 
-    def test_cookie_never_saved_or_returned_in_snapshot(self):
+    def test_pending_session_never_saved_or_returned_in_snapshot(self):
         self.controller.change_settings(hour="19:00")
         self.assertNotIn("private-secret", json.dumps(self.storage.data))
         self.assertNotIn("private-secret", json.dumps(self.controller.snapshot()))
-        self.assertTrue(self.controller.snapshot()["has_cookie"])
+        self.assertTrue(self.controller.snapshot()["has_session"])
 
     def test_saved_thumbnail_is_completed_before_next_video_needs_chatgpt(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -388,6 +388,61 @@ class PublishingControllerTests(unittest.TestCase):
         self.assertNotIn("image_request", restored[1])
         self.controller.change_settings(image_prompt="A new image prompt")
         self.assertNotIn("image_request", self.controller.rows[0])
+
+    def test_reset_images_preserves_uploaded_thumbnail_and_other_videos(self):
+        self.controller.rows = [
+            row(image_request={"provider": "phoma", "job_id": "old"}, thumbnail_path="old.jpg"),
+            row(OTHER, thumbnail_uploaded=True, thumbnail_path="uploaded.jpg"),
+            row("Ghi123_-XYZ", selected=False, thumbnail_path="unselected.jpg"),
+        ]
+        self.controller.reset_images()
+        self.assertNotIn("image_request", self.controller.rows[0])
+        self.assertNotIn("thumbnail_path", self.controller.rows[0])
+        self.assertEqual(self.controller.rows[1]["thumbnail_path"], "uploaded.jpg")
+        self.assertEqual(self.controller.rows[2]["thumbnail_path"], "unselected.jpg")
+
+    def test_phoma_image_is_used_in_existing_thumbnail_and_scheduling_pipeline(self):
+        from src import gpt_service
+        from src.phoma_image_generator import PhomaImageGenerator
+        import uuid
+
+        identifier = str(uuid.uuid4())
+        self.controller.image_factory = PhomaImageGenerator
+        self.controller.set_session("")
+        self.controller.settings["image_model"] = "gpt-6-high"
+        self.controller.rows = [row(reference=REFERENCE, publish_at=STAMP)]
+        actions = []
+
+        def call(action, **arguments):
+            actions.append((action, arguments))
+            if action == "accounts":
+                return [{"id": "account", "active": True}]
+            if action == "start":
+                return {"id": identifier}
+            if action == "job":
+                return {"status": "success"}
+            raise AssertionError(action)
+
+        with tempfile.TemporaryDirectory() as folder:
+            source = Path(folder) / "result.png"
+            source.write_bytes(b"generated")
+            reference = Path(folder) / "reference.jpg"
+            reference.write_bytes(b"reference")
+            self.controller.settings["output_folder"] = folder
+            with patch.object(gpt_service, "call", side_effect=call), \
+                 patch("src.phoma_image_generator.generated_image", return_value=source), \
+                 patch("src.video_publishing_tasks.download_reference_image", return_value=str(reference)), \
+                 patch("src.video_publishing_tasks.normalize_thumbnail", return_value=str(source)):
+                self.controller._worker("run", create_run_context("publishing-phoma"))
+        self.assertEqual(self.controller.rows[0]["status"], "successful")
+        self.assertEqual(self.controller.rows[0]["image_request"]["job_id"], identifier)
+        submitted = next(arguments for action, arguments in actions if action == "start")
+        self.assertEqual(submitted["model"], "gpt-6-high")
+        self.assertEqual(submitted["size"], "16:9")
+        self.thumbnail.upload.assert_called_once()
+        self.module.copy_metadata.assert_called_once()
+        self.module.schedule.assert_called_once()
+        self.image.generate.assert_not_called()
 
     def test_scan_all_pages_deduplicates_drafts_filters_and_reserves_days(self):
         claimed = video(OTHER, copyright_check_status="COPYRIGHT_CLAIMED")
@@ -712,14 +767,14 @@ class PublishingControllerTests(unittest.TestCase):
         self.controller.rows = [row(publish_at=STAMP)]
         self.image.ensure_ready.side_effect = ChatGPTSessionNeedsAction("needs login", reason="login")
         self.controller._worker("run", create_run_context("publishing-reuse-image-session"))
-        factory.assert_called_once_with("session=private-secret")
+        factory.assert_called_once_with('{"accessToken":"private-secret"}')
         self.image.close.assert_not_called()
         self.assertIs(self.controller.image_session, self.image)
 
-    def test_cookie_update_is_queued_on_same_session_without_saving_secret(self):
+    def test_session_update_is_queued_on_same_adapter_without_saving_secret_in_sqlite(self):
         self.controller.prepare_chatgpt_session()
-        self.controller.set_cookie("session=updated-secret")
-        self.image.update_cookies.assert_called_once_with("session=updated-secret")
+        self.controller.set_session('{"accessToken":"updated-secret"}')
+        self.image.update_session.assert_called_once_with('{"accessToken":"updated-secret"}')
         self.controller._save()
         self.assertNotIn("updated-secret", json.dumps(self.storage.data))
         self.assertNotIn("updated-secret", json.dumps(self.controller.snapshot()))
@@ -751,7 +806,7 @@ class PublishingControllerTests(unittest.TestCase):
             self.controller._remember_conversation(self.controller.rows[0], "https://chatgpt.com/c/accepted-request")
         self.assertEqual(self.storage.load_state(STATE_KEY)["rows"][0]["conversation_url"], "https://chatgpt.com/c/accepted-request")
 
-    def test_reload_restores_checkpoints_but_requires_new_cookie(self):
+    def test_reload_restores_checkpoints_without_pending_session_text(self):
         for status in ("processing", "waiting_session"):
             with self.subTest(status=status):
                 self.controller.rows = [row(status=status, publish_at=STAMP, reference=REFERENCE, thumbnail_uploaded=True)]
@@ -760,7 +815,7 @@ class PublishingControllerTests(unittest.TestCase):
                 self.assertEqual(restored.rows[0]["status"], "stopped")
                 self.assertEqual(restored.rows[0]["publish_at"], STAMP)
                 self.assertTrue(restored.rows[0]["thumbnail_uploaded"])
-                self.assertFalse(restored.snapshot()["has_cookie"])
+                self.assertFalse(restored.snapshot()["has_session"])
                 self.assertFalse(restored.busy)
 
     def test_query_edit_invalidates_reference_before_remote_writes(self):

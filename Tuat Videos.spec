@@ -1,4 +1,5 @@
 import os
+import shutil
 from pathlib import Path
 
 from PyInstaller.utils.hooks import (
@@ -28,6 +29,8 @@ oauth_client_json = Path(
         project_root / "assets" / "google_oauth_client.json",
     )
 )
+node_executable = os.environ.get("TVAUTOMATION_NODE") or shutil.which("node")
+gpt_backend = project_root / "gpt_backend"
 
 
 def collect_media_binaries():
@@ -55,6 +58,14 @@ def collect_google_oauth_client():
     return [(str(oauth_client_json), "assets")]
 
 
+def collect_node():
+    if not node_executable or not Path(node_executable).is_file():
+        raise FileNotFoundError("Node.js is required to package GPT image generation.")
+    if not (gpt_backend / "node_modules" / "puppeteer-core").is_dir():
+        raise FileNotFoundError("Run npm ci in gpt_backend before building.")
+    return [(node_executable, "tools/node")]
+
+
 datas = [
     (str(project_root / "VERSION"), "."),
     (str(project_root / "assets" / "logo.png"), "assets"),
@@ -62,6 +73,10 @@ datas = [
     (str(project_root / "vendor" / "ffmpeg" / "README.txt"), "licenses/ffmpeg"),
     (str(project_root / "vendor" / "chromedriver" / "LICENSE.chromedriver"), "licenses/chromedriver"),
     (str(project_root / "vendor" / "chromedriver" / "THIRD_PARTY_NOTICES.chromedriver"), "licenses/chromedriver"),
+    (str(gpt_backend / "worker.js"), "gpt_backend"),
+    (str(gpt_backend / "package.json"), "gpt_backend"),
+    (str(gpt_backend / "src"), "gpt_backend/src"),
+    (str(gpt_backend / "node_modules"), "gpt_backend/node_modules"),
     *collect_google_oauth_client(),
     *collect_data_files("nicegui"),
     *collect_data_files("certifi"),
@@ -90,6 +105,7 @@ a = Analysis(
     binaries=(
         collect_media_binaries()
         + collect_chromedriver()
+        + collect_node()
         + collect_dynamic_libs("ctranslate2")
         + collect_dynamic_libs("av")
     ),

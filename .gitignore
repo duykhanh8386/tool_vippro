@@ -5,6 +5,7 @@ __pycache__/
 build/
 dist/
 installer_dist/
+node_modules/
 *.db
 license.json
 assets/google_oauth_client.json

@@ -150,16 +150,16 @@ class PublishingPageSelectionTests(unittest.TestCase):
         self.assertFalse(self.button("Quét video").enabled)
 
     def test_session_can_be_prepared_before_selecting_any_video(self):
-        self.assertTrue(self.button("Mở / kiểm tra phiên").enabled)
-        self.assertTrue(self.button("Đóng cửa sổ phiên").enabled)
+        self.assertTrue(self.button("Kiểm tra tài khoản").enabled)
+        self.assertTrue(self.button("Bỏ phiên xử lý").enabled)
         self.assertFalse(self.button("Tự động SEO, tạo thumbnail & lên lịch").enabled)
 
     def test_session_preparation_disables_actions_but_not_as_a_running_batch(self):
         self.controller.session_busy = True
         with self.client:
             self.refresh()
-        self.assertFalse(self.button("Mở / kiểm tra phiên").enabled)
-        self.assertFalse(self.button("Đóng cửa sổ phiên").enabled)
+        self.assertFalse(self.button("Kiểm tra tài khoản").enabled)
+        self.assertFalse(self.button("Bỏ phiên xử lý").enabled)
         self.assertFalse(self.button("Dừng").enabled)
         self.assertIsNone(self.table.selection)
 

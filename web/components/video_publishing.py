@@ -12,6 +12,7 @@ from src.video_publishing import (
     publishing_row_matches, publishing_row_selectable,
 )
 from src.video_publishing_tasks import STATUS_LABELS, get_video_publishing_controller
+from src.phoma_image_generator import IMAGE_MODELS
 from web.components.common import create_channel_selection, select_directory
 from web.theme import app_card, page_header, page_shell, section_header
 
@@ -23,6 +24,7 @@ def create_video_publishing_page():
     fields, buttons = {}, {}
     syncing = {"active": False, "revision": -1}
     visible = {"ids": []}
+    account_sync = {"active": False}
 
     def invoke(callback):
         try:
@@ -41,10 +43,10 @@ def create_video_publishing_page():
     def choose_channels(identifiers):
         return change("channel_ids", list(identifiers or []))
 
-    def set_cookie():
-        if invoke(lambda: controller.set_cookie(cookie_field.value or "")):
-            cookie_field.set_value("")
-            ui.notify("Đã nhận cookie. Bấm Mở / kiểm tra phiên để xác nhận đăng nhập ChatGPT.", type="positive")
+    async def set_session():
+        if invoke(lambda: controller.set_session(session_field.value or "")):
+            session_field.set_value("")
+            await prepare_session()
 
     async def session_action(action):
         try:
@@ -56,9 +58,70 @@ def create_video_publishing_page():
 
     async def prepare_session():
         await session_action(controller.prepare_chatgpt_session)
+        await refresh_accounts()
 
     async def close_session():
         await session_action(controller.close_chatgpt_session)
+
+    async def refresh_accounts():
+        try:
+            accounts = await asyncio.to_thread(controller.gpt_account_action, "accounts")
+            account_sync["active"] = True
+            account_select.set_options({item["id"]: f'{item["name"]} ({item["status"]})' for item in accounts})
+            account_select.set_value(next((item["id"] for item in accounts if item.get("active")), None))
+        except ValueError as exc:
+            ui.notify(str(exc), type="negative")
+        finally:
+            account_sync["active"] = False
+            refresh()
+
+    def select_account(event):
+        if account_sync["active"] or not event.value:
+            return
+        return session_action(lambda: controller.gpt_account_action("select", id=event.value))
+
+    async def replace_session():
+        if not account_select.value or not session_field.value:
+            ui.notify("Chọn tài khoản và nhập session mới.", type="warning")
+            return
+        try:
+            await asyncio.to_thread(controller.gpt_account_action, "replace",
+                                    id=account_select.value, session=session_field.value)
+            session_field.set_value("")
+            await refresh_accounts()
+        except ValueError as exc:
+            ui.notify(str(exc), type="negative")
+
+    def remove_account():
+        account_id = account_select.value
+        if not account_id:
+            ui.notify("Chọn tài khoản GPT.", type="warning")
+            return
+        with ui.dialog() as dialog, ui.card():
+            ui.label("Xóa tài khoản GPT và session đã lưu trên máy?")
+
+            async def confirm():
+                dialog.close()
+                await session_action(lambda: controller.gpt_account_action("remove", id=account_id))
+                await refresh_accounts()
+
+            with ui.row():
+                ui.button("Hủy", on_click=dialog.close).props("flat")
+                ui.button("Xóa tài khoản", color="negative", on_click=confirm)
+        dialog.open()
+
+    def reset_images():
+        with ui.dialog() as dialog, ui.card():
+            ui.label("Tạo lại ảnh cho các video đã chọn chưa tải thumbnail lên YouTube? Mã yêu cầu cũ sẽ bị bỏ; yêu cầu mới có thể dùng thêm lượt tạo ảnh.")
+
+            def confirm():
+                if invoke(controller.reset_images):
+                    dialog.close()
+
+            with ui.row():
+                ui.button("Hủy", on_click=dialog.close).props("flat")
+                ui.button("Tạo lại", on_click=confirm)
+        dialog.open()
 
     def choose_folder():
         folder = select_directory(initial_dir=fields["output_folder"].value or None, title="Chọn thư mục lưu thumbnail")
@@ -146,7 +209,8 @@ def create_video_publishing_page():
             fields["channel_links"].set_visibility(from_links)
             channel_picker.set_visibility(not from_links)
             source_status.set_text("Nguồn quét: các link kênh đã dán." if from_links else f"Nguồn quét: {len(config['channel_ids'])} thẻ kênh đã chọn.")
-            cookie_field.set_enabled(not busy)
+            session_field.set_enabled(not busy)
+            account_select.set_enabled(not busy)
             for key, button in buttons.items():
                 button.set_enabled(not busy)
             buttons["stop"].set_enabled(job_busy)
@@ -164,7 +228,7 @@ def create_video_publishing_page():
             scheduled_count=sum(row.get("visibility_type")=="scheduled" or row["status"]=="successful" for row in data["rows"])
             summary.set_text(f"{len(data['rows'])} đã quét · {len(filtered)} trong bộ lọc · {selectable_count} có thể tích chọn · {chosen} đã chọn toàn bộ ({chosen - shown_selected} ngoài bộ lọc) · {scheduled_count} video có lịch · {sum(row['status'] == 'successful' for row in data['rows'])} hoàn tất tác vụ")
             rescan_hint.set_visibility(data["needs_rescan"])
-            cookie_status.set_text("Đã nhận cookie nhập tay." if data["has_cookie"] else "Có thể dùng phiên Chrome đã lưu hoặc đăng nhập trực tiếp.")
+            session_hint.set_text("Session đang chờ nạp." if data["has_session"] else "Dùng tài khoản GPT đã chọn trên máy.")
             session_status.set_text(data["chatgpt_status"])
             selection = None if busy else "multiple"
             if table.selection != selection:
@@ -216,16 +280,27 @@ def create_video_publishing_page():
                                             on_change=lambda e: change("limit", e.value)).props("outlined").classes("w-44")
             ui.label("Sau khi quét, lọc theo loại video và trạng thái bản quyền trong Danh sách xử lý để chọn video lên lịch.").classes("text-xs text-gray-500")
         with app_card():
-            with section_header("ChatGPT vẽ thumbnail", "Dùng lại một phiên Chrome riêng của tool cho các lượt chạy."):
-                buttons["session"] = ui.button("Mở / kiểm tra phiên", icon="open_in_browser", on_click=prepare_session).props("outline")
-                buttons["close_session"] = ui.button("Đóng cửa sổ phiên", icon="close", on_click=close_session).props("flat")
+            with section_header("ChatGPT vẽ thumbnail", "Tạo ảnh bằng backend phoma ngay trong quy trình SEO."):
+                buttons["session"] = ui.button("Kiểm tra tài khoản", icon="verified_user", on_click=prepare_session).props("outline")
+                buttons["close_session"] = ui.button("Bỏ phiên xử lý", icon="close", on_click=close_session).props("flat")
             with ui.row().classes("w-full gap-3 items-end"):
-                cookie_field = ui.input("Cookie ChatGPT tùy chọn (JSON hoặc Cookie header)", password=True, password_toggle_button=True).props("outlined autocomplete=off").classes("flex-1 min-w-0")
-                buttons["cookie"] = ui.button("Nạp cookie", icon="key", on_click=set_cookie).props("outline")
-                buttons["clear_cookie"] = ui.button("Bỏ cookie nhập tay", icon="clear", on_click=lambda: invoke(lambda: controller.set_cookie(""))).props("flat")
-            cookie_status = ui.label().classes("text-xs text-gray-500")
+                account_select = ui.select({}, label="Tài khoản GPT", on_change=select_account).props("outlined").classes("flex-1")
+                buttons["accounts"] = ui.button("Làm mới tài khoản", on_click=refresh_accounts).props("flat")
+                buttons["remove_account"] = ui.button("Xóa tài khoản GPT", on_click=remove_account).props("flat color=negative")
+            with ui.row().classes("w-full gap-3 items-end"):
+                session_field = ui.input("Session JSON hoặc access token ChatGPT (không phải cookie)", password=True, password_toggle_button=True).props("outlined autocomplete=off").classes("flex-1 min-w-0")
+                buttons["import_session"] = ui.button("Thêm tài khoản", icon="key", on_click=set_session).props("outline")
+                buttons["replace_session"] = ui.button("Thay session tài khoản", on_click=replace_session).props("outline")
+                buttons["clear_session"] = ui.button("Bỏ session nhập tay", icon="clear", on_click=lambda: invoke(lambda: controller.set_session(""))).props("flat")
+            session_hint = ui.label().classes("text-xs text-gray-500")
             session_status = ui.label().classes("text-sm text-emerald-700 break-words")
-            ui.label("Chrome lưu phiên riêng trên máy để dùng lại. Bạn có thể nạp cookie hoặc đăng nhập trong phiên này. Khi tác vụ đang chạy, tool chờ tối đa 10 phút để bạn đăng nhập/xác minh thủ công và tự tiếp tục gửi prompt khi sẵn sàng; bấm Dừng để hủy chờ. Ô cookie không được lưu vào cấu hình; Bỏ cookie nhập tay không đăng xuất phiên Chrome đã lưu.").classes("text-xs text-gray-500")
+            ui.label("Tài khoản và access token được lưu không mã hóa trong dữ liệu riêng của tool. Không dùng cookie Selenium cũ. Backend phoma vẫn có thể bị giới hạn hoặc yêu cầu xác minh; khi đó tool báo lỗi/dừng để bạn kiểm tra. Title/description không gửi AI để viết lại.").classes("text-xs text-gray-500")
+            with ui.row().classes("w-full gap-3 items-center"):
+                fields["image_model"] = ui.select(list(IMAGE_MODELS), label="Model tạo thumbnail", value=settings["image_model"],
+                                                  on_change=lambda e: change("image_model", e.value)).props("outlined")
+                fields["image_cleanup"] = ui.checkbox("Ẩn hội thoại sau khi tạo ảnh", value=settings["image_cleanup"],
+                                                      on_change=lambda e: change("image_cleanup", e.value))
+                buttons["reset_images"] = ui.button("Tạo lại ảnh chưa tải", on_click=reset_images).props("outline")
             fields["image_prompt"] = ui.textarea("Prompt chung vẽ lại thumbnail", value=settings["image_prompt"],
                                                  on_change=lambda e: change("image_prompt", e.value or "")).props("outlined autogrow").classes("w-full")
             with ui.row().classes("w-full gap-3 items-end"):
@@ -270,4 +345,5 @@ def create_video_publishing_page():
             table.add_slot("body-cell-action", '<q-td :props="props"><q-btn flat dense icon="visibility" @click="$parent.$emit(\'view_reference\', props.row.video_id)" aria-label="Xem dữ liệu tham chiếu" /></q-td>')
             table.on("view_reference", details)
         refresh()
+        ui.timer(0.1, refresh_accounts, once=True)
         ui.timer(1.0, refresh)

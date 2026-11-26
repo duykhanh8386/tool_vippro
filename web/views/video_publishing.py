@@ -3,7 +3,7 @@ from web.components.drawer import create_drawer, nav_state
 from web.components.video_publishing import create_video_publishing_page
 
 
-@router.register("/videos/publishing", "SEO, thumbnail & lên lịch")
+@router.register("/videos/publishing", "SEO, thumbnail & lên lịch", local_only=True)
 def video_publishing_page():
     create_drawer()
     nav_state.set_active_route("/videos/publishing")
