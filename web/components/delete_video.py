@@ -11,9 +11,9 @@ from web.components.drawer import nav_state
 from web.theme import app_card, empty_state, page_header, page_shell, section_header
 
 PRIVACY_BADGE: dict[str, tuple[str, str]] = {
-    "VIDEO_PRIVACY_PRIVATE": ("lock", "bg-gray-200 text-gray-600"),
-    "VIDEO_PRIVACY_PUBLIC": ("public", "bg-green-100 text-green-700"),
-    "VIDEO_PRIVACY_UNLISTED": ("link_off", "bg-orange-100 text-orange-700"),
+    "VIDEO_PRIVACY_PRIVATE": ("lock", "bg-sunken text-subtitle"),
+    "VIDEO_PRIVACY_PUBLIC": ("public", "bg-ok-soft text-ok"),
+    "VIDEO_PRIVACY_UNLISTED": ("link_off", "bg-orange-soft text-orange"),
 }
 
 PRIVACY_LABEL: dict[str, str] = {
@@ -23,13 +23,13 @@ PRIVACY_LABEL: dict[str, str] = {
 }
 
 ROW_STATUS_META: dict[str, tuple[str, str, str]] = {
-    "waiting": ("hourglass_empty", "bg-yellow-100 text-yellow-700", "Chờ xử lý"),
-    "ready": ("schedule_send", "bg-orange-100 text-orange-700", "Sắp xóa"),
-    "deleting": ("autorenew", "bg-blue-100 text-blue-700", "Đang xóa..."),
-    "deleted": ("check_circle", "bg-green-100 text-green-700", "Đã xóa ✓"),
-    "error": ("error", "bg-red-100 text-red-700", "Lỗi ✗"),
-    "skipped": ("skip_next", "bg-gray-100 text-gray-500", "Bỏ qua"),
-    "stopped": ("stop_circle", "bg-amber-50 text-amber-700", "Đã dừng"),
+    "waiting": ("hourglass_empty", "bg-warn-soft text-warn", "Chờ xử lý"),
+    "ready": ("schedule_send", "bg-orange-soft text-orange", "Sắp xóa"),
+    "deleting": ("autorenew", "bg-info-soft text-info", "Đang xóa..."),
+    "deleted": ("check_circle", "bg-ok-soft text-ok", "Đã xóa ✓"),
+    "error": ("error", "bg-bad-soft text-bad", "Lỗi ✗"),
+    "skipped": ("skip_next", "bg-sunken text-muted", "Bỏ qua"),
+    "stopped": ("stop_circle", "bg-warn-soft text-warn", "Đã dừng"),
 }
 
 NAV_LOCK_MSG = "Đang xử lý Xóa - Back, hãy bấm Dừng trước khi chuyển trang."
@@ -60,18 +60,18 @@ def create_delete_video_page():
     def _render_chip(container, status: str):
         container.clear()
         icon_name, chip_cls, label_text = ROW_STATUS_META.get(
-            status, ("help", "bg-gray-100 text-gray-600", status)
+            status, ("help", "bg-sunken text-subtitle", status)
         )
         with container:
             with ui.row().classes(
-                f"items-center gap-1 px-2 py-0.5 rounded text-xs font-medium {chip_cls}"
+                f"items-center gap-1 px-2 py-0.5 rounded-xs text-label-m font-medium {chip_cls}"
             ):
-                ui.icon(icon_name).classes("text-sm")
+                ui.icon(icon_name).classes("text-body-s")
                 ui.label(label_text)
 
     def _render_header():
         with ui.row().classes(
-            "w-full min-h-[42px] items-center font-semibold text-xs text-gray-500 bg-gray-50 border-b border-gray-200 px-3"
+            "w-full min-h-[42px] items-center font-semibold text-label-m text-muted bg-sunken border-b border-line px-3"
         ):
             ui.label("Thumb").classes("w-16 shrink-0")
             ui.label("Kênh").classes("w-40 shrink-0")
@@ -84,17 +84,17 @@ def create_delete_video_page():
         vid_id = video["id"]
         video_url = video.get("video_url") or video_watch_url(vid_id)
         with ui.row().classes(
-            "w-full min-h-[54px] items-center flex-nowrap border-b border-gray-100 bg-white hover:bg-gray-50"
+            "w-full min-h-[54px] items-center flex-nowrap border-b border-line bg-white hover:bg-sunken"
         ):
             # Thumb
             with ui.column().classes("w-16 shrink-0 p-1"):
                 if video.get("thumbnail"):
                     ui.image(video["thumbnail"]).classes(
-                        "w-full aspect-video object-cover rounded"
+                        "w-full aspect-video object-cover rounded-xs"
                     )
                 else:
                     ui.icon("videocam_off").classes(
-                        "text-xl text-gray-300 mx-auto block"
+                        "text-xl text-disabled mx-auto block"
                     )
 
             # Channel
@@ -106,16 +106,16 @@ def create_delete_video_page():
                     ui.image(avatar).classes("w-6 h-6 rounded-full shrink-0")
                 else:
                     ui.icon("account_circle").classes(
-                        "text-xl text-gray-400 shrink-0"
+                        "text-xl text-disabled shrink-0"
                     )
                 ch_name = video.get("channel_name") or "–"
-                ui.label(ch_name).classes("text-xs text-gray-700 truncate")
+                ui.label(ch_name).classes("text-label-m text-subtitle truncate")
 
             # Video ID
             with ui.column().classes("w-36 shrink-0 px-1"):
                 with ui.row().classes("items-center gap-1 flex-nowrap"):
                     ui.link(vid_id, video_url, new_tab=True).classes(
-                        "text-xs font-mono bg-gray-100 text-gray-700 px-1.5 py-0.5 rounded break-all leading-tight"
+                        "text-label-m font-mono bg-sunken text-subtitle px-1.5 py-0.5 rounded-xs break-all leading-tight"
                     ).tooltip(video_url)
                     ui.button(
                         icon="content_copy",
@@ -125,18 +125,18 @@ def create_delete_video_page():
             # Title
             with ui.column().classes("flex-1 min-w-0 px-1"):
                 ui.label(video.get("title") or "–").classes(
-                    "text-xs font-medium text-gray-800 line-clamp-2 leading-tight"
+                    "text-label-m font-medium text-ink line-clamp-2 leading-tight"
                 )
 
             # Privacy
             with ui.column().classes("w-28 shrink-0 px-1"):
                 priv = video.get("privacy", "")
                 p_icon, p_cls = PRIVACY_BADGE.get(
-                    priv, ("help", "bg-gray-100 text-gray-600")
+                    priv, ("help", "bg-sunken text-subtitle")
                 )
                 p_text = PRIVACY_LABEL.get(priv, priv or "–")
                 with ui.row().classes(
-                    f"items-center gap-1 px-2 py-0.5 rounded text-xs font-medium {p_cls}"
+                    f"items-center gap-1 px-2 py-0.5 rounded-xs text-label-m font-medium {p_cls}"
                 ):
                     ui.icon(p_icon).classes("text-sm")
                     ui.label(p_text)
@@ -387,13 +387,13 @@ def create_delete_video_page():
         # Output dir settings card
         with app_card(compact=True):
             with ui.row().classes("items-center gap-2 w-full flex-nowrap"):
-                ui.icon("o_folder").classes("text-emerald-600 shrink-0")
+                ui.icon("o_folder").classes("text-brand shrink-0")
                 ui.label("Thư mục lưu lịch sử xóa:").classes(
-                    "text-sm text-gray-600 shrink-0"
+                    "text-body-s text-subtitle shrink-0"
                 )
                 ui_refs["folder_label"] = ui.label(
                     str(delete_controller.output_dir)
-                ).classes("text-sm font-mono text-gray-800 truncate flex-1")
+                ).classes("text-body-s font-mono text-ink truncate flex-1")
                 ui.button(
                     "Chọn thư mục", icon="folder_open", on_click=handle_pick_folder
                 ).props("dense").classes("app-button-secondary text-xs")
@@ -438,7 +438,7 @@ def create_delete_video_page():
                 ui_refs["clear_btn"] = clear_btn
             ui.separator().classes("my-2 opacity-40")
             ui_refs["status_label"] = ui.label(delete_controller.status_text).classes(
-                "text-sm text-gray-600 italic"
+                "text-body-s text-subtitle italic"
             )
 
         # Video status list card
@@ -453,9 +453,9 @@ def create_delete_video_page():
             ui_refs["progress_bar"] = pb
             with ui.row().classes("items-center justify-between mb-3"):
                 ui_refs["summary_label"] = ui.label("").classes(
-                    "text-xs text-gray-500"
+                    "text-label-m text-muted"
                 )
-                cd_lbl = ui.label("").classes("text-xs text-orange-400 italic")
+                cd_lbl = ui.label("").classes("text-label-m text-orange italic")
                 cd_lbl.set_visibility(False)
                 ui_refs["countdown_label"] = cd_lbl
 

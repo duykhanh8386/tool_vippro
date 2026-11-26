@@ -28,7 +28,7 @@ def create_scan_date_input(*, value: str = "", on_change):
             "Để trống để quét không giới hạn ngày."
         )
         field.on("focus", lambda: field.props(f"max={scan_today().isoformat()}"))
-        ui.label("Đến hôm nay · giờ Việt Nam").classes("text-xs text-gray-500")
+        ui.label("Đến hôm nay · giờ Việt Nam").classes("text-label-m text-muted")
     return field
 
 
@@ -216,7 +216,7 @@ def create_channel_selection(
         with channels_container:
             if not channels:
                 ui.label("Không có kênh nào. Hãy thêm kênh trước.").classes(
-                    "text-gray-500 italic"
+                    "text-muted italic"
                 )
                 return
 
@@ -249,19 +249,19 @@ def create_channel_selection(
                             ui.image(avatar).classes("w-6 h-6 rounded-full")
                         else:
                             ui.icon("o_account_circle").classes(
-                                "text-xl text-gray-400"
+                                "text-xl text-disabled"
                             )
                         with ui.column().classes("gap-0 flex-1 min-w-0"):
                             ui.label(name).classes(
-                                "text-xs font-medium text-gray-900 truncate w-full"
+                                "text-label-m font-medium text-ink truncate w-full"
                             )
                             ui.label(channel_gmail(channel_data) or "Chưa xác định Gmail").classes(
-                                "text-[10px] text-gray-500 truncate w-full"
+                                "text-2xs text-muted truncate w-full"
                             )
 
                         if is_selected:
                             ui.icon("check_circle").classes(
-                                "text-emerald-600 text-sm"
+                                "text-brand text-sm"
                             )
 
     with app_card(compact=True):
@@ -275,11 +275,11 @@ def create_channel_selection(
                 with ui.row().classes("gap-1"):
                     ui.button("Tất cả", on_click=select_all).props(
                         "dense flat size=sm"
-                    ).classes("text-emerald-600 text-xs")
-                    ui.label("·").classes("text-gray-300 self-center")
+                    ).classes("text-brand text-label-m")
+                    ui.label("·").classes("text-line-strong self-center")
                     ui.button("Bỏ chọn", on_click=deselect_all).props(
                         "dense flat size=sm"
-                    ).classes("text-gray-500 text-xs")
+                    ).classes("text-muted text-label-m")
 
         gmail_select = ui.select(
             gmail_filter_options(channels),
@@ -290,7 +290,7 @@ def create_channel_selection(
         if any(not channel_gmail(channel) for channel in channels):
             ui.label(
                 "Kênh cũ chưa có Gmail: vào Tài khoản & kênh → Quét Gmail để cập nhật."
-            ).classes("text-xs text-gray-500 mb-2")
+            ).classes("text-label-m text-muted mb-2")
         channels_container = ui.row().classes("gap-2 flex-wrap")
         refresh_channel_display()
 

@@ -20,11 +20,11 @@ def create_update_control() -> None:
     """Add the application-update button and its progress dialog to a drawer."""
 
     with ui.dialog() as dialog, ui.card().classes("w-[min(460px,calc(100vw-32px))] gap-4"):
-        ui.label("Cập nhật Tuất Videos").classes("text-lg font-semibold text-gray-800")
-        version_label = ui.label().classes("text-sm text-gray-500")
-        status_label = ui.label().classes("min-h-[24px] text-sm text-gray-700")
+        ui.label("Cập nhật Tuất Videos").classes("text-title-xs text-ink")
+        version_label = ui.label().classes("text-body-s text-muted")
+        status_label = ui.label().classes("min-h-[24px] text-body-s text-body")
         progress = ui.linear_progress(value=0).classes("w-full")
-        notes_label = ui.label().classes("max-h-28 overflow-y-auto whitespace-pre-wrap text-xs text-gray-500")
+        notes_label = ui.label().classes("max-h-28 overflow-y-auto whitespace-pre-wrap text-label-m text-muted")
 
         with ui.row().classes("w-full justify-end gap-2"):
             cancel_button = ui.button("Hủy tải", icon="close").classes("app-button-secondary")

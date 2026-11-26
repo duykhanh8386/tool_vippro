@@ -29,7 +29,7 @@ from src.task_runtime import (
 )
 from src.utils import AUDIO_EXTENSIONS, VIDEO_EXTENSIONS, FFprobeError, build_intermittent_audio, get_channels_info, get_video_duration, list_media_files, multiply_audio, mux_audio_into_video, normalize_path
 from web.components.common import create_channel_selection, select_directory, select_file
-from web.components.drawer import nav_state; STEP_STYLE = {"pending": ("schedule", "text-gray-400", "Chờ"), "processing": ("hourglass_top", "text-blue-600", "Đang xử lý"), "successful": ("check_circle", "text-green-600", "Xong"), "stopped": ("stop_circle", "text-amber-600", "Đã dừng"), "unsuccessful": ("error", "text-red-600", "Lỗi")}
+from web.components.drawer import nav_state; STEP_STYLE = {"pending": ("schedule", "text-faint", "Chờ"), "processing": ("hourglass_top", "text-info", "Đang xử lý"), "successful": ("check_circle", "text-ok", "Xong"), "stopped": ("stop_circle", "text-warn", "Đã dừng"), "unsuccessful": ("error", "text-bad", "Lỗi")}
 from web.theme import app_card, page_header, section_header, workflow_steps
 
 MAX_ACTIVE_VIDEOS = 5
@@ -825,13 +825,13 @@ def create_add_audio_flow_page():
             items = videos_state["items"]
             with video_list_container:
                 with ui.row().classes("items-center gap-2 mb-1"):
-                    ui.icon("video_library").classes("text-gray-500")
-                    ui.label(f"Tìm thấy {len(items)} video").classes("text-sm font-semibold text-gray-700")
+                    ui.icon("video_library").classes("text-muted")
+                    ui.label(f"Tìm thấy {len(items)} video").classes("text-body-s font-semibold text-subtitle")
                 if not items:
-                    ui.label("Chưa chọn folder video hoặc folder không có video nào.").classes("text-gray-500 italic text-sm")
+                    ui.label("Chưa chọn folder video hoặc folder không có video nào.").classes("text-muted italic text-body-s")
                     return
 
-                with ui.row().classes("w-full min-h-[42px] items-center font-semibold text-xs text-gray-500 bg-gray-50 border-b border-gray-200 px-3 flex-nowrap"):
+                with ui.row().classes("w-full min-h-[42px] items-center font-semibold text-label-m text-muted bg-sunken border-b border-line px-3 flex-nowrap"):
                     ui.label("#").classes("w-1/12")
                     ui.label("Video").classes("w-2/12")
                     ui.label("ID").classes("w-2/12")
@@ -844,10 +844,10 @@ def create_add_audio_flow_page():
 
                 for idx, item in enumerate(items, 1):
                     steps = item["steps"]
-                    with ui.row().classes("w-full min-h-[54px] items-center bg-white px-3 py-1 border-b border-gray-100 flex-nowrap hover:bg-gray-50"):
-                        ui.label(str(idx)).classes("w-1/12 text-xs text-gray-500")
+                    with ui.row().classes("w-full min-h-[54px] items-center bg-white px-3 py-1 border-b border-line flex-nowrap hover:bg-sunken"):
+                        ui.label(str(idx)).classes("w-1/12 text-label-m text-muted")
                         with ui.column().classes("w-2/12 min-w-0 gap-0"):
-                            ui.label(item["name"]).classes("truncate text-sm font-medium text-gray-800").tooltip(item["name"])
+                            ui.label(item["name"]).classes("truncate text-body-s font-medium text-ink").tooltip(item["name"])
                             meta = _human_size(item["size"])
                             if item.get("duration_error"):
                                 meta += " · không đọc được duration"
@@ -855,18 +855,18 @@ def create_add_audio_flow_page():
                                 meta += " · đang đọc..."
                             else:
                                 meta += f" · {_fmt_duration(item['duration'])}"
-                            meta_label = ui.label(meta).classes("text-xs text-gray-400")
+                            meta_label = ui.label(meta).classes("text-label-m text-faint")
                             if item.get("duration_error"):
                                 meta_label.tooltip(item["duration_error"])
 
                         vid = item.get("video_id")
                         with ui.column().classes("w-2/12 min-w-0"):
                             if vid:
-                                ui.label(vid).classes("truncate text-xs font-medium text-indigo-600").tooltip(vid)
+                                ui.label(vid).classes("truncate text-label-m font-medium text-brand").tooltip(vid)
                             else:
-                                ui.label("—").classes("text-xs text-gray-400")
+                                ui.label("—").classes("text-label-m text-faint")
 
-                        ui.label(item.get("music") or "—").classes("w-2/12 truncate text-xs text-gray-600")
+                        ui.label(item.get("music") or "—").classes("w-2/12 truncate text-label-m text-subtitle")
                         with ui.element("div").classes("w-1/12 flex justify-center"):
                             step_badge(steps["merge"])
                         with ui.element("div").classes("w-1/12 flex justify-center"):
@@ -1220,7 +1220,7 @@ def create_add_audio_flow_page():
         safe_element_call(ui_refs.get("stop_btn"), "set_enabled", active)
         if active:
             safe_element_call(progress_refs.get("log"), "clear")
-    LOG_STYLE = {"info": ("chevron_right", "text-gray-600"), "work": ("autorenew", "text-blue-600"), "wait": ("hourglass_top", "text-amber-600"), "ok": ("check_circle", "text-green-600"), "error": ("error", "text-red-600")}
+    LOG_STYLE = {"info": ("chevron_right", "text-subtitle"), "work": ("autorenew", "text-info"), "wait": ("hourglass_top", "text-warn"), "ok": ("check_circle", "text-ok"), "error": ("error", "text-bad")}
     def push_log(message: str, level: str="info", indent: bool=False):
         """Thêm 1 dòng progress thân thiện cho user (không lộ chi tiết kỹ thuật)."""
         log = progress_refs.get("log")
@@ -1231,8 +1231,8 @@ def create_add_audio_flow_page():
         def render():
             with log:
                 with ui.row().classes(f"items-center gap-1 w-full flex-nowrap {'pl-5' if indent else ''}"):
-                    ui.icon(icon).classes(f"text-sm shrink-0 {color}")
-                    ui.label(message).classes(f"text-xs {color} truncate")
+                    ui.icon(icon).classes(f"text-body-s shrink-0 {color}")
+                    ui.label(message).classes(f"text-label-m {color} truncate")
             area = progress_refs.get("log_area")
             if element_is_alive(area):
                 area.scroll_to(percent=1.0)
@@ -1763,13 +1763,13 @@ def create_add_audio_flow_page():
             with card:
                 with ui.column().classes("w-full h-full justify-center"):
                     with ui.row().classes("items-center gap-3 w-full flex-nowrap"):
-                        ui.icon(icon).classes("text-2xl shrink-0 " + ("text-emerald-600" if path else "text-gray-400"))
+                        ui.icon(icon).classes("text-2xl shrink-0 " + ("text-brand" if path else "text-disabled"))
                         with ui.column().classes("gap-0 min-w-0 flex-1"):
-                            ui.label(label).classes("text-xs font-semibold text-gray-600")
+                            ui.label(label).classes("text-label-m font-semibold text-subtitle")
                             if path:
-                                ui.label(path).classes("text-sm text-gray-800 truncate").tooltip(path)
+                                ui.label(path).classes("text-body-s text-ink truncate").tooltip(path)
                             else:
-                                ui.label(placeholder).classes("text-sm text-gray-400 italic truncate")
+                                ui.label(placeholder).classes("text-body-s text-faint italic truncate")
                         if extra_render:
                             with ui.element("div").classes("shrink-0").on("click.stop", lambda: None):
                                 extra_render()
@@ -1848,21 +1848,21 @@ def create_add_audio_flow_page():
             with overlay_row:
                 cid = selected_channel["id"]
                 if not cid:
-                    ui.label("Chọn kênh để gán ảnh tên kênh (overlay phủ toàn khung)").classes("text-xs text-gray-400 italic")
+                    ui.label("Chọn kênh để gán ảnh tên kênh (overlay phủ toàn khung)").classes("text-label-m text-faint italic")
                     return
                 ch = get_channels_info(cid)
                 png = (ch.overlay_png if ch else "") or ""
                 exists = bool(png) and Path(normalize_path(png)).is_file()
                 if exists:
-                    icon, color, text = "check_circle", "text-green-600", Path(png).name
+                    icon, color, text = "check_circle", "text-ok", Path(png).name
                 elif png:
-                    icon, color, text = "error", "text-red-600", f"Không tồn tại: {Path(png).name}"
+                    icon, color, text = "error", "text-bad", f"Không tồn tại: {Path(png).name}"
                 else:
-                    icon, color, text = "error", "text-red-600", "Chưa có ảnh tên kênh"
+                    icon, color, text = "error", "text-bad", "Chưa có ảnh tên kênh"
 
                 ui.icon(icon).classes(f"{color} shrink-0")
-                ui.label("Ảnh tên kênh:").classes("text-xs text-gray-600 shrink-0")
-                ui.label(text).classes(f"text-xs font-medium {color} truncate max-w-[240px]").tooltip(png or "")
+                ui.label("Ảnh tên kênh:").classes("text-label-m text-subtitle shrink-0")
+                ui.label(text).classes(f"text-label-m font-medium {color} truncate max-w-[240px]").tooltip(png or "")
                 ui.button("Chọn PNG", icon="upload_file", on_click=pick_overlay).props("dense outline size=sm")
                 if png:
                     ui.button(icon="close", on_click=clear_overlay).props("flat round dense size=sm color=grey").tooltip("Bỏ ảnh")
@@ -1937,7 +1937,7 @@ def create_add_audio_flow_page():
                 .classes("w-64")
             )
             ui_refs["lang_input"] = lang_input
-            ui.label("Mã ngôn ngữ audio ở bước 4 (vd: en, vi, ja). Bước 5 thêm nhạc đầy đủ vào Âm thanh mô tả cho ngôn ngữ gốc và từng mã đã nhập.").classes("text-xs text-gray-500")
+            ui.label("Mã ngôn ngữ audio ở bước 4 (vd: en, vi, ja). Bước 5 thêm nhạc đầy đủ vào Âm thanh mô tả cho ngôn ngữ gốc và từng mã đã nhập.").classes("text-label-m text-muted")
 
         with ui.row().classes("w-full gap-2 mt-3"):
             ui_refs["process_btn"] = ui.button("Xử lý", icon="play_arrow", on_click=handle_process).classes("app-button-primary flex-1")
@@ -1955,11 +1955,11 @@ def create_add_audio_flow_page():
         with progress_panel:
             with ui.row().classes("items-center gap-2 w-full flex-nowrap"):
                 ui.spinner(size="sm", color="primary")
-                progress_refs["current"] = ui.label("Đang chuẩn bị...").classes("text-sm font-medium text-blue-700")
-            progress_refs["step"] = ui.label("").classes("text-xs text-gray-600")
-            progress_refs["remaining"] = ui.label("").classes("text-xs text-gray-500")
+                progress_refs["current"] = ui.label("Đang chuẩn bị...").classes("text-body-s font-medium text-info")
+            progress_refs["step"] = ui.label("").classes("text-label-m text-subtitle")
+            progress_refs["remaining"] = ui.label("").classes("text-label-m text-muted")
             progress_refs["bar"] = ui.linear_progress(value=0).classes("w-full")
-            progress_refs["log_area"] = ui.scroll_area().classes("w-full h-40 bg-white rounded border border-blue-100 mt-1")
+            progress_refs["log_area"] = ui.scroll_area().classes("w-full h-40 bg-white rounded-card border border-line mt-1")
             with progress_refs["log_area"]:
                 progress_refs["log"] = ui.column().classes("w-full gap-0.5 p-1")
         progress_panel.set_visibility(False)

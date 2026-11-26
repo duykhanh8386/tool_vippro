@@ -750,10 +750,10 @@ def create_studio_content(*, reload_alerts: bool = False):
             ).classes("app-section-copy")
             processing_status = ui.label(
                 "Bạn có tối đa 10 phút để hoàn tất xác thực Google."
-            ).classes("text-sm text-gray-600")
+            ).classes("text-body-s text-subtitle")
             auth_countdown = ui.label(
                 "Thời gian xác thực còn lại: 10:00"
-            ).classes("text-lg font-semibold text-primary")
+            ).classes("text-title-xs text-brand")
             cancel_scan_button = ui.button(
                 "Hủy",
                 icon="close",
@@ -766,7 +766,7 @@ def create_studio_content(*, reload_alerts: bool = False):
         with ui.card().classes("app-card w-full max-w-md"):
             with ui.column().classes("gap-1 mb-2"):
                 login_title = ui.label("Thêm kênh YouTube mới").classes(
-                    "text-xl font-semibold leading-snug text-gray-900"
+                    "text-title-s leading-snug text-ink"
                 )
                 ui_refs["login_title"] = login_title
                 login_copy = ui.label(
@@ -794,7 +794,7 @@ def create_studio_content(*, reload_alerts: bool = False):
                     "Xóa thông tin",
                     icon="backspace",
                     on_click=clear_login_inputs,
-                ).props("flat").classes("text-gray-500")
+                ).props("flat").classes("text-muted")
                 with ui.row().classes("gap-2"):
                     ui.button(
                         "Đóng",
@@ -864,12 +864,12 @@ def create_studio_content(*, reload_alerts: bool = False):
                         "Chọn tất cả",
                         icon="done_all",
                         on_click=select_all_recovery_channels,
-                    ).props("flat dense no-caps").classes("text-emerald-700")
+                    ).props("flat dense no-caps").classes("text-brand")
                     ui.button(
                         "Bỏ chọn tất cả",
                         icon="remove_done",
                         on_click=deselect_all_recovery_channels,
-                    ).props("flat dense no-caps").classes("text-gray-600")
+                    ).props("flat dense no-caps").classes("text-muted")
                 recovery_scope_refs["selection_actions"] = (
                     recovery_selection_actions
                 )
@@ -878,7 +878,7 @@ def create_studio_content(*, reload_alerts: bool = False):
                     == RECOVERY_SCAN_MODE_SELECTED
                 )
             recovery_scope_summary = ui.label("").classes(
-                "text-xs text-gray-500 mb-2"
+                "text-label-m text-muted mb-2"
             )
             recovery_scope_refs["summary"] = recovery_scope_summary
 
@@ -888,7 +888,7 @@ def create_studio_content(*, reload_alerts: bool = False):
                 "Danh sách kênh được lưu riêng cho phiên bản ứng dụng này.",
             ):
                 channel_count_label = ui.label("0 kênh").classes(
-                    "text-xs font-medium text-gray-500"
+                    "text-label-m font-medium text-muted"
                 )
                 ui.button(
                     icon="refresh",
@@ -903,7 +903,7 @@ def create_studio_content(*, reload_alerts: bool = False):
                         ui.menu_item(
                             "Xóa tất cả kênh",
                             on_click=confirm_delete_all,
-                        ).classes("text-red-600")
+                        ).classes("text-bad")
 
             gmail_filter_container = ui.column().classes("w-full")
             channels_container = ui.column().classes("w-full gap-0")
@@ -915,17 +915,17 @@ def create_studio_content(*, reload_alerts: bool = False):
         with app_card(compact=True):
             with ui.row().classes("w-full items-center gap-3"):
                 with ui.element("div").classes(
-                    "w-9 h-9 rounded-lg bg-emerald-50 text-emerald-600 grid place-items-center shrink-0"
+                    "w-9 h-9 rounded-card bg-brand-soft text-brand grid place-items-center shrink-0"
                 ):
                     ui.icon("o_verified_user").classes("text-xl")
                 with ui.column().classes("gap-0 flex-1 min-w-0"):
                     ui.label("Giấy phép ứng dụng").classes(
-                        "text-sm font-semibold text-gray-800"
+                        "text-body-s font-semibold text-ink"
                     )
                     ui.label(
                         f"{'Đang hoạt động' if license_info else 'Chưa kích hoạt'} · "
                         f"Thời hạn: {expiry_text}"
-                    ).classes("text-xs text-gray-500 truncate")
+                    ).classes("text-label-m text-muted truncate")
                 status_badge(
                     "Đã kích hoạt" if license_info else "Cần kiểm tra",
                     "success" if license_info else "warning",
@@ -961,7 +961,7 @@ def create_studio_content(*, reload_alerts: bool = False):
                 ui.label(
                     "Kênh cũ chưa có Gmail nằm trong ‘Chưa xác định Gmail’. "
                     "Bấm Quét Gmail và đăng nhập Gmail tương ứng để cập nhật."
-                ).classes("text-xs text-gray-500")
+                ).classes("text-label-m text-muted")
         preferences = recovery_scope_snapshot()
         recovery_scan_mode = preferences["scan_mode"]
         recovery_selected_ids = set(preferences["selected_channel_ids"])
@@ -1035,13 +1035,13 @@ def create_studio_content(*, reload_alerts: bool = False):
                                     ui.icon("smart_display").classes("text-base")
                             with ui.column().classes("gap-0 min-w-0"):
                                 ui.label(name).classes(
-                                    "text-sm font-semibold text-gray-800 truncate"
+                                    "text-body-s font-semibold text-ink truncate"
                                 )
                                 ui.label(channel_gmail(channel_data) or "Chưa xác định Gmail").classes(
-                                    "text-[11px] text-gray-400"
+                                    "text-2xs text-faint"
                                 )
                         ui.label(channel_id).classes(
-                            "text-xs text-gray-500 truncate"
+                            "text-label-m text-muted truncate"
                         ).tooltip(channel_id)
                         status_badge(
                             "Active" if recovery_channel_active else "Deactive",

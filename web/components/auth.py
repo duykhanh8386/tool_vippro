@@ -13,7 +13,7 @@ def create_auth_page():
                     "w-16 h-16 rounded-xl object-cover mb-1"
                 )
                 ui.label("Kích hoạt Tuất Videos").classes(
-                    "text-2xl font-bold leading-tight text-gray-900"
+                    "text-title-m text-ink leading-tight"
                 )
                 ui.label(
                     "Nhập license key để mở workspace và sử dụng các tác vụ tự động hóa."
@@ -31,12 +31,12 @@ def create_auth_page():
                 ui.navigate.to(router.start_path)
             else:
                 with ui.row().classes(
-                    "w-full items-start gap-2 rounded-lg border border-amber-200 bg-amber-50 p-3"
+                    "w-full items-start gap-2 rounded-card border border-warn-line bg-warn-soft p-3"
                 ):
-                    ui.icon("o_info").classes("text-lg text-amber-600 shrink-0")
+                    ui.icon("o_info").classes("text-lg text-warn shrink-0")
                     ui.label(
                         "License chưa được kích hoạt hoặc đã hết hạn."
-                    ).classes("text-xs text-amber-700")
+                    ).classes("text-label-m text-warn")
 
             def handle_auth():
                 key = license_input.value
@@ -65,4 +65,4 @@ def create_auth_page():
 
             ui.label(
                 "License và dữ liệu được lưu riêng trên thiết bị này."
-            ).classes("text-[11px] text-gray-400 text-center mt-2")
+            ).classes("text-label-s text-faint text-center mt-2")

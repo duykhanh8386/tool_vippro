@@ -153,15 +153,15 @@ def create_video_publishing_page():
         if not row:
             return
         with ui.dialog() as dialog, ui.card().classes("w-[900px] max-w-full"):
-            ui.label(row["old_title"]).classes("text-lg font-semibold break-words")
-            ui.label(f"{row['channel_id']} · {row['video_id']}").classes("text-xs text-gray-500")
-            ui.label(f"Loại video: {row.get('visibility_label', 'Cần quét lại')} · {row['copyright_label']}").classes("text-sm")
+            ui.label(row["old_title"]).classes("text-title-xs break-words")
+            ui.label(f"{row['channel_id']} · {row['video_id']}").classes("text-label-m text-muted")
+            ui.label(f"Loại video: {row.get('visibility_label', 'Cần quét lại')} · {row['copyright_label']}").classes("text-body-s")
             reference = row.get("reference") or {}
             if reference:
                 ui.link("Mở video tham chiếu", reference["url"], new_tab=True)
-                ui.label(reference.get("selection_label", "Đã chọn từ phiên trước")).classes("text-sm text-emerald-700")
+                ui.label(reference.get("selection_label", "Đã chọn từ phiên trước")).classes("text-body-s text-brand")
                 if row.get("duration_seconds"):
-                    ui.label(f"Thời lượng video hiện tại: {row['duration_seconds']:g} giây").classes("text-xs text-gray-500")
+                    ui.label(f"Thời lượng video hiện tại: {row['duration_seconds']:g} giây").classes("text-label-m text-muted")
                 ui.input("Title sẽ chép nguyên văn", value=reference["title"]).props("outlined readonly").classes("w-full")
                 ui.textarea("Description sẽ chép nguyên văn", value=reference["description"]).props("outlined readonly autogrow").classes("w-full")
                 ui.image(reference["thumbnail"]).classes("w-96 max-w-full")
@@ -258,7 +258,7 @@ def create_video_publishing_page():
                 pass
             fields["channel_source"] = ui.toggle({"selected": "Kênh đã chọn", "links": "Link kênh"}, value=settings["channel_source"],
                                                   on_change=lambda e: change("channel_source", e.value))
-            source_status = ui.label().classes("text-sm text-emerald-700")
+            source_status = ui.label().classes("text-body-s text-brand")
         with ui.column().classes("w-full") as channel_picker:
             create_channel_selection(get_channels_info() or [], choose_channels, multi_select=True,
                                      initial_selected_ids=settings["channel_ids"],
@@ -278,7 +278,7 @@ def create_video_publishing_page():
                 fields["scan_all"] = ui.switch("Quét hết video", value=settings["scan_all"], on_change=lambda e: change("scan_all", e.value))
                 fields["limit"] = ui.number("Số video mỗi kênh", value=settings["limit"], min=1, max=10000, step=1,
                                             on_change=lambda e: change("limit", e.value)).props("outlined").classes("w-44")
-            ui.label("Sau khi quét, lọc theo loại video và trạng thái bản quyền trong Danh sách xử lý để chọn video lên lịch.").classes("text-xs text-gray-500")
+            ui.label("Sau khi quét, lọc theo loại video và trạng thái bản quyền trong Danh sách xử lý để chọn video lên lịch.").classes("text-label-m text-muted")
         with app_card():
             with section_header("ChatGPT vẽ thumbnail", "Tạo ảnh bằng backend phoma ngay trong quy trình SEO."):
                 buttons["session"] = ui.button("Kiểm tra tài khoản", icon="verified_user", on_click=prepare_session).props("outline")
@@ -292,9 +292,9 @@ def create_video_publishing_page():
                 buttons["import_session"] = ui.button("Thêm tài khoản", icon="key", on_click=set_session).props("outline")
                 buttons["replace_session"] = ui.button("Thay session tài khoản", on_click=replace_session).props("outline")
                 buttons["clear_session"] = ui.button("Bỏ session nhập tay", icon="clear", on_click=lambda: invoke(lambda: controller.set_session(""))).props("flat")
-            session_hint = ui.label().classes("text-xs text-gray-500")
-            session_status = ui.label().classes("text-sm text-emerald-700 break-words")
-            ui.label("Tài khoản và access token được lưu không mã hóa trong dữ liệu riêng của tool. Không dùng cookie Selenium cũ. Backend phoma vẫn có thể bị giới hạn hoặc yêu cầu xác minh; khi đó tool báo lỗi/dừng để bạn kiểm tra. Title/description không gửi AI để viết lại.").classes("text-xs text-gray-500")
+            session_hint = ui.label().classes("text-label-m text-muted")
+            session_status = ui.label().classes("text-body-s text-brand break-words")
+            ui.label("Tài khoản và access token được lưu không mã hóa trong dữ liệu riêng của tool. Không dùng cookie Selenium cũ. Backend phoma vẫn có thể bị giới hạn hoặc yêu cầu xác minh; khi đó tool báo lỗi/dừng để bạn kiểm tra. Title/description không gửi AI để viết lại.").classes("text-label-m text-muted")
             with ui.row().classes("w-full gap-3 items-center"):
                 fields["image_model"] = ui.select(list(IMAGE_MODELS), label="Model tạo thumbnail", value=settings["image_model"],
                                                   on_change=lambda e: change("image_model", e.value)).props("outlined")
@@ -326,10 +326,10 @@ def create_video_publishing_page():
                                             on_change=lambda e: change("scope", e.value)).props("outlined").classes("w-96 max-w-full")
                 fields["categories"] = ui.select(COPYRIGHT_LABELS, multiple=True, clearable=True, label="Lọc trạng thái bản quyền (trống = tất cả)",
                                                  value=settings["categories"], on_change=lambda e: change("categories", list(e.value or []))).props("outlined use-chips").classes("flex-1 min-w-64")
-            ui.label("Bảng áp dụng đồng thời loại video và bản quyền. Xóa bộ lọc bản quyền để thấy đủ video thuộc loại đã chọn. Đổi bộ lọc vẫn giữ các video đã chọn; video bị khóa checkbox có lý do tại từng dòng.").classes("text-xs text-gray-500")
-            rescan_hint = ui.label("Danh sách cũ chưa được kiểm tra bằng cách nhận diện bản nháp mới. Bấm Quét video lại một lần để cập nhật đúng loại video.").classes("text-sm text-amber-700")
-            message = ui.label().classes("text-sm text-emerald-700 break-words")
-            summary = ui.label().classes("text-xs text-gray-500")
+            ui.label("Bảng áp dụng đồng thời loại video và bản quyền. Xóa bộ lọc bản quyền để thấy đủ video thuộc loại đã chọn. Đổi bộ lọc vẫn giữ các video đã chọn; video bị khóa checkbox có lý do tại từng dòng.").classes("text-label-m text-muted")
+            rescan_hint = ui.label("Danh sách cũ chưa được kiểm tra bằng cách nhận diện bản nháp mới. Bấm Quét video lại một lần để cập nhật đúng loại video.").classes("text-body-s text-warn")
+            message = ui.label().classes("text-body-s text-ok break-words")
+            summary = ui.label().classes("text-label-m text-muted")
             columns = [{"name": key, "label": label, "field": key, "align": "left"} for key, label in (
                 ("channel_id", "Kênh"), ("video_id", "Video ID"), ("old_title", "Title hiện tại"), ("visibility_label", "Loại video"), ("copyright_label", "Bản quyền"),
                 ("song", "Bài nhạc tìm kiếm"), ("reference_title", "Title sẽ chép nguyên văn"), ("publish_label", "Ngày giờ UTC+7"),

@@ -95,8 +95,8 @@ def create_video_titles_page():
         options = {item["path"]: f"{Path(item['path']).name} · {_duration(item['seconds'])} · lệch {item['delta']:.2f}s"
                    for item in row["candidates"]}
         with ui.dialog() as dialog, ui.card().classes("w-[760px] max-w-full"):
-            ui.label(f"Chọn bài nhạc cho {row['video_id']}").classes("text-lg font-semibold")
-            ui.label(row["old_title"]).classes("text-sm text-gray-500 break-all")
+            ui.label(f"Chọn bài nhạc cho {row['video_id']}").classes("text-title-xs text-ink")
+            ui.label(row["old_title"]).classes("text-body-s text-muted break-all")
             choice = ui.select(options, label="File khớp thời lượng", value=row.get("audio_path") or None).props("outlined").classes("w-full")
 
             def apply():
@@ -185,20 +185,20 @@ def create_video_titles_page():
                 fields["end_date"] = ui.input("Đến hết ngày", value=settings["end_date"], on_change=lambda e: change("end_date", e.value)).props("outlined type=date").classes("w-48")
                 fields["date_type"] = ui.select(SCAN_DATE_TYPE_OPTIONS, label="Tính theo ngày", value=settings["date_type"],
                                                 on_change=lambda e: change("date_type", e.value)).props("outlined").classes("w-64")
-            ui.label("Khoảng ngày tính theo giờ Việt Nam, gồm cả ngày kết thúc. Chế độ số lượng lấy video mới nhất sau khi lọc phạm vi.").classes("text-xs text-gray-500")
+            ui.label("Khoảng ngày tính theo giờ Việt Nam, gồm cả ngày kết thúc. Chế độ số lượng lấy video mới nhất sau khi lọc phạm vi.").classes("text-label-m text-muted")
             with ui.row().classes("title-folder-row w-full items-center gap-3"):
                 fields["title_keyword"] = ui.input("Từ khóa trong tiêu đề", value=settings["title_keyword"],
                                                    placeholder="Ví dụ: nonstop hoặc Part 2",
                                                    on_change=lambda e: change("title_keyword", e.value or "")).props("outlined clearable").classes("flex-1 min-w-0")
                 buttons["scan_keyword"] = ui.button("Quét theo từ khóa", icon="filter_alt", on_click=lambda: start("scan_keyword")).props("outline")
-            ui.label("Lấy các tiêu đề chứa từ hoặc cụm từ đã nhập, không phân biệt hoa thường. Số lượng tính sau khi lọc tiêu đề và phạm vi đã chọn.").classes("text-xs text-gray-500")
+            ui.label("Lấy các tiêu đề chứa từ hoặc cụm từ đã nhập, không phân biệt hoa thường. Số lượng tính sau khi lọc tiêu đề và phạm vi đã chọn.").classes("text-label-m text-muted")
             ui.separator()
             fields["manual_ids"] = ui.textarea("Video ID thủ công", value=settings["manual_ids"],
                                                placeholder="Mỗi dòng một Video ID hoặc link YouTube / Studio",
                                                on_change=lambda e: change("manual_ids", e.value or "")).props("outlined autogrow").classes("w-full")
             with ui.row().classes("w-full items-center gap-3"):
                 buttons["scan_manual"] = ui.button("Đọc Video ID thủ công", icon="playlist_add", on_click=lambda: start("scan_manual")).props("outline")
-                ui.label("Đọc đúng danh sách đã nhập và thay thế bảng bên dưới; bỏ qua bộ lọc ngày, số lượng và phạm vi. Video phải thuộc kênh đã chọn.").classes("text-xs text-gray-500 flex-1 min-w-0")
+                ui.label("Đọc đúng danh sách đã nhập và thay thế bảng bên dưới; bỏ qua bộ lọc ngày, số lượng và phạm vi. Video phải thuộc kênh đã chọn.").classes("text-label-m text-muted flex-1 min-w-0")
         with app_card():
             with section_header("Ghép tên bài nhạc theo thời lượng", "Tên file nhạc bỏ phần mở rộng sẽ trở thành tiêu đề video trên YouTube."):
                 buttons["match"] = ui.button("Ghép theo thời lượng", icon="timer", on_click=lambda: start("match")).props("outline")
@@ -209,14 +209,14 @@ def create_video_titles_page():
                 fields["recursive"] = ui.switch("Quét cả thư mục con", value=settings["recursive"], on_change=lambda e: change("recursive", e.value))
                 fields["tolerance"] = ui.number("Lệch tối đa (giây)", value=settings["tolerance"], min=0, max=60, step=.1,
                                                 on_change=lambda e: change("tolerance", e.value)).props("outlined").classes("w-44")
-            ui.label("Một bài nhạc có thể ghép cho nhiều video. Nếu nhiều tên khớp ngang nhau, chọn file tại từng dòng trước khi đổi. Tiêu đề được lọc ký tự và rút gọn tối đa 100 ký tự.").classes("text-xs text-gray-500")
+            ui.label("Một bài nhạc có thể ghép cho nhiều video. Nếu nhiều tên khớp ngang nhau, chọn file tại từng dòng trước khi đổi. Tiêu đề được lọc ký tự và rút gọn tối đa 100 ký tự.").classes("text-label-m text-muted")
         with app_card():
             with section_header("Xem trước tiêu đề", "Các video ghép được được chọn sẵn. Bỏ chọn những dòng chưa muốn đổi."):
                 buttons["select"] = ui.button("Chọn các dòng đã ghép", icon="checklist", on_click=select_ready).props("outline")
                 buttons["update"] = ui.button("Đổi tiêu đề đã chọn", icon="drive_file_rename_outline", on_click=lambda: start("update"))
                 buttons["stop"] = ui.button("Dừng", icon="stop", on_click=lambda: (controller.stop(), refresh())).props("outline color=negative")
-            message = ui.label().classes("text-sm text-emerald-700 break-words")
-            summary = ui.label().classes("text-xs text-gray-500")
+            message = ui.label().classes("text-body-s text-ok break-words")
+            summary = ui.label().classes("text-label-m text-muted")
             columns = [{"name": name, "label": label, "field": name, "align": "left", "sortable": True}
                        for name, label in [("video_id", "Video ID"), ("old_title", "Tiêu đề lúc quét"), ("video_length", "Video"),
                                            ("audio_name", "File nhạc"), ("audio_length", "Nhạc"), ("delta_label", "Độ lệch"),

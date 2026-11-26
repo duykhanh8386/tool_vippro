@@ -165,9 +165,42 @@ def create_drawer():
                     ui.label("Tuất Videos").classes("app-brand-title")
                     ui.label("Operations workspace").classes("app-brand-copy")
 
-            recovery_alert_container = ui.column().classes("w-full gap-1")
+            recovery_alert_container = ui.column().classes("w-full gap-1.5 mt-2")
             recovery_alert_state = {"signature": None}
             recovery_alert_channel_names: dict[str, str] = {}
+
+            with ui.dialog() as recovery_alert_dialog, ui.card().classes(
+                "gap-3"
+            ).style(
+                "width: min(640px, calc(100vw - 32px)); max-width: calc(100vw - 32px)"
+            ):
+                with ui.row().classes("w-full items-center justify-between no-wrap"):
+                    with ui.row().classes("items-center gap-2 no-wrap"):
+                        ui.icon("warning_amber").classes("text-bad text-2xl")
+                        ui.label("Cảnh báo session token kênh").classes(
+                            "text-title-xs text-ink"
+                        )
+                    ui.button(icon="close", on_click=recovery_alert_dialog.close).props(
+                        "flat round dense"
+                    )
+                recovery_alert_dialog_summary = ui.label().classes(
+                    "text-body-s text-subtitle"
+                )
+                recovery_alert_dialog_list = ui.column().classes(
+                    "w-full gap-2 max-h-80 overflow-y-auto"
+                )
+                with ui.row().classes("w-full justify-end gap-2 mt-1"):
+                    ui.button("Đóng", on_click=recovery_alert_dialog.close).classes(
+                        "app-button-secondary"
+                    )
+                    ui.button(
+                        "Load lại đúng kênh lỗi",
+                        icon="refresh",
+                        on_click=lambda: (
+                            recovery_alert_dialog.close(),
+                            _navigate("/studio?reload_alerts=1"),
+                        ),
+                    ).classes("app-button-primary")
 
             def recovery_alert_channel_name(
                 channel_id: str, alert: dict
@@ -217,63 +250,63 @@ def create_drawer():
                     or alert.get("validation_failed")
                     for alert in alerts.values()
                 )
-                card_classes = (
-                    "w-full p-2 bg-red-50 border border-red-300 shadow-none"
-                    if has_validation_error
-                    else "w-full p-2 bg-amber-50 border border-amber-300 shadow-none"
+                pill_tone = "app-sidebar-pill--bad" if has_validation_error else "app-sidebar-pill--warn"
+                recovery_alert_dialog_summary.set_text(
+                    f"YouTube chưa cấp session token cho {len(alerts)} kênh."
                 )
-                title_classes = (
-                    "text-xs font-semibold text-red-900"
-                    if has_validation_error
-                    else "text-xs font-semibold text-amber-900"
-                )
-                with recovery_alert_container:
-                    with ui.card().classes(card_classes):
-                        ui.label(
-                            f"YouTube chưa cấp session token cho {len(alerts)} kênh."
-                        ).classes(title_classes)
-                        for channel_id, alert in sorted(alerts.items()):
-                            is_error = bool(
-                                alert.get("severity") == "error"
-                                or alert.get("validation_failed")
-                            )
-                            detail_classes = (
-                                "w-full gap-0 rounded border border-red-200 bg-white/70 p-1.5"
-                                if is_error
-                                else "w-full gap-0 rounded border border-amber-200 bg-white/70 p-1.5"
-                            )
-                            with ui.column().classes(detail_classes):
-                                ui.label(
-                                    recovery_alert_channel_name(channel_id, alert)
-                                ).classes(
-                                    "text-xs font-semibold break-all "
-                                    + (
-                                        "text-red-900"
-                                        if is_error
-                                        else "text-amber-900"
-                                    )
-                                )
-                                ui.label(f"ID: {channel_id}").classes(
-                                    "text-[10px] font-mono break-all select-text text-gray-700"
-                                )
-                                ui.label(
-                                    f"Lỗi lúc: {recovery_alert_time(alert)}"
-                                ).classes("text-[10px] text-gray-600")
-                                if is_error:
-                                    ui.label(
-                                        "Kiểm tra session token thất bại sau khi load lại."
-                                    ).classes("text-[10px] font-medium text-red-700")
-                        ui.button(
-                            "Load lại đúng kênh lỗi",
-                            icon="refresh",
-                            on_click=lambda: _navigate(
-                                "/studio?reload_alerts=1"
-                            ),
-                        ).props("flat dense no-caps").classes(
-                            "text-red-800"
-                            if has_validation_error
-                            else "text-amber-800"
+                recovery_alert_dialog_list.clear()
+                with recovery_alert_dialog_list:
+                    for channel_id, alert in sorted(alerts.items()):
+                        is_error = bool(
+                            alert.get("severity") == "error"
+                            or alert.get("validation_failed")
                         )
+                        detail_classes = (
+                            "w-full gap-1 rounded-card border border-bad-line bg-bad-soft p-3"
+                            if is_error
+                            else "w-full gap-1 rounded-card border border-warn-line bg-warn-soft p-3"
+                        )
+                        with ui.column().classes(detail_classes):
+                            ui.label(
+                                recovery_alert_channel_name(channel_id, alert)
+                            ).classes(
+                                "text-body-s font-semibold break-all "
+                                + ("text-bad" if is_error else "text-warn")
+                            )
+                            ui.label(f"ID: {channel_id}").classes(
+                                "text-label-m font-mono break-all select-text text-body"
+                            )
+                            ui.label(
+                                f"Lỗi lúc: {recovery_alert_time(alert)}"
+                            ).classes("text-label-m text-muted")
+                            if is_error:
+                                ui.label(
+                                    "Kiểm tra session token thất bại sau khi load lại."
+                                ).classes("text-label-m font-medium text-bad")
+
+                with recovery_alert_container:
+                    with ui.column().classes(
+                        f"app-sidebar-pill app-sidebar-pill--clickable {pill_tone} gap-1"
+                    ).on("click", recovery_alert_dialog.open):
+                        with ui.row().classes("w-full items-center gap-1.5 no-wrap"):
+                            ui.icon(
+                                "error_outline" if has_validation_error else "warning_amber"
+                            ).classes("text-base shrink-0")
+                            ui.label(
+                                f"Token lỗi · {len(alerts)} kênh"
+                            ).classes("text-label-m font-semibold truncate")
+                            ui.icon("chevron_right").classes(
+                                "text-base shrink-0 ml-auto opacity-70"
+                            )
+                        ui.label("Nhấp xem chi tiết kênh lỗi").classes("text-2xs opacity-80")
+                        ui.button(
+                            "Load lại kênh lỗi",
+                            icon="refresh",
+                            on_click=lambda: _navigate("/studio?reload_alerts=1"),
+                        ).props("flat dense no-caps size=sm").classes(
+                            "self-start px-1 text-label-m font-semibold "
+                            + ("text-bad" if has_validation_error else "text-warn")
+                        ).on("click.stop", lambda: None)
                 if recovery_alert_state["signature"] != signature:
                     ui.notify(
                         "Kiểm tra session token thất bại; xem tên và Channel ID "
@@ -305,20 +338,20 @@ def create_drawer():
             ):
                 with ui.row().classes("w-full items-center justify-between no-wrap"):
                     with ui.row().classes("items-center gap-2 no-wrap"):
-                        ui.icon("manage_search").classes("text-blue-700 text-2xl")
+                        ui.icon("manage_search").classes("text-info text-2xl")
                         ui.label("Chi tiết Auto audio").classes(
-                            "text-lg font-semibold text-gray-800"
+                            "text-title-xs text-ink"
                         )
                     ui.button(icon="close", on_click=recovery_detail_dialog.close).props(
                         "flat round dense"
                     )
 
                 recovery_detail_status = ui.label().classes(
-                    "text-sm font-medium text-blue-800"
+                    "text-body-s font-medium text-info"
                 )
-                recovery_detail_summary = ui.label().classes("text-xs text-gray-600")
-                recovery_detail_capacity = ui.label().classes("text-xs text-gray-500")
-                ui.label("Kênh trong lượt quét").classes("text-xs font-medium text-gray-700")
+                recovery_detail_summary = ui.label().classes("text-label-m text-subtitle")
+                recovery_detail_capacity = ui.label().classes("text-label-m text-muted")
+                ui.label("Kênh trong lượt quét").classes("text-label-m font-medium text-subtitle")
                 recovery_channel_table = ui.table(
                     columns=[
                         {"name": "name", "label": "Kênh", "field": "name", "classes": "whitespace-normal"},
@@ -335,7 +368,7 @@ def create_drawer():
                 recovery_channel_table.add_slot("body-cell-transfer", '''
                     <q-td :props="props">
                         <div v-if="props.row.phase === 'uploading'" class="column q-gutter-xs">
-                            <q-linear-progress rounded color="blue" size="8px"
+                            <q-linear-progress rounded color="info" size="8px"
                                 :value="props.row.upload_fraction || 0"
                                 :indeterminate="['deleting', 'authenticating', 'starting', 'registering', 'verifying'].includes(props.row.upload_status)" />
                             <span>{{ props.row.transfer }}</span>
@@ -362,43 +395,43 @@ def create_drawer():
                     </q-td>
                 ''')
                 recovery_detail_progress = ui.linear_progress(value=0, show_value=False, size="12px").props(
-                    "rounded color=blue"
+                    "rounded color=info"
                 ).classes("w-full")
                 recovery_detail_transfer = ui.label().classes(
-                    "text-xs text-gray-600"
+                    "text-label-m text-subtitle"
                 )
 
                 with ui.grid(columns=1).classes(
-                    "w-full gap-2 rounded-lg bg-gray-50 border border-gray-200 p-3"
+                    "w-full gap-2 rounded-card bg-sunken border border-line p-3"
                 ):
                     ui.label("Kênh đang xử lý").classes(
-                        "text-[11px] uppercase tracking-wide text-gray-500"
+                        "text-label-s uppercase tracking-wide text-muted"
                     )
                     recovery_detail_channel_name = ui.label("—").classes(
-                        "text-sm font-semibold text-gray-900 break-all select-text"
+                        "text-body-s font-semibold text-ink break-all select-text"
                     )
                     ui.label("Channel ID").classes(
-                        "text-[11px] uppercase tracking-wide text-gray-500 mt-1"
+                        "text-label-s uppercase tracking-wide text-muted mt-1"
                     )
                     recovery_detail_channel_id = ui.label("—").classes(
-                        "text-xs font-mono text-gray-800 break-all select-text"
+                        "text-label-m font-mono text-body break-all select-text"
                     )
                     ui.label("Video ID đang add lại").classes(
-                        "text-[11px] uppercase tracking-wide text-gray-500 mt-1"
+                        "text-label-s uppercase tracking-wide text-muted mt-1"
                     )
                     recovery_detail_video_id = ui.label("—").classes(
-                        "text-sm font-mono font-semibold text-gray-900 break-all select-text"
+                        "text-body-s font-mono font-semibold text-ink break-all select-text"
                     )
                     ui.label("Ngôn ngữ").classes(
-                        "text-[11px] uppercase tracking-wide text-gray-500 mt-1"
+                        "text-label-s uppercase tracking-wide text-muted mt-1"
                     )
                     recovery_detail_language = ui.label("—").classes(
-                        "text-sm font-mono text-gray-800 break-all select-text"
+                        "text-body-s font-mono text-body break-all select-text"
                     )
 
                 ui.label(
                     "Thông tin này tự cập nhật trong khi hộp thoại đang mở."
-                ).classes("text-[11px] text-gray-500")
+                ).classes("text-label-m text-muted")
 
             def get_recovery_channel_name(channel_id: str) -> str:
                 if not channel_id:
@@ -505,130 +538,119 @@ def create_drawer():
                 recovery_activity_container.clear()
                 with recovery_activity_container:
                     if active:
-                        with ui.card().classes(
-                            "w-full p-2 bg-blue-50 border border-blue-200 shadow-none "
-                            "cursor-pointer hover:bg-blue-100"
-                        ).on("click", open_recovery_details):
-                            with ui.row().classes("w-full items-center gap-2 no-wrap"):
-                                ui.icon("sync").classes("text-blue-700 animate-spin")
-                                ui.label(
-                                    "Đang tắt Auto Registry — chờ tác vụ hiện tại kết thúc"
-                                    if not status.get("enabled", True)
-                                    else str(status.get("message") or "Đang tự động quét audio")
-                                ) \
-                                    .classes("text-xs font-semibold text-blue-900")
-
-                            ui.label(_recovery_channel_summary(status)).classes(
-                                "text-[11px] text-blue-800"
-                            )
+                        title_text = (
+                            "Đang tắt Auto Registry..."
+                            if not status.get("enabled", True)
+                            else str(status.get("message") or "Đang tự động quét audio")
+                        )
+                        with ui.column().classes(
+                            "app-sidebar-pill app-sidebar-pill--info app-sidebar-pill--clickable gap-1.5 mt-1"
+                        ).on("click", open_recovery_details).tooltip(
+                            "Nhấp để xem Channel ID và Video ID"
+                        ):
+                            with ui.row().classes("w-full items-center gap-1.5 no-wrap"):
+                                ui.icon("sync").classes("animate-spin text-base shrink-0")
+                                ui.label(title_text).classes(
+                                    "text-label-m font-semibold leading-tight truncate"
+                                )
+                                ui.icon("chevron_right").classes(
+                                    "text-base shrink-0 ml-auto opacity-70"
+                                )
                             if phase == "uploading":
                                 fraction = float(status.get("upload_fraction") or 0)
-                                ui.linear_progress(value=fraction, show_value=False).props(
-                                    "rounded color=blue"
-                                ).classes("w-full mt-1")
-                                ui.label(
-                                    _recovery_transfer_text(status)
-                                ).classes("text-[11px] text-blue-800")
-                                ui.label(
-                                    f"Video: {status.get('video_id') or '—'} · "
-                                    f"Ngôn ngữ: {status.get('language') or '—'}"
-                                ).classes("text-[10px] text-blue-700 break-all")
+                                ui.linear_progress(
+                                    value=fraction, show_value=False, size="4px"
+                                ).props("rounded color=info").classes("w-full")
+                                summary_text = f"{fraction:.0%} · {status.get('video_id') or '—'}"
                             elif phase == "scanning":
                                 current = int(status.get("completed_channel_count") or 0)
                                 total = int(status.get("channel_total") or 0)
                                 fraction = current / total if total else 0
-                                ui.linear_progress(value=fraction, show_value=False).props(
-                                    "rounded color=blue"
-                                ).classes("w-full mt-1")
-                                ui.label(
-                                    f"Đang đọc lại trạng thái audio · {status.get('completed_pass_count', 0)} lượt đã xong"
-                                    if status.get("continuous") else
-                                    f"Đã hoàn tất {current}/{total} kênh" if total else "Đang đọc danh sách theo dõi..."
-                                ).classes("text-[11px] text-blue-800")
+                                ui.linear_progress(
+                                    value=fraction, show_value=False, size="4px"
+                                ).props("rounded color=info").classes("w-full")
+                                summary_text = _recovery_channel_summary(status)
                             else:
-                                ui.linear_progress(value=0, show_value=False).props(
-                                    "indeterminate rounded color=blue"
-                                ).classes("w-full mt-1")
-                                if phase == "preparing":
-                                    ui.label(
-                                        f"Đã tạo {_format_transfer_size(status.get('preparation_bytes', 0))} · "
-                                        f"{status.get('preparation_elapsed_seconds', 0)} giây"
-                                    ).classes("text-[11px] text-blue-800")
-                                if status.get("video_id"):
-                                    ui.label(
-                                        f"Video: {status['video_id']}"
-                                    ).classes("text-[10px] text-blue-700 break-all")
-                            ui.label("Nhấp để xem Channel ID và Video ID").classes(
-                                "text-[10px] text-blue-600 underline"
-                            )
+                                ui.linear_progress(
+                                    value=0, show_value=False, size="4px"
+                                ).props("indeterminate rounded color=info").classes("w-full")
+                                summary_text = (
+                                    f"Video: {status['video_id']}"
+                                    if status.get("video_id")
+                                    else _recovery_channel_summary(status)
+                                )
+                            ui.label(summary_text).classes("text-2xs truncate w-full opacity-85")
                     elif not status.get("enabled", True):
-                        with ui.card().classes(
-                            "w-full p-2 bg-gray-50 border border-gray-200 shadow-none"
+                        with ui.row().classes(
+                            "app-sidebar-pill app-sidebar-pill--neutral items-center gap-1.5 no-wrap mt-1"
                         ):
-                            with ui.row().classes("w-full items-center gap-2 no-wrap"):
-                                ui.icon("pause_circle_outline").classes("text-gray-600")
-                                ui.label("Auto Registry đã tắt").classes(
-                                    "text-xs font-semibold text-gray-700"
-                                )
-                    elif status.get("monitor_running"):
-                        with ui.card().classes(
-                            "w-full p-2 bg-emerald-50 border border-emerald-200 shadow-none "
-                            "cursor-pointer hover:bg-emerald-100"
-                        ).on("click", open_recovery_details):
-                            with ui.row().classes("w-full items-center gap-2 no-wrap"):
-                                ui.icon("verified").classes("text-emerald-700")
-                                ui.label("Auto Registry đang chờ video cần bổ sung audio").classes(
-                                    "text-xs font-semibold text-emerald-900"
-                                )
-                            finished_at = status.get("last_cycle_finished_at")
-                            if finished_at:
-                                deferred_video_scope = int(
-                                    status.get("deferred_video_scope") or 0
-                                )
-                                deferred_visibility = int(
-                                    status.get("deferred_visibility_unknown") or 0
-                                )
-                                ui.label(
-                                    f"Lần quét cuối {time.strftime('%H:%M:%S', time.localtime(finished_at))} · "
-                                    f"đã gửi lại {status.get('repaired', 0)}, "
-                                    f"phụ đề failed đã sửa {status.get('captions_repaired', 0)}, "
-                                    f"hoãn {deferred_video_scope} ngoài loại đã chọn, "
-                                    f"{deferred_visibility} chưa đọc được trạng thái, "
-                                    f"lỗi {int(status.get('failed') or 0) + int(status.get('captions_failed') or 0)}"
-                                ).classes("text-[10px] text-emerald-800")
-                            else:
-                                ui.label("Đang chờ vòng quét đầu tiên").classes(
-                                    "text-[10px] text-emerald-800"
-                                )
-                            ui.label("Nhấp để xem chi tiết").classes(
-                                "text-[10px] text-emerald-700 underline"
+                            ui.icon("pause_circle_outline").classes("text-base shrink-0")
+                            ui.label("Auto Registry đã tắt").classes(
+                                "text-label-m font-medium truncate"
                             )
+                    elif status.get("monitor_running"):
+                        finished_at = status.get("last_cycle_finished_at")
+                        if finished_at:
+                            error_count = int(status.get("failed") or 0) + int(
+                                status.get("captions_failed") or 0
+                            )
+                            idle_summary = (
+                                f"Quét cuối {time.strftime('%H:%M', time.localtime(finished_at))} · "
+                                f"sửa {status.get('repaired', 0)} · lỗi {error_count}"
+                            )
+                        else:
+                            idle_summary = "Đang chờ vòng quét đầu"
+                        with ui.column().classes(
+                            "app-sidebar-pill app-sidebar-pill--ok app-sidebar-pill--clickable gap-0.5 mt-1"
+                        ).on("click", open_recovery_details).tooltip(
+                            "Nhấp để xem chi tiết Auto Registry"
+                        ):
+                            with ui.row().classes("w-full items-center gap-1.5 no-wrap"):
+                                ui.icon("verified").classes("text-base shrink-0")
+                                ui.label("Auto Registry đang chạy").classes(
+                                    "text-label-m font-semibold truncate"
+                                )
+                                ui.icon("chevron_right").classes(
+                                    "text-base shrink-0 ml-auto opacity-70"
+                                )
+                            ui.label(idle_summary).classes("text-2xs truncate w-full opacity-85")
 
                     caption_quota_message = str(
                         status.get("caption_quota_message") or ""
                     )
                     if caption_quota_message:
-                        with ui.card().classes(
-                            "w-full p-2 bg-orange-50 border border-orange-300 shadow-none"
-                        ):
-                            ui.label(caption_quota_message).classes(
-                                "text-[11px] text-orange-900"
-                            )
+                        with ui.row().classes(
+                            "app-sidebar-pill app-sidebar-pill--warn items-center gap-1.5 no-wrap"
+                        ).tooltip(caption_quota_message):
+                            ui.icon("warning_amber").classes("text-sm shrink-0")
+                            ui.label(caption_quota_message).classes("text-2xs truncate")
 
                     if processing_warning_count:
-                        ui.label(
-                            f"{processing_warning_count} audio xử lý quá 2 giờ đang chờ thêm lại. "
-                            "Xem chi tiết trong Auto Registry."
-                        ).classes("text-[11px] text-amber-800")
+                        with ui.row().classes(
+                            "app-sidebar-pill app-sidebar-pill--warn app-sidebar-pill--clickable items-center gap-1.5 no-wrap"
+                        ).on("click", open_recovery_details):
+                            ui.icon("schedule").classes("text-sm shrink-0")
+                            ui.label(f"{processing_warning_count} audio chờ thêm lại").classes(
+                                "text-2xs font-medium truncate"
+                            )
+                            ui.icon("chevron_right").classes(
+                                "text-base shrink-0 ml-auto opacity-70"
+                            )
                     channel_errors = sum(
                         result.get("outcome") == "error"
                         for result in status.get("channel_results", [])
                     )
                     if channel_errors:
-                        ui.label(
-                            f"{channel_errors} kênh có lỗi trong lượt quét. "
-                            "Mở chi tiết Auto audio để xem nguyên nhân."
-                        ).classes("text-[11px] text-red-700")
+                        with ui.row().classes(
+                            "app-sidebar-pill app-sidebar-pill--bad app-sidebar-pill--clickable items-center gap-1.5 no-wrap"
+                        ).on("click", open_recovery_details):
+                            ui.icon("error_outline").classes("text-sm shrink-0")
+                            ui.label(f"{channel_errors} kênh lỗi lượt quét").classes(
+                                "text-2xs font-medium truncate"
+                            )
+                            ui.icon("chevron_right").classes(
+                                "text-base shrink-0 ml-auto opacity-70"
+                            )
 
                 refresh_recovery_details(status)
 
@@ -707,13 +729,7 @@ def create_drawer():
                 ):
                     pass
 
-            ui.separator().classes("bg-gray-200 mb-2")
+            ui.separator().classes("bg-line mb-2")
             create_update_control()
-            with (
-                ui.row()
-                .classes("app-account w-full items-center gap-2 cursor-pointer")
-                .on("click", lambda: _navigate("/studio"))
-            ):
-                pass
 
     return drawer

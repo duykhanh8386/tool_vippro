@@ -77,19 +77,19 @@ PERSIST_FIELDS = (
 )
 
 STEP_STYLE = {
-    "pending": ("hourglass_empty", "text-gray-400", "Chờ"),
-    "processing": ("autorenew", "text-blue-600", "Đang xử lý..."),
-    "successful": ("check_circle", "text-green-600", "Thành công"),
-    "stopped": ("stop_circle", "text-amber-600", "Đã dừng"),
-    "error": ("error", "text-red-600", "Lỗi"),
-    "skipped": ("skip_next", "text-gray-400", "Bỏ qua"),
+    "pending": ("hourglass_empty", "text-faint", "Chờ"),
+    "processing": ("autorenew", "text-info", "Đang xử lý..."),
+    "successful": ("check_circle", "text-ok", "Thành công"),
+    "stopped": ("stop_circle", "text-warn", "Đã dừng"),
+    "error": ("error", "text-bad", "Lỗi"),
+    "skipped": ("skip_next", "text-faint", "Bỏ qua"),
 }
 
 LOG_STYLE = {
-    "info": "text-gray-700",
-    "success": "text-green-600 font-medium",
-    "error": "text-red-600 font-medium",
-    "warning": "text-amber-600",
+    "info": "text-subtitle",
+    "success": "text-ok font-medium",
+    "error": "text-bad font-medium",
+    "warning": "text-warn",
 }
 
 
@@ -737,19 +737,19 @@ def create_delete_back_flow_page():
         items = videos_state["items"]
         with video_list_container:
             with ui.row().classes("items-center gap-2 mb-1"):
-                ui.icon("video_library").classes("text-gray-500")
+                ui.icon("video_library").classes("text-muted")
                 ui.label(f"Tìm thấy {len(items)} video").classes(
-                    "text-sm font-semibold text-gray-700"
+                    "text-body-s font-semibold text-subtitle"
                 )
 
             if not items:
                 ui.label("Chưa chọn folder video hoặc folder không có video nào.").classes(
-                    "text-gray-500 italic text-xs py-4"
+                    "text-muted italic text-label-m py-4"
                 )
                 return
 
             with ui.row().classes(
-                "w-full min-h-[42px] items-center font-semibold text-xs text-gray-500 bg-gray-50 border-b border-gray-200 px-3"
+                "w-full min-h-[42px] items-center font-semibold text-label-m text-muted bg-sunken border-b border-line px-3"
             ):
                 ui.label("#").classes("w-1/12")
                 ui.label("Video").classes("w-3/12")
@@ -763,12 +763,12 @@ def create_delete_back_flow_page():
             for idx, item in enumerate(items, 1):
                 steps = item["steps"]
                 with ui.row().classes(
-                    "w-full min-h-[54px] items-center bg-white px-3 py-1 border-b border-gray-100 flex-nowrap hover:bg-gray-50"
+                    "w-full min-h-[54px] items-center bg-white px-3 py-1 border-b border-line flex-nowrap hover:bg-sunken"
                 ):
-                    ui.label(str(idx)).classes("w-1/12 text-xs text-gray-500")
+                    ui.label(str(idx)).classes("w-1/12 text-label-m text-muted")
                     with ui.column().classes("w-3/12 min-w-0 gap-0"):
                         ui.label(item["name"]).classes(
-                            "truncate text-sm font-medium text-gray-800"
+                            "truncate text-body-s font-medium text-ink"
                         ).tooltip(item["name"])
                         size_str = _human_size(item["size"])
                         if item.get("duration_error"):
@@ -777,7 +777,7 @@ def create_delete_back_flow_page():
                             dur_str = "đang đọc..."
                         else:
                             dur_str = _fmt_duration(item["duration"])
-                        meta_label = ui.label(f"{size_str} · {dur_str}").classes("text-xs text-gray-400")
+                        meta_label = ui.label(f"{size_str} · {dur_str}").classes("text-label-m text-faint")
                         if item.get("duration_error"):
                             meta_label.tooltip(item["duration_error"])
 
@@ -785,14 +785,14 @@ def create_delete_back_flow_page():
                     with ui.column().classes("w-2/12 min-w-0"):
                         if vid:
                             ui.label(vid).classes(
-                                "truncate text-xs font-medium text-indigo-600"
+                                "truncate text-label-m font-medium text-brand"
                             ).tooltip(vid)
                         else:
-                            ui.label("—").classes("text-xs text-gray-400")
+                            ui.label("—").classes("text-label-m text-faint")
 
                     music_name = item.get("music") or "—"
                     ui.label(music_name).classes(
-                        "w-2/12 truncate text-xs text-gray-600"
+                        "w-2/12 truncate text-label-m text-subtitle"
                     ).tooltip(music_name)
 
                     with ui.element("div").classes("w-1/12 flex justify-center"):
@@ -1411,18 +1411,18 @@ def create_delete_back_flow_page():
             card.clear()
             with card:
                 with ui.row().classes("items-center gap-3 w-full flex-nowrap"):
-                    ui.icon(icon).classes("text-2xl shrink-0 text-emerald-600")
+                    ui.icon(icon).classes("text-2xl shrink-0 text-brand")
                     with ui.column().classes("gap-0 min-w-0 flex-1"):
                         ui.label(label).classes(
-                            "text-xs font-semibold text-gray-600"
+                            "text-label-m font-semibold text-subtitle"
                         )
                         if path:
                             ui.label(path).classes(
-                                "text-sm text-gray-800 truncate"
+                                "text-body-s text-ink truncate"
                             ).tooltip(path)
                         else:
                             ui.label(placeholder).classes(
-                                "text-sm text-gray-400 italic truncate"
+                                "text-body-s text-faint italic truncate"
                             )
 
                     if path:
@@ -1510,7 +1510,7 @@ def create_delete_back_flow_page():
                 if not cid:
                     ui.label(
                         "Chọn kênh để gán ảnh tên kênh (overlay phủ toàn khung)"
-                    ).classes("text-xs text-gray-400 italic")
+                    ).classes("text-label-m text-faint italic")
                     return
 
                 png = channel_store.get_overlay_png(cid)
@@ -1518,23 +1518,23 @@ def create_delete_back_flow_page():
 
                 if exists:
                     text = Path(png).name
-                    color = "text-green-600"
+                    color = "text-ok"
                     icon_name = "check_circle"
                 elif png:
                     text = f"Không tồn tại: {Path(png).name}"
-                    color = "text-red-600"
+                    color = "text-bad"
                     icon_name = "error"
                 else:
                     icon_name, color, text = (
                         "error",
-                        "text-red-600",
+                        "text-bad",
                         "Chưa có ảnh tên kênh",
                     )
 
                 ui.icon(icon_name).classes(f"{color} shrink-0")
-                ui.label("Ảnh tên kênh:").classes("text-xs text-gray-600 shrink-0")
+                ui.label("Ảnh tên kênh:").classes("text-label-m text-subtitle shrink-0")
                 ui.label(text).classes(
-                    f"text-xs font-medium {color} truncate max-w-[240px]"
+                    f"text-label-m font-medium {color} truncate max-w-[240px]"
                 ).tooltip(png)
                 ui.button(
                     "Chọn PNG", icon="upload_file", on_click=pick_overlay
@@ -1629,14 +1629,14 @@ def create_delete_back_flow_page():
             with ui.row().classes("items-center gap-2 w-full flex-nowrap"):
                 ui.spinner(size="sm", color="primary")
                 progress_refs["current"] = ui.label("Đang chuẩn bị...").classes(
-                    "text-sm font-medium text-blue-900 flex-1 truncate"
+                    "text-body-s font-medium text-ink flex-1 truncate"
                 )
                 progress_refs["remaining"] = ui.label("").classes(
-                    "text-xs text-blue-700 shrink-0"
+                    "text-label-m text-info shrink-0"
                 )
-            progress_refs["step"] = ui.label("").classes("text-xs text-gray-600")
+            progress_refs["step"] = ui.label("").classes("text-label-m text-subtitle")
             progress_refs["log_area"] = ui.scroll_area().classes(
-                "w-full h-28 bg-white rounded border border-blue-100 mt-1"
+                "w-full h-28 bg-white rounded-card border border-line mt-1"
             )
             with progress_refs["log_area"]:
                 progress_refs["log"] = ui.column().classes("w-full gap-0.5 p-1")

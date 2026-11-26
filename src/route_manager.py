@@ -11,6 +11,7 @@ from loguru import logger
 from nicegui import ui
 
 from src.license_manager import is_licensed, verify_license
+from web.theme import apply_page_theme
 
 
 @dataclass
@@ -74,6 +75,7 @@ class RouterManager:
                         return self.handle_unauthorized()
 
                     try:
+                        apply_page_theme()
                         kwargs = {
                             param: request.query_params.get(param)
                             for param in route.params
@@ -94,6 +96,7 @@ class RouterManager:
                     ):
                         return self.handle_unauthorized()
 
+                    apply_page_theme()
                     kwargs = {
                         param: request.query_params.get(param)
                         for param in route.params

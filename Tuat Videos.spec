@@ -58,6 +58,14 @@ def collect_google_oauth_client():
     return [(str(oauth_client_json), "assets")]
 
 
+def collect_bundled_fonts():
+    """Bundle local Inter font files for offline desktop UI rendering."""
+    fonts_dir = project_root / "assets" / "fonts"
+    if not fonts_dir.is_dir():
+        return []
+    return [(str(path), "assets/fonts") for path in sorted(fonts_dir.glob("*.woff2"))]
+
+
 def collect_node():
     if not node_executable or not Path(node_executable).is_file():
         raise FileNotFoundError("Node.js is required to package GPT image generation.")
@@ -69,6 +77,7 @@ def collect_node():
 datas = [
     (str(project_root / "VERSION"), "."),
     (str(project_root / "assets" / "logo.png"), "assets"),
+    *collect_bundled_fonts(),
     (str(project_root / "vendor" / "ffmpeg" / "LICENSE"), "licenses/ffmpeg"),
     (str(project_root / "vendor" / "ffmpeg" / "README.txt"), "licenses/ffmpeg"),
     (str(project_root / "vendor" / "chromedriver" / "LICENSE.chromedriver"), "licenses/chromedriver"),

@@ -386,13 +386,13 @@ def create_auto_registry_content(*, on_change: Callable[[], None] | None = None)
                     )
                 ui.label(message).classes("app-section-copy")
                 with ui.column().classes(
-                    "w-full max-h-48 overflow-auto gap-1 rounded border border-gray-200 p-2"
+                    "w-full max-h-48 overflow-auto gap-1 rounded-card border border-line p-2"
                 ):
                     for row in selected:
                         description = row["channel_id"]
                         if scope == "videos":
                             description += f' / {row["video_id"]}'
-                        ui.label(description).classes("text-xs font-mono break-all")
+                        ui.label(description).classes("text-label-m font-mono break-all")
                 with ui.row().classes("w-full justify-end gap-2"):
                     ui.button("Hủy", on_click=dialog.close).classes("app-button-secondary")
                     ui.button("Xóa", icon="delete_outline", on_click=remove).classes(
@@ -437,7 +437,7 @@ def create_auto_registry_content(*, on_change: Callable[[], None] | None = None)
                 ui.button("Chọn tất cả kết quả lọc", icon="select_all",
                     on_click=lambda: select_filtered_videos()).props("flat no-caps")
                 ui.button("Bỏ chọn", on_click=lambda: clear_video_selection()).props("flat no-caps")
-                filter_controls["count"] = ui.label().classes("text-xs text-gray-500")
+                filter_controls["count"] = ui.label().classes("text-label-m text-muted")
         with ui.row().classes("w-full items-center gap-2 flex-wrap"):
             if scope == "channels":
                 search = ui.input("Tìm theo ID hoặc tên kênh").props(
@@ -514,7 +514,7 @@ def create_auto_registry_content(*, on_change: Callable[[], None] | None = None)
         remove_selected.bind_enabled_from(table, "selected", backward=bool)
         ui.label().bind_text_from(
             table, "selected", backward=lambda rows: f"Đã chọn {len(rows)} mục"
-        ).classes("text-xs text-gray-500")
+        ).classes("text-label-m text-muted")
         tables[scope] = table
 
     def select_filtered_videos():
@@ -543,8 +543,8 @@ def create_auto_registry_content(*, on_change: Callable[[], None] | None = None)
             "Tắt để ngừng tự động quét và khôi phục audio/phụ đề. "
             "Thao tác đang chạy được hoàn tất; danh sách đăng ký và lựa chọn bật/tắt "
             "được giữ khi mở lại ứng dụng."
-        ).classes("text-xs text-gray-500")
-        summary = ui.label("").classes("text-xs text-gray-500")
+        ).classes("text-label-m text-muted")
+        summary = ui.label("").classes("text-label-m text-muted")
         with ui.row().classes("w-full gap-4 flex-wrap"):
             dubbed_switch = ui.switch("Audio ngôn ngữ", value=True, on_change=change_audio_types)
             description_switch = ui.switch("Âm thanh mô tả", value=True, on_change=change_audio_types)
@@ -553,8 +553,8 @@ def create_auto_registry_content(*, on_change: Callable[[], None] | None = None)
             "Audio ngôn ngữ đã dùng được luôn được giữ nguyên. "
             "Tắt cả hai để ngừng xử lý audio. Lựa chọn được lưu khi mở lại ứng dụng. "
             "Tool tự tìm file nhạc đầy đủ đã ghép đúng video; video đã đủ các loại audio đang bật sẽ được bỏ qua."
-        ).classes("text-xs text-gray-500")
-        ui.label("Chế độ quét song song").classes("text-sm font-medium")
+        ).classes("text-label-m text-muted")
+        ui.label("Chế độ quét song song").classes("text-body-s font-medium")
         concurrency_mode_toggle = ui.toggle(
             RECOVERY_CONCURRENCY_MODE_LABELS,
             value=DEFAULT_RECOVERY_CONCURRENCY_MODE,
@@ -563,8 +563,8 @@ def create_auto_registry_content(*, on_change: Callable[[], None] | None = None)
         ui.label(
             "Chọn quét từng video trên 3 kênh cùng lúc (mặc định) hoặc quét 3 video trên 1 kênh cùng lúc. "
             "Lựa chọn áp dụng từ vòng quét tiếp theo và được lưu khi mở lại ứng dụng."
-        ).classes("text-xs text-gray-500")
-        ui.label("Loại video tự động quét").classes("text-sm font-medium")
+        ).classes("text-label-m text-muted")
+        ui.label("Loại video tự động quét").classes("text-body-s font-medium")
         video_scope = ui.toggle(
             RECOVERY_VIDEO_SCOPE_LABELS,
             value=RECOVERY_VIDEO_SCOPE_PUBLIC,
@@ -576,26 +576,26 @@ def create_auto_registry_content(*, on_change: Callable[[], None] | None = None)
         ui.label(
             "Chọn video công khai, video đang chờ đến lịch công khai hoặc cả hai. "
             "Lựa chọn áp dụng từ vòng quét tiếp theo và được lưu khi mở lại ứng dụng."
-        ).classes("text-xs text-gray-500")
+        ).classes("text-label-m text-muted")
         ui.label(
             "Ngôn ngữ đã có audio tốt sẽ chỉ được bổ sung hoặc sửa mô tả khi cần. "
             "Nếu audio lỗi/thiếu phải tải lại, tool thêm mô tả ngay sau khi file tải hoàn tất. "
             "Các video đăng ký từ trước cũng áp dụng lựa chọn hiện tại."
-        ).classes("text-xs text-gray-500")
+        ).classes("text-label-m text-muted")
         ui.label(
             "Track bị lỗi sẽ được xóa đúng loại và ngôn ngữ rồi tải lại file nhạc đầy đủ. "
             "Audio thiếu hoặc xử lý quá 2 giờ sẽ được thử thêm lại. "
             "Sau mỗi lượt gửi, tool chờ ít nhất 30 giây trước lượt xác nhận hoặc thử lại tiếp theo."
-        ).classes("text-xs text-amber-700")
+        ).classes("text-label-m text-warn")
         ui.label(
             "Mặc định tự động quét tất cả các kênh Active. Kênh Deactive vẫn ở trong "
             "danh sách và có thể Active lại bằng nút; toàn bộ video của kênh Deactive "
             "được bỏ qua. Deactive video chỉ áp dụng cho ID đó. Trạng thái được lưu "
             "khi đóng và mở lại ứng dụng."
-        ).classes("text-xs text-gray-500")
+        ).classes("text-label-m text-muted")
         ui.label("Ưu tiên video mới thêm âm trước. Mỗi video được tự động nạp lại trong 20 ngày; "
                  "hết hạn sẽ Deactive và vẫn giữ trong danh sách. Bộ lọc dưới đây chỉ lọc danh sách, "
-                 "không thay đổi phạm vi quét. Mục cũ thiếu ngày thêm âm được tính từ lần cập nhật này.").classes("text-xs text-gray-500")
+                 "không thay đổi phạm vi quét. Mục cũ thiếu ngày thêm âm được tính từ lần cập nhật này.").classes("text-label-m text-muted")
         with ui.tabs().classes("w-full") as tabs:
             channel_tab = ui.tab("Theo ID kênh", icon="subscriptions")
             video_tab = ui.tab("Theo ID video", icon="smart_display")
@@ -622,7 +622,7 @@ def create_auto_registry_content(*, on_change: Callable[[], None] | None = None)
                     {"name": "languages", "label": "Ngôn ngữ audio", "field": "languages"},
                     {"name": "dubbed_status", "label": "Audio ngôn ngữ", "field": "dubbed_status", "classes": "whitespace-normal"},
                     {"name": "description_status", "label": "Âm thanh mô tả", "field": "description_status", "classes": "whitespace-normal"},
-                    {"name": "processing_warning", "label": "Cảnh báo", "field": "processing_warning", "classes": "whitespace-normal text-amber-700"},
+                    {"name": "processing_warning", "label": "Cảnh báo", "field": "processing_warning", "classes": "whitespace-normal text-warn"},
                     {"name": "status", "label": "Trạng thái", "field": "status"},
                     {"name": "actions", "label": "Thao tác", "field": "id", "sortable": False},
                 ])

@@ -284,7 +284,7 @@ def create_remove_audio_page():
         with container:
             if scan_runtime["running"]:
                 ui.label("Đang quét video và trạng thái audio trên kênh...").classes(
-                    "text-xs text-blue-600"
+                    "text-label-m text-info"
                 )
             elif scan_state.get("channel_id"):
                 scope = scan_state.get("last_scan_scope") or "all"
@@ -295,22 +295,22 @@ def create_remove_audio_page():
                     f"Đã bắt {scan_state.get('matched', 0)}/{scan_state.get('total', 0)} "
                     f"video trong phạm vi {scope_label} có audio Đang xử lý / Không xử lý được / "
                     "Không đủ điều kiện / Đã xoá."
-                ).classes("text-xs font-medium text-emerald-700")
+                ).classes("text-label-m font-medium text-ok")
                 date_label = scan_date_label(
                     scan_state.get("last_scan_start_date"), end_date=scan_state.get("last_scan_end_date"),
                     date_type=scan_state.get("last_scan_date_type", "uploaded"),
                 )
                 if date_label:
-                    ui.label(f"Đã lọc {date_label}.").classes("text-xs text-gray-600")
+                    ui.label(f"Đã lọc {date_label}.").classes("text-label-m text-subtitle")
                 if scan_state.get("skipped", 0):
                     ui.label(
                         f"YouTube không cho đọc {scan_state['skipped']} video."
-                    ).classes("text-xs text-orange-600")
+                    ).classes("text-label-m text-orange")
             else:
                 ui.label(
                     "Quét video có audio Đang xử lý, Không xử lý được, Không đủ điều kiện hoặc Đã xoá. "
                     "Giữ audio đã xuất bản và bỏ qua video chưa có audio."
-                ).classes("text-xs text-gray-600")
+                ).classes("text-label-m text-subtitle")
 
     def refresh_right_panel():
         right_panel_container.clear()
@@ -324,7 +324,7 @@ def create_remove_audio_page():
                 return
 
             with ui.row().classes(
-                "w-full min-h-[42px] items-center font-semibold text-xs text-gray-500 bg-gray-50 border-b border-gray-200 px-3"
+                "w-full min-h-[42px] items-center font-semibold text-label-m text-muted bg-sunken border-b border-line px-3"
             ):
                 ui.label("Video ID").classes("w-8/12 p-2")
                 ui.label("Status").classes("w-3/12 p-2 text-center")
@@ -333,28 +333,28 @@ def create_remove_audio_page():
             for vid in ids_state["ids"]:
                 status = video_processing_status.get(vid, "pending")
                 if status == "successful":
-                    status_icon, status_color = "check_circle", "text-green-600"
+                    status_icon, status_color = "check_circle", "text-ok"
                 elif status == "unsuccessful":
-                    status_icon, status_color = "error", "text-red-600"
+                    status_icon, status_color = "error", "text-bad"
                 elif status == "processing":
-                    status_icon, status_color = "autorenew", "text-blue-600"
+                    status_icon, status_color = "autorenew", "text-info"
                 elif status == "skipped":
-                    status_icon, status_color = "skip_next", "text-gray-600"
+                    status_icon, status_color = "skip_next", "text-subtitle"
                 else:
-                    status_icon, status_color = "schedule", "text-yellow-600"
+                    status_icon, status_color = "schedule", "text-warn"
 
                 with ui.row().classes(
-                    "w-full min-h-[52px] items-center bg-white border-b border-gray-100 flex-nowrap px-1"
+                    "w-full min-h-[52px] items-center bg-white border-b border-line flex-nowrap px-1"
                 ):
                     with ui.column().classes("w-8/12 p-2"):
                         ui.label(vid).classes(
-                            "truncate px-2 py-1 font-medium text-gray-800 text-xs"
+                            "truncate px-2 py-1 font-medium text-ink text-label-m"
                         )
                     with ui.column().classes("w-3/12 text-center p-2"):
                         with ui.row().classes("items-center justify-center gap-1"):
-                            ui.icon(status_icon).classes(f"text-sm {status_color}")
+                            ui.icon(status_icon).classes(f"text-body-s {status_color}")
                             ui.label("Bỏ qua: không có track lỗi cần xóa" if status == "skipped" else status.title()).classes(
-                                f"text-xs font-medium {status_color}"
+                                f"text-label-m font-medium {status_color}"
                             )
 
                     def make_delete(video_id=vid):
@@ -584,7 +584,7 @@ def create_remove_audio_page():
         with ui.dialog() as progress_dialog:
             with ui.card().classes("app-card w-96"):
                 ui.label("Đang xóa âm thanh...").classes("text-base font-semibold")
-                status_label = ui.label("").classes("text-sm text-gray-600")
+                status_label = ui.label("").classes("text-body-s text-subtitle")
                 progress_bar = ui.linear_progress(value=0)
 
         progress_dialog.props("persistent")
@@ -837,7 +837,7 @@ def create_remove_audio_page():
                 pass
             with ui.row().classes("w-full items-end gap-3 flex-wrap"):
                 with ui.column().classes("gap-1"):
-                    ui.label("Phạm vi quét trên kênh").classes("text-xs font-semibold text-gray-700")
+                    ui.label("Phạm vi quét trên kênh").classes("text-label-m font-semibold text-subtitle")
                     ui_refs["scan_scope_toggle"] = ui.toggle(
                         VIDEO_SCAN_SCOPE_OPTIONS,
                         value=scan_settings["scan_scope"],
@@ -886,7 +886,7 @@ def create_remove_audio_page():
                 concurrency_input.on("change", update_remove_concurrency)
                 ui.label(
                     "Khi bấm Bắt đầu xóa, ứng dụng xử lý đồng thời 3–5 video."
-                ).classes("text-xs text-gray-600 pb-3")
+                ).classes("text-label-m text-subtitle pb-3")
             scan_status_container = ui.column().classes("w-full gap-0")
             ui_refs["scan_status_container"] = scan_status_container
             refresh_scan_controls()
@@ -901,7 +901,7 @@ def create_remove_audio_page():
             with ui.row().classes("w-full items-start gap-5 flex-wrap"):
                 with ui.column().classes("w-72 shrink-0 gap-2"):
                     ui.label("Danh sách Video ID").classes(
-                        "text-sm font-semibold text-gray-700"
+                        "text-body-s font-semibold text-subtitle"
                     )
                     ids_textarea = ui.textarea(
                         on_change=lambda e: on_ids_input()
@@ -912,7 +912,7 @@ def create_remove_audio_page():
 
                 with ui.column().classes("flex-1 min-w-[420px]"):
                     right_panel_container = ui.column().classes(
-                        "w-full border border-gray-200 rounded-lg overflow-hidden gap-0"
+                        "w-full border border-line rounded-card overflow-hidden gap-0"
                     )
 
     load_remove_state()

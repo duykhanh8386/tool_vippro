@@ -716,7 +716,7 @@ def create_channel_selection(channels, on_channel_select):
         channels_container.clear()
         with channels_container:
             if not channels:
-                ui.label("Không có kênh nào. Hãy thêm kênh trước.").classes("text-gray-500 italic")
+                ui.label("Không có kênh nào. Hãy thêm kênh trước.").classes("text-muted italic")
                 return
             for channel_data in filter_channels_by_gmail(channels, selected_gmail["value"]):
                 name = channel_data.name
@@ -738,14 +738,14 @@ def create_channel_selection(channels, on_channel_select):
                         if avatar:
                             ui.image(avatar).classes("w-6 h-6 rounded-full")
                         else:
-                            ui.icon("o_account_circle").classes("text-xl text-gray-400")
+                            ui.icon("o_account_circle").classes("text-xl text-disabled")
                         with ui.column().classes("gap-0 flex-1 min-w-0"):
-                            ui.label(name).classes("text-xs font-medium text-gray-900 truncate w-full")
+                            ui.label(name).classes("text-label-m font-medium text-ink truncate w-full")
                             ui.label(channel_gmail(channel_data) or "Chưa xác định Gmail").classes(
-                                "text-[10px] text-gray-500 truncate w-full"
+                                "text-2xs text-muted truncate w-full"
                             )
                         if is_selected:
-                            ui.icon("check_circle").classes("text-green-600 text-sm")
+                            ui.icon("check_circle").classes("text-brand text-sm")
 
     with app_card(classes="audio-add-section"):
         ui.label("Chọn kênh").classes("app-section-title")
@@ -759,7 +759,7 @@ def create_channel_selection(channels, on_channel_select):
         if any(not channel_gmail(channel) for channel in channels):
             ui.label(
                 "Kênh cũ chưa có Gmail: vào Tài khoản & kênh → Quét Gmail để cập nhật."
-            ).classes("text-xs text-gray-500 mb-2")
+            ).classes("text-label-m text-muted mb-2")
         channels_container = ui.row().classes("gap-2 flex-wrap")
         refresh_channel_display()
     return selected_channel, refresh_channel_display
@@ -1164,7 +1164,7 @@ def create_add_audio_page(*, delete_existing: bool = True):
             language_chips_container.clear()
             with language_chips_container:
                 for language in list(selected_languages["languages"]):
-                    chip_classes = "px-2 py-1 rounded-full text-xs font-medium cursor-pointer transition-all duration-200 border bg-emerald-50 text-emerald-700 border-emerald-200 hover:bg-emerald-100"
+                    chip_classes = "px-2 py-1 rounded-full text-label-m font-medium cursor-pointer transition-all duration-200 border bg-brand-soft text-brand border-brand-tint hover:bg-brand-tint"
                     def create_remove_handler(lang: str):
                         def _remove():
                             if configuration_change_blocked():
@@ -1195,7 +1195,7 @@ def create_add_audio_page(*, delete_existing: bool = True):
         with app_card(classes="audio-add-section"):
             with ui.row().classes("items-center justify-between mb-2"):
                 ui.label("Nhập ngôn ngữ").classes("app-section-title")
-                ui.button("Đặt lại", on_click=reset_languages).props("dense flat").classes("text-xs text-gray-500")
+                ui.button("Đặt lại", on_click=reset_languages).props("dense flat").classes("text-label-m text-muted")
             language_input = ui.input(label="Mã ngôn ngữ, cách nhau bởi khoảng trắng").props('outlined clearable placeholder="en vi ja ..."').classes("w-full")
             ui_refs["language_input"] = language_input
             language_input.on("input", on_language_input_change)
@@ -1230,26 +1230,26 @@ def create_add_audio_page(*, delete_existing: bool = True):
         with container:
             if not channel_id:
                 ui.label("Chọn kênh để kiểm tra quyền đăng phụ đề.").classes(
-                    "text-xs text-gray-500"
+                    "text-label-m text-muted"
                 )
             elif has_caption_oauth(channel_id):
                 ui.label("Kênh đã được cấp quyền đăng phụ đề.").classes(
-                    "text-xs font-medium text-emerald-700"
+                    "text-label-m font-medium text-ok"
                 )
             elif find_caption_oauth_client(subtitle_settings.get("oauth_client_json")):
                 ui.label(
                     "Tool đã có cấu hình OAuth; khi cần sẽ tự mở trang Google cấp quyền."
-                ).classes("text-xs font-medium text-orange-600")
+                ).classes("text-label-m font-medium text-orange")
             else:
                 ui.label(
                     "Bản tool đang thiếu cấu hình OAuth của nhà phát hành."
                 ).classes(
-                    "text-xs font-medium text-red-700"
+                    "text-label-m font-medium text-bad"
                 )
             quota = get_caption_quota_status()
             if quota.get("blocked"):
                 ui.label(str(quota.get("message") or "Đã hết quota phụ đề.")).classes(
-                    "text-xs font-medium text-red-700"
+                    "text-label-m font-medium text-bad"
                 )
 
     def create_subtitle_settings() -> None:
@@ -1348,7 +1348,7 @@ def create_add_audio_page(*, delete_existing: bool = True):
                 "OAuth được tool tự tìm và tự mở; người dùng chỉ xác nhận Cho phép lần đầu. "
                 "Lần đầu model nhận dạng sẽ được tải về. Khi quota YouTube hết, "
                 "audio vẫn chạy; lần sau bấm chạy lại sẽ tiếp tục các phụ đề còn thiếu."
-            ).classes("text-[11px] text-gray-500")
+            ).classes("text-2xs text-muted")
 
     def create_audio_type_settings():
         def change_audio_type(kind, event):
@@ -1580,18 +1580,18 @@ def create_add_audio_page(*, delete_existing: bool = True):
             if mode == "manual":
                 ui.label(
                     f"Đang dùng {len(video_ids_state['ids'])} Video ID nhập thủ công."
-                ).classes("text-xs text-gray-600")
+                ).classes("text-label-m text-subtitle")
                 return
             failed_channel = video_source_state.get("failed_channel")
             if not failed_channel:
                 ui.label(
                     "Chưa quét. Hãy chọn kênh rồi bấm Quét ID audio cần xử lý."
-                ).classes("text-xs text-orange-600")
+                ).classes("text-label-m text-orange")
                 return
             if failed_channel != selected_channel["id"]:
                 ui.label(
                     "Kết quả quét thuộc kênh khác. Hãy quét lại kênh đang chọn."
-                ).classes("text-xs text-orange-600")
+                ).classes("text-label-m text-orange")
                 return
             last_scope = video_source_state.get("last_scan_scope") or "all"
             scope_label = VIDEO_SCAN_SCOPE_LABELS.get(last_scope, "video")
@@ -1613,20 +1613,20 @@ def create_add_audio_page(*, delete_existing: bool = True):
                 f"{failed_language_count} audio cần sửa hoặc thêm; "
                 f"đọc được {max(0, video_source_state.get('scan_total', 0) - video_source_state.get('scan_skipped', 0))}/"
                 f"{video_source_state.get('scan_total', 0)} video trong phạm vi {scope_label}."
-            ).classes("text-xs font-medium text-emerald-700")
-            ui.label(AUDIO_SCAN_FILTERS[video_source_state["audio_filter"]]).classes("text-xs text-gray-600")
+            ).classes("text-label-m font-medium text-ok")
+            ui.label(AUDIO_SCAN_FILTERS[video_source_state["audio_filter"]]).classes("text-label-m text-subtitle")
             date_label = scan_date_label(
                 video_source_state.get("last_scan_start_date"),
                 end_date=video_source_state.get("last_scan_end_date"),
                 date_type=video_source_state.get("last_scan_date_type", "uploaded"),
             )
             if date_label:
-                ui.label(f"Đã lọc {date_label}.").classes("text-xs text-gray-600")
+                ui.label(f"Đã lọc {date_label}.").classes("text-label-m text-subtitle")
             if video_source_state.get("scan_skipped", 0):
                 ui.label(
                     f"YouTube không cho đọc trạng thái của "
                     f"{video_source_state['scan_skipped']} video."
-                ).classes("text-xs text-orange-600")
+                ).classes("text-label-m text-orange")
 
     def refresh_scan_preview():
         if not scan_preview_container:
@@ -1639,17 +1639,17 @@ def create_add_audio_page(*, delete_existing: bool = True):
             return
         with scan_preview_container:
             with ui.row().classes("items-center gap-2 flex-wrap"):
-                ui.icon("task_alt").classes("text-emerald-600")
+                ui.icon("task_alt").classes("text-ok")
                 ui.label(
                     f"Đã quét {summary.get('videos', 0)} video và "
                     f"{summary.get('audio_files', 0)} file · "
                     f"ghép được {summary.get('matched', 0)}"
-                ).classes("text-sm font-semibold text-gray-700")
+                ).classes("text-body-s font-semibold text-subtitle")
                 ui.label(
                     f"Thiếu {summary.get('unmatched', 0)} · "
                     f"trùng {summary.get('ambiguous', 0)} · "
                     f"file dư {summary.get('extra_files', 0)}"
-                ).classes("text-xs text-gray-500")
+                ).classes("text-label-m text-muted")
                 mode_label = {
                     "duration": "Chế độ: khớp thời lượng",
                     "title": "Chế độ: khớp tiêu đề",
@@ -1657,34 +1657,34 @@ def create_add_audio_page(*, delete_existing: bool = True):
                 }.get(summary.get("mode"))
                 if mode_label:
                     ui.label(mode_label).classes(
-                        "text-xs font-medium text-blue-600"
+                        "text-label-m font-medium text-info"
                     )
             if issues:
                 total_issues = summary.get("unmatched", 0) + summary.get("ambiguous", 0)
                 with ui.expansion(
                     f"Xem {total_issues} video chưa thể ghép tự động",
                     icon="warning_amber",
-                ).classes("w-full text-sm"):
+                ).classes("w-full text-body-s"):
                     for issue in issues:
                         title = issue.get("title") or "Không có tiêu đề"
                         ui.label(
                             f"{issue.get('video_id', '')} · {title}: {issue.get('detail', '')}"
-                        ).classes("text-xs text-gray-600 break-words")
+                        ).classes("text-label-m text-subtitle break-words")
                     if total_issues > len(issues):
                         ui.label(
                             f"Còn {total_issues - len(issues)} video khác; hãy đổi tên file theo Video ID rồi quét lại."
-                        ).classes("text-xs text-orange-600")
+                        ).classes("text-label-m text-orange")
             if extra_files:
                 total_extra = summary.get("extra_files", len(extra_files))
                 with ui.expansion(
                     f"Xem {total_extra} file chưa được dùng",
                     icon="audio_file",
-                ).classes("w-full text-sm"):
+                ).classes("w-full text-body-s"):
                     for path in extra_files:
-                        ui.label(path).classes("text-xs text-gray-600 break-all")
+                        ui.label(path).classes("text-label-m text-subtitle break-all")
                     if total_extra > len(extra_files):
                         ui.label(f"Còn {total_extra - len(extra_files)} file khác.").classes(
-                            "text-xs text-orange-600"
+                            "text-label-m text-orange"
                         )
 
     def refresh_rename_button():
@@ -2081,22 +2081,22 @@ def create_add_audio_page(*, delete_existing: bool = True):
             return
 
         with ui.dialog() as rename_dialog, ui.card().classes("app-card w-[680px] max-w-[95vw]"):
-            ui.label("Đổi tên file nhạc theo Video ID?").classes("text-lg font-semibold")
+            ui.label("Đổi tên file nhạc theo Video ID?").classes("text-title-xs text-ink")
             ui.label(
                 f"{len(plan)} file sẽ được đổi tên thật trên ổ đĩa. Định dạng file được giữ nguyên."
-            ).classes("text-sm text-gray-600")
+            ).classes("text-body-s text-subtitle")
             if shared_count:
                 ui.label(
                     f"Bỏ qua {shared_count} lượt ghép dùng file chung để không làm hỏng mapping."
-                ).classes("text-xs text-orange-600")
-            with ui.scroll_area().classes("w-full h-64 border rounded p-2"):
+                ).classes("text-label-m text-orange")
+            with ui.scroll_area().classes("w-full h-64 border border-line rounded-card p-2"):
                 for item in plan[:100]:
                     ui.label(f"{item.source.name}  →  {item.target.name}").classes(
-                        "text-xs text-gray-700 break-all"
+                        "text-label-m text-subtitle break-all"
                     )
                 if len(plan) > 100:
                     ui.label(f"Còn {len(plan) - 100} file khác.").classes(
-                        "text-xs text-orange-600"
+                        "text-label-m text-orange"
                     )
 
             def confirm_rename():
@@ -2142,7 +2142,7 @@ def create_add_audio_page(*, delete_existing: bool = True):
         cleanup_dubs = delete_existing and dubbed_enabled
 
         with right_panel_container:
-            with ui.row().classes("audio-add-table-header w-full min-h-[42px] items-center font-semibold text-xs text-gray-500 bg-gray-50 border-b border-gray-200 px-2"):
+            with ui.row().classes("audio-add-table-header w-full min-h-[42px] items-center font-semibold text-label-m text-muted bg-sunken border-b border-line px-2"):
                 ui.label("Video ID").classes("w-2/12 p-2")
                 ui.label("Audio Path").classes("w-5/12")
                 ui.label("Ngôn ngữ").classes("w-2/12")
@@ -2187,7 +2187,7 @@ def create_add_audio_page(*, delete_existing: bool = True):
                 effective_success = successful_count + already_added_count
                 if total_languages == 0 or not audio_types:
                     overall_status = "pending"
-                    status_color = "text-yellow-600"
+                    status_color = "text-warn"
                     status_icon = "schedule"
                 elif (
                     (not cleanup_dubs or cleanup_status == "successful")
@@ -2195,17 +2195,17 @@ def create_add_audio_page(*, delete_existing: bool = True):
                     and (not description_enabled or description_complete == total_languages)
                 ):
                     overall_status = "successful"
-                    status_color = "text-green-600"
+                    status_color = "text-ok"
                     status_icon = "check_circle"
                 elif (cleanup_dubs and cleanup_status == "unsuccessful") or unsuccessful_count > 0 or (description_enabled and any(
                     descriptions.get(lang) == "unsuccessful" for lang in active_languages
                 )):
                     overall_status = "unsuccessful"
-                    status_color = "text-red-600"
+                    status_color = "text-bad"
                     status_icon = "error"
                 else:
                     overall_status = "pending"
-                    status_color = "text-yellow-600"
+                    status_color = "text-warn"
                     status_icon = "schedule"
                 status_text = {
                     "pending": "Chờ xử lý",
@@ -2213,12 +2213,12 @@ def create_add_audio_page(*, delete_existing: bool = True):
                     "unsuccessful": "Thất bại",
                 }[overall_status]
 
-                with ui.row().classes("audio-add-table-row w-full min-h-[56px] items-center bg-white border-b border-gray-100 flex-nowrap"):
+                with ui.row().classes("audio-add-table-row w-full min-h-[56px] items-center bg-white border-b border-line flex-nowrap"):
                     with ui.column().classes("w-2/12 p-2"):
-                        ui.label(vid).classes("truncate px-2 py-1 font-medium text-gray-800")
+                        ui.label(vid).classes("truncate px-2 py-1 font-medium text-ink")
                         if video_titles.get(vid):
                             ui.label(video_titles[vid]).classes(
-                                "truncate px-2 text-[11px] text-gray-500"
+                                "truncate px-2 text-2xs text-muted"
                             ).tooltip(video_titles[vid])
                         match = auto_match_info.get(vid) or {}
                         if match:
@@ -2231,28 +2231,28 @@ def create_add_audio_page(*, delete_existing: bool = True):
                                 "manual": "Thủ công",
                             }.get(match.get("status"), match.get("detail", ""))
                             ui.label(match_label).classes(
-                                "px-2 text-[10px] font-medium text-emerald-600"
+                                "px-2 text-2xs font-medium text-ok"
                             )
                         if cleanup_dubs:
                             if video_source_state.get("mode") == "failed":
                                 cleanup_labels = {
-                                    "pending": ("Chờ xóa đúng audio lỗi", "text-gray-500"),
-                                    "processing": ("Đang xóa audio lỗi", "text-blue-600"),
-                                    "successful": ("Đã xóa audio lỗi", "text-emerald-600"),
-                                    "unsuccessful": ("Xóa audio lỗi thất bại", "text-red-600"),
+                                    "pending": ("Chờ xóa đúng audio lỗi", "text-muted"),
+                                    "processing": ("Đang xóa audio lỗi", "text-info"),
+                                    "successful": ("Đã xóa audio lỗi", "text-ok"),
+                                    "unsuccessful": ("Xóa audio lỗi thất bại", "text-bad"),
                                 }
                             else:
                                 cleanup_labels = {
-                                    "pending": ("Chờ xóa audio cũ", "text-gray-500"),
-                                    "processing": ("Đang xóa audio cũ", "text-blue-600"),
-                                    "successful": ("Đã xóa audio cũ", "text-emerald-600"),
-                                    "unsuccessful": ("Xóa audio thất bại", "text-red-600"),
+                                    "pending": ("Chờ xóa audio cũ", "text-muted"),
+                                    "processing": ("Đang xóa audio cũ", "text-info"),
+                                    "successful": ("Đã xóa audio cũ", "text-ok"),
+                                    "unsuccessful": ("Xóa audio thất bại", "text-bad"),
                                 }
                             cleanup_text, cleanup_color = cleanup_labels.get(
                                 cleanup_status, cleanup_labels["pending"]
                             )
                             ui.label(cleanup_text).classes(
-                                f"px-2 text-[10px] font-medium {cleanup_color}"
+                                f"px-2 text-2xs font-medium {cleanup_color}"
                             )
 
                     def make_path_on_change(video_id: str, input_ref):
@@ -2290,15 +2290,15 @@ def create_add_audio_page(*, delete_existing: bool = True):
                         path_input.on("change", make_path_on_change(vid, path_input))
 
                     with ui.column().classes("w-2/12 text-center ml-20"):
-                        ui.label(f"{effective_success}/{total_languages}").classes("text-sm font-medium text-gray-700")
+                        ui.label(f"{effective_success}/{total_languages}").classes("text-body-s font-medium text-subtitle")
                         if video_source_state.get("mode") == "failed":
                             ui.label(
                                 ", ".join(active_languages)
                                 if active_languages
                                 else "Không có mã lỗi được chọn"
-                            ).classes("text-[10px] text-blue-600 break-all")
+                            ).classes("text-2xs text-info break-all")
                         if already_added_count > 0:
-                            ui.label(f"{already_added_count} đã có").classes("text-xs text-orange-500")
+                            ui.label(f"{already_added_count} đã có").classes("text-label-m text-orange")
 
                     with ui.column().classes("w-2/12 text-center p-2"):
                         status_tone = {
@@ -2307,8 +2307,8 @@ def create_add_audio_page(*, delete_existing: bool = True):
                             "unsuccessful": "danger",
                         }[overall_status]
                         with ui.row().classes(f"app-status app-status--{status_tone} items-center justify-center gap-1 mx-auto"):
-                            ui.icon(status_icon).classes(f"text-sm {status_color}")
-                            ui.label(status_text).classes(f"text-xs font-medium {status_color}")
+                            ui.icon(status_icon).classes(f"text-body-s {status_color}")
+                            ui.label(status_text).classes(f"text-label-m font-medium {status_color}")
 
                     def make_delete(video_id: str):
                         def _delete():
@@ -2362,12 +2362,12 @@ def create_add_audio_page(*, delete_existing: bool = True):
                     with ui.column().classes("w-1/12 flex justify-center"):
                         ui.button(icon="delete", on_click=make_delete(vid)).props("flat round dense")
 
-                with ui.row().classes("w-full items-center gap-2 bg-emerald-50 border-b border-emerald-100 px-4 py-2"):
-                    ui.icon("record_voice_over").classes("text-emerald-700")
+                with ui.row().classes("w-full items-center gap-2 bg-brand-soft border-b border-brand-tint px-4 py-2"):
+                    ui.icon("record_voice_over").classes("text-brand")
                     ui.label(
                         f"Âm thanh mô tả: {description_complete}/{total_languages} ngôn ngữ"
                         if description_enabled else "Âm thanh mô tả: Đã tắt trong tác vụ này"
-                    ).classes("text-xs font-medium text-emerald-800")
+                    ).classes("text-label-m font-medium text-ink")
                     description_errors = {
                         lang: error for lang, error in video_description_errors.get(vid, {}).items()
                         if description_enabled and lang in active_language_set
@@ -2376,9 +2376,9 @@ def create_add_audio_page(*, delete_existing: bool = True):
                         with ui.expansion(
                             f"{len(description_errors)} ngôn ngữ mô tả lỗi — xem chi tiết",
                             icon="error_outline",
-                        ).classes("w-full text-xs text-red-700"):
+                        ).classes("w-full text-label-m text-bad"):
                             for lang, error in description_errors.items():
-                                ui.label(f"{lang}: {audio_error_message(error)}").classes("text-xs whitespace-normal break-words")
+                                ui.label(f"{lang}: {audio_error_message(error)}").classes("text-label-m whitespace-normal break-words")
 
                 if subtitle_settings["enabled"] or caption_status:
                     caption_complete = sum(
@@ -2388,25 +2388,25 @@ def create_add_audio_page(*, delete_existing: bool = True):
                         in ("successful", "already_added")
                     )
                     with ui.row().classes(
-                        "w-full items-center gap-2 bg-blue-50 border-b border-blue-100 px-4 py-2"
+                        "w-full items-center gap-2 bg-info-soft border-b border-line px-4 py-2"
                     ):
-                        ui.icon("subtitles").classes("text-blue-700")
+                        ui.icon("subtitles").classes("text-info")
                         ui.label(
                             f"Phụ đề: {caption_complete}/{len(active_caption_languages)} ngôn ngữ"
-                        ).classes("text-xs font-medium text-blue-800")
+                        ).classes("text-label-m font-medium text-ink")
                         if any(
                             caption_status.get(language) == "processing"
                             for language in active_caption_languages
                         ):
-                            ui.label("Đang xử lý").classes("text-xs text-blue-600")
+                            ui.label("Đang xử lý").classes("text-label-m text-info")
                         elif (
                             caption_complete == len(active_caption_languages)
                             and active_caption_languages
                         ):
-                            ui.label("Hoàn tất").classes("text-xs text-emerald-700")
+                            ui.label("Hoàn tất").classes("text-label-m text-ok")
                         elif caption_status:
                             ui.label("Còn chờ chạy tiếp").classes(
-                                "text-xs text-orange-600"
+                                "text-label-m text-orange"
                             )
 
                 active_caption_errors = {
@@ -2416,31 +2416,31 @@ def create_add_audio_page(*, delete_existing: bool = True):
                 }
                 if active_caption_errors:
                     with ui.card().classes(
-                        "w-full bg-orange-50 border border-orange-300 px-4 py-2 mt-1"
+                        "w-full bg-orange-soft border border-orange-line px-4 py-2 mt-1"
                     ):
                         with ui.row().classes("items-center gap-2"):
-                            ui.icon("subtitles_off").classes("text-orange-700")
+                            ui.icon("subtitles_off").classes("text-orange")
                             ui.label(f"Phụ đề video {vid} còn chờ xử lý").classes(
-                                "font-semibold text-orange-800"
+                                "font-semibold text-orange"
                             )
                         for error_lang, error_message in active_caption_errors.items():
                             ui.label(
                                 f"Ngôn ngữ {error_lang}: {error_message}"
                             ).classes(
-                                "text-sm text-orange-800 whitespace-normal break-words"
+                                "text-body-s text-orange whitespace-normal break-words"
                             )
 
                 if video_errors:
-                    with ui.card().classes("w-full bg-red-50 border border-red-300 px-4 py-2 mt-1"):
+                    with ui.card().classes("w-full bg-bad-soft border border-bad-line px-4 py-2 mt-1"):
                         with ui.row().classes("items-center gap-2"):
-                            ui.icon("error").classes("text-red-600")
-                            ui.label(f"Không thể cập nhật audio cho video {vid}").classes("font-semibold text-red-700")
+                            ui.icon("error").classes("text-bad")
+                            ui.label(f"Không thể cập nhật audio cho video {vid}").classes("font-semibold text-bad")
                         with ui.expansion(
                             f"{len(video_errors)} ngôn ngữ audio lỗi — xem chi tiết",
                             icon="error_outline",
-                        ).classes("w-full text-xs text-red-700"):
+                        ).classes("w-full text-label-m text-bad"):
                             for error_lang, error_message in video_errors.items():
-                                ui.label(f"Ngôn ngữ {error_lang}: {audio_error_message(error_message)}").classes("text-sm whitespace-normal break-words")
+                                ui.label(f"Ngôn ngữ {error_lang}: {audio_error_message(error_message)}").classes("text-body-s whitespace-normal break-words")
     async def _execute_add_audio():
         if _ADD_AUDIO_RUN_GUARD.locked():
             ui.notify("Tác vụ audio đang chạy ở một trang khác.", type="warning")
@@ -2558,10 +2558,10 @@ def create_add_audio_page(*, delete_existing: bool = True):
                 ui.label(
                     "Đang xóa và thêm âm thanh..." if delete_existing else "Đang thêm âm thanh..."
                 ).classes("text-base font-semibold")
-                current_video_label = ui.label("").classes("text-sm font-medium text-blue-600")
-                status_label = ui.label("").classes("text-sm text-gray-600")
-                remaining_label = ui.label("").classes("text-xs text-gray-500")
-                concurrent_label = ui.label("").classes("text-xs text-gray-500 mt-1")
+                current_video_label = ui.label("").classes("text-body-s font-medium text-info")
+                status_label = ui.label("").classes("text-body-s text-subtitle")
+                remaining_label = ui.label("").classes("text-label-m text-muted")
+                concurrent_label = ui.label("").classes("text-label-m text-muted mt-1")
                 progress_bar = ui.linear_progress(value=0)
         progress_dialog.props("persistent")
         best_effort_ui("open progress dialog", progress_dialog.open)
@@ -3691,10 +3691,10 @@ def create_add_audio_page(*, delete_existing: bool = True):
             refresh_video_source_controls()
             save_right_panel_state()
 
-        with ui.card().classes("w-full bg-emerald-50 border border-emerald-200 p-3 mb-4"):
+        with ui.card().classes("w-full bg-canvas border border-brand-tint p-3 mb-4"):
             with ui.row().classes("w-full items-center justify-between gap-3 flex-wrap"):
                 with ui.column().classes("gap-1"):
-                    ui.label("Nguồn Video ID").classes("text-sm font-semibold text-gray-700")
+                    ui.label("Nguồn Video ID").classes("text-body-s font-semibold text-subtitle")
                     source_toggle = ui.toggle(
                         {
                             "manual": "Nhập ID thủ công",
@@ -3717,14 +3717,14 @@ def create_add_audio_page(*, delete_existing: bool = True):
                 )
             with ui.row().classes("w-full items-end gap-3 flex-wrap"):
                 with ui.column().classes("gap-1"):
-                    ui.label("Tình trạng âm thanh cần quét").classes("text-xs font-semibold text-gray-700")
+                    ui.label("Tình trạng âm thanh cần quét").classes("text-label-m font-semibold text-subtitle")
                     ui_refs["audio_filter_toggle"] = ui.toggle(
                         AUDIO_SCAN_FILTERS, value=video_source_state["audio_filter"],
                         on_change=on_audio_filter_change,
                     ).props("no-caps disable")
                 with ui.column().classes("gap-1"):
                     ui.label("Phạm vi quét trên kênh").classes(
-                        "text-xs font-semibold text-gray-700"
+                        "text-label-m font-semibold text-subtitle"
                     )
                     scan_scope_toggle = ui.toggle(
                         VIDEO_SCAN_SCOPE_OPTIONS,
@@ -3754,7 +3754,7 @@ def create_add_audio_page(*, delete_existing: bool = True):
             ui.label(
                 "Quét thiếu âm thanh mô tả theo các mã ngôn ngữ đã nhập. "
                 "Bổ sung mô tả bằng file nhạc tương ứng; giữ bản audio và mô tả đang dùng được."
-            ).classes("text-xs text-gray-600")
+            ).classes("text-label-m text-subtitle")
             video_source_status_container = ui.column().classes("w-full gap-0")
             refresh_video_source_controls()
             ui.separator().classes("my-1")
@@ -3817,7 +3817,7 @@ def create_add_audio_page(*, delete_existing: bool = True):
                 "Một file nhạc có thể tự ghép cho nhiều Video ID nếu từng video đều nằm trong mức sai lệch. "
                 "Ghép theo tiêu đề chỉ cần toàn bộ tiêu đề YouTube xuất hiện trong tên file, "
                 "không cần giống 100%. Vẫn có thể dùng Ghép lần lượt hoặc mapping.csv."
-            ).classes("text-xs text-gray-600")
+            ).classes("text-label-m text-subtitle")
             scan_preview_container = ui.column().classes("w-full gap-1")
             refresh_scan_preview()
             refresh_rename_button()
@@ -3830,7 +3830,7 @@ def create_add_audio_page(*, delete_existing: bool = True):
                 ids_textarea = ui.textarea(
                     label="Danh sách Video ID",
                     on_change=handle_ids_textarea_change,
-                ).props('outlined autogrow color=green placeholder="Nhập mỗi dòng một ID"').classes("w-full")
+                ).props('outlined autogrow color=primary placeholder="Nhập mỗi dòng một ID"').classes("w-full")
                 ui_refs["ids_textarea"] = ids_textarea
             with ui.column().classes("flex-1 min-w-[560px]"):
                 right_panel_container = ui.column().classes("audio-add-table w-full gap-1")
