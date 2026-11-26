@@ -52,6 +52,42 @@ class ThumbnailReadbackTests(unittest.TestCase):
         self.assertFalse(self.verifier()())
         self.request.assert_not_called()
 
+    def test_matching_saved_asset_id_confirms_this_upload_when_cdn_image_is_old(self):
+        self.reader.return_value.thumbnail_editor_state={"customThumbnail":{"externalImageId":"IM-old"},"defaultStill":False}
+        self.pixels.side_effect=[bytes([100]*43200),bytes([200]*43200)]
+        verifier=self.verifier()
+        self.assertFalse(verifier())
+        result={"video":{"videoId":"Abc123_-XYZ","channelId":"channel","thumbnailEditorState":{
+            "customThumbnail":{"externalImageId":"IM-new"},"stillId":0,"defaultStill":False}}}
+        self.assertTrue(verifier.observe_save_response(result,{"IM-new"}))
+        self.assertTrue(verifier())
+        self.reader.assert_called_once()
+
+    def test_unrelated_response_old_asset_or_auto_thumbnail_cannot_confirm(self):
+        verifier=self.verifier()
+        verifier.initial_asset_id="IM-old"
+        for channel,video_id,asset,default,ids in (("other","Abc123_-XYZ","IM-new",False,{"IM-new"}),
+                ("channel","Def123_-XYZ","IM-new",False,{"IM-new"}),
+                ("channel","Abc123_-XYZ","IM-old",False,{"IM-old"}),
+                ("channel","Abc123_-XYZ","IM-new",True,{"IM-new"}),
+                ("channel","Abc123_-XYZ","IM-new",False,{"IM-other"}),
+                ("channel","Abc123_-XYZ","IM-new",False,{"IM-new","IM-old"})):
+            payload={"video":{"videoId":video_id,"channelId":channel,"thumbnailEditorState":{
+                "customThumbnail":{"externalImageId":asset},"defaultStill":default}}}
+            with self.subTest(asset=asset,channel=channel,default=default):
+                self.assertFalse(verifier.observe_save_response(payload,ids))
+
+    def test_saved_asset_is_read_back_even_when_the_mutation_response_was_lost(self):
+        self.reader.return_value.thumbnail_editor_state={"customThumbnail":{"externalImageId":"IM-old"},"defaultStill":False}
+        self.pixels.side_effect=[bytes([100]*43200),bytes([200]*43200)]
+        verifier=self.verifier()
+        self.assertFalse(verifier())
+        verifier.expect_upload_asset({"IM-new"})
+        self.reader.return_value.thumbnail_editor_state={"customThumbnail":{"externalImageId":"IM-new"},"defaultStill":False,"stillId":0}
+        self.assertTrue(verifier())
+        self.request.assert_called_once()
+        self.assertEqual(verifier.confirmed_asset_id,"IM-new")
+
     @unittest.skipUnless(shutil.which("ffmpeg"), "FFmpeg unavailable")
     def test_real_jpeg_recompression_matches_but_a_different_image_does_not(self):
         self.pixels.stop()

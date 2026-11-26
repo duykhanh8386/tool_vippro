@@ -747,6 +747,30 @@ class StudioThumbnailBrowser:
             button.click()
             saves = set()
             response_ids = set()
+            save_asset_ids = {}
+
+            def image_ids(value):
+                if isinstance(value, dict):
+                    for key, child in value.items():
+                        if key in {"externalImageId", "imageId"} and isinstance(child, str):
+                            yield child
+                        elif isinstance(child, (dict, list)):
+                            yield from image_ids(child)
+                elif isinstance(value, list):
+                    for child in value:
+                        yield from image_ids(child)
+
+            def thumbnail_mutations(value):
+                if isinstance(value, dict):
+                    fields = [child for key, child in value.items() if "thumbnail" in key.lower() and key != "videoReadMask"]
+                    if (value.get("encryptedVideoId") or value.get("videoId")) == video_id and fields:
+                        yield set(identifier for field in fields for identifier in image_ids(field))
+                    for key, child in value.items():
+                        if key not in {"context", "videoReadMask", "mask", "delegationContext"}:
+                            yield from thumbnail_mutations(child)
+                elif isinstance(value, list):
+                    for child in value:
+                        yield from thumbnail_mutations(child)
 
             def confirmed_save():
                 for entry in driver.get_log("performance"):
@@ -755,14 +779,20 @@ class StudioThumbnailBrowser:
                     request_id = params.get("requestId")
                     if event.get("method") == "Network.requestWillBeSent":
                         request = params.get("request", {})
-                        if "/video_manager/metadata_update" in request.get("url", ""):
+                        request_url = urlparse(request.get("url", ""))
+                        if request_url.hostname == "studio.youtube.com" and "/youtubei/" in request_url.path:
                             body = request.get("postData", "")
                             try:
                                 update = json.loads(body)
                             except ValueError:
                                 continue
-                            if (update.get("encryptedVideoId") or update.get("videoId")) == video_id and any("thumbnail" in key.lower() for key in update):
+                            mutations = list(thumbnail_mutations(update))
+                            if mutations:
                                 saves.add(request_id)
+                                save_asset_ids[request_id] = set().union(*mutations)
+                                expect_asset = getattr(verify_saved, "expect_upload_asset", None)
+                                if callable(expect_asset):
+                                    expect_asset(save_asset_ids[request_id])
                     elif event.get("method") == "Network.responseReceived" and request_id in saves:
                         if int(params.get("response", {}).get("status", 0)) != 200:
                             raise PublishingBrowserError("YouTube từ chối lưu thumbnail; chưa lên lịch video.")
@@ -781,12 +811,21 @@ class StudioThumbnailBrowser:
                             continue
                         if not isinstance(saved, dict) or saved.get("error") or saved.get("success") is False:
                             raise PublishingBrowserError("YouTube báo lỗi khi lưu thumbnail; chưa lên lịch video.")
+                        observer = getattr(verify_saved, "observe_save_response", None)
+                        if callable(observer):
+                            observer(saved, save_asset_ids.get(request_id, set()))
                 if time.monotonic() - last_check[0] >= 3:
                     last_check[0] = time.monotonic()
                     return verify_saved()
                 return False
 
-            wait_for(confirmed_save, timeout=90, message="Chưa đọc lại được đúng ảnh thumbnail đã lưu trên YouTube. Ảnh đã tạo vẫn được giữ để tiếp tục; chưa đặt lịch video này.")
+            try:
+                wait_for(confirmed_save, timeout=90, message="Chưa xác nhận thumbnail đã lưu.")
+            except PublishingBrowserError as exc:
+                if str(exc) != "Chưa xác nhận thumbnail đã lưu.":
+                    raise
+                reason = getattr(verify_saved, "last_reason", "Chưa có bằng chứng máy chủ lưu đúng ảnh đã gửi.")
+                raise PublishingBrowserError(str(reason) + " Ảnh đã tạo được giữ; chưa đặt lịch video này.") from None
             errors = driver.find_elements(By.CSS_SELECTOR, "ytcp-thumbnail-editor [role=alert], ytcp-video-metadata-editor .error-message:not([hidden])")
             if any(node.is_displayed() and node.text.strip() for node in errors):
                 raise PublishingBrowserError("Studio báo lỗi khi lưu thumbnail; chưa lên lịch video này.")

@@ -2,6 +2,7 @@
 import copy
 import json
 import tempfile
+import unicodedata
 import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -234,6 +235,54 @@ class PublishingModuleTests(unittest.TestCase):
             self.copy_metadata()
         self.post.assert_not_called()
 
+    def test_metadata_uses_loaded_studio_context_instead_of_old_client_constants(self):
+        captured = {"client":{"clientName":62,"clientVersion":"1.20261123.01.00","userAgent":"Captured browser"},
+                    "user":{"delegationContext":{"externalChannelId":CHANNEL,"roleType":{"channelRoleType":"OWNER"}}},
+                    "request":{"reauthRequestInfo":{"stale":"proof"},"returnLogEntry":True}}
+        channel = SimpleNamespace(id=CHANNEL, role="OWNER", delegated_session_id="delegate", cookies=[],
+                                  cookie_string=lambda:"cookie",studio_context=captured)
+        with patch("src.module.video_publishing_module.get_channels_info",return_value=channel), \
+                patch.object(self.module,"_get_video_info",side_effect=[video(description="old description"),video(title=REFERENCE["title"],description=REFERENCE["description"])]):
+            self.copy_metadata()
+        request=self.post.call_args.kwargs
+        self.assertEqual(request["json"]["context"]["client"]["clientVersion"],"1.20261123.01.00")
+        self.assertEqual(request["headers"]["user-agent"],"Captured browser")
+        self.assertNotIn("reauthRequestInfo",request["json"]["context"]["request"])
+        self.assertEqual(request["json"]["context"]["request"]["sessionInfo"],{"token":"token"})
+        self.assertIn("reauthRequestInfo",captured["request"])
+
+    def test_correct_mutation_response_is_not_discarded_for_stale_readback(self):
+        self.response.json.return_value={"video":{"videoId":VIDEO,"channelId":CHANNEL,"title":REFERENCE["title"],
+                                                   "description":REFERENCE["description"]}}
+        with patch.object(self.module,"_get_video_info",return_value=video(description="old description")) as read:
+            result=self.copy_metadata()
+        self.assertEqual(result.title,REFERENCE["title"])
+        read.assert_called_once()
+        self.post.assert_called_once()
+
+    def test_metadata_readback_can_arrive_after_the_previous_six_second_window(self):
+        old=video(description="old description")
+        saved=video(title=REFERENCE["title"],description=REFERENCE["description"])
+        with patch.object(self.module,"_get_video_info",side_effect=[old]+[old]*5+[saved]):
+            self.assertEqual(self.copy_metadata().description,REFERENCE["description"])
+        self.post.assert_called_once()
+
+    def test_partial_metadata_write_can_be_completed_without_overwriting_manual_changes(self):
+        for before in (video(title=REFERENCE["title"],description="old description"),video(description=REFERENCE["description"])):
+            with self.subTest(title=before.title),patch.object(self.module,"_get_video_info",side_effect=[before,video(title=REFERENCE["title"],description=REFERENCE["description"])]):
+                self.copy_metadata()
+
+    def test_equivalent_unicode_and_newlines_are_not_treated_as_failed_saves(self):
+        saved=video(title=unicodedata.normalize("NFD",REFERENCE["title"]),description=REFERENCE["description"].replace("\n","\r\n"))
+        with patch.object(self.module,"_get_video_info",return_value=saved):
+            self.copy_metadata()
+        self.post.assert_not_called()
+
+    def test_publishing_reads_request_fresh_server_data(self):
+        with patch("src.module.base.IModule._get_video_info",return_value=video()) as read:
+            self.module._get_video_info(VIDEO,CHANNEL)
+        read.assert_called_once_with(VIDEO,CHANNEL,critical_read=True)
+
     def test_changed_original_and_foreign_channel_block_mutation(self):
         for before in (video(title="Manual edit"), video(channel_id=CHANNEL2), video(privacy="PUBLIC"),
                        video(copyright_check_status="CHECK_COMPLETED"), video(privacy="")):
@@ -276,6 +325,15 @@ class PublishingModuleTests(unittest.TestCase):
         with patch.object(self.module, "_get_video_info", return_value=before), self.assertRaises(ValueError):
             self.copy_metadata()
         self.post.assert_not_called()
+
+    def test_planned_time_on_a_draft_is_not_mistaken_for_a_completed_schedule(self):
+        before=video(title=REFERENCE["title"],description=REFERENCE["description"],draft_status="DRAFT_STATUS_PUBLIC",
+                     scheduled_publishing_details={"publishTimeSeconds":STAMP})
+        after=video(title=REFERENCE["title"],description=REFERENCE["description"],draft_status="DRAFT_STATUS_NONE",
+                    scheduled_publishing_details={"publishTimeSeconds":STAMP})
+        with patch.object(self.module,"_get_video_info",side_effect=[before,after]):
+            self.module.schedule(CHANNEL,VIDEO,STAMP,REFERENCE,categories=["clear"])
+        self.post.assert_called_once()
 
 
 class PublishingControllerTests(unittest.TestCase):

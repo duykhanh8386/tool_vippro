@@ -68,6 +68,26 @@ def _response_json_or_error(response: requests.Response, action: str) -> dict:
     return payload
 
 
+def studio_video_from_payload(video):
+    thumbnails = (video.get("thumbnailDetails") or {}).get("thumbnails") or [{}]
+    audio_language = video.get("audioLanguage") or ""
+    if isinstance(audio_language, dict):
+        audio_language = audio_language.get("languageCode") or ""
+    return Video(
+        id=video.get("videoId", ""), channel_id=video.get("channelId", ""),
+        title=video.get("title", ""), description=video.get("description", ""),
+        duration_ms=video.get("videoDurationMs", 0), thumbnail=thumbnails[0].get("url", ""),
+        thumbnail_details=video.get("thumbnailDetails") or {},
+        thumbnail_editor_state=video.get("thumbnailEditorState") or {},
+        video_status=video.get("status", ""), audio_language=str(audio_language).strip(),
+        privacy=video.get("privacy", ""), draft_status=video.get("draftStatus", ""),
+        scheduled_publishing_details=video.get("scheduledPublishingDetails", ""),
+        visibility=video.get("visibility", ""), time_created_seconds=video.get("timeCreatedSeconds", ""),
+        time_published_seconds=video.get("timePublishedSeconds", ""),
+        restriction_details=restriction_details(video), copyright_check_status=copyright_check_status(video),
+    )
+
+
 class IModule(ABC):
     EATS = "AXAuXyagZ24uKnNz0kYZbLTt32KGDRxhKqK2ns7At7Rkxw4UXW19g-oH1ng4py8No7EiqwNid9eQAFhJ7_8XJFiitSaWQdlXlG7nmJStO8tVWrrAAQ=="; CLIENT_SCREEN_NONCE = "8Z1g2AhnbTXfVuBp"; CHALLENGE = "a=6&a2=3&b=UAAoAmaAwwDIrKcvn9_rgzH-Jr4&c=1746756602&d=62&e3=UCAICychz3FdwEAyD6Rv-IRQ&c1a=1&hh=PSyUV3k8pO-Z9_6qmFQtKyKipjuIekgJtEtZvvmqpn0"; BOT_GUARD_RESPONSE = "$euU55b1RAAbvRbg0z0XewMv_S0uMtXGnADQBEArZ1HMQG4pgLXVbdPcdDixwJ1GZIjKtUDtG9tZmNJbg9W0ElVuifwYo-lT9CfcGMbryngAAACzOAAAA8fQBB-IASY3N5JAhIeAY5HKAdoI0yEECI_IJZ-vRui2z4nzlEoLB50R2iz607ou69KS463F-Ncivzmqmrurv2jJXSyl-d0TbLu7WaW-WEbsFBG4ZglwEBE_ccLro1tMinuYe2g0-E842CWJroVmf6sc716sKgXbH8XKn5WXsRjXqeuVHSZ8g-ds5FQLBMCLVRU7zVhpijepG729n8mztRnv3IuDL4sWycDhphf0IyIxPhQ_vVeuwX9En5nue0pZjeNetiMIFmI1acJDq474vIS9dU6XDknDze6gN0QbjXWrsYMYyO1zj5sMiLShfljFfCp7dp2f0LHOmAPGJdklHWgMXIYOmZW2wDi5FmcZBK12hx4YUrtMxXtXv1l6BJftZCzR0apgb5kDcR56jtHzxQCGp4kaNPV5SLO4oUV7vlkUCL2yc_a9seNhRnDeIM3ToQYRv7M1nQpPDfeiFaP4-X3WtlvdNFit_0UQV8BYImVdnnTdulniHz2roAg3PoMhtLT0QFUE5UfE6gupz1A35kHrb9UAqMtAgC0JSEI9Hn2m64wviQH5YyOoYlxNIGYz7vFGDqXX_yquJ57zosGcmgGwPulJjh_cUOBXjnwGRFAgTdvHkaIcwQNmWdJUWT4yxhy7-9AsLAravJUjygijZfajXrVEd9Dhv2GvyKSDGO_8WCunYImbXNy6bjfdO31HD9B0Bb9Yaqsyq3TFlUy1giqhdDJKRVZ2fQpjIKApaXITB-uLJQfleS6VVCKeMfwrtty056wlNQVuWuaQ8-XqDgOJclKHt8wOEMSEBEpwVc5ocBjEZ-wBLiorr7G1q66Ulp-HF4_Iwh7xUULUhH1M5FupXG93XQY9AR1M-MWeqQ07AIJ7FKGthd0wLuTavQ-1xQrymxWULSIuyaC7hpQxf1cIVh7EE2YrOhKVBowEe1LnFCUgCGXPBOd9TrQnkGLyKcYAOwzWdII7Zl5RPfHmPLUyk-niJ1Ygey4Dhmxzv9g8udrOvGr9mZDtIjKr-1z1cl-W2lDXWuRjfiRYNgOhPQOCXq21ULvlEOtR-9C2EVIABVXd14rGtJzsuXUwnr6CD29Odm64nbRPCa3leXuz1pOR1QOi0984sblJ0B_lRIGiXVd4RoUewatihEyzSGg2MFV1k2CdYrxK_yfv0hCHWc-JmixNmWFjXp7PrQvD3NMWZlb5Wb9J1mgl6nnxT7gPGo07xvYpiRBRwA6HU7QFcnP7yYsekWGXte5Sk3QJsu2m1lWpp-R9jiqpfw6Qf8zjwDVgbjXaq7pkrCyJIZeiBgDEWow2IbKa0GlRPuvmxLj3QToOjqCCqCXAtRiYGJzeyH0dd6HdIaJckCHYE1KiWp1SifXILE9TwQs2izR55MteVSZ_D9k3n0GBNnJXhUv5LREKWCFo5i0IgFMIFUEYA9uAaA_KPIxbfNYwy5VL6GvHFctg8RdHvZb6-ZYpieMTnkT2srMF20Yh148zsAIoZ3Z6J6upgwljNeHqOUXYVtIORaPUt7Sq54x67YZ7eVKU1-eA-qpqqAJ9jfTXjalxYRe2RbScWuluGr7lfL4vT5CL_ySttj-4doOtBJgVW4YRkhKjicZpBZg_uZizhgzB3Q7Q"
     pass
@@ -152,7 +172,7 @@ class IModule(ABC):
         return videos
 
         cookie = None
-    def _get_video_info(self, video_id: str, channel_id: str) -> Video:
+    def _get_video_info(self, video_id: str, channel_id: str, *, critical_read=False) -> Video:
         channel_info = get_channels_info(channel_id); cookie_string = "; ".join([f"{cookie['name']}={cookie['value']}" for cookie in channel_info.cookies]); session_token = self._get_session_token(channel_info); url = "https://studio.youtube.com/youtubei/v1/creator/get_creator_videos?alt=json"; headers = {"origin": "https://studio.youtube.com", "user-agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36", "cookie": cookie_string, "content-type": "application/json", "authorization": studio_authorization_header(channel_info.cookies)}
 
         payload = {"context": {"client": {"clientName": 62, "clientVersion": "1.20250905.02.00", "hl": "vi", "gl": "VN", "experimentsToken": "", "utcOffsetMinutes": 420, "userInterfaceTheme": "USER_INTERFACE_THEME_DARK", "screenWidthPoints": 2560, "screenHeightPoints": 544, "screenPixelDensity": 2, "screenDensityFloat": 1.5}, "request": {"returnLogEntry": True, "internalExperimentFlags": [], "eats": "AWSNWa2q-ubSn35ywNe6Myhvveym5w_4-S_D3p_lk689PZciFEJrTquCWvtc1PgiFObkpeU638J5M3CTcvCmegVUfkseMdAJaVgmOWE_S5SHQpzuXaZu1I7szwPPUQ==", "sessionInfo": {"token": session_token}, "consistencyTokenJars": []}, "user": {"onBehalfOfUser": channel_info.delegated_session_id, "delegationContext": {"externalChannelId": channel_info.id, "roleType": {"channelRoleType": channel_info.role}}, "serializedDelegationContext": ""}, "clickTracking": {"visualElement": {"veType": 74_615}}, "clientScreenNonce": "rQg33g-jDrOyosOi"}, "failOnError": True, "videoIds": [video_id], "mask": {"channelId": True, "downloadUrl": True, "origin": True, "premiere": {"all": True},
@@ -178,7 +198,7 @@ class IModule(ABC):
     "titleFormattedString": {"all": True}, "viewCountIsHidden": True, "autoChapterSettings": {"all": True}, "autoPlacesMentionedSettings": {"all": True}, "videoArtworkEditorState": {"all": True}, "learningConceptSettings": {"all": True}, "videoEditorProject": {"all": True}, "originalFilename": True, "timeCreatedSeconds": True,
 
     "videoResolutions": {"all": True}, "watchUrl": True, "publicShorts": {"all": True}, "publicMetrics": {"all": True}, "academicLearning": {"all": True}, "manualPlacesMentionedPlaces": {"all": True}, "autoProductsSettings": {"all": True},
-    "videoAutoSummarySettings": {"all": True}, "issues": {"all": True}}, "criticalRead": False}; response = post_with_stop(url=url, headers=headers, json=payload)
+    "videoAutoSummarySettings": {"all": True}, "issues": {"all": True}}, "criticalRead": bool(critical_read)}; response = post_with_stop(url=url, headers=headers, json=payload)
         res = _response_json_or_error(response, "video status check")
         videos = res.get("videos")
         if not isinstance(videos, list) or not videos or not isinstance(videos[0], dict):
@@ -187,30 +207,7 @@ class IModule(ABC):
                 status_code=response.status_code,
                 response_excerpt=_safe_response_excerpt(response),
             )
-        video = videos[0]
-        thumbnails = video.get("thumbnailDetails", {}).get("thumbnails") or [{}]
-        audio_language = video.get("audioLanguage") or ""
-        if isinstance(audio_language, dict):
-            audio_language = audio_language.get("languageCode") or ""
-        return Video(
-            id=video.get("videoId", ""),
-            title=video.get("title", ""),
-            description=video.get("description", ""),
-            channel_id=video.get("channelId", ""),
-            duration_ms=video.get("videoDurationMs", 0),
-            thumbnail=thumbnails[0].get("url", ""),
-            thumbnail_details=video.get("thumbnailDetails") or {},
-            video_status=video.get("status", ""),
-            audio_language=str(audio_language).strip(),
-            privacy=video.get("privacy", ""),
-            draft_status=video.get("draftStatus", ""),
-            scheduled_publishing_details=video.get("scheduledPublishingDetails", ""),
-            visibility=video.get("visibility", ""),
-            time_created_seconds=video.get("timeCreatedSeconds", ""),
-            time_published_seconds=video.get("timePublishedSeconds", ""),
-            restriction_details=restriction_details(video),
-            copyright_check_status=copyright_check_status(video),
-        )
+        return studio_video_from_payload(videos[0])
 
         cookie = None
     def _build_context(self, channel_id: str, role: str, delegated_session_id: str, *, client_version: str="1.20260311.03.00", hl: str="en", theme: str="USER_INTERFACE_THEME_DARK", screen_width: int=1920, screen_height: int=945, include_on_behalf_of_user: bool=True, extra_request_fields: dict | None=None) -> dict:
