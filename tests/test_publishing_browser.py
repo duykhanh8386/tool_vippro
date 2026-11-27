@@ -209,6 +209,42 @@ class ReferencePriorityTests(unittest.TestCase):
 
 
 class StudioControlTests(unittest.TestCase):
+    def test_done_and_save_activate_native_button_inside_custom_wrapper(self):
+        for selector in (".done-button", "#save"):
+            with self.subTest(selector=selector):
+                scope, wrapper, native = Mock(), Mock(), Mock()
+                wrapper.tag_name = "ytcp-button"
+                wrapper.find_elements.return_value = [native]
+                wrapper.get_attribute.return_value = "false"
+                native.is_displayed.return_value = True
+                native.is_enabled.return_value = True
+                native.get_attribute.side_effect = lambda key:"false" if key=="aria-disabled" else None
+                scope.find_elements.return_value = [wrapper]
+                self.assertIs(StudioThumbnailBrowser._button_control(scope, selector), native)
+
+    def test_disabled_native_save_does_not_fall_back_to_enabled_wrapper(self):
+        driver, wrapper, native = Mock(), Mock(), Mock()
+        wrapper.tag_name = "ytcp-button"
+        wrapper.find_elements.return_value = [native]
+        wrapper.is_enabled.return_value = True
+        native.is_displayed.return_value = True
+        native.is_enabled.return_value = False
+        driver.find_elements.return_value = [wrapper]
+        self.assertIsNone(StudioThumbnailBrowser._save_button(driver))
+
+    def test_mounted_playlist_wrapper_with_hidden_controls_is_closed(self):
+        dialog, wrapper, native, option = Mock(), Mock(), Mock(), Mock()
+        dialog.is_displayed.return_value = True
+        wrapper.tag_name = "ytcp-button"
+        wrapper.is_displayed.return_value = True
+        wrapper.find_elements.return_value = [native]
+        native.is_displayed.return_value = False
+        option.is_displayed.return_value = False
+        dialog.find_elements.side_effect = lambda by, selector:[wrapper] if selector==".done-button" else [option]
+        self.assertFalse(StudioThumbnailBrowser._playlist_is_open(dialog))
+        native.is_displayed.return_value = True
+        self.assertTrue(StudioThumbnailBrowser._playlist_is_open(dialog))
+
     def test_blocked_click_reports_reason_without_exposing_webdriver_exception_text(self):
         driver, button = Mock(), Mock()
         button.is_displayed.return_value = True
@@ -294,6 +330,7 @@ class ThumbnailSaveTests(unittest.TestCase):
         state = {"saved": False}
         driver.current_url = f"https://studio.youtube.com/video/{VIDEO}/edit?hl=en"
         button.is_displayed.return_value = True
+        button.tag_name = "button"
         button.is_enabled.side_effect = lambda: not state["saved"]
         button.get_attribute.return_value = None
         request = {"encryptedVideoId": identifier}

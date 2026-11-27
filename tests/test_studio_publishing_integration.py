@@ -14,6 +14,7 @@ import requests
 from selenium import webdriver
 from selenium.common.exceptions import ElementClickInterceptedException
 from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.support.ui import WebDriverWait
 
 from src.module.base import studio_video_from_payload
 from src.module.video_publishing_module import VideoPublishingModule
@@ -31,13 +32,26 @@ ytcp-checkbox-lit [role=checkbox] { position:absolute;inset:0;border:1px solid g
 ytcp-checkbox-lit paper-ripple { display:block;position:absolute;inset:0;z-index:2; }
 ytcp-checkbox-lit input[slot=hidden-input] { display:none; }
 label { display:flex;align-items:center;gap:8px;padding:8px; }
+ytcp-playlist-dialog { display:block;min-height:2px; }
+ytcp-button { display:inline-block;padding:12px 40px 12px 0; }
 </style><ytcp-video-metadata-editor><ytcp-thumbnail-editor>
 <input type="file" accept="image/jpeg" hidden></ytcp-thumbnail-editor>
 <ytcp-video-metadata-playlists><ytcp-dropdown-trigger role="button" style="display:block">Playlists</ytcp-dropdown-trigger></ytcp-video-metadata-playlists>
-<button id="save" disabled>Save</button></ytcp-video-metadata-editor><script>
-const file=document.querySelector('input'),save=document.querySelector('#save');
-let thumbnailDirty=false;const assigned=__PLAYLISTS__;
-file.onchange=()=>{thumbnailDirty=true;save.disabled=false;};
+<ytcp-button id="save" tabindex="-1" type="filled" aria-disabled="true">
+ <dom-if></dom-if><div style="display:contents"><ytcp-button-shape>
+  <button class="ytcpButtonShapeImplHost" aria-label="Lưu" aria-disabled="true" tabindex="0" disabled>
+   <div class="ytcpButtonShapeImpl__button-text-content">Lưu</div><yt-touch-feedback-shape aria-hidden="true"></yt-touch-feedback-shape>
+  </button>
+ </ytcp-button-shape></div>
+</ytcp-button></ytcp-video-metadata-editor><script>
+const file=document.querySelector('input'),saveHost=document.querySelector('#save'),save=saveHost.querySelector('button');
+let thumbnailDirty=false,playlistDirty=false;const assigned=__PLAYLISTS__;
+function setSaveEnabled(enabled){
+ save.disabled=!enabled;
+ save.setAttribute('aria-disabled',enabled?'false':'true');
+ saveHost.setAttribute('aria-disabled',enabled?'false':'true');
+}
+file.onchange=()=>{thumbnailDirty=true;setSaveEnabled(true);};
 save.onclick=async()=>{
  const body={encryptedVideoId:'Abc123_-XYZ'};
  if(thumbnailDirty) body.thumbnail={customThumbnail:{externalImageId:'IM-upload'}};
@@ -45,9 +59,9 @@ save.onclick=async()=>{
  if(JSON.stringify(playlists)!==JSON.stringify(assigned))body.playlists=playlists;
  await fetch('/youtubei/v1/video_manager/metadata_update',{method:'POST',headers:{'Content-Type':'application/json'},
  body:JSON.stringify(body)});
- thumbnailDirty=false;save.disabled=true;
+ thumbnailDirty=false;playlistDirty=false;setSaveEnabled(false);
 };</script>
-<ytcp-playlist-dialog style="display:none;position:fixed;inset:0;background:white;z-index:1000"><div id="playlists-list">
+<ytcp-playlist-dialog><div class="playlist-panel" style="display:none;position:fixed;inset:0;background:white;z-index:1000"><div id="playlists-list">
 <label><ytcp-checkbox-lit label-wrap aria-labelledby="checkbox-label-0" id="checkbox-0" test-id="PL-first" compact>
  <div id="root-container"><div id="checkbox-line-height-aligner-container"><div id="checkbox-line-height-aligner"><div id="checkbox-container">
   <div id="checkbox" role="checkbox" tabindex="0" aria-checked="false" aria-disabled="false" aria-labelledby="checkbox-label-0"></div>
@@ -60,9 +74,15 @@ save.onclick=async()=>{
   <paper-ripple id="ink" class="circle" center></paper-ripple>
  </div><input slot="hidden-input" type="checkbox"></div>
 </ytcp-checkbox-lit><span id="checkbox-label-1" class="label-text">Existing playlist</span></label>
-</div><ytcp-button class="done-button" role="button">Done</ytcp-button></ytcp-playlist-dialog><script>
-const dialog=document.querySelector('ytcp-playlist-dialog');
-document.querySelector('ytcp-dropdown-trigger').onclick=()=>dialog.style.display='block';
+</div><ytcp-button class="done-button action-button" label="Xong" tabindex="-1" type="tonal" aria-disabled="false">
+ <dom-if></dom-if><div style="display:contents"><ytcp-button-shape>
+  <button class="ytcpButtonShapeImplHost" aria-label="Xong" aria-disabled="false" tabindex="0">
+   <div class="ytcpButtonShapeImpl__button-text-content">Xong</div><yt-touch-feedback-shape aria-hidden="true"></yt-touch-feedback-shape>
+  </button>
+ </ytcp-button-shape></div>
+</ytcp-button></div></ytcp-playlist-dialog><script>
+const panel=document.querySelector('.playlist-panel');
+document.querySelector('ytcp-dropdown-trigger').onclick=()=>panel.style.display='block';
 for(const host of document.querySelectorAll('ytcp-checkbox-lit')){
  const checkbox=host.querySelector('[role=checkbox]');
  const id=host.getAttribute('test-id');
@@ -70,13 +90,14 @@ for(const host of document.querySelectorAll('ytcp-checkbox-lit')){
  host.onclick=event=>{
   event.preventDefault();
   checkbox.setAttribute('aria-checked',checkbox.getAttribute('aria-checked')==='true'?'false':'true');
+  playlistDirty=true;
  };
 }
-document.querySelector('.done-button').onclick=()=>{
- save.disabled=false;
+document.querySelector('.done-button button').onclick=()=>{
+ if(playlistDirty)setSaveEnabled(true);
  // Studio enables Save while its playlist dialog is still closing. A click
  // before the transition finishes hits the dialog instead of the Save button.
- setTimeout(()=>dialog.style.display='none',1800);
+ setTimeout(()=>panel.style.display='none',1800);
 };
 </script>'''
 
@@ -182,6 +203,12 @@ class StudioPublishingBrowserTests(unittest.TestCase):
                     inner.click()
                 self.assertEqual(inner.get_attribute("aria-checked"), "false")
                 self.assertEqual(server.steps, [])
+                done = driver.find_element("css selector", ".done-button button")
+                done.click()
+                WebDriverWait(driver, 10).until(lambda browser:not done.is_displayed())
+                # This is a mounted wrapper, not an open popup. The previous
+                # wait on wrapper.is_displayed() would never finish here.
+                self.assertTrue(driver.find_element("css selector", "ytcp-playlist-dialog").is_displayed())
                 with patch("src.publishing_thumbnails.thumbnail_pixels",side_effect=cached_pixels), \
                         patch("requests.get") as get:
                     get.return_value.__enter__.return_value=response

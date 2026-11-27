@@ -705,9 +705,35 @@ class StudioThumbnailBrowser:
         self.verify_saved = verify_saved
 
     @staticmethod
+    def _button_control(scope, selector, *, enabled=True):
+        for host in scope.find_elements(By.CSS_SELECTOR, selector):
+            # Current Studio attaches the action to the native button inside
+            # ytcp-button. Clicking the wrapper is not an activation of it.
+            if host.tag_name == "button":
+                candidates = [host]
+            else:
+                candidates = host.find_elements(By.CSS_SELECTOR, "button")
+                if not candidates and host.get_attribute("role") == "button":
+                    candidates = [host]  # Older Studio renders a role button.
+            for node in candidates:
+                if node.is_displayed() and (not enabled or (
+                        node.is_enabled() and node.get_attribute("disabled") is None
+                        and node.get_attribute("aria-disabled") != "true"
+                        and host.get_attribute("aria-disabled") != "true")):
+                    return node
+        return None
+
+    @staticmethod
     def _save_button(driver):
-        return next((node for node in driver.find_elements(By.CSS_SELECTOR,"#save") if node.is_displayed() and node.is_enabled()
-                     and node.get_attribute("disabled") is None and node.get_attribute("aria-disabled") != "true"),None)
+        return StudioThumbnailBrowser._button_control(driver, "#save")
+
+    @staticmethod
+    def _playlist_is_open(dialog):
+        # The custom-element wrapper can stay displayed after its inner panel
+        # closes. Test the visible actions/options, not the wrapper's rectangle.
+        if StudioThumbnailBrowser._button_control(dialog, ".done-button", enabled=False) is not None:
+            return True
+        return any(node.is_displayed() for node in dialog.find_elements(By.CSS_SELECTOR, "#playlists-list ytcp-checkbox-lit"))
 
     @staticmethod
     def _open_editor(driver, video_id):
@@ -756,27 +782,29 @@ class StudioThumbnailBrowser:
         StudioThumbnailBrowser._click_control(driver,
             lambda: next((node for node in driver.find_elements(By.CSS_SELECTOR,"ytcp-video-metadata-playlists ytcp-dropdown-trigger") if node.is_displayed()),None),
             timeout=45, message="Chưa mở được ô Danh sách phát; kiểm tra hộp thoại đang che trong Studio.")
-        return wait_for(lambda:next((node for node in driver.find_elements(By.CSS_SELECTOR,"ytcp-playlist-dialog") if node.is_displayed()),None),
+        return wait_for(lambda:next((node for node in driver.find_elements(By.CSS_SELECTOR,"ytcp-playlist-dialog") if StudioThumbnailBrowser._playlist_is_open(node)),None),
                         timeout=30,message="Chưa mở được danh sách phát của kênh.")
 
     @staticmethod
     def _playlist_done(driver):
         def locate():
             for dialog in driver.find_elements(By.CSS_SELECTOR,"ytcp-playlist-dialog"):
-                if dialog.is_displayed():
-                    return next((node for node in dialog.find_elements(By.CSS_SELECTOR,".done-button") if node.is_displayed()),None)
+                if StudioThumbnailBrowser._playlist_is_open(dialog):
+                    return StudioThumbnailBrowser._button_control(dialog, ".done-button")
             return None
+        if not any(StudioThumbnailBrowser._playlist_is_open(dialog) for dialog in driver.find_elements(By.CSS_SELECTOR,"ytcp-playlist-dialog")):
+            return
         StudioThumbnailBrowser._click_control(driver, locate, message="Chưa bấm được nút Xong của danh sách phát.")
-        wait_for(lambda: not any(node.is_displayed() for node in driver.find_elements(By.CSS_SELECTOR,"ytcp-playlist-dialog")),
+        wait_for(lambda: not any(StudioThumbnailBrowser._playlist_is_open(node) for node in driver.find_elements(By.CSS_SELECTOR,"ytcp-playlist-dialog")),
                  timeout=30, message="Hộp thoại danh sách phát chưa đóng; chưa bấm Lưu.")
 
     @staticmethod
     def _playlist_option(driver, playlist_id):
         for dialog in driver.find_elements(By.CSS_SELECTOR,"ytcp-playlist-dialog"):
-            if not dialog.is_displayed():
+            if not StudioThumbnailBrowser._playlist_is_open(dialog):
                 continue
             for option in dialog.find_elements(By.CSS_SELECTOR,"#playlists-list ytcp-checkbox-lit"):
-                if option.get_attribute("test-id") == playlist_id:
+                if option.is_displayed() and option.get_attribute("test-id") == playlist_id:
                     return option
         return None
 
@@ -888,8 +916,7 @@ class StudioThumbnailBrowser:
             inputs[0].send_keys(str(Path(path).resolve()))
 
             def save_button():
-                nodes = driver.find_elements(By.CSS_SELECTOR, "#save")
-                return next((node for node in nodes if node.is_displayed() and node.is_enabled() and node.get_attribute("disabled") is None and node.get_attribute("aria-disabled") != "true"), None)
+                return self._save_button(driver)
 
             last_check = [0.0]
             def save_or_already_saved():
