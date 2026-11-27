@@ -13,7 +13,7 @@ from src.module.base import YouTubeRequestError, _response_json_or_error, studio
 from src.module.video_title_module import VideoTitleModule
 from src.task_runtime import check_stopped, post_with_stop, wait_interruptibly
 from src.utils import get_channels_info
-from src.video_publishing import copyright_category, has_schedule_info, schedule_timestamp
+from src.video_publishing import has_schedule_info, schedule_timestamp
 from src.video_scan_dates import _status_indicates_draft
 from src.youtube_auth import studio_authorization_header
 
@@ -33,9 +33,9 @@ class VideoPublishingModule(VideoTitleModule):
 
     def require_eligible(self, channel_id, video_id, categories, *, publish_at=None):
         video = self.read_video(channel_id, video_id)
-        category = copyright_category(video)
-        if category not in set(categories) or category in {"unknown", "checking"}:
-            raise ValueError("Trạng thái bản quyền đã thay đổi so với lúc chọn video. Quét lại video này.")
+        # Copyright categories filter the scan, not an already selected job.
+        # Claims may change while the thumbnail is generated; keep processing
+        # that video and let Studio report any actual publishing restriction.
         existing = schedule_timestamp(video)
         if has_schedule_info(video) and existing is None:
             raise ValueError("Video có lịch đăng nhưng chưa đọc được thời gian; giữ nguyên lịch hiện tại.")

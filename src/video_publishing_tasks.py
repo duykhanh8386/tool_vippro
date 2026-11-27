@@ -4,8 +4,14 @@ from __future__ import annotations
 import copy
 import re
 import threading
+import traceback
 from datetime import datetime, timedelta
 from pathlib import Path
+
+import requests
+from loguru import logger
+from selenium.common import exceptions as browser_errors
+from urllib3.exceptions import HTTPError as TransportError
 
 from src.module.base import YouTubeRequestError
 from src.module.list_videos_module import list_videos_module
@@ -29,6 +35,15 @@ from src.video_title_matching import parse_manual_title_ids
 STATE_KEY = "video_publishing"
 STATUS_LABELS = {"scanned": "Đã quét", "ready": "Đã tìm tham chiếu", "processing": "Đang xử lý", "successful": "Đã lên lịch",
                  "skipped": "Bỏ qua", "error": "Lỗi", "stopped": "Đã dừng", "waiting_session": "Chờ phiên ChatGPT"}
+STEP_LABELS = {
+    "scan": "Quét video", "check_schedules": "Kiểm tra lịch hiện có",
+    "validate_video": "Kiểm tra video", "find_reference": "Tìm video tham chiếu",
+    "image_session": "Kiểm tra phiên tạo ảnh", "prepare_image": "Chuẩn bị tệp ảnh",
+    "download_reference": "Tải ảnh tham chiếu", "generate_image": "Tạo và tải ảnh GPT",
+    "normalize_thumbnail": "Chuẩn hóa thumbnail", "upload_thumbnail": "Lưu thumbnail và danh sách phát",
+    "assign_playlist": "Lưu danh sách phát", "copy_metadata": "Lưu title/description",
+    "schedule_video": "Lưu lịch đăng", "process": "Xử lý video",
+}
 
 
 def default_settings():
@@ -345,8 +360,52 @@ class VideoPublishingController:
             run.request_stop()
 
     @staticmethod
-    def _error(exc):
-        return str(exc) if isinstance(exc, (ValueError, YouTubeRequestError)) else "Không hoàn tất do lỗi kết nối/trình duyệt. Kiểm tra Chrome và phiên đăng nhập rồi tiếp tục."
+    def _error(exc, *, step=None):
+        if isinstance(exc, (ValueError, YouTubeRequestError)):
+            detail = str(exc)
+        else:
+            if isinstance(exc, (browser_errors.InvalidSessionIdException, browser_errors.NoSuchWindowException)):
+                reason = "Mất phiên hoặc cửa sổ Chrome đang xử lý. Mở lại tác vụ để tiếp tục từ tiến độ đã lưu."
+            elif isinstance(exc, browser_errors.SessionNotCreatedException):
+                reason = "Không khởi tạo được Chrome. Kiểm tra phiên bản Chrome và ChromeDriver."
+            elif isinstance(exc, browser_errors.TimeoutException):
+                reason = "Chrome chưa tải xong trang hoặc chưa phản hồi trong thời gian chờ."
+            elif isinstance(exc, (browser_errors.ElementClickInterceptedException, browser_errors.ElementNotInteractableException,
+                                  browser_errors.NoSuchElementException, browser_errors.StaleElementReferenceException)):
+                reason = "Chưa thao tác được điều khiển trên trang; kiểm tra hộp thoại đang mở trong Chrome rồi tiếp tục."
+            elif isinstance(exc, browser_errors.WebDriverException):
+                reason = "Chrome không thực hiện được lệnh ở bước này. Kiểm tra cửa sổ và phiên trình duyệt."
+            elif isinstance(exc, (requests.Timeout, TimeoutError)):
+                reason = "Kết nối hết thời gian chờ. Kiểm tra mạng rồi tiếp tục để đọc lại kết quả."
+            elif isinstance(exc, (requests.RequestException, TransportError, ConnectionError)):
+                reason = "Không nhận được phản hồi qua kết nối. Kiểm tra mạng rồi tiếp tục để đọc lại kết quả."
+            elif isinstance(exc, FileNotFoundError):
+                reason = "Không tìm thấy tệp cần dùng ở bước này. Kiểm tra thư mục ảnh và các công cụ đã cài."
+            elif isinstance(exc, PermissionError):
+                reason = "Không có quyền đọc hoặc ghi tệp. Kiểm tra quyền truy cập thư mục ảnh."
+            elif isinstance(exc, OSError):
+                reason = "Không đọc hoặc ghi được tệp ở bước này. Kiểm tra thư mục ảnh và dung lượng ổ đĩa."
+            else:
+                reason = "Lỗi xử lý nội bộ. Tiến độ được giữ; gửi mã lỗi và bước này để kiểm tra."
+            # Browser/transport exception messages may contain URLs or tokens.
+            # Expose their type, never their raw message or request arguments.
+            detail = f"{reason} ({type(exc).__name__})"
+        return f"{STEP_LABELS.get(step, 'Xử lý video')}: {detail}" if step else detail
+
+    @staticmethod
+    def _log_error(exc, *, step, row=None):
+        # Keep useful source locations without exception text, source lines,
+        # local variables, credential-bearing request URLs or absolute paths.
+        chain, seen, current = [], set(), exc
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+            frames = traceback.extract_tb(current.__traceback__)
+            locations = " > ".join(f"{Path(frame.filename).name}:{frame.lineno}:{frame.name}" for frame in frames)
+            chain.append(f"{type(current).__name__}[{locations}]")
+            current = current.__cause__ or (None if current.__suppress_context__ else current.__context__)
+        logger.error("Publishing failed: channel={} video={} step={} type={} stack={}",
+                     row.get("channel_id", "") if row else "", row.get("video_id", "") if row else "",
+                     step, type(exc).__name__, " | caused by ".join(chain))
 
     def _scan(self, settings, reference):
         channels = list(settings["channel_ids"])
@@ -434,10 +493,11 @@ class VideoPublishingController:
         for index, row in enumerate(selected, 1):
             check_stopped()
             self._progress(f"{index}/{len(selected)} · {row['channel_id']} · {row['video_id']}")
-            self._checkpoint(row, status="processing", detail="Đang kiểm tra video và tìm tham chiếu…")
+            self._checkpoint(row, status="processing", step="validate_video", error_step="", error_type="",
+                             detail="Đang kiểm tra video và tìm tham chiếu…")
             try:
-                # Each explicit row selection authorizes that row's scanned
-                # copyright type, independently of the current display filter.
+                # Scan categories remain a display filter. Later copyright
+                # changes must not cancel an explicitly selected video.
                 categories = [row["copyright"]]
                 current = self.module.require_eligible(row["channel_id"], row["video_id"], categories, publish_at=row.get("publish_at"))
                 duration_ms = positive_seconds(getattr(current, "duration_ms", None))
@@ -450,6 +510,7 @@ class VideoPublishingController:
                     previous.get("selection") != "id" and previous.get("target_duration_seconds") != positive_seconds(row.get("duration_seconds")))
                 replace_preview = stale_selection and not (row.get("metadata_copied") or row.get("thumbnail_uploaded"))
                 if not previous or replace_preview:
+                    self._checkpoint(row, step="find_reference", detail="Đang tìm video tham chiếu…")
                     found = reference.find(row["song"], source_title=row["old_title"], duration_seconds=row.get("duration_seconds"),
                                            exclude_ids=[entry["video_id"] for entry in self.rows])
                     if previous and any(found.get(key) != previous.get(key) for key in ("video_id", "title", "description", "thumbnail")):
@@ -463,18 +524,20 @@ class VideoPublishingController:
                     self._checkpoint(row, status="ready", detail=method + "; title và description sẽ chép nguyên văn.")
                     continue
                 if not row.get("thumbnail_path") or not Path(row["thumbnail_path"]).is_file():
+                    self._checkpoint(row, step="image_session", detail="Đang kiểm tra phiên tạo ảnh…")
                     if image is None:
                         image = self._image_session()
                     image.ensure_ready(wait_for_user=True, allow_image_result=True,
                                        on_state=lambda state, message, row=row: self._image_session_state(row, state, message))
+                    self._checkpoint(row, step="prepare_image", detail="Đang chuẩn bị thư mục và tệp ảnh…")
                     folder = output / row["channel_id"]
                     folder.mkdir(parents=True, exist_ok=True)
                     base = str(folder / thumbnail_file_stem(row["reference"]["title"], row["video_id"]))
                     reference_path = base + ".reference.jpg"
                     if not row.get("conversation_url") and not row.get("image_request"):
-                        self._checkpoint(row, detail="Đang tải ảnh tham chiếu và chuyển sang JPEG…")
+                        self._checkpoint(row, step="download_reference", detail="Đang tải ảnh tham chiếu và chuyển sang JPEG…")
                         reference_path = download_reference_image(row["reference"]["thumbnail"], reference_path)
-                    self._checkpoint(row, detail="Đang yêu cầu ChatGPT vẽ lại thumbnail…")
+                    self._checkpoint(row, step="generate_image", detail="Đang yêu cầu ChatGPT vẽ lại thumbnail…")
                     raw = image.generate(reference_path, settings["image_prompt"], row["reference"], base + ".generated",
                                          conversation_url=row.get("conversation_url", ""),
                                          video_id=row["video_id"], request=row.get("image_request"),
@@ -483,17 +546,17 @@ class VideoPublishingController:
                                          on_state=lambda state, message, row=row: self._image_session_state(row, state, message),
                                          on_progress=lambda message, row=row: self._image_progress(row, message),
                                          model=settings["image_model"], cleanup=settings["image_cleanup"])
-                    self._checkpoint(row, detail="Đã tải ảnh ChatGPT; đang chuẩn hóa thumbnail JPEG 1280×720…")
+                    self._checkpoint(row, step="normalize_thumbnail", detail="Đã tải ảnh ChatGPT; đang chuẩn hóa thumbnail JPEG 1280×720…")
                     path = normalize_thumbnail(raw, base + ".jpg")
                     self._checkpoint(row, thumbnail_path=path)
                 if not row.get("thumbnail_uploaded"):
-                    self._checkpoint(row, detail="Đang tải thumbnail và đọc lại ảnh đã lưu trên YouTube…")
+                    self._checkpoint(row, step="upload_thumbnail", detail="Đang tải thumbnail và đọc lại ảnh đã lưu trên YouTube…")
                     self.module.require_eligible(row["channel_id"], row["video_id"], categories, publish_at=row["publish_at"])
                     playlist = thumbnail.upload(row["channel_id"], row["video_id"], row["thumbnail_path"], ensure_playlist=True,
                                                 on_saved=lambda row=row:self._remember_thumbnail_saved(row))
                     self._checkpoint(row, thumbnail_uploaded=True)
                 elif not row.get("playlist_assigned"):
-                    self._checkpoint(row,detail="Đang chọn và lưu danh sách phát đầu tiên…")
+                    self._checkpoint(row, step="assign_playlist", detail="Đang chọn và lưu danh sách phát đầu tiên…")
                     playlist = thumbnail.assign_first_playlist(row["channel_id"],row["video_id"])
                 else:
                     playlist = None
@@ -501,12 +564,12 @@ class VideoPublishingController:
                     if not isinstance(playlist,dict) or not playlist.get("playlist_id"):
                         raise ValueError("Chưa xác nhận được danh sách phát đầu tiên; chưa đặt lịch video này.")
                     self._checkpoint(row,playlist_assigned=True,**playlist)
-                self._checkpoint(row, detail="Đã xác nhận thumbnail và danh sách phát. Đang chép title/description…")
+                self._checkpoint(row, step="copy_metadata", detail="Đã xác nhận thumbnail và danh sách phát. Đang chép title/description…")
                 self.module.copy_metadata(row["channel_id"], row["video_id"], row["reference"],
                                           expected_title=row["old_title"], expected_description=row["old_description"],
                                           categories=categories, publish_at=row["publish_at"])
                 self._checkpoint(row, metadata_copied=True)
-                self._checkpoint(row, detail="Đang đặt lịch và đọc lại kết quả…")
+                self._checkpoint(row, step="schedule_video", detail="Đang đặt lịch và đọc lại kết quả…")
                 self.module.schedule(row["channel_id"], row["video_id"], row["publish_at"], row["reference"], categories=categories)
                 self._checkpoint(row, status="successful", selected=False, detail="Đã xác nhận metadata và lịch đăng trên YouTube.")
             except ChatGPTSessionNeedsAction as exc:
@@ -516,7 +579,9 @@ class VideoPublishingController:
             except TaskStopped:
                 raise
             except Exception as exc:
-                self._checkpoint(row, status="error", detail=self._error(exc))
+                step = row["step"]
+                self._log_error(exc, step=step, row=row)
+                self._checkpoint(row, status="error", error_step=step, error_type=type(exc).__name__, detail=self._error(exc, step=step))
                 if isinstance(exc, YouTubeRequestError) and exc.status_code in {401, 403}:
                     raise
         successes = sum(row["status"] == "successful" for row in self.rows)
@@ -583,6 +648,7 @@ class VideoPublishingController:
 
     def _worker(self, action, run):
         reference = image = None
+        step = "scan" if action == "scan" else "process"
         try:
             with bind_run_context(run):
                 settings = copy.deepcopy(self.settings)
@@ -591,7 +657,9 @@ class VideoPublishingController:
                     self._scan(settings, reference)
                 else:
                     if action == "run":
+                        step = "check_schedules"
                         self._check_schedule_conflicts()
+                    step = "process"
                     self._process(settings, reference, image, action)
         except ChatGPTSessionNeedsAction as exc:
             self._session_progress(str(exc))
@@ -599,7 +667,8 @@ class VideoPublishingController:
         except TaskStopped:
             self._progress("Đã dừng; có thể tiếp tục các dòng chưa xong.")
         except Exception as exc:
-            self._progress(self._error(exc))
+            self._log_error(exc, step=step)
+            self._progress(self._error(exc, step=step))
         finally:
             # The image adapter is app-owned; only per-run reference browsers close.
             for adapter in (reference,):

@@ -19,7 +19,10 @@ import uuid
 from pathlib import Path
 from urllib.parse import quote, urlparse
 
-from selenium.common.exceptions import StaleElementReferenceException, WebDriverException
+from selenium.common.exceptions import (
+    ElementClickInterceptedException, ElementNotInteractableException,
+    StaleElementReferenceException, WebDriverException,
+)
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 
@@ -714,39 +717,76 @@ class StudioThumbnailBrowser:
             raise PublishingBrowserError("Studio chuyển sang video khác; chưa lưu thay đổi.")
 
     @staticmethod
+    def _click_control(driver, locate, *, message, selected=None, timeout=30):
+        def click_when_ready():
+            node = locate()
+            if node is None or not node.is_displayed():
+                return False
+            if selected is not None and selected(node):
+                return True
+            if not node.is_enabled() or node.get_attribute("disabled") is not None or node.get_attribute("aria-disabled") == "true":
+                return False
+            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", node)
+            try:
+                node.click()
+            except (ElementClickInterceptedException, ElementNotInteractableException):
+                # These failures occur before a click is delivered. Re-find the
+                # element after Studio finishes its dialog/upload animation.
+                return False
+            return True
+        wait_for(click_when_ready, timeout=timeout, message=message)
+
+    @staticmethod
     def _playlist_dialog(driver):
-        trigger=wait_for(lambda:next((node for node in driver.find_elements(By.CSS_SELECTOR,"ytcp-video-metadata-playlists ytcp-dropdown-trigger") if node.is_displayed()),None),
-                         timeout=45,message="Không tìm được ô Danh sách phát trong Studio.")
-        driver.execute_script("arguments[0].scrollIntoView({block:'center'});",trigger)
-        trigger.click()
+        StudioThumbnailBrowser._click_control(driver,
+            lambda: next((node for node in driver.find_elements(By.CSS_SELECTOR,"ytcp-video-metadata-playlists ytcp-dropdown-trigger") if node.is_displayed()),None),
+            timeout=45, message="Chưa mở được ô Danh sách phát; kiểm tra hộp thoại đang che trong Studio.")
         return wait_for(lambda:next((node for node in driver.find_elements(By.CSS_SELECTOR,"ytcp-playlist-dialog") if node.is_displayed()),None),
                         timeout=30,message="Chưa mở được danh sách phát của kênh.")
 
     @staticmethod
-    def _playlist_done(dialog):
-        button=next((node for node in dialog.find_elements(By.CSS_SELECTOR,".done-button") if node.is_displayed() and node.is_enabled()),None)
-        if button is None:
-            raise PublishingBrowserError("Không tìm được nút Xong của danh sách phát.")
-        button.click()
+    def _playlist_done(driver):
+        def locate():
+            for dialog in driver.find_elements(By.CSS_SELECTOR,"ytcp-playlist-dialog"):
+                if dialog.is_displayed():
+                    return next((node for node in dialog.find_elements(By.CSS_SELECTOR,".done-button") if node.is_displayed()),None)
+            return None
+        StudioThumbnailBrowser._click_control(driver, locate, message="Chưa bấm được nút Xong của danh sách phát.")
+        wait_for(lambda: not any(node.is_displayed() for node in driver.find_elements(By.CSS_SELECTOR,"ytcp-playlist-dialog")),
+                 timeout=30, message="Hộp thoại danh sách phát chưa đóng; chưa bấm Lưu.")
+
+    @staticmethod
+    def _playlist_checkbox(driver, playlist_id):
+        for dialog in driver.find_elements(By.CSS_SELECTOR,"ytcp-playlist-dialog"):
+            if not dialog.is_displayed():
+                continue
+            for option in dialog.find_elements(By.CSS_SELECTOR,"#playlists-list ytcp-checkbox-lit"):
+                if option.get_attribute("test-id") == playlist_id:
+                    return next(iter(option.find_elements(By.CSS_SELECTOR,"[role=checkbox]")),None)
+        return None
 
     def _assign_playlist(self, driver, video_id):
-        dialog=self._playlist_dialog(driver)
-        options=wait_for(lambda:[node for node in dialog.find_elements(By.CSS_SELECTOR,"#playlists-list ytcp-checkbox-lit") if node.is_displayed()],
+        self._playlist_dialog(driver)
+        options=wait_for(lambda:[node for node in driver.find_elements(By.CSS_SELECTOR,"ytcp-playlist-dialog #playlists-list ytcp-checkbox-lit") if node.is_displayed()],
                          timeout=30,message="Kênh chưa có danh sách phát để tự chọn mục đầu tiên.")
         first=options[0]
         playlist_id=first.get_attribute("test-id")
         if not playlist_id:
             raise PublishingBrowserError("Chưa đọc được mã danh sách phát đầu tiên; chưa chọn mục khác thay thế.")
-        checkbox=first.find_element(By.CSS_SELECTOR,"[role=checkbox]")
-        title=driver.execute_script("return arguments[0].closest('label')?.querySelector('.label-text')?.textContent || '';",first)
+        checkbox=wait_for(lambda:self._playlist_checkbox(driver,playlist_id),timeout=30,
+                          message="Chưa đọc được ô chọn danh sách phát đầu tiên.")
+        title=driver.execute_script("return arguments[0].closest('label')?.querySelector('.label-text')?.textContent || '';",checkbox)
         info={"playlist_id":playlist_id,"playlist_title":str(title or "").strip()}
         changed=checkbox.get_attribute("aria-checked") != "true"
         if changed:
             if checkbox.get_attribute("aria-disabled") == "true":
                 raise PublishingBrowserError("Danh sách phát đầu tiên đang bị khóa; chưa chọn mục khác thay thế.")
-            checkbox.click()
-            wait_for(lambda:checkbox.get_attribute("aria-checked")=="true",timeout=10,message="Chưa tích được danh sách phát đầu tiên.")
-        self._playlist_done(dialog)
+            self._click_control(driver,lambda:self._playlist_checkbox(driver,playlist_id),
+                                selected=lambda node:node.get_attribute("aria-checked")=="true",
+                                message="Chưa tích được danh sách phát đầu tiên; kiểm tra hộp thoại trong Studio.")
+            wait_for(lambda:(node:=self._playlist_checkbox(driver,playlist_id)) is not None and node.get_attribute("aria-checked")=="true",
+                     timeout=10,message="Chưa tích được danh sách phát đầu tiên.")
+        self._playlist_done(driver)
         if not changed:
             return info
         try:
@@ -755,7 +795,7 @@ class StudioThumbnailBrowser:
             button=None
         if button is not None:
             check_stopped()
-            button.click()
+            self._click_control(driver,lambda:self._save_button(driver),message="Chưa bấm được Lưu danh sách phát trong Studio.")
             try:
                 wait_for(lambda:not self._save_button(driver),timeout=45,message="Studio vẫn hiển thị thay đổi chưa lưu.")
             except PublishingBrowserError:
@@ -763,11 +803,10 @@ class StudioThumbnailBrowser:
         check_stopped()
         driver.refresh()
         self._open_editor(driver,video_id)
-        dialog=self._playlist_dialog(driver)
-        saved=next((node for node in dialog.find_elements(By.CSS_SELECTOR,"#playlists-list ytcp-checkbox-lit") if node.get_attribute("test-id")==playlist_id),None)
-        if saved is None or saved.find_element(By.CSS_SELECTOR,"[role=checkbox]").get_attribute("aria-checked") != "true":
-            raise PublishingBrowserError("Studio chưa lưu video vào danh sách phát đầu tiên; giữ tiến độ để thử tiếp.")
-        self._playlist_done(dialog)
+        self._playlist_dialog(driver)
+        wait_for(lambda:(node:=self._playlist_checkbox(driver,playlist_id)) is not None and node.get_attribute("aria-checked")=="true",
+                 timeout=30,message="Studio chưa lưu video vào danh sách phát đầu tiên; giữ tiến độ để thử tiếp.")
+        self._playlist_done(driver)
         return info
 
     def assign_first_playlist(self, channel_id, video_id):
@@ -830,7 +869,7 @@ class StudioThumbnailBrowser:
                 check_stopped()
                 return self._assign_playlist(driver,video_id) if ensure_playlist else None
             driver.get_log("performance")
-            button.click()
+            self._click_control(driver,save_button,message="Chưa bấm được Lưu thumbnail; kiểm tra hộp thoại đang che trong Studio.")
             saves = set()
             response_ids = set()
             save_asset_ids = {}

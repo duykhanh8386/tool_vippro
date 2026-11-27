@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import requests
+from selenium.common.exceptions import ElementClickInterceptedException, InvalidSessionIdException, TimeoutException
 
 from src.module.model import Video
 from src.module.video_publishing_module import VideoPublishingModule
@@ -285,10 +286,33 @@ class PublishingModuleTests(unittest.TestCase):
 
     def test_changed_original_and_foreign_channel_block_mutation(self):
         for before in (video(title="Manual edit"), video(channel_id=CHANNEL2), video(privacy="PUBLIC"),
-                       video(copyright_check_status="CHECK_COMPLETED"), video(privacy="")):
+                       video(privacy="")):
             with self.subTest(before=before), patch.object(self.module, "_get_video_info", return_value=before), self.assertRaises(ValueError):
                 self.copy_metadata()
         self.post.assert_not_called()
+
+    def test_copyright_changes_do_not_block_metadata_or_scheduling_of_selected_video(self):
+        cases = [
+            {"copyright_check_status": "COPYRIGHT_CHECK_NO_ISSUES"},
+            {"copyright_check_status": "COPYRIGHT_CLAIMED"},
+            {"restriction_details": {"copyrightSummary": {"policy": "COPYRIGHT_POLICY_PARTIALLY_BLOCKED"}}},
+            {"restriction_details": {"copyrightSummary": {"policy": "COPYRIGHT_POLICY_BLOCKED"}}},
+            {"copyright_check_status": "CHECK_COMPLETED"},
+            {"copyright_check_status": "CHECK_STATUS_PENDING"},
+        ]
+        for changes in cases:
+            with self.subTest(changes=changes):
+                self.post.reset_mock()
+                before = video(description="old description", **changes)
+                metadata = video(title=REFERENCE["title"], description=REFERENCE["description"], **changes)
+                scheduled = video(title=REFERENCE["title"], description=REFERENCE["description"],
+                                  scheduled_publishing_details={"publishTimeSeconds": STAMP}, **changes)
+                with patch.object(self.module, "_get_video_info", side_effect=[before, metadata, metadata, scheduled]):
+                    self.module.copy_metadata(CHANNEL, VIDEO, REFERENCE, expected_title="Original",
+                                              expected_description="old description", categories=["partial"])
+                    result = self.module.schedule(CHANNEL, VIDEO, STAMP, REFERENCE, categories=["partial"])
+                self.assertEqual(schedule_timestamp(result), STAMP)
+                self.assertEqual(self.post.call_count, 2)
 
     def test_uncertain_network_response_reads_back_without_resubmitting(self):
         after = video(title=REFERENCE["title"], description=REFERENCE["description"])
@@ -686,6 +710,88 @@ class PublishingControllerTests(unittest.TestCase):
         self.assertEqual(snapshot["rows"][0]["detail"], "Downloading completed image")
         self.assertEqual(snapshot["rows"][0]["status"], "processing")
         self.assertEqual(snapshot["chatgpt_status"], "Downloading completed image")
+
+    def test_unexpected_errors_report_real_type_and_step_without_leaking_exception_text(self):
+        cases = [
+            (TimeoutException, "Chrome chưa tải xong"),
+            (InvalidSessionIdException, "Mất phiên"),
+            (ElementClickInterceptedException, "Chưa thao tác được"),
+            (requests.ConnectionError, "kết nối"),
+            (FileNotFoundError, "Không tìm thấy tệp"),
+            (PermissionError, "Không có quyền"),
+            (KeyError, "Lỗi xử lý nội bộ"),
+        ]
+        secret = "access_token=private-secret-cookie"
+        for exception, expected in cases:
+            with self.subTest(exception=exception):
+                self.controller.rows = [row()]
+                self.reference.find.side_effect = exception(secret)
+                with patch("src.video_publishing_tasks.logger.error") as log:
+                    self.controller._process(self.controller.settings, self.reference, None, "references")
+                saved = self.storage.load_state(STATE_KEY)["rows"][0]
+                self.assertEqual(saved["status"], "error")
+                self.assertEqual(saved["error_step"], "find_reference")
+                self.assertEqual(saved["error_type"], exception.__name__)
+                self.assertTrue(saved["detail"].startswith("Tìm video tham chiếu:"))
+                self.assertIn(expected, saved["detail"])
+                self.assertIn(exception.__name__, saved["detail"])
+                self.assertNotIn(secret, json.dumps(self.storage.data))
+                self.assertNotIn(secret, str(log.call_args))
+                self.assertIn("video_publishing_tasks.py", str(log.call_args))
+        self.module.copy_metadata.assert_not_called()
+        self.module.schedule.assert_not_called()
+
+    def test_error_log_preserves_wrapped_cause_without_its_sensitive_message(self):
+        def fail(*args, **kwargs):
+            try:
+                raise InvalidSessionIdException("cookie=private-secret")
+            except InvalidSessionIdException as cause:
+                raise RuntimeError("access_token=private-secret") from cause
+        self.controller.rows = [row()]
+        self.reference.find.side_effect = fail
+        with patch("src.video_publishing_tasks.logger.error") as log:
+            self.controller._process(self.controller.settings, self.reference, None, "references")
+        recorded = str(log.call_args)
+        self.assertIn("RuntimeError", recorded)
+        self.assertIn("InvalidSessionIdException", recorded)
+        self.assertIn("test_video_publishing.py", recorded)
+        self.assertNotIn("private-secret", recorded)
+        self.assertNotIn("private-secret", json.dumps(self.storage.data))
+
+    def test_schedule_failure_keeps_saved_assets_and_resume_clears_old_error(self):
+        with tempfile.TemporaryDirectory() as folder:
+            thumb = Path(folder) / "thumbnail.jpg"
+            thumb.write_bytes(b"cached")
+            self.controller.rows = [row(reference=REFERENCE, thumbnail_path=str(thumb), publish_at=STAMP)]
+            self.module.schedule.side_effect = [requests.ConnectionError("secret-token"), None]
+            with patch("src.video_publishing_tasks.logger.error"):
+                self.controller._worker("run", create_run_context("schedule-error"))
+            saved = self.storage.load_state(STATE_KEY)["rows"][0]
+            self.assertEqual(saved["error_step"], "schedule_video")
+            self.assertIn("Lưu lịch đăng:", saved["detail"])
+            self.assertTrue(saved["thumbnail_uploaded"])
+            self.assertTrue(saved["playlist_assigned"])
+            self.assertTrue(saved["metadata_copied"])
+            self.controller._worker("run", create_run_context("schedule-error-resume"))
+        self.assertEqual(self.controller.rows[0]["status"], "successful")
+        self.assertEqual(self.controller.rows[0]["error_type"], "")
+        self.assertEqual(self.controller.rows[0]["error_step"], "")
+        self.thumbnail.upload.assert_called_once()
+        self.thumbnail.assign_first_playlist.assert_not_called()
+        self.image.generate.assert_not_called()
+
+    def test_preflight_failure_names_schedule_check_and_does_not_mutate(self):
+        self.controller.rows = [row(publish_at=STAMP)]
+        self.listing.list_all_videos.side_effect = requests.Timeout("secret-token")
+        with patch("src.video_publishing_tasks.logger.error") as log:
+            self.controller._worker("run", create_run_context("preflight-timeout"))
+        self.assertIn("Kiểm tra lịch hiện có:", self.controller.message)
+        self.assertIn("Timeout", self.controller.message)
+        self.assertNotIn("secret-token", self.controller.message)
+        self.assertNotIn("secret-token", str(log.call_args))
+        self.thumbnail.upload.assert_not_called()
+        self.module.copy_metadata.assert_not_called()
+        self.module.schedule.assert_not_called()
 
     def test_storage_failure_stops_before_remote_mutation(self):
         self.controller.rows = [row(publish_at=STAMP)]

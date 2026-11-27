@@ -7,6 +7,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+from selenium.common.exceptions import ElementClickInterceptedException, ElementNotInteractableException, WebDriverException
+
 from src.publishing_browser import ChatGPTImageBrowser, PublishingBrowserError, StudioThumbnailBrowser, YouTubeReferenceBrowser, loaded_search_results, search_result_duration, wait_for
 from src.task_runtime import TaskStopped
 
@@ -204,6 +206,40 @@ class ReferencePriorityTests(unittest.TestCase):
                                    ({"lengthSeconds": "61.234"}, 61.234), ({"lengthText": {"simpleText": "LIVE"}}, None),
                                    ({"lengthText": {"simpleText": "01:99"}}, None), ({}, None)):
             self.assertEqual(search_result_duration(renderer), expected)
+
+
+class StudioControlTests(unittest.TestCase):
+    def test_obscured_control_is_relocated_before_retrying_native_click(self):
+        driver, old, current = Mock(), Mock(), Mock()
+        for node in (old, current):
+            node.is_displayed.return_value = True
+            node.is_enabled.return_value = True
+            node.get_attribute.return_value = None
+        old.click.side_effect = ElementClickInterceptedException("dialog closing")
+        current.click.side_effect = [ElementNotInteractableException("rendering"), None]
+        locate = Mock(side_effect=[old, current, current])
+        with patch("src.publishing_browser.wait_interruptibly"):
+            StudioThumbnailBrowser._click_control(driver, locate, message="not ready")
+        self.assertEqual(locate.call_count, 3)
+        old.click.assert_called_once()
+        self.assertEqual(current.click.call_count, 2)
+
+    def test_checked_playlist_is_not_toggled_off_when_relocated(self):
+        driver, checked = Mock(), Mock()
+        checked.is_displayed.return_value = True
+        checked.get_attribute.return_value = "true"
+        StudioThumbnailBrowser._click_control(driver, lambda:checked, selected=lambda node:node.get_attribute("aria-checked")=="true", message="not ready")
+        checked.click.assert_not_called()
+
+    def test_uncertain_driver_failure_is_not_retried_as_another_save(self):
+        driver, button = Mock(), Mock()
+        button.is_displayed.return_value = True
+        button.is_enabled.return_value = True
+        button.get_attribute.return_value = None
+        button.click.side_effect = WebDriverException("connection lost after command")
+        with self.assertRaises(WebDriverException):
+            StudioThumbnailBrowser._click_control(driver, lambda:button, message="not ready")
+        button.click.assert_called_once()
 
 
 class ThumbnailSaveTests(unittest.TestCase):

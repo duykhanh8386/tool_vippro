@@ -38,7 +38,7 @@ save.onclick=async()=>{
  body:JSON.stringify(body)});
  thumbnailDirty=false;save.disabled=true;
 };</script>
-<ytcp-playlist-dialog style="display:none"><div id="playlists-list">
+<ytcp-playlist-dialog style="display:none;position:fixed;inset:0;background:white;z-index:1000"><div id="playlists-list">
 <label><ytcp-checkbox-lit test-id="PL-first"><div role="checkbox" aria-checked="false" aria-disabled="false">Check</div></ytcp-checkbox-lit><span class="label-text">First playlist</span></label>
 <label><ytcp-checkbox-lit test-id="PL-existing"><div role="checkbox" aria-checked="true" aria-disabled="false">Check</div></ytcp-checkbox-lit><span class="label-text">Existing playlist</span></label>
 </div><ytcp-button class="done-button" role="button">Done</ytcp-button></ytcp-playlist-dialog><script>
@@ -49,7 +49,12 @@ for(const checkbox of document.querySelectorAll('[role=checkbox]')){
  checkbox.setAttribute('aria-checked',assigned.includes(id)?'true':'false');
  checkbox.onclick=()=>checkbox.setAttribute('aria-checked',checkbox.getAttribute('aria-checked')==='true'?'false':'true');
 }
-document.querySelector('.done-button').onclick=()=>{dialog.style.display='none';save.disabled=false;};
+document.querySelector('.done-button').onclick=()=>{
+ save.disabled=false;
+ // Studio enables Save while its playlist dialog is still closing. A click
+ // before the transition finishes hits the dialog instead of the Save button.
+ setTimeout(()=>dialog.style.display='none',1800);
+};
 </script>'''
 
 
@@ -75,6 +80,7 @@ class StudioFixture(BaseHTTPRequestHandler):
         if "playlists" in data:
             self.server.steps.append("playlist")
             self.server.playlists=data["playlists"]
+            state["videoPrechecks"]["videoUploadChecksNotMonetized"]["copyrightCheck"]["checkStatus"]="CHECK_STATUS_PENDING"
         if "scheduledPublishing" in data:
             self.server.steps.append("schedule")
             state["scheduledPublishingDetails"] = {"publishTimeSeconds":data["scheduledPublishing"]["set"]["timeSec"]}
