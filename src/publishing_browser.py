@@ -836,7 +836,8 @@ class StudioThumbnailBrowser:
         wait_for(lambda:(node:=self._playlist_checkbox(driver,playlist_id)) is not None and node.get_attribute("aria-checked")=="true",
                  timeout=10,message="Đã bấm checkbox nhưng Studio chưa xác nhận tích danh sách phát đầu tiên.")
 
-    def _assign_playlist(self, driver, video_id):
+    def _stage_first_playlist(self, driver):
+        """Choose a playlist and press Done, leaving the main Save untouched."""
         self._playlist_dialog(driver)
         options=wait_for(lambda:[node for node in driver.find_elements(By.CSS_SELECTOR,"ytcp-playlist-dialog #playlists-list ytcp-checkbox-lit") if node.is_displayed()],
                          timeout=30,message="Kênh chưa có danh sách phát để tự chọn mục đầu tiên.")
@@ -854,6 +855,11 @@ class StudioThumbnailBrowser:
                 raise PublishingBrowserError("Danh sách phát đầu tiên đang bị khóa; chưa chọn mục khác thay thế.")
             self._select_playlist(driver,playlist_id)
         self._playlist_done(driver)
+        return info, changed
+
+    def _assign_playlist(self, driver, video_id):
+        info, changed = self._stage_first_playlist(driver)
+        playlist_id = info["playlist_id"]
         if not changed:
             return info
         try:
@@ -875,6 +881,10 @@ class StudioThumbnailBrowser:
                  timeout=30,message="Studio chưa lưu video vào danh sách phát đầu tiên; giữ tiến độ để thử tiếp.")
         self._playlist_done(driver)
         return info
+
+    def publish(self, channel_id, video_id, path, reference, publish_at, **options):
+        from src.studio_publishing_editor import StudioPublishingEditor
+        return StudioPublishingEditor(self).publish(channel_id, video_id, path, reference, publish_at, **options)
 
     def assign_first_playlist(self, channel_id, video_id):
         channel=get_channels_info(channel_id)

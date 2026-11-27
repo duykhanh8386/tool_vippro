@@ -43,6 +43,7 @@ STEP_LABELS = {
     "normalize_thumbnail": "Chuẩn hóa thumbnail", "upload_thumbnail": "Lưu thumbnail và danh sách phát",
     "assign_playlist": "Lưu danh sách phát", "copy_metadata": "Lưu title/description",
     "schedule_video": "Lưu lịch đăng", "process": "Xử lý video",
+    "final_save": "Lưu toàn bộ video", "verify_saved": "Kiểm tra video đã lưu",
 }
 
 
@@ -306,6 +307,12 @@ class VideoPublishingController:
             self.revision += 1
             self._save()
 
+    def _remember_publication(self, row, receipt):
+        with self.lock:
+            row["publishing_request"] = copy.deepcopy(receipt)
+            self.revision += 1
+            self._save()
+
     def _progress(self, message):
         with self.lock:
             self.message = message
@@ -549,29 +556,24 @@ class VideoPublishingController:
                     self._checkpoint(row, step="normalize_thumbnail", detail="Đã tải ảnh ChatGPT; đang chuẩn hóa thumbnail JPEG 1280×720…")
                     path = normalize_thumbnail(raw, base + ".jpg")
                     self._checkpoint(row, thumbnail_path=path)
-                if not row.get("thumbnail_uploaded"):
-                    self._checkpoint(row, step="upload_thumbnail", detail="Đang tải thumbnail và đọc lại ảnh đã lưu trên YouTube…")
-                    self.module.require_eligible(row["channel_id"], row["video_id"], categories, publish_at=row["publish_at"])
-                    playlist = thumbnail.upload(row["channel_id"], row["video_id"], row["thumbnail_path"], ensure_playlist=True,
-                                                on_saved=lambda row=row:self._remember_thumbnail_saved(row))
-                    self._checkpoint(row, thumbnail_uploaded=True)
-                elif not row.get("playlist_assigned"):
-                    self._checkpoint(row, step="assign_playlist", detail="Đang chọn và lưu danh sách phát đầu tiên…")
-                    playlist = thumbnail.assign_first_playlist(row["channel_id"],row["video_id"])
-                else:
-                    playlist = None
-                if not row.get("playlist_assigned"):
-                    if not isinstance(playlist,dict) or not playlist.get("playlist_id"):
-                        raise ValueError("Chưa xác nhận được danh sách phát đầu tiên; chưa đặt lịch video này.")
-                    self._checkpoint(row,playlist_assigned=True,**playlist)
-                self._checkpoint(row, step="copy_metadata", detail="Đã xác nhận thumbnail và danh sách phát. Đang chép title/description…")
-                self.module.copy_metadata(row["channel_id"], row["video_id"], row["reference"],
-                                          expected_title=row["old_title"], expected_description=row["old_description"],
-                                          categories=categories, publish_at=row["publish_at"])
-                self._checkpoint(row, metadata_copied=True)
-                self._checkpoint(row, step="schedule_video", detail="Đang đặt lịch và đọc lại kết quả…")
-                self.module.schedule(row["channel_id"], row["video_id"], row["publish_at"], row["reference"], categories=categories)
-                self._checkpoint(row, status="successful", selected=False, detail="Đã xác nhận metadata và lịch đăng trên YouTube.")
+                self._checkpoint(row, step="upload_thumbnail", detail="Đang mở Studio để cập nhật thumbnail, metadata, playlist và lịch…")
+                self.module.require_eligible(row["channel_id"], row["video_id"], categories, publish_at=row["publish_at"])
+                result = thumbnail.publish(row["channel_id"], row["video_id"], row["thumbnail_path"], row["reference"], row["publish_at"],
+                    expected_title=row["old_title"], expected_description=row["old_description"],
+                    thumbnail_uploaded=bool(row.get("thumbnail_uploaded")),
+                    before_save=lambda row=row,categories=categories:self.module.require_eligible(row["channel_id"],row["video_id"],categories,publish_at=row["publish_at"]),
+                    on_saved=lambda row=row:self._remember_thumbnail_saved(row),
+                    on_submit=lambda receipt, row=row:self._remember_publication(row, receipt),
+                    on_progress=lambda step, message, row=row:self._checkpoint(row, step=step, detail=message))
+                if (not isinstance(result, dict) or result.get("verified") is not True
+                        or result.get("video_id") != row["video_id"] or result.get("channel_id") != row["channel_id"]
+                        or result.get("publish_at") != row["publish_at"] or not result.get("playlist_id")):
+                    raise ValueError("Studio chưa xác nhận đủ thumbnail, metadata, playlist và lịch của đúng video; giữ tiến độ để kiểm tra lại.")
+                self._checkpoint(row, status="successful", selected=False, thumbnail_uploaded=True, metadata_copied=True, playlist_assigned=True,
+                                 visibility_type="scheduled", visibility_label=VIDEO_TYPE_LABELS["scheduled"],
+                                 playlist_id=result["playlist_id"], playlist_title=result.get("playlist_title", ""),
+                                 thumbnail_asset_id=result.get("thumbnail_asset_id", ""), publishing_flow_version=2,
+                                 detail="Đã xác nhận thumbnail, title/description, playlist và lịch sau lần Lưu cuối trong Studio.")
             except ChatGPTSessionNeedsAction as exc:
                 self._session_progress(str(exc))
                 self._checkpoint(row, status="waiting_session", detail=str(exc))
@@ -616,6 +618,14 @@ class VideoPublishingController:
                 seen[current.id] = current
                 kind = publishing_video_type(current)
                 stamp = schedule_timestamp(current)
+                receipt = row.get("publishing_request") or {}
+                own_pending_save = (receipt.get("save_clicked") is True and receipt.get("video_id") == row["video_id"]
+                                    and receipt.get("channel_id") == channel_id and receipt.get("publish_at") == stamp)
+                if kind == "scheduled" and own_pending_save:
+                    # A lost response can leave a fully saved schedule. Let the
+                    # native editor verify all fields, without changing its day.
+                    remote_pending[row["video_id"]] = int(stamp)
+                    continue
                 if kind in {"scheduled", "public"}:
                     changes = dict(selected=False, visibility_type=kind, visibility_label=VIDEO_TYPE_LABELS[kind], status="skipped",
                                    availability_reason="Video đã có lịch đăng; giữ lịch hiện tại." if kind=="scheduled" else "Video đã công khai; giữ trạng thái hiện tại.",

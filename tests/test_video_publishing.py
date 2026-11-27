@@ -368,12 +368,18 @@ class PublishingControllerTests(unittest.TestCase):
         self.module.read_video.side_effect = lambda channel_id,video_id:video(video_id,channel_id=channel_id)
         self.thumbnail.upload.return_value = {"playlist_id":"PL-first","playlist_title":"First playlist"}
         self.thumbnail.assign_first_playlist.return_value = {"playlist_id":"PL-first","playlist_title":"First playlist"}
+        self.thumbnail.publish.side_effect = self.published
         self.reference.find.return_value = dict(REFERENCE)
         self.listing.list_all_videos.return_value = ([], None)
         self.controller = VideoPublishingController(storage=self.storage, module=self.module, listing=self.listing,
                 reference_factory=lambda: self.reference, image_factory=lambda session: self.image, thumbnail_factory=lambda: self.thumbnail)
         self.controller.settings.update(channel_ids=[CHANNEL], start_date="2099-01-02", hour="18:00")
         self.controller.set_session('{"accessToken":"private-secret"}')
+
+    @staticmethod
+    def published(channel_id, video_id, path, reference, publish_at, **options):
+        return {"verified":True,"channel_id":channel_id,"video_id":video_id,"publish_at":publish_at,
+                "playlist_id":"PL-first","playlist_title":"First playlist"}
 
     def test_pending_session_never_saved_or_returned_in_snapshot(self):
         self.controller.change_settings(hour="19:00")
@@ -388,13 +394,35 @@ class PublishingControllerTests(unittest.TestCase):
             self.controller.rows = [row(reference=REFERENCE, thumbnail_path=str(path), publish_at=STAMP), row(OTHER, publish_at=STAMP+86400)]
             self.image.ensure_ready.side_effect = ChatGPTSessionNeedsAction("Verify next image", reason="verification")
             timeline = Mock()
-            timeline.attach_mock(self.thumbnail.upload, "thumbnail")
-            timeline.attach_mock(self.module.copy_metadata, "metadata")
-            timeline.attach_mock(self.module.schedule, "schedule")
+            timeline.attach_mock(self.thumbnail.publish, "publish")
             self.controller._worker("run", create_run_context("publishing-saved-image-first"))
-        self.assertEqual([item[0] for item in timeline.mock_calls], ["thumbnail", "metadata", "schedule"])
+        self.assertEqual([item[0] for item in timeline.mock_calls], ["publish"])
         self.assertEqual([item["status"] for item in self.controller.rows], ["successful", "waiting_session"])
         self.image.generate.assert_not_called()
+
+    def test_own_pending_native_save_is_verified_without_skipping_or_moving_its_day(self):
+        receipt={"save_clicked":True,"channel_id":CHANNEL,"video_id":VIDEO,"publish_at":STAMP}
+        self.controller.rows=[row(publish_at=STAMP,publishing_request=receipt)]
+        self.module.read_video.side_effect=lambda channel_id,video_id:video(video_id,channel_id=channel_id,scheduled_publishing_details={"publishTimeSeconds":STAMP})
+        self.controller._check_schedule_conflicts()
+        self.assertTrue(self.controller.rows[0]["selected"])
+        self.assertEqual(self.controller.rows[0]["publish_at"],STAMP)
+        self.assertNotEqual(self.controller.rows[0]["status"],"skipped")
+
+    def test_unverified_or_other_video_result_does_not_mark_native_save_successful(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path=Path(folder)/"thumb.jpg";path.write_bytes(b"saved")
+            good=self.published(CHANNEL,VIDEO,str(path),REFERENCE,STAMP)
+            for changes in ({"verified":False},{"video_id":OTHER},{"channel_id":CHANNEL2},{"publish_at":STAMP+86400},{"playlist_id":""}):
+                with self.subTest(changes=changes):
+                    self.controller.rows=[row(reference=REFERENCE,thumbnail_path=str(path),publish_at=STAMP)]
+                    self.thumbnail.publish.side_effect=None
+                    self.thumbnail.publish.return_value={**good,**changes}
+                    with patch("src.video_publishing_tasks.logger.error"):
+                        self.controller._process(self.controller.settings,self.reference,None,"run")
+                    self.assertEqual(self.controller.rows[0]["status"],"error")
+                    self.assertFalse(self.controller.rows[0].get("metadata_copied",False))
+                    self.assertFalse(self.controller.rows[0].get("playlist_assigned",False))
 
     def test_thumbnail_name_keeps_title_and_video_identity(self):
         stem = thumbnail_file_stem('เพลงไทย 1.2 / Live: Music?', VIDEO)
@@ -463,9 +491,9 @@ class PublishingControllerTests(unittest.TestCase):
         submitted = next(arguments for action, arguments in actions if action == "start")
         self.assertEqual(submitted["model"], "gpt-6-high")
         self.assertEqual(submitted["size"], "16:9")
-        self.thumbnail.upload.assert_called_once()
-        self.module.copy_metadata.assert_called_once()
-        self.module.schedule.assert_called_once()
+        self.thumbnail.publish.assert_called_once()
+        self.module.copy_metadata.assert_not_called()
+        self.module.schedule.assert_not_called()
         self.image.generate.assert_not_called()
 
     def test_scan_all_pages_deduplicates_drafts_filters_and_reserves_days(self):
@@ -648,20 +676,26 @@ class PublishingControllerTests(unittest.TestCase):
         self.assertEqual(schedule_timestamp(video(scheduled_publishing_details={"isScheduled":False,"timeSec":STAMP},
                                                  scheduled_creator_visibility={"timeSec":STAMP+86400})),STAMP+86400)
 
-    def test_playlist_is_added_before_metadata_and_kept_when_retrying(self):
+    def test_native_save_receipt_is_kept_and_retry_uses_saved_thumbnail(self):
         with tempfile.TemporaryDirectory() as folder:
             path=Path(folder)/"thumb.jpg";path.write_bytes(b"cached")
             self.controller.rows=[row(reference=REFERENCE,thumbnail_path=str(path),thumbnail_uploaded=True,publish_at=STAMP)]
-            order=Mock()
-            order.attach_mock(self.thumbnail.assign_first_playlist,"playlist")
-            order.attach_mock(self.module.copy_metadata,"metadata")
-            order.attach_mock(self.module.schedule,"schedule")
-            self.module.schedule.side_effect=[ValueError("pending"),None]
+            calls=[]
+            def publish(*args, **kwargs):
+                calls.append(kwargs)
+                if len(calls)==1:
+                    kwargs["on_submit"]({"video_id":VIDEO,"publish_at":STAMP,"save_clicked":True})
+                    raise ValueError("pending")
+                return self.published(*args, **kwargs)
+            self.thumbnail.publish.side_effect=publish
             self.controller._worker("run",create_run_context("playlist-first-attempt"))
-            self.assertTrue(self.controller.rows[0]["playlist_assigned"])
+            self.assertTrue(self.controller.rows[0]["publishing_request"]["save_clicked"])
             self.controller._worker("run",create_run_context("playlist-resume"))
-        self.assertEqual([call[0] for call in order.mock_calls], ["playlist","metadata","schedule","metadata","schedule"])
-        self.thumbnail.assign_first_playlist.assert_called_once()
+        self.assertEqual(len(calls),2)
+        self.assertTrue(calls[1]["thumbnail_uploaded"])
+        self.assertEqual(self.controller.rows[0]["status"],"successful")
+        self.module.copy_metadata.assert_not_called()
+        self.module.schedule.assert_not_called()
         self.image.generate.assert_not_called()
 
     def test_full_worker_checkpoints_and_resumes_without_regenerating(self):
@@ -671,7 +705,14 @@ class PublishingControllerTests(unittest.TestCase):
             thumb = Path(folder) / "thumbnail.jpg"
             thumb.write_bytes(b"fake")
             self.image.generate.side_effect = lambda *args, **kw: (kw["on_conversation"]("https://chatgpt.com/c/abc-123") or "generated")
-            self.module.schedule.side_effect = [ValueError("response pending"), None]
+            calls=[]
+            def publish(*args, **kwargs):
+                calls.append(kwargs)
+                if len(calls)==1:
+                    kwargs["on_saved"]()
+                    raise ValueError("response pending")
+                return self.published(*args, **kwargs)
+            self.thumbnail.publish.side_effect=publish
             with patch("src.video_publishing_tasks.download_reference_image", return_value="reference.jpg"), patch("src.video_publishing_tasks.normalize_thumbnail", return_value=str(thumb)):
                 self.controller._worker("run", create_run_context("publishing-test"))
                 self.assertEqual(self.controller.rows[0]["status"], "error")
@@ -683,7 +724,8 @@ class PublishingControllerTests(unittest.TestCase):
             self.assertFalse(self.controller.rows[0]["selected"])
             self.assertEqual(self.image.generate.call_count, 1)
             self.assertEqual(self.reference.find.call_count, 1)
-            self.assertEqual(self.thumbnail.upload.call_count, 1)
+            self.assertEqual(self.thumbnail.publish.call_count, 2)
+            self.assertTrue(calls[1]["thumbnail_uploaded"])
 
     def test_resume_after_chatgpt_pause_reuses_valid_source_without_searching_again(self):
         reference = {**REFERENCE, "selection_version": REFERENCE_SELECTION_VERSION,
@@ -701,7 +743,7 @@ class PublishingControllerTests(unittest.TestCase):
         self.assertEqual(self.image.generate.call_args.kwargs["conversation_url"], "https://chatgpt.com/c/keep")
         self.assertEqual(self.controller.rows[0]["reference"], reference)
         self.assertEqual(self.controller.rows[0]["status"], "successful")
-        self.module.schedule.assert_called_once()
+        self.thumbnail.publish.assert_called_once()
 
     def test_progress_reports_which_chatgpt_step_is_running(self):
         self.controller.rows = [row()]
@@ -763,20 +805,28 @@ class PublishingControllerTests(unittest.TestCase):
             thumb = Path(folder) / "thumbnail.jpg"
             thumb.write_bytes(b"cached")
             self.controller.rows = [row(reference=REFERENCE, thumbnail_path=str(thumb), publish_at=STAMP)]
-            self.module.schedule.side_effect = [requests.ConnectionError("secret-token"), None]
+            calls=[]
+            def publish(*args, **kwargs):
+                calls.append(kwargs)
+                if len(calls)==1:
+                    kwargs["on_saved"]()
+                    kwargs["on_progress"]("verify_saved","Checking final save")
+                    raise requests.ConnectionError("secret-token")
+                return self.published(*args, **kwargs)
+            self.thumbnail.publish.side_effect=publish
             with patch("src.video_publishing_tasks.logger.error"):
                 self.controller._worker("run", create_run_context("schedule-error"))
             saved = self.storage.load_state(STATE_KEY)["rows"][0]
-            self.assertEqual(saved["error_step"], "schedule_video")
-            self.assertIn("Lưu lịch đăng:", saved["detail"])
+            self.assertEqual(saved["error_step"], "verify_saved")
+            self.assertIn("Kiểm tra video đã lưu:", saved["detail"])
             self.assertTrue(saved["thumbnail_uploaded"])
-            self.assertTrue(saved["playlist_assigned"])
-            self.assertTrue(saved["metadata_copied"])
+            self.assertFalse(saved.get("playlist_assigned",False))
+            self.assertFalse(saved.get("metadata_copied",False))
             self.controller._worker("run", create_run_context("schedule-error-resume"))
         self.assertEqual(self.controller.rows[0]["status"], "successful")
         self.assertEqual(self.controller.rows[0]["error_type"], "")
         self.assertEqual(self.controller.rows[0]["error_step"], "")
-        self.thumbnail.upload.assert_called_once()
+        self.assertEqual(self.thumbnail.publish.call_count,2)
         self.thumbnail.assign_first_playlist.assert_not_called()
         self.image.generate.assert_not_called()
 
@@ -843,7 +893,7 @@ class PublishingControllerTests(unittest.TestCase):
             self.controller._worker("run", create_run_context("publishing-auto-resume"))
         self.assertEqual(observed, [(True, "waiting_session")])
         self.image.generate.assert_called_once()
-        self.module.schedule.assert_called_once()
+        self.thumbnail.publish.assert_called_once()
         self.assertEqual(self.controller.rows[0]["status"], "successful")
         self.image.close.assert_not_called()
 
