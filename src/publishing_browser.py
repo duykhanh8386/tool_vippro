@@ -778,9 +778,10 @@ class StudioThumbnailBrowser:
             raise PublishingBrowserError(message + " Lý do: " + blocked[0] + ".") from None
 
     @staticmethod
-    def _playlist_dialog(driver):
+    def _playlist_dialog(driver, *, scope=None):
+        root = scope or driver
         StudioThumbnailBrowser._click_control(driver,
-            lambda: next((node for node in driver.find_elements(By.CSS_SELECTOR,"ytcp-video-metadata-playlists ytcp-dropdown-trigger") if node.is_displayed()),None),
+            lambda: next((node for node in root.find_elements(By.CSS_SELECTOR,"ytcp-video-metadata-playlists ytcp-dropdown-trigger") if node.is_displayed()),None),
             timeout=45, message="Chưa mở được ô Danh sách phát; kiểm tra hộp thoại đang che trong Studio.")
         return wait_for(lambda:next((node for node in driver.find_elements(By.CSS_SELECTOR,"ytcp-playlist-dialog") if StudioThumbnailBrowser._playlist_is_open(node)),None),
                         timeout=30,message="Chưa mở được danh sách phát của kênh.")
@@ -836,9 +837,9 @@ class StudioThumbnailBrowser:
         wait_for(lambda:(node:=self._playlist_checkbox(driver,playlist_id)) is not None and node.get_attribute("aria-checked")=="true",
                  timeout=10,message="Đã bấm checkbox nhưng Studio chưa xác nhận tích danh sách phát đầu tiên.")
 
-    def _stage_first_playlist(self, driver):
+    def _stage_first_playlist(self, driver, *, scope=None):
         """Choose a playlist and press Done, leaving the main Save untouched."""
-        self._playlist_dialog(driver)
+        self._playlist_dialog(driver, scope=scope)
         options=wait_for(lambda:[node for node in driver.find_elements(By.CSS_SELECTOR,"ytcp-playlist-dialog #playlists-list ytcp-checkbox-lit") if node.is_displayed()],
                          timeout=30,message="Kênh chưa có danh sách phát để tự chọn mục đầu tiên.")
         first=options[0]

@@ -38,8 +38,8 @@ def field_text(driver, node):
     """, node) or ""
 
 
-def set_text(driver, node, text, *, commit=Keys.TAB):
-    if VideoPublishingModule._same_text(field_text(driver, node), text):
+def set_text(driver, node, text, *, commit=Keys.TAB, force=False):
+    if not force and VideoPublishingModule._same_text(field_text(driver, node), text):
         return
     driver.execute_script("arguments[0].scrollIntoView({block:'center'});", node)
     node.click()
@@ -56,17 +56,26 @@ def set_text(driver, node, text, *, commit=Keys.TAB):
         if line:
             driver.execute_cdp_cmd("Input.insertText", {"text": line})
     actual = field_text(driver, node)
-    if plain.endswith("\n") and actual == plain + "\n" and node.get_attribute("contenteditable") == "true":
-        # Chrome keeps an extra caret line at the end of a contenteditable.
-        # Replace that representation with plain text and notify the editor;
-        # no HTML from the reference is interpreted, and Save still persists it.
+    if (
+        node.get_attribute("contenteditable") == "true"
+        and actual.endswith("\n")
+        and VideoPublishingModule._same_text(actual[:-1], plain)
+    ):
+        # Chrome keeps an extra caret sentinel newline at the end of pre-wrap
+        # contenteditable fields after line breaks even when plain has no
+        # trailing newline. Replace that DOM representation with plain text
+        # and notify the editor; no HTML from the reference is interpreted.
         driver.execute_script("""
             arguments[0].textContent=arguments[1];
             arguments[0].dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:arguments[1]}));
         """, node, plain)
     if not VideoPublishingModule._same_text(field_text(driver, node), text):
         raise PublishingBrowserError("Studio chưa nhận đúng nội dung vừa nhập; chưa bấm Lưu.")
-    node.send_keys(commit)
+    if isinstance(commit, (tuple, list)):
+        for key in commit:
+            node.send_keys(key)
+    elif commit:
+        node.send_keys(commit)
 
 
 def validate_metadata(title, description, reference, expected_title, expected_description):
@@ -227,14 +236,62 @@ class StudioPublishingEditor:
         wait_for(lambda:self._state(driver, select).get("offset")==420 and self._state(driver, select).get("timezoneIndex")==0,
                  timeout=10, message="Studio chưa nhận múi giờ UTC+7.")
 
-    def _stage_schedule(self, driver, publish_at):
-        select = self._visibility(driver)
-        original = self._state(driver, select)
-        was_scheduled = self._scheduled_badge(driver)
-        if was_scheduled:
-            if original.get("timestamp") != int(publish_at):
-                raise PublishingBrowserError("Studio đang có lịch khác ngày/giờ đã chọn; giữ nguyên lịch hiện tại.")
-        if not original.get("scheduled"):
+    def _draft_edit_button(self, driver):
+        return self.controls._button_control(driver, "ytcp-banner.entity-banner #action-1")
+
+    def _editor_mode(self, driver):
+        if visible(driver, "ytcp-video-metadata-visibility #container") is not None:
+            return "standard"
+        if self._draft_edit_button(driver) is None:
+            return None
+        is_draft = driver.execute_script("""
+            if (document.querySelector('ytcp-video-metadata-visibility #container')) return false;
+            const editor = document.querySelector('ytcp-video-metadata-editor');
+            const draft = String(editor?.video?.draftStatus ?? editor?.isDraft ?? '').toUpperCase();
+            if (draft && !/UNSPECIFIED|NOT_DRAFT/.test(draft)) return true;
+            return !!document.querySelector('ytcp-video-metadata-editor-sidepanel ytcp-video-info');
+        """)
+        return "draft" if is_draft else None
+
+    def _wait_editor_mode(self, driver, timeout=30):
+        return wait_for(
+            lambda: self._editor_mode(driver),
+            timeout=timeout,
+            message="Chưa tải được trạng thái hiển thị video trong Studio.",
+        )
+
+    def _open_draft_dialog(self, driver, video_id):
+        self.controls._click_control(
+            driver,
+            lambda: self._draft_edit_button(driver),
+            timeout=30,
+            message="Chưa mở được hộp thoại Chỉnh sửa bản nháp trong Studio.",
+        )
+        dialog = wait_for(
+            lambda: visible(driver, "ytcp-uploads-dialog"),
+            timeout=30,
+            message="Chưa tải được hộp thoại Chỉnh sửa bản nháp trong Studio.",
+        )
+        dialog_video = dialog.get_attribute("video-id")
+        if dialog_video and dialog_video != video_id:
+            raise PublishingBrowserError("Hộp thoại bản nháp Studio không khớp đúng video; chưa bấm Lưu.")
+        if visible(dialog, TITLE) is None or visible(dialog, DESCRIPTION) is None:
+            self.controls._click_control(
+                driver,
+                lambda: visible(dialog, "#step-badge-0, [test-id='DETAILS']"),
+                timeout=30,
+                message="Chưa mở được bước Chi tiết trong hộp thoại bản nháp Studio.",
+            )
+            wait_for(
+                lambda: visible(dialog, TITLE) and visible(dialog, DESCRIPTION),
+                timeout=30,
+                message="Chưa tải được ô title/description trong hộp thoại bản nháp Studio.",
+            )
+        return dialog
+
+    def _fill_schedule(self, driver, select, publish_at, *, original=None):
+        current_state = original if original is not None else self._state(driver, select)
+        if not current_state.get("scheduled"):
             self.controls._click_control(driver, lambda:visible(select, "#second-container-expand-button"),
                                          message="Chưa chọn được mục Lên lịch công khai.")
             wait_for(lambda:self._state(driver, select).get("scheduled") and visible(select, "ytcp-datetime-picker input"),
@@ -258,7 +315,7 @@ class StudioPublishingEditor:
                 return new Intl.DateTimeFormat(locale,{year:'numeric',month:'short',day:'numeric',timeZone:'UTC'})
                     .format(new Date(Date.UTC(target.year,target.month,target.day,12)));
             """, field, expected_date, state["date"])
-            set_text(driver, field, date_text, commit=Keys.ENTER)
+            set_text(driver, field, date_text, commit=Keys.ENTER, force=True)
             wait_for(lambda:self._state(driver, select).get("date")==expected_date, timeout=10,
                      message="Studio chưa nhận đúng ngày đăng; chưa bấm Lưu.")
             wait_for(lambda:visible(driver, "ytcp-date-picker input") is None, timeout=10,
@@ -270,12 +327,21 @@ class StudioPublishingEditor:
                              timeout=10, message="Chưa tìm thấy ô giờ đăng.")
             current_time = field_text(driver, field)
             text = target.strftime("%I:%M %p").lstrip("0") if re.search(r"\b[AP]M\b", current_time, re.I) else target.strftime("%H:%M")
-            set_text(driver, field, text)
+            set_text(driver, field, text, commit=(Keys.ENTER, Keys.TAB), force=True)
             wait_for(lambda:self._state(driver, select).get("seconds")==expected_seconds, timeout=10,
                      message="Studio chưa nhận đúng giờ đăng; chưa bấm Lưu.")
         state = self._state(driver, select)
         if not state.get("scheduled") or state.get("timestamp") != int(publish_at) or state.get("offset") != 420:
             raise PublishingBrowserError("Ngày/giờ công khai Studio nhận còn khác lịch UTC+7 đã chọn; chưa bấm Lưu.")
+
+    def _stage_schedule(self, driver, publish_at):
+        select = self._visibility(driver)
+        original = self._state(driver, select)
+        was_scheduled = self._scheduled_badge(driver)
+        if was_scheduled:
+            if original.get("timestamp") != int(publish_at):
+                raise PublishingBrowserError("Studio đang có lịch khác ngày/giờ đã chọn; giữ nguyên lịch hiện tại.")
+        self._fill_schedule(driver, select, publish_at, original=original)
         popup = visible(driver, "ytcp-video-visibility-edit-popup")
         if self.controls._button_control(popup, "#save-button") is not None:
             self.controls._click_control(driver, lambda:self.controls._button_control(popup, "#save-button"),
@@ -285,6 +351,21 @@ class StudioPublishingEditor:
         else:
             self._close_visibility(driver)
         return not was_scheduled or original.get("timestamp") != publish_at
+
+    def _stage_draft_schedule(self, driver, dialog, publish_at):
+        self.controls._click_control(
+            driver,
+            lambda: visible(dialog, "#step-badge-3, [test-id='REVIEW']"),
+            timeout=30,
+            message="Chưa mở được bước Chế độ hiển thị trong hộp thoại bản nháp Studio.",
+        )
+        select = wait_for(
+            lambda: visible(dialog, "ytcp-video-visibility-select"),
+            timeout=30,
+            message="Chưa tải được phần Lên lịch trong hộp thoại bản nháp Studio.",
+        )
+        self._fill_schedule(driver, select, publish_at)
+        return True
 
     @staticmethod
     def _scheduled_badge(driver):
@@ -317,8 +398,9 @@ class StudioPublishingEditor:
             driver.execute_cdp_cmd("Emulation.setTimezoneOverride", {"timezoneId":"Asia/Bangkok"})
             inject_cookies_via_cdp(driver, channel.cookies)
             self._open(driver, video_id)
-            wait_for(lambda:visible(driver,"ytcp-video-metadata-visibility #container"),timeout=30,
-                     message="Chưa tải được trạng thái hiển thị video trong Studio.")
+            mode = self._wait_editor_mode(driver)
+            if mode == "draft":
+                return {"source":"studio_ui","channel_id":channel_id,"video_id":video_id,"scheduled":False,"publish_at":None}
             proof = {"source":"studio_ui","channel_id":channel_id,"video_id":video_id,
                      "scheduled":self._scheduled_badge(driver),"publish_at":None}
             if proof["scheduled"]:
@@ -347,26 +429,34 @@ class StudioPublishingEditor:
             driver.execute_cdp_cmd("Emulation.setTimezoneOverride", {"timezoneId":"Asia/Bangkok"})
             inject_cookies_via_cdp(driver, channel.cookies)
             self._open(driver, video_id)
-            title, description = visible(driver, TITLE), visible(driver, DESCRIPTION)
+            mode = self._wait_editor_mode(driver)
+            scope = self._open_draft_dialog(driver, video_id) if mode == "draft" else driver
+            title, description = visible(scope, TITLE), visible(scope, DESCRIPTION)
             validate_metadata(field_text(driver, title), field_text(driver, description), reference, expected_title, expected_description)
+            pre_observer = NativeSave(driver, channel_id, video_id, verify)
+            driver.get_log("performance")
             changed = not saved_thumbnail
             if not saved_thumbnail:
                 on_progress("upload_thumbnail", "Đang đưa thumbnail vào trang Studio; sẽ lưu cùng metadata và lịch…")
-                field = wait_for(lambda:next(iter(driver.find_elements(By.CSS_SELECTOR,"ytcp-thumbnail-editor input[type=file],ytcp-thumbnail-uploader input[type=file]")),None),
+                field = wait_for(lambda:next(iter(scope.find_elements(By.CSS_SELECTOR,"ytcp-thumbnail-editor input[type=file],ytcp-thumbnail-uploader input[type=file]")),None),
                                  timeout=30, message="Chưa tìm được ô tải thumbnail trong Studio.")
                 field.send_keys(str(Path(path).resolve()))
             on_progress("copy_metadata", "Đang nhập title và description nguyên văn vào cùng trang Studio…")
             for selector, text in ((TITLE, reference["title"]), (DESCRIPTION, reference["description"])):
-                field = visible(driver, selector)
+                field = visible(scope, selector)
                 if not VideoPublishingModule._same_text(field_text(driver, field), text):
                     set_text(driver, field, text)
                     changed = True
             on_progress("assign_playlist", "Đang chọn playlist đầu tiên và bấm Xong; chưa bấm Lưu trang…")
-            playlist, playlist_changed = self.controls._stage_first_playlist(driver)
+            playlist, playlist_changed = self.controls._stage_first_playlist(driver, scope=scope)
             changed = changed or playlist_changed
             on_progress("schedule_video", "Đang chọn Lên lịch công khai và nhập ngày/giờ UTC+7…")
-            changed = self._stage_schedule(driver, publish_at) or changed
+            if mode == "draft":
+                changed = self._stage_draft_schedule(driver, scope, publish_at) or changed
+            else:
+                changed = self._stage_schedule(driver, publish_at) or changed
             if changed:
+                pre_observer()
                 current = before_save()
                 if current is not None:
                     validate_metadata(current.title, current.description, reference, expected_title, expected_description)
@@ -374,8 +464,13 @@ class StudioPublishingEditor:
                 on_progress("final_save", "Thumbnail, title/description, playlist và lịch đã sẵn sàng. Đang bấm Lưu cuối…")
                 observer = NativeSave(driver, channel_id, video_id, verify)
                 driver.get_log("performance")
-                self.controls._click_control(driver, lambda:self.controls._save_button(driver), timeout=90,
-                                             message="Studio chưa cho bấm Lưu cuối; kiểm tra lỗi ở các ô video.")
+                if mode == "draft":
+                    save_locate = lambda:self.controls._button_control(scope, "#done-button")
+                    save_message = "Studio chưa cho bấm Lên lịch bản nháp; kiểm tra lỗi ở các bước Chi tiết/Chế độ hiển thị."
+                else:
+                    save_locate = lambda:self.controls._save_button(driver)
+                    save_message = "Studio chưa cho bấm Lưu cuối; kiểm tra lỗi ở các ô video."
+                self.controls._click_control(driver, save_locate, timeout=90, message=save_message)
                 on_submit({"video_id":video_id,"channel_id":channel_id,"publish_at":int(publish_at),"save_clicked":True})
                 try:
                     wait_for(observer, timeout=45, message="Chưa nhận phản hồi Lưu cuối.")
