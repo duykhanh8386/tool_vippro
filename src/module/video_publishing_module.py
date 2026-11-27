@@ -31,15 +31,17 @@ class VideoPublishingModule(VideoTitleModule):
     def _metadata_matches(self, video, reference):
         return self._same_text(video.title, reference["title"]) and self._same_text(video.description, reference["description"])
 
-    def require_eligible(self, channel_id, video_id, categories, *, publish_at=None):
+    def require_eligible(self, channel_id, video_id, categories, *, publish_at=None, defer_schedule_to_studio=False):
         video = self.read_video(channel_id, video_id)
         # Copyright categories filter the scan, not an already selected job.
         # Claims may change while the thumbnail is generated; keep processing
         # that video and let Studio report any actual publishing restriction.
         existing = schedule_timestamp(video)
-        if has_schedule_info(video) and existing is None:
+        # The native editor checks the actual visible schedule before Save.
+        # Its callers must not get stuck on the same incomplete API fields.
+        if not defer_schedule_to_studio and has_schedule_info(video) and existing is None:
             raise ValueError("Video có lịch đăng nhưng chưa đọc được thời gian; giữ nguyên lịch hiện tại.")
-        if existing and (not publish_at or abs(existing - publish_at) > 1):
+        if not defer_schedule_to_studio and existing and (not publish_at or abs(existing - publish_at) > 1):
             raise ValueError("Video đã có lịch đăng khác; quét lại để giữ lịch đã đặt.")
         if _is_currently_public_video(video):
             raise ValueError("Video đã công khai; tác vụ lên lịch chỉ xử lý video chưa công khai.")

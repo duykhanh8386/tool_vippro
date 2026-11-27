@@ -307,6 +307,31 @@ class StudioPublishingEditor:
         self.controls._playlist_done(driver)
         return "" if checked else "danh sách phát"
 
+    def inspect_schedule(self, channel_id, video_id):
+        """Read persisted visibility/date without selecting or saving anything."""
+        channel = get_channels_info(channel_id)
+        if not channel or channel.id != channel_id:
+            raise PublishingBrowserError("Chưa có phiên kênh để đọc lại lịch trong Studio.")
+        driver = _new_driver()
+        try:
+            driver.execute_cdp_cmd("Emulation.setTimezoneOverride", {"timezoneId":"Asia/Bangkok"})
+            inject_cookies_via_cdp(driver, channel.cookies)
+            self._open(driver, video_id)
+            wait_for(lambda:visible(driver,"ytcp-video-metadata-visibility #container"),timeout=30,
+                     message="Chưa tải được trạng thái hiển thị video trong Studio.")
+            proof = {"source":"studio_ui","channel_id":channel_id,"video_id":video_id,
+                     "scheduled":self._scheduled_badge(driver),"publish_at":None}
+            if proof["scheduled"]:
+                select = self._visibility(driver)
+                state = self._state(driver, select)
+                self._close_visibility(driver)
+                if not state.get("scheduled") or state.get("timestamp") is None:
+                    raise PublishingBrowserError("Studio có lịch nhưng chưa đọc được ngày/giờ của video " + video_id + ".")
+                proof["publish_at"] = state["timestamp"]
+            return proof
+        finally:
+            close_driver(driver)
+
     def publish(self, channel_id, video_id, path, reference, publish_at, *, expected_title, expected_description,
                 thumbnail_uploaded=False, on_saved=lambda:None, on_submit=lambda receipt:None,
                 on_progress=lambda step,message:None, before_save=lambda:None):

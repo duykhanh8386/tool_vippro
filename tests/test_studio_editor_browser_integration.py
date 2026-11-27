@@ -55,6 +55,7 @@ scheduler.model=config.model;
 function popupEnabled(value){popupDone.disabled=!value;popupDone.parentElement.setAttribute('aria-disabled',value?'false':'true');}
 function render(){select.setAttribute('second-container-style',working?'selected':'');select.setAttribute('first-container-style',working?'':'selected');scheduler.hidden=!working;document.querySelector('#second-container-expand-button').hidden=working;timeField.value=String(Math.floor(scheduler.model.selectedTimeOfDayValue/3600)).padStart(2,'0')+':'+String(Math.floor(scheduler.model.selectedTimeOfDayValue%3600/60)).padStart(2,'0');}
 badge.className=config.scheduled?'schedule-icon':'private-icon';
+document.querySelector('ytcp-video-metadata-visibility #visibility-text').innerText=config.scheduled?'Scheduled':'Private';
 file.addEventListener('change',()=>actions.push('thumbnail'));
 for(const [node,name] of [[title,'title'],[description,'description']])node.addEventListener('input',()=>{actions.push(name);setSaveEnabled(true);});
 for(const host of document.querySelectorAll('ytcp-checkbox-lit')){const handler=host.onclick;host.onclick=event=>{handler(event);actions.push('playlist');};}
@@ -74,7 +75,7 @@ dateField.onkeydown=event=>{if(event.key!=='Enter')return;event.preventDefault()
 timeField.onchange=()=>{const match=timeField.value.match(/(\\d+):(\\d+)(?:\\s*([AP]M))?/i);let hour=Number(match[1]);if(match[3])hour=hour%12+(match[3].toUpperCase()==='PM'?12:0);scheduler.model.selectedTimeOfDayValue=hour*3600+Number(match[2])*60;popupEnabled(true);actions.push('time');};
 document.querySelector('#timezone-select-button button').onclick=()=>timezonePanel.style.display='block';
 document.querySelector('tp-yt-paper-item[test-id="0"]').onclick=()=>{scheduler.model.selectedTimezoneIndex=0;timezonePanel.style.display='none';popupEnabled(true);actions.push('timezone');};
-popupDone.onclick=()=>{draftScheduled=working;visibilityPanel.style.display='none';badge.className=draftScheduled?'schedule-icon':'private-icon';setSaveEnabled(true);actions.push('schedule_done');};
+popupDone.onclick=()=>{draftScheduled=working;visibilityPanel.style.display='none';badge.className=draftScheduled?'schedule-icon':'private-icon';document.querySelector('ytcp-video-metadata-visibility #visibility-text').innerText=draftScheduled?'Scheduled':'Private';setSaveEnabled(true);actions.push('schedule_done');};
 document.addEventListener('keydown',event=>{if(event.key==='Escape'){if(datePanel.style.display!=='none')datePanel.style.display='none';else{scheduler.model=JSON.parse(JSON.stringify(baselineModel));visibilityPanel.style.display='none';}}});
 save.onclick=async()=>{
  actions.push('save');const model=scheduler.model,d=model.date;
@@ -158,6 +159,9 @@ class SingleSaveEditorTests(unittest.TestCase):
                             verifier=ThumbnailReadback(CHANNEL,VIDEO,image,reader=lambda *_:studio_video_from_payload(server.config['video']))
                             controls=StudioThumbnailBrowser(verify_saved=verifier)
                             before=len(server.saves)
+                            before_proof=controls.inspect_schedule(CHANNEL,VIDEO)
+                            self.assertFalse(before_proof['scheduled']);self.assertIsNone(before_proof['publish_at'])
+                            self.assertEqual(len(server.saves),before)
                             result=controls.publish(CHANNEL,VIDEO,image,reference,STAMP,expected_title='Original',expected_description='Old description')
                             self.assertTrue(result['verified']);self.assertEqual(len(server.saves),before+1)
                             saved=server.saves[-1]
@@ -167,8 +171,15 @@ class SingleSaveEditorTests(unittest.TestCase):
                             order=[saved['actions'].index(name) for name in ['thumbnail','title','description','playlist','playlist_done','schedule','schedule_done','save']]
                             self.assertEqual(order,sorted(order))
                             self.assertEqual(server.config['video']['draftStatus'],'DRAFT_STATUS_PUBLIC')
+                            proof=controls.inspect_schedule(CHANNEL,VIDEO)
+                            self.assertTrue(proof['scheduled']);self.assertEqual(proof['publish_at'],STAMP)
+                            self.assertEqual(proof['video_id'],VIDEO);self.assertEqual(proof['channel_id'],CHANNEL)
+                            self.assertEqual(len(server.saves),before+1)
                             again=controls.publish(CHANNEL,VIDEO,image,reference,STAMP,expected_title='Original',expected_description='Old description',thumbnail_uploaded=True)
                             self.assertTrue(again['verified']);self.assertEqual(len(server.saves),before+1)
+                            with self.assertRaisesRegex(PublishingBrowserError,'lịch khác'):
+                                controls.publish(CHANNEL,VIDEO,image,reference,STAMP+86400,expected_title='Original',expected_description='Old description',thumbnail_uploaded=True)
+                            self.assertEqual(len(server.saves),before+1)
                     reset('en-US');server.config['video']['title']='Manual change'
                     before=len(server.saves)
                     with self.assertRaisesRegex(PublishingBrowserError,'được sửa khác'):

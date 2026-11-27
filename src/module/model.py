@@ -75,6 +75,8 @@ class Video:
     thumbnail_details: dict = field(default_factory=dict)
     thumbnail_editor_state: dict = field(default_factory=dict)
     scheduled_creator_visibility: object = ""
+    # Read-only Studio UI evidence can resolve stale/incomplete API schedules.
+    studio_schedule: dict = field(default_factory=dict)
 
 
 class AuthSignal(Enum):

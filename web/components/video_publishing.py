@@ -166,7 +166,7 @@ def create_video_publishing_page():
                 ui.textarea("Description sẽ chép nguyên văn", value=reference["description"]).props("outlined readonly autogrow").classes("w-full")
                 ui.image(reference["thumbnail"]).classes("w-96 max-w-full")
             query = ui.input("Bài nhạc dùng tìm kiếm", value=row["song"]).props("outlined").classes("w-full")
-            if not controller.snapshot()["busy"] and row["status"] not in {"skipped", "successful"} and not row.get("metadata_copied"):
+            if not controller.snapshot()["busy"] and row["status"] not in {"skipped", "successful", "scheduled"} and not row.get("metadata_copied"):
                 def update_query():
                     if invoke(lambda: controller.set_song(row["video_id"], query.value)):
                         dialog.close()

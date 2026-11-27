@@ -67,6 +67,17 @@ class MemoryState:
 
 
 class CopyrightTests(unittest.TestCase):
+    def test_native_schedule_overrides_stale_draft_without_replacing_raw_status(self):
+        item=video(draft_status="DRAFT_STATUS_PUBLIC",scheduled_publishing_details={"unknown":True})
+        item.studio_schedule={"source":"studio_ui","video_id":VIDEO,"channel_id":CHANNEL,"scheduled":True,"publish_at":STAMP}
+        self.assertEqual(publishing_video_type(item),"scheduled")
+        self.assertEqual(schedule_timestamp(item),STAMP)
+        self.assertEqual(item.draft_status,"DRAFT_STATUS_PUBLIC")
+        item.studio_schedule["scheduled"]=False
+        item.studio_schedule["publish_at"]=None
+        self.assertIsNone(schedule_timestamp(item))
+        self.assertEqual(publishing_video_type(item),"draft")
+
     def test_finished_check_is_not_claim_free(self):
         self.assertEqual(copyright_category(video(copyright_check_status="CHECK_STATUS_COMPLETED")), "unknown")
 
@@ -350,6 +361,17 @@ class PublishingModuleTests(unittest.TestCase):
             self.copy_metadata()
         self.post.assert_not_called()
 
+    def test_native_editor_can_resolve_api_schedule_without_disabling_ownership_checks(self):
+        before=video(scheduled_publishing_details={"unknown":True})
+        with patch.object(self.module,"_get_video_info",return_value=before):
+            with self.assertRaises(ValueError):
+                self.module.require_eligible(CHANNEL,VIDEO,["clear"],publish_at=STAMP)
+            self.assertIs(self.module.require_eligible(CHANNEL,VIDEO,["clear"],publish_at=STAMP,defer_schedule_to_studio=True),before)
+        for before in (video(channel_id=CHANNEL2),video(privacy="PUBLIC")):
+            with patch.object(self.module,"_get_video_info",return_value=before),self.assertRaises(ValueError):
+                self.module.require_eligible(CHANNEL,VIDEO,["clear"],publish_at=STAMP,defer_schedule_to_studio=True)
+        self.post.assert_not_called()
+
     def test_planned_time_on_a_draft_is_not_mistaken_for_a_completed_schedule(self):
         before=video(title=REFERENCE["title"],description=REFERENCE["description"],draft_status="DRAFT_STATUS_PUBLIC",
                      scheduled_publishing_details={"publishTimeSeconds":STAMP})
@@ -580,7 +602,7 @@ class PublishingControllerTests(unittest.TestCase):
         self.controller.rows = [row(copyright="partial", visibility_type="private")]
         self.controller.settings.update(scope="draft", categories=["clear"])
         self.controller._process(self.controller.settings, self.reference, None, "references")
-        self.module.require_eligible.assert_called_once_with(CHANNEL, VIDEO, ["partial"], publish_at=None)
+        self.module.require_eligible.assert_called_once_with(CHANNEL, VIDEO, ["partial"], publish_at=None, defer_schedule_to_studio=True)
         self.assertIn("reference", self.controller.rows[0])
 
     def test_settings_validation_does_not_partially_change_schedule(self):
@@ -640,13 +662,72 @@ class PublishingControllerTests(unittest.TestCase):
         self.controller._process(self.controller.settings, self.reference, None, "references")
         self.reference.find.assert_not_called()
 
-    def test_unknown_existing_schedule_blocks_new_schedules(self):
-        self.controller.rows = [row(publish_at=STAMP)]
+    def test_unreadable_unselected_video_does_not_block_other_selected_videos(self):
+        self.controller.rows = [row(publish_at=STAMP),row(OTHER,selected=False,status="error",publish_at=STAMP+86400)]
         self.listing.list_all_videos.return_value = ([video(OTHER, scheduled_publishing_details={"unrecognizedScheduleShape": True})], None)
-        self.module.read_video.side_effect = lambda channel_id,video_id:video(video_id,channel_id=channel_id,scheduled_publishing_details={"unrecognizedScheduleShape":True})
-        with self.assertRaises(ValueError):
-            self.controller._check_schedule_conflicts()
+        self.module.read_video.side_effect = lambda channel_id,video_id:video(video_id,channel_id=channel_id,scheduled_publishing_details={"unrecognizedScheduleShape":True} if video_id==OTHER else "")
+        self.thumbnail.inspect_schedule.side_effect=ValueError("Studio not ready")
+        self.controller._check_schedule_conflicts()
+        self.assertTrue(self.controller.rows[0]["selected"])
+        self.assertEqual(self.controller.rows[0]["publish_at"],STAMP)
+        self.assertEqual(self.controller.rows[1]["status"],"skipped")
+        self.assertIsNone(self.controller.rows[1]["publish_at"])
+        self.assertIn((CHANNEL,OTHER),self.controller.schedule_issues)
         self.module.schedule.assert_not_called()
+
+    def test_studio_recovers_saved_schedule_updates_unselected_old_error_and_reserves_day(self):
+        self.controller.rows=[row(publish_at=STAMP),row(OTHER,selected=False,status="error",publish_at=STAMP+86400,detail="old error")]
+        self.listing.list_all_videos.return_value=([video(OTHER,draft_status="DRAFT_STATUS_PUBLIC",scheduled_publishing_details={"unknown":True})],None)
+        self.module.read_video.side_effect=lambda channel_id,identifier:video(identifier,channel_id=channel_id,draft_status="DRAFT_STATUS_PUBLIC" if identifier==OTHER else "",
+            scheduled_publishing_details={"unknown":True} if identifier==OTHER else "")
+        self.thumbnail.inspect_schedule.return_value={"source":"studio_ui","channel_id":CHANNEL,"video_id":OTHER,"scheduled":True,"publish_at":STAMP}
+        self.controller._check_schedule_conflicts()
+        saved=self.controller.rows[1]
+        self.assertEqual(saved["visibility_type"],"scheduled")
+        self.assertEqual(saved["publish_at"],STAMP)
+        self.assertNotEqual(saved["status"],"error")
+        self.assertEqual(saved["status"],"scheduled")
+        self.assertNotIn("old error",saved["detail"])
+        self.assertEqual(self.controller.rows[0]["publish_at"],STAMP+86400)
+        self.thumbnail.inspect_schedule.assert_called_once_with(CHANNEL,OTHER)
+        self.thumbnail.publish.assert_not_called()
+
+    def test_scan_keeps_other_rows_when_one_video_schedule_is_unreadable(self):
+        self.listing.list_all_videos.return_value=([video(),video(OTHER,scheduled_publishing_details={"unknown":True})],None)
+        self.module.read_video.side_effect=lambda channel_id,identifier:video(identifier,channel_id=channel_id,scheduled_publishing_details={"unknown":True} if identifier==OTHER else "")
+        self.thumbnail.inspect_schedule.side_effect=ValueError("unreadable")
+        with patch("src.video_publishing_tasks.get_channels_info",return_value=[SimpleNamespace(id=CHANNEL)]):
+            self.controller._scan(self.controller.settings,self.reference)
+        self.assertEqual(len(self.controller.rows),2)
+        self.assertTrue(publishing_row_selectable(self.controller.rows[0]))
+        self.assertTrue(self.controller.rows[1]["schedule_unreadable"])
+        self.assertFalse(publishing_row_selectable(self.controller.rows[1]))
+
+    def test_foreign_native_schedule_evidence_is_not_accepted(self):
+        self.controller.rows=[row(publish_at=STAMP)]
+        self.listing.list_all_videos.return_value=([video(OTHER,scheduled_publishing_details={"unknown":True})],None)
+        self.module.read_video.side_effect=lambda channel_id,identifier:video(identifier,channel_id=channel_id,scheduled_publishing_details={"unknown":True} if identifier==OTHER else "")
+        self.thumbnail.inspect_schedule.return_value={"source":"studio_ui","channel_id":CHANNEL2,"video_id":OTHER,"scheduled":True,"publish_at":STAMP}
+        self.controller._check_schedule_conflicts()
+        self.assertTrue(self.controller.rows[0]["selected"])
+        self.assertEqual(self.controller.occupied[CHANNEL],[])
+        self.assertIn((CHANNEL,OTHER),self.controller.schedule_issues)
+
+    def test_worker_continues_selected_video_after_unselected_schedule_read_fails(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path=Path(folder)/"thumb.jpg";path.write_bytes(b"cached")
+            self.controller.rows=[row(reference=REFERENCE,thumbnail_path=str(path),publish_at=STAMP),row(OTHER,selected=False,status="error",publish_at=STAMP+86400)]
+            self.listing.list_all_videos.return_value=([video(OTHER,scheduled_publishing_details={"unknown":True})],None)
+            self.module.read_video.side_effect=lambda channel_id,identifier:video(identifier,channel_id=channel_id,scheduled_publishing_details={"unknown":True} if identifier==OTHER else "")
+            self.thumbnail.inspect_schedule.side_effect=ValueError("not ready")
+            with patch("src.video_publishing_tasks.logger.error"):
+                self.controller._worker("run",create_run_context("isolated-schedule-read"))
+            self.assertEqual(self.controller.rows[0]["status"],"successful")
+            self.assertEqual(self.controller.rows[1]["status"],"skipped")
+            self.assertIn("1 video chưa đọc được",self.controller.message)
+            self.thumbnail.publish.assert_called_once()
+            self.assertEqual(self.thumbnail.publish.call_args.args[1],VIDEO)
+            self.image.generate.assert_not_called()
 
     def test_unreadable_list_schedule_is_refreshed_and_existing_schedule_is_preserved(self):
         self.controller.rows=[row(publish_at=STAMP),row(OTHER,publish_at=STAMP+86400)]

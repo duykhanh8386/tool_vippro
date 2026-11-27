@@ -26,7 +26,24 @@ SELECTABLE_COPYRIGHT_TYPES = {"clear", "limited", "partial", "blocked"}
 PUBLISHING_SCAN_SCHEMA_VERSION = 2
 
 
+def studio_schedule_result(video):
+    proof = getattr(video, "studio_schedule", None)
+    if (not isinstance(proof, dict) or proof.get("source") != "studio_ui"
+            or proof.get("video_id") != getattr(video, "id", None)
+            or proof.get("channel_id") != getattr(video, "channel_id", None)
+            or type(proof.get("scheduled")) is not bool):
+        return None
+    if proof["scheduled"] and _timestamp(proof.get("publish_at")) is None:
+        return None
+    return proof
+
+
 def _schedule_sources(video):
+    proof = studio_schedule_result(video)
+    if proof is not None:
+        if proof["scheduled"]:
+            yield {"timeSec": proof["publish_at"]}
+        return
     def meaningful(value):
         if isinstance(value, dict):
             return any(meaningful(child) for key,child in value.items() if key not in {"privacy","targetPrivacy","newPrivacy"})
@@ -47,6 +64,9 @@ def has_schedule_info(video):
 
 
 def publishing_video_type(video) -> str:
+    proof = studio_schedule_result(video)
+    if proof is not None and proof["scheduled"]:
+        return "scheduled"
     if _status_indicates_draft(getattr(video, "draft_status", None)) or _status_indicates_draft(getattr(video, "video_status", None)):
         return "draft"
     if has_schedule_info(video):
