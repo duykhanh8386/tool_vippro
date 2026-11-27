@@ -209,6 +209,52 @@ class ReferencePriorityTests(unittest.TestCase):
 
 
 class StudioControlTests(unittest.TestCase):
+    def test_blocked_click_reports_reason_without_exposing_webdriver_exception_text(self):
+        driver, button = Mock(), Mock()
+        button.is_displayed.return_value = True
+        button.is_enabled.return_value = True
+        button.get_attribute.return_value = None
+        button.click.side_effect = ElementClickInterceptedException("secret-cookie")
+        with patch("src.publishing_browser.wait_interruptibly"), \
+                patch("src.publishing_browser.time.monotonic", side_effect=[0, 0, 31]), \
+                self.assertRaises(PublishingBrowserError) as raised:
+            StudioThumbnailBrowser._click_control(driver, lambda:button, message="Chưa tick được playlist.")
+        self.assertIn("vùng bấm bị phần tử khác che", str(raised.exception))
+        self.assertNotIn("secret-cookie", str(raised.exception))
+
+    def test_playlist_selection_clicks_component_and_reads_inner_state(self):
+        browser, driver, option, role = StudioThumbnailBrowser(), Mock(), Mock(), Mock()
+        state = {"checked": "false"}
+        option.is_displayed.return_value = True
+        option.is_enabled.return_value = True
+        option.get_attribute.return_value = None
+        option.find_elements.return_value = [role]
+        role.get_attribute.side_effect = lambda key:state["checked"] if key=="aria-checked" else "false"
+        option.click.side_effect = lambda:state.update(checked="true")
+        with patch.object(browser, "_playlist_option", return_value=option):
+            browser._select_playlist(driver, "PL-first")
+        option.click.assert_called_once()
+        role.click.assert_not_called()
+        self.assertEqual(state["checked"], "true")
+
+    def test_playlist_role_disabled_state_is_checked_even_when_host_is_enabled(self):
+        browser, option, role = StudioThumbnailBrowser(), Mock(), Mock()
+        option.find_elements.return_value = [role]
+        role.get_attribute.side_effect = lambda key:"true" if key=="aria-disabled" else "false"
+        with patch.object(browser, "_playlist_option", return_value=option), self.assertRaisesRegex(PublishingBrowserError,"đang bị khóa"):
+            browser._select_playlist(Mock(), "PL-first")
+        option.click.assert_not_called()
+
+    def test_already_selected_playlist_component_is_not_clicked_again(self):
+        browser, option, role = StudioThumbnailBrowser(), Mock(), Mock()
+        option.is_displayed.return_value = True
+        option.find_elements.return_value = [role]
+        role.get_attribute.side_effect = lambda key:"true" if key=="aria-checked" else "false"
+        with patch.object(browser, "_playlist_option", return_value=option):
+            browser._select_playlist(Mock(), "PL-first")
+        option.click.assert_not_called()
+        role.click.assert_not_called()
+
     def test_obscured_control_is_relocated_before_retrying_native_click(self):
         driver, old, current = Mock(), Mock(), Mock()
         for node in (old, current):

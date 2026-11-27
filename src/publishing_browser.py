@@ -718,23 +718,38 @@ class StudioThumbnailBrowser:
 
     @staticmethod
     def _click_control(driver, locate, *, message, selected=None, timeout=30):
+        blocked = ["không tìm thấy điều khiển"]
         def click_when_ready():
             node = locate()
-            if node is None or not node.is_displayed():
+            if node is None:
+                blocked[0] = "không tìm thấy điều khiển"
+                return False
+            if not node.is_displayed():
+                blocked[0] = "điều khiển đang bị ẩn"
                 return False
             if selected is not None and selected(node):
                 return True
             if not node.is_enabled() or node.get_attribute("disabled") is not None or node.get_attribute("aria-disabled") == "true":
+                blocked[0] = "điều khiển đang bị khóa"
                 return False
             driver.execute_script("arguments[0].scrollIntoView({block:'center'});", node)
             try:
                 node.click()
-            except (ElementClickInterceptedException, ElementNotInteractableException):
+            except ElementClickInterceptedException:
                 # These failures occur before a click is delivered. Re-find the
                 # element after Studio finishes its dialog/upload animation.
+                blocked[0] = "vùng bấm bị phần tử khác che (ElementClickInterceptedException)"
+                return False
+            except ElementNotInteractableException:
+                blocked[0] = "điều khiển chưa nhận thao tác (ElementNotInteractableException)"
                 return False
             return True
-        wait_for(click_when_ready, timeout=timeout, message=message)
+        try:
+            wait_for(click_when_ready, timeout=timeout, message=message)
+        except PublishingBrowserError as exc:
+            if str(exc) != message:
+                raise
+            raise PublishingBrowserError(message + " Lý do: " + blocked[0] + ".") from None
 
     @staticmethod
     def _playlist_dialog(driver):
@@ -756,14 +771,42 @@ class StudioThumbnailBrowser:
                  timeout=30, message="Hộp thoại danh sách phát chưa đóng; chưa bấm Lưu.")
 
     @staticmethod
-    def _playlist_checkbox(driver, playlist_id):
+    def _playlist_option(driver, playlist_id):
         for dialog in driver.find_elements(By.CSS_SELECTOR,"ytcp-playlist-dialog"):
             if not dialog.is_displayed():
                 continue
             for option in dialog.find_elements(By.CSS_SELECTOR,"#playlists-list ytcp-checkbox-lit"):
                 if option.get_attribute("test-id") == playlist_id:
-                    return next(iter(option.find_elements(By.CSS_SELECTOR,"[role=checkbox]")),None)
+                    return option
         return None
+
+    def _playlist_checkbox(self, driver, playlist_id):
+        option = self._playlist_option(driver, playlist_id)
+        return next(iter(option.find_elements(By.CSS_SELECTOR,"[role=checkbox]")),None) if option is not None else None
+
+    def _select_playlist(self, driver, playlist_id):
+        def locate():
+            option = self._playlist_option(driver, playlist_id)
+            if option is None:
+                return None
+            role = next(iter(option.find_elements(By.CSS_SELECTOR,"[role=checkbox]")),None)
+            if role is None:
+                return None
+            if role.get_attribute("aria-disabled") == "true" and role.get_attribute("aria-checked") != "true":
+                raise PublishingBrowserError("Danh sách phát đầu tiên đang bị khóa; chưa chọn mục khác thay thế.")
+            return option
+
+        def checked(option):
+            role = next(iter(option.find_elements(By.CSS_SELECTOR,"[role=checkbox]")),None)
+            return role is not None and role.get_attribute("aria-checked") == "true"
+
+        # The inner role reports state, but its sibling paper-ripple can cover
+        # the hit area. Click the owning component, as a user clicking the row
+        # does; do not click the hidden native input or set aria-checked in JS.
+        self._click_control(driver, locate, selected=checked,
+                            message="Chưa bấm được checkbox danh sách phát đầu tiên trong Studio.")
+        wait_for(lambda:(node:=self._playlist_checkbox(driver,playlist_id)) is not None and node.get_attribute("aria-checked")=="true",
+                 timeout=10,message="Đã bấm checkbox nhưng Studio chưa xác nhận tích danh sách phát đầu tiên.")
 
     def _assign_playlist(self, driver, video_id):
         self._playlist_dialog(driver)
@@ -781,11 +824,7 @@ class StudioThumbnailBrowser:
         if changed:
             if checkbox.get_attribute("aria-disabled") == "true":
                 raise PublishingBrowserError("Danh sách phát đầu tiên đang bị khóa; chưa chọn mục khác thay thế.")
-            self._click_control(driver,lambda:self._playlist_checkbox(driver,playlist_id),
-                                selected=lambda node:node.get_attribute("aria-checked")=="true",
-                                message="Chưa tích được danh sách phát đầu tiên; kiểm tra hộp thoại trong Studio.")
-            wait_for(lambda:(node:=self._playlist_checkbox(driver,playlist_id)) is not None and node.get_attribute("aria-checked")=="true",
-                     timeout=10,message="Chưa tích được danh sách phát đầu tiên.")
+            self._select_playlist(driver,playlist_id)
         self._playlist_done(driver)
         if not changed:
             return info

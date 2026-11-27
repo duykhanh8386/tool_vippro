@@ -12,6 +12,7 @@ from urllib.parse import urlsplit
 
 import requests
 from selenium import webdriver
+from selenium.common.exceptions import ElementClickInterceptedException
 from selenium.webdriver.chrome.service import Service
 
 from src.module.base import studio_video_from_payload
@@ -22,7 +23,15 @@ from src.publishing_thumbnails import ThumbnailReadback
 VIDEO = "Abc123_-XYZ"
 CHANNEL = "UC" + "a" * 22
 STAMP = 4070998800
-PAGE = '''<!doctype html><ytcp-video-metadata-editor><ytcp-thumbnail-editor>
+PAGE = '''<!doctype html><style>
+ytcp-checkbox-lit { display:inline-flex;position:relative;width:24px;height:24px; }
+ytcp-checkbox-lit #root-container, ytcp-checkbox-lit #checkbox-line-height-aligner-container,
+ytcp-checkbox-lit #checkbox-line-height-aligner, ytcp-checkbox-lit #checkbox-container { width:100%;height:100%; }
+ytcp-checkbox-lit [role=checkbox] { position:absolute;inset:0;border:1px solid gray; }
+ytcp-checkbox-lit paper-ripple { display:block;position:absolute;inset:0;z-index:2; }
+ytcp-checkbox-lit input[slot=hidden-input] { display:none; }
+label { display:flex;align-items:center;gap:8px;padding:8px; }
+</style><ytcp-video-metadata-editor><ytcp-thumbnail-editor>
 <input type="file" accept="image/jpeg" hidden></ytcp-thumbnail-editor>
 <ytcp-video-metadata-playlists><ytcp-dropdown-trigger role="button" style="display:block">Playlists</ytcp-dropdown-trigger></ytcp-video-metadata-playlists>
 <button id="save" disabled>Save</button></ytcp-video-metadata-editor><script>
@@ -39,15 +48,29 @@ save.onclick=async()=>{
  thumbnailDirty=false;save.disabled=true;
 };</script>
 <ytcp-playlist-dialog style="display:none;position:fixed;inset:0;background:white;z-index:1000"><div id="playlists-list">
-<label><ytcp-checkbox-lit test-id="PL-first"><div role="checkbox" aria-checked="false" aria-disabled="false">Check</div></ytcp-checkbox-lit><span class="label-text">First playlist</span></label>
-<label><ytcp-checkbox-lit test-id="PL-existing"><div role="checkbox" aria-checked="true" aria-disabled="false">Check</div></ytcp-checkbox-lit><span class="label-text">Existing playlist</span></label>
+<label><ytcp-checkbox-lit label-wrap aria-labelledby="checkbox-label-0" id="checkbox-0" test-id="PL-first" compact>
+ <div id="root-container"><div id="checkbox-line-height-aligner-container"><div id="checkbox-line-height-aligner"><div id="checkbox-container">
+  <div id="checkbox" role="checkbox" tabindex="0" aria-checked="false" aria-disabled="false" aria-labelledby="checkbox-label-0"></div>
+  <paper-ripple id="ink" class="circle" center></paper-ripple>
+ </div></div></div><input slot="hidden-input" type="checkbox"></div>
+</ytcp-checkbox-lit><span id="checkbox-label-0" class="label-text">First playlist</span></label>
+<label><ytcp-checkbox-lit label-wrap aria-labelledby="checkbox-label-1" id="checkbox-1" test-id="PL-existing" compact>
+ <div id="root-container"><div id="checkbox-container">
+  <div id="checkbox" role="checkbox" tabindex="0" aria-checked="true" aria-disabled="false" aria-labelledby="checkbox-label-1"></div>
+  <paper-ripple id="ink" class="circle" center></paper-ripple>
+ </div><input slot="hidden-input" type="checkbox"></div>
+</ytcp-checkbox-lit><span id="checkbox-label-1" class="label-text">Existing playlist</span></label>
 </div><ytcp-button class="done-button" role="button">Done</ytcp-button></ytcp-playlist-dialog><script>
 const dialog=document.querySelector('ytcp-playlist-dialog');
 document.querySelector('ytcp-dropdown-trigger').onclick=()=>dialog.style.display='block';
-for(const checkbox of document.querySelectorAll('[role=checkbox]')){
- const id=checkbox.closest('ytcp-checkbox-lit').getAttribute('test-id');
+for(const host of document.querySelectorAll('ytcp-checkbox-lit')){
+ const checkbox=host.querySelector('[role=checkbox]');
+ const id=host.getAttribute('test-id');
  checkbox.setAttribute('aria-checked',assigned.includes(id)?'true':'false');
- checkbox.onclick=()=>checkbox.setAttribute('aria-checked',checkbox.getAttribute('aria-checked')==='true'?'false':'true');
+ host.onclick=event=>{
+  event.preventDefault();
+  checkbox.setAttribute('aria-checked',checkbox.getAttribute('aria-checked')==='true'?'false':'true');
+ };
 }
 document.querySelector('.done-button').onclick=()=>{
  save.disabled=false;
@@ -149,6 +172,16 @@ class StudioPublishingBrowserTests(unittest.TestCase):
                 pixel_reads.append(str(path))
                 return bytes([100 if len(pixel_reads)==1 else 200]*43200)
             try:
+                driver.get(origin + f"/video/{VIDEO}/edit")
+                driver.find_element("css selector", "ytcp-dropdown-trigger").click()
+                inner = driver.find_element("css selector", "ytcp-checkbox-lit[test-id='PL-first'] [role=checkbox]")
+                # Reproduce the inner-checkbox click failure that the previous
+                # plain-div fixture could not expose. The sibling ripple is
+                # part of the owning component, not a foreign dialog overlay.
+                with self.assertRaises(ElementClickInterceptedException):
+                    inner.click()
+                self.assertEqual(inner.get_attribute("aria-checked"), "false")
+                self.assertEqual(server.steps, [])
                 with patch("src.publishing_thumbnails.thumbnail_pixels",side_effect=cached_pixels), \
                         patch("requests.get") as get:
                     get.return_value.__enter__.return_value=response
