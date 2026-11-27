@@ -32,6 +32,7 @@ def field_text(driver, node):
     return driver.execute_script("""
         const node=arguments[0];
         if('value' in node)return node.value;
+        if(node.childNodes.length===1 && node.firstChild.nodeType===Node.TEXT_NODE)return node.textContent;
         if(node.childNodes.length===1 && node.firstChild.nodeName==='BR')return '';
         return node.innerText;
     """, node) or ""
@@ -46,13 +47,23 @@ def set_text(driver, node, text, *, commit=Keys.TAB):
     node.send_keys(Keys.BACKSPACE)
     # CDP's native text insertion supports emoji outside ChromeDriver's BMP
     # send_keys limit and dispatches the editor's normal input events.
-    for index, line in enumerate(text.replace("\r\n", "\n").replace("\r", "\n").split("\n")):
+    plain = text.replace("\r\n", "\n").replace("\r", "\n")
+    for index, line in enumerate(plain.split("\n")):
         if index:
             # Plain Enter makes block divs whose blank lines can gain an extra
             # newline. Shift+Enter inserts the editor's explicit line break.
             node.send_keys(Keys.SHIFT, Keys.ENTER, Keys.NULL)
         if line:
             driver.execute_cdp_cmd("Input.insertText", {"text": line})
+    actual = field_text(driver, node)
+    if plain.endswith("\n") and actual == plain + "\n" and node.get_attribute("contenteditable") == "true":
+        # Chrome keeps an extra caret line at the end of a contenteditable.
+        # Replace that representation with plain text and notify the editor;
+        # no HTML from the reference is interpreted, and Save still persists it.
+        driver.execute_script("""
+            arguments[0].textContent=arguments[1];
+            arguments[0].dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:arguments[1]}));
+        """, node, plain)
     if not VideoPublishingModule._same_text(field_text(driver, node), text):
         raise PublishingBrowserError("Studio chưa nhận đúng nội dung vừa nhập; chưa bấm Lưu.")
     node.send_keys(commit)

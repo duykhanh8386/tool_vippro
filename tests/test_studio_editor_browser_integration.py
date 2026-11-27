@@ -19,7 +19,7 @@ from src.publishing_thumbnails import ThumbnailReadback
 from tests.test_studio_publishing_integration import PAGE, CHANNEL, VIDEO, LocalStudioDriver
 
 STAMP = 4071034800  # 2099-01-02 18:00 UTC+7
-REFERENCE = {"title":"เพลงใหม่ 🎵 | Música", "description":"Dòng đầu 🎶\n\n00:00 Canção de Fé\n#Música"}
+REFERENCE = {"title":"เพลงใหม่ 🎵 | Música", "description":"Dòng đầu 🎶\n\n00:00 Canção de Fé\n#Música\n"}
 FIELDS = '''<div id="title-textarea"><div id="textbox" contenteditable="true" role="textbox"></div></div>
 <div id="description-textarea"><div id="textbox" contenteditable="true" role="textbox"></div></div>'''
 EDITOR = '''
@@ -79,7 +79,7 @@ document.addEventListener('keydown',event=>{if(event.key==='Escape'){if(datePane
 save.onclick=async()=>{
  actions.push('save');const model=scheduler.model,d=model.date;
  const stamp=Math.floor((Date.UTC(d.year,d.month,d.day)+model.selectedTimeOfDayValue*1000-420*60000)/1000);
- const descriptionValue=description.innerHTML.toLowerCase()==='<br>'?'':description.innerText;
+ const descriptionValue=description.innerHTML.toLowerCase()==='<br>'?'':(description.childNodes.length===1 && description.firstChild.nodeType===Node.TEXT_NODE?description.textContent:description.innerText);
  const body={encryptedVideoId:config.video.videoId,nativeEditorCommit:true,actions,title:{newTitle:title.innerText},description:{newDescription:descriptionValue},
   playlists:Array.from(document.querySelectorAll('ytcp-checkbox-lit')).filter(e=>e.querySelector('[role=checkbox]').getAttribute('aria-checked')==='true').map(e=>e.getAttribute('test-id')),
   scheduledPublishing:{set:{timeSec:String(stamp),privacy:'PUBLIC'}},model:JSON.parse(JSON.stringify(model)),draftScheduled};
