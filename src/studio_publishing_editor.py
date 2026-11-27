@@ -388,6 +388,23 @@ class StudioPublishingEditor:
         self.controls._playlist_done(driver)
         return "" if checked else "danh sách phát"
 
+    def _inspect_schedule_in_driver(self, driver, channel_id, video_id):
+        """Read persisted visibility/date in an already authenticated Studio driver."""
+        self._open(driver, video_id)
+        mode = self._wait_editor_mode(driver)
+        if mode == "draft":
+            return {"source":"studio_ui","channel_id":channel_id,"video_id":video_id,"scheduled":False,"publish_at":None}
+        proof = {"source":"studio_ui","channel_id":channel_id,"video_id":video_id,
+                 "scheduled":self._scheduled_badge(driver),"publish_at":None}
+        if proof["scheduled"]:
+            select = self._visibility(driver)
+            state = self._state(driver, select)
+            self._close_visibility(driver)
+            if not state.get("scheduled") or state.get("timestamp") is None:
+                raise PublishingBrowserError("Studio có lịch nhưng chưa đọc được ngày/giờ của video " + video_id + ".")
+            proof["publish_at"] = state["timestamp"]
+        return proof
+
     def inspect_schedule(self, channel_id, video_id):
         """Read persisted visibility/date without selecting or saving anything."""
         channel = get_channels_info(channel_id)
@@ -397,20 +414,49 @@ class StudioPublishingEditor:
         try:
             driver.execute_cdp_cmd("Emulation.setTimezoneOverride", {"timezoneId":"Asia/Bangkok"})
             inject_cookies_via_cdp(driver, channel.cookies)
-            self._open(driver, video_id)
-            mode = self._wait_editor_mode(driver)
-            if mode == "draft":
-                return {"source":"studio_ui","channel_id":channel_id,"video_id":video_id,"scheduled":False,"publish_at":None}
-            proof = {"source":"studio_ui","channel_id":channel_id,"video_id":video_id,
-                     "scheduled":self._scheduled_badge(driver),"publish_at":None}
-            if proof["scheduled"]:
-                select = self._visibility(driver)
-                state = self._state(driver, select)
-                self._close_visibility(driver)
-                if not state.get("scheduled") or state.get("timestamp") is None:
-                    raise PublishingBrowserError("Studio có lịch nhưng chưa đọc được ngày/giờ của video " + video_id + ".")
-                proof["publish_at"] = state["timestamp"]
-            return proof
+            return self._inspect_schedule_in_driver(driver, channel_id, video_id)
+        finally:
+            close_driver(driver)
+
+    def inspect_schedules(self, channel_id, video_ids, *, on_progress=lambda index, total, video_id: None):
+        """Read persisted visibility/date across multiple videos in one shared Chrome session."""
+        unique_ids = []
+        seen = set()
+        for raw_id in video_ids:
+            vid = str(raw_id or "").strip()
+            if vid and vid not in seen:
+                seen.add(vid)
+                unique_ids.append(vid)
+        if not unique_ids:
+            return {}
+        channel = get_channels_info(channel_id)
+        if not channel or channel.id != channel_id:
+            raise PublishingBrowserError("Chưa có phiên kênh để đọc lại lịch trong Studio.")
+        results = {}
+        driver = _new_driver()
+        try:
+            driver.execute_cdp_cmd("Emulation.setTimezoneOverride", {"timezoneId":"Asia/Bangkok"})
+            inject_cookies_via_cdp(driver, channel.cookies)
+            total = len(unique_ids)
+            for index, video_id in enumerate(unique_ids, 1):
+                check_stopped()
+                on_progress(index, total, video_id)
+                try:
+                    results[video_id] = self._inspect_schedule_in_driver(driver, channel_id, video_id)
+                except TaskStopped:
+                    raise
+                except Exception as exc:
+                    results[video_id] = exc
+                    if isinstance(exc, WebDriverException):
+                        try:
+                            alive = bool(driver.window_handles)
+                        except WebDriverException:
+                            alive = False
+                        if not alive:
+                            for remaining_id in unique_ids[index:]:
+                                results[remaining_id] = exc
+                            break
+            return results
         finally:
             close_driver(driver)
 

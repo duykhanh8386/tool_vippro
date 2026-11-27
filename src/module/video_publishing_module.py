@@ -4,6 +4,7 @@ Schedule wire format: https://github.com/yusufusta/ytstudio/blob/master/ytstudio
 Mutations are confirmed by reading the video back, including uncertain responses.
 """
 from datetime import datetime, timezone
+import re
 import unicodedata
 
 import requests
@@ -21,6 +22,26 @@ from src.youtube_auth import studio_authorization_header
 class VideoPublishingModule(VideoTitleModule):
     def _get_video_info(self, video_id, channel_id):
         return super()._get_video_info(video_id, channel_id, critical_read=True)
+
+    def read_videos(self, channel_id, video_ids):
+        """Batch-read current metadata and schedule details for a channel's videos."""
+        check_stopped()
+        ids = []
+        seen = set()
+        for raw_id in video_ids:
+            video_id = str(raw_id or "")
+            if not re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id):
+                raise ValueError("Video ID không hợp lệ.")
+            if video_id not in seen:
+                seen.add(video_id)
+                ids.append(video_id)
+        if not ids:
+            return {}
+        videos = self._get_videos_info(ids, channel_id, critical_read=True)
+        for video in videos.values():
+            if video.channel_id != channel_id:
+                raise ValueError("Video không thuộc đúng kênh đã chọn; chưa gửi lệnh đổi tiêu đề.")
+        return videos
 
     @staticmethod
     def _same_text(left, right):

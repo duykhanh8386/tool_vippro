@@ -891,6 +891,10 @@ class StudioThumbnailBrowser:
         from src.studio_publishing_editor import StudioPublishingEditor
         return StudioPublishingEditor(self).inspect_schedule(channel_id, video_id)
 
+    def inspect_schedules(self, channel_id, video_ids, **options):
+        from src.studio_publishing_editor import StudioPublishingEditor
+        return StudioPublishingEditor(self).inspect_schedules(channel_id, video_ids, **options)
+
     def assign_first_playlist(self, channel_id, video_id):
         channel=get_channels_info(channel_id)
         if not channel or channel.id != channel_id:

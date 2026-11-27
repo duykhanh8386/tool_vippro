@@ -12,15 +12,17 @@ from unittest.mock import Mock, patch
 import requests
 from selenium.common.exceptions import ElementClickInterceptedException, InvalidSessionIdException, TimeoutException
 
+from src.module.base import IModule
+from src.module.list_videos_module import ListVideosModule
 from src.module.model import Video
 from src.module.video_publishing_module import VideoPublishingModule
 from src.publishing_browser import video_search_results
 from src.task_runtime import create_run_context
 from src.publishing_browser import ChatGPTSessionNeedsAction
 from src.video_publishing import (
-    REFERENCE_SELECTION_VERSION, copyright_category, first_song, parse_chatgpt_cookies, plan_daily,
+    REFERENCE_SELECTION_VERSION, copyright_category, first_song, has_schedule_info, parse_chatgpt_cookies, plan_daily,
     publishing_row_matches, publishing_row_selectable, publishing_video_type,
-    reference_search_query, reference_video_id, schedule_timestamp, thumbnail_file_stem,
+    reference_search_query, reference_video_id, schedule_timestamp, studio_schedule_result, thumbnail_file_stem,
 )
 from src.video_publishing_tasks import STATE_KEY, VideoPublishingController
 from src.video_scan_dates import VIETNAM_TIMEZONE
@@ -623,10 +625,19 @@ class PublishingControllerTests(unittest.TestCase):
         self.image.generate.assert_not_called()
 
     def test_schedule_conflicts_detected_before_processing(self):
-        self.controller.rows = [row(publish_at=STAMP)]
-        self.listing.list_all_videos.return_value = ([video(OTHER, scheduled_publishing_details={"publishTimeSeconds": STAMP - 3600})], None)
+        self.controller.rows = [row(publish_at=STAMP), row(OTHER, publish_at=STAMP + 86400), row("Ghi123_-XYZ", selected=False, visibility_type="scheduled", publish_at=STAMP + 2 * 86400)]
+        self.module.read_video.side_effect = lambda channel_id, identifier: (
+            video(identifier, channel_id=channel_id, scheduled_publishing_details={"publishTimeSeconds": STAMP})
+            if identifier == VIDEO else video(identifier, channel_id=channel_id)
+        )
+        # Simulate another selected video scheduled on the same day to confirm collision shifting works without scanning the channel.
+        self.controller.rows[1]["publish_at"] = STAMP
         self.controller._check_schedule_conflicts()
-        self.assertEqual(self.controller.rows[0]["publish_at"],STAMP+86400)
+        self.listing.list_all_videos.assert_not_called()
+        self.assertFalse(self.controller.rows[0]["selected"])
+        self.assertEqual(self.controller.rows[0]["status"], "scheduled")
+        self.assertIn(STAMP, self.controller.occupied[CHANNEL])
+        self.assertEqual(self.controller.rows[1]["publish_at"], STAMP + 86400)
         self.module.copy_metadata.assert_not_called()
 
     def test_reference_selection_receives_original_filename_and_current_duration(self):
@@ -662,32 +673,32 @@ class PublishingControllerTests(unittest.TestCase):
         self.controller._process(self.controller.settings, self.reference, None, "references")
         self.reference.find.assert_not_called()
 
-    def test_unreadable_unselected_video_does_not_block_other_selected_videos(self):
-        self.controller.rows = [row(publish_at=STAMP),row(OTHER,selected=False,status="error",publish_at=STAMP+86400)]
-        self.listing.list_all_videos.return_value = ([video(OTHER, scheduled_publishing_details={"unrecognizedScheduleShape": True})], None)
+    def test_unreadable_selected_video_does_not_block_other_selected_videos(self):
+        self.controller.rows = [row(publish_at=STAMP), row(OTHER, selected=True, publish_at=STAMP + 86400)]
         self.module.read_video.side_effect = lambda channel_id,video_id:video(video_id,channel_id=channel_id,scheduled_publishing_details={"unrecognizedScheduleShape":True} if video_id==OTHER else "")
         self.thumbnail.inspect_schedule.side_effect=ValueError("Studio not ready")
         self.controller._check_schedule_conflicts()
+        self.listing.list_all_videos.assert_not_called()
         self.assertTrue(self.controller.rows[0]["selected"])
         self.assertEqual(self.controller.rows[0]["publish_at"],STAMP)
         self.assertEqual(self.controller.rows[1]["status"],"skipped")
+        self.assertFalse(self.controller.rows[1]["selected"])
         self.assertIsNone(self.controller.rows[1]["publish_at"])
         self.assertIn((CHANNEL,OTHER),self.controller.schedule_issues)
         self.module.schedule.assert_not_called()
 
-    def test_studio_recovers_saved_schedule_updates_unselected_old_error_and_reserves_day(self):
-        self.controller.rows=[row(publish_at=STAMP),row(OTHER,selected=False,status="error",publish_at=STAMP+86400,detail="old error")]
-        self.listing.list_all_videos.return_value=([video(OTHER,draft_status="DRAFT_STATUS_PUBLIC",scheduled_publishing_details={"unknown":True})],None)
+    def test_studio_recovers_saved_schedule_updates_selected_row_and_reserves_day(self):
+        self.controller.rows=[row(publish_at=STAMP),row(OTHER,selected=True,publish_at=STAMP)]
         self.module.read_video.side_effect=lambda channel_id,identifier:video(identifier,channel_id=channel_id,draft_status="DRAFT_STATUS_PUBLIC" if identifier==OTHER else "",
             scheduled_publishing_details={"unknown":True} if identifier==OTHER else "")
         self.thumbnail.inspect_schedule.return_value={"source":"studio_ui","channel_id":CHANNEL,"video_id":OTHER,"scheduled":True,"publish_at":STAMP}
         self.controller._check_schedule_conflicts()
+        self.listing.list_all_videos.assert_not_called()
         saved=self.controller.rows[1]
         self.assertEqual(saved["visibility_type"],"scheduled")
         self.assertEqual(saved["publish_at"],STAMP)
-        self.assertNotEqual(saved["status"],"error")
+        self.assertFalse(saved["selected"])
         self.assertEqual(saved["status"],"scheduled")
-        self.assertNotIn("old error",saved["detail"])
         self.assertEqual(self.controller.rows[0]["publish_at"],STAMP+86400)
         self.thumbnail.inspect_schedule.assert_called_once_with(CHANNEL,OTHER)
         self.thumbnail.publish.assert_not_called()
@@ -704,24 +715,24 @@ class PublishingControllerTests(unittest.TestCase):
         self.assertFalse(publishing_row_selectable(self.controller.rows[1]))
 
     def test_foreign_native_schedule_evidence_is_not_accepted(self):
-        self.controller.rows=[row(publish_at=STAMP)]
-        self.listing.list_all_videos.return_value=([video(OTHER,scheduled_publishing_details={"unknown":True})],None)
+        self.controller.rows=[row(publish_at=STAMP),row(OTHER,selected=True,publish_at=STAMP+86400)]
         self.module.read_video.side_effect=lambda channel_id,identifier:video(identifier,channel_id=channel_id,scheduled_publishing_details={"unknown":True} if identifier==OTHER else "")
         self.thumbnail.inspect_schedule.return_value={"source":"studio_ui","channel_id":CHANNEL2,"video_id":OTHER,"scheduled":True,"publish_at":STAMP}
         self.controller._check_schedule_conflicts()
+        self.listing.list_all_videos.assert_not_called()
         self.assertTrue(self.controller.rows[0]["selected"])
-        self.assertEqual(self.controller.occupied[CHANNEL],[])
+        self.assertEqual(self.controller.occupied.get(CHANNEL,[]),[])
         self.assertIn((CHANNEL,OTHER),self.controller.schedule_issues)
 
-    def test_worker_continues_selected_video_after_unselected_schedule_read_fails(self):
+    def test_worker_continues_selected_video_after_another_selected_schedule_read_fails(self):
         with tempfile.TemporaryDirectory() as folder:
             path=Path(folder)/"thumb.jpg";path.write_bytes(b"cached")
-            self.controller.rows=[row(reference=REFERENCE,thumbnail_path=str(path),publish_at=STAMP),row(OTHER,selected=False,status="error",publish_at=STAMP+86400)]
-            self.listing.list_all_videos.return_value=([video(OTHER,scheduled_publishing_details={"unknown":True})],None)
+            self.controller.rows=[row(reference=REFERENCE,thumbnail_path=str(path),publish_at=STAMP),row(OTHER,reference=REFERENCE,thumbnail_path=str(path),selected=True,publish_at=STAMP+86400)]
             self.module.read_video.side_effect=lambda channel_id,identifier:video(identifier,channel_id=channel_id,scheduled_publishing_details={"unknown":True} if identifier==OTHER else "")
             self.thumbnail.inspect_schedule.side_effect=ValueError("not ready")
             with patch("src.video_publishing_tasks.logger.error"):
                 self.controller._worker("run",create_run_context("isolated-schedule-read"))
+            self.listing.list_all_videos.assert_not_called()
             self.assertEqual(self.controller.rows[0]["status"],"successful")
             self.assertEqual(self.controller.rows[1]["status"],"skipped")
             self.assertIn("1 video chưa đọc được",self.controller.message)
@@ -729,12 +740,12 @@ class PublishingControllerTests(unittest.TestCase):
             self.assertEqual(self.thumbnail.publish.call_args.args[1],VIDEO)
             self.image.generate.assert_not_called()
 
-    def test_unreadable_list_schedule_is_refreshed_and_existing_schedule_is_preserved(self):
+    def test_unreadable_selected_schedule_is_refreshed_and_existing_schedule_is_preserved(self):
         self.controller.rows=[row(publish_at=STAMP),row(OTHER,publish_at=STAMP+86400)]
-        self.listing.list_all_videos.return_value=([video(scheduled_publishing_details={"unknown":True}),video(OTHER)],None)
         self.module.read_video.side_effect=lambda channel_id,identifier:video(identifier,channel_id=channel_id,
             scheduled_publishing_details={"scheduledTimeSeconds":str(STAMP)} if identifier==VIDEO else "")
         self.controller._check_schedule_conflicts()
+        self.listing.list_all_videos.assert_not_called()
         self.assertFalse(self.controller.rows[0]["selected"])
         self.assertEqual(self.controller.rows[0]["visibility_type"],"scheduled")
         self.assertEqual(self.controller.rows[0]["publish_at"],STAMP)
@@ -742,11 +753,12 @@ class PublishingControllerTests(unittest.TestCase):
         self.module.schedule.assert_not_called()
 
     def test_stale_unknown_schedule_that_is_absent_on_refresh_does_not_block(self):
-        self.controller.rows=[row(publish_at=STAMP)]
-        self.listing.list_all_videos.return_value=([video(OTHER,scheduled_publishing_details={"unknown":True})],None)
-        self.controller._check_schedule_conflicts()
-        self.assertEqual(self.controller.rows[0]["publish_at"],STAMP)
-        self.assertTrue(self.controller.rows[0]["selected"])
+        self.listing.list_all_videos.side_effect=[([video(OTHER,scheduled_publishing_details={"unknown":True})],None),([],None)]
+        self.module.read_video.side_effect=lambda channel_id,identifier:video(identifier,channel_id=channel_id)
+        with patch("src.video_publishing_tasks.get_channels_info",return_value=[SimpleNamespace(id=CHANNEL)]):
+            self.controller._scan(self.controller.settings,self.reference)
+        self.thumbnail.inspect_schedule.assert_not_called()
+        self.assertTrue(publishing_row_selectable(self.controller.rows[0]))
 
     def test_new_schedule_field_names_and_explicit_unscheduled_flags(self):
         for key in ("scheduledTimeSeconds","scheduledTimeSec","scheduledPublishTimeSec"):
@@ -913,7 +925,7 @@ class PublishingControllerTests(unittest.TestCase):
 
     def test_preflight_failure_names_schedule_check_and_does_not_mutate(self):
         self.controller.rows = [row(publish_at=STAMP)]
-        self.listing.list_all_videos.side_effect = requests.Timeout("secret-token")
+        self.module.read_video.side_effect = requests.Timeout("secret-token")
         with patch("src.video_publishing_tasks.logger.error") as log:
             self.controller._worker("run", create_run_context("preflight-timeout"))
         self.assertIn("Kiểm tra lịch hiện có:", self.controller.message)
@@ -1064,6 +1076,147 @@ class PublishingControllerTests(unittest.TestCase):
         self.controller.rows[0]["metadata_copied"] = True
         with self.assertRaises(ValueError):
             self.controller.set_song(VIDEO, "Another song")
+
+
+class FastScanTests(unittest.TestCase):
+    def _channel(self):
+        return SimpleNamespace(
+            id=CHANNEL, delegated_session_id="delegate", role="CREATOR_CHANNEL_ROLE_TYPE_OWNER",
+            cookies=[{"name": "SAPISID", "value": "cookie-secret"}], cookie_string=lambda: "SID=value",
+        )
+
+    def test_list_all_videos_builds_fast_status_filters_and_falls_back_on_http_400(self):
+        module = ListVideosModule()
+        channel = self._channel()
+        ok_resp = Mock(status_code=200)
+        ok_resp.json.return_value = {"videos": [{"videoId": VIDEO, "channelId": CHANNEL, "privacy": "VIDEO_PRIVACY_PRIVATE"}]}
+        for flag, check in (
+            ("exclude_public", lambda ops: any("or" in op for op in ops)),
+            ("scheduled_only", lambda ops: {"isScheduledToBePublic": {}} in ops),
+            ("public_only", lambda ops: any("and" in op for op in ops)),
+        ):
+            with self.subTest(flag=flag), \
+                    patch("src.module.list_videos_module.get_channels_info", return_value=channel), \
+                    patch.object(module, "_get_session_token", return_value="token"), \
+                    patch("src.module.list_videos_module.post_with_stop", return_value=ok_resp) as post:
+                videos, _ = module.list_all_videos(CHANNEL, **{flag: True})
+                operands = post.call_args.kwargs["json"]["filter"]["and"]["operands"]
+                self.assertTrue(check(operands))
+                if flag == "scheduled_only":
+                    self.assertTrue(has_schedule_info(videos[0]))
+
+        bad_resp = Mock(status_code=400)
+        bad_resp.json.return_value = {"error": {"message": "bad filter"}}
+        with patch("src.module.list_videos_module.get_channels_info", return_value=channel), \
+                patch.object(module, "_get_session_token", return_value="token"), \
+                patch("src.module.list_videos_module.post_with_stop", side_effect=[bad_resp, ok_resp]) as post:
+            videos, _ = module.list_all_videos(CHANNEL, exclude_public=True)
+        self.assertEqual(post.call_count, 2)
+        self.assertEqual(len(videos), 1)
+
+    def test_schedule_sources_ignore_placeholder_enums_and_read_visibility_nested_schedule(self):
+        clean = video(scheduled_publishing_details={"creatorVisibility": "CREATOR_VISIBILITY_UNSPECIFIED", "status": "SCHEDULE_STATUS_NONE"})
+        self.assertFalse(has_schedule_info(clean))
+        self.assertIsNone(schedule_timestamp(clean))
+        nested = video(visibility={"scheduledVisibility": {"publishTimeSeconds": str(STAMP)}})
+        self.assertTrue(has_schedule_info(nested))
+        self.assertEqual(schedule_timestamp(nested), STAMP)
+
+    def test_scan_resolves_stale_draft_scheduled_and_real_drafts_without_chrome_or_extra_reads(self):
+        storage = MemoryState()
+        listing, module, ref, img, thumb = Mock(), Mock(), Mock(), Mock(), Mock()
+        controller = VideoPublishingController(storage=storage, module=module, listing=listing,
+                                               reference_factory=lambda: ref, image_factory=lambda *_: img, thumbnail_factory=lambda: thumb)
+        controller.settings["channel_ids"] = [CHANNEL]
+        scheduled_stale = video(VIDEO, draft_status="DRAFT_STATUS_PUBLIC", scheduled_publishing_details={"publishTimeSeconds": str(STAMP)})
+        real_draft = video(OTHER, draft_status="DRAFT_STATUS_PUBLIC", scheduled_publishing_details={"publishTimeSeconds": str(STAMP + 86400)})
+        listing.list_all_videos.side_effect = [([scheduled_stale, real_draft], None), ([copy.deepcopy(real_draft)], None)]
+        with patch("src.video_publishing_tasks.get_channels_info", return_value=[SimpleNamespace(id=CHANNEL)]):
+            controller._scan(controller.settings, ref)
+        module.read_video.assert_not_called()
+        thumb.inspect_schedule.assert_not_called()
+        self.assertEqual(controller.rows[0]["visibility_type"], "scheduled")
+        self.assertEqual(controller.rows[0]["draft_status"], "DRAFT_STATUS_PUBLIC")
+        self.assertEqual(controller.rows[0]["publish_at"], STAMP)
+        self.assertEqual(controller.rows[1]["visibility_type"], "draft")
+        self.assertIsNone(controller.rows[1].get("publish_at"))
+        self.assertEqual(controller.occupied[CHANNEL], [STAMP])
+
+    def test_scan_scope_controls_exclude_public_and_newest_limit_stops_pagination(self):
+        storage = MemoryState()
+        listing = Mock()
+        controller = VideoPublishingController(storage=storage, listing=listing, module=Mock(),
+                                               reference_factory=Mock, image_factory=Mock, thumbnail_factory=Mock)
+        controller.settings.update(channel_ids=[CHANNEL], scope="unpublished", scan_all=False, limit=2, order="newest")
+        listing.list_all_videos.side_effect = [
+            ([video("v0000000001"), video("v0000000002")], "page-2"),
+            ([video("v0000000003", draft_status="DRAFT_STATUS_PRIVATE")], None),
+        ]
+        with patch("src.video_publishing_tasks.get_channels_info", return_value=[SimpleNamespace(id=CHANNEL)]):
+            controller._scan(controller.settings, Mock())
+        self.assertEqual(listing.list_all_videos.call_count, 2)
+        self.assertTrue(listing.list_all_videos.call_args_list[0].kwargs.get("exclude_public"))
+
+        listing.reset_mock()
+        controller.settings.update(scope="all", scan_all=True)
+        listing.list_all_videos.side_effect = [([], None), ([], None)]
+        with patch("src.video_publishing_tasks.get_channels_info", return_value=[SimpleNamespace(id=CHANNEL)]):
+            controller._scan(controller.settings, Mock())
+        self.assertFalse(listing.list_all_videos.call_args_list[0].kwargs.get("exclude_public", False))
+
+    def test_resolve_schedules_batches_api_reads_and_single_browser_session(self):
+        class BatchModule:
+            def __init__(self):
+                self.calls = []
+            def read_videos(self, channel_id, video_ids):
+                self.calls.append((channel_id, list(video_ids)))
+                return {vid: video(vid, channel_id=channel_id, scheduled_publishing_details={"unknown": True}) for vid in video_ids}
+            def read_video(self, channel_id, video_id):
+                raise AssertionError("single read_video should not be used when batch succeeds")
+
+        class BatchBrowser:
+            def __init__(self):
+                self.calls = []
+            def inspect_schedules(self, channel_id, video_ids, **_kwargs):
+                self.calls.append((channel_id, list(video_ids)))
+                return {vid: {"source": "studio_ui", "channel_id": channel_id, "video_id": vid, "scheduled": True, "publish_at": STAMP} for vid in video_ids}
+
+        batch_module = BatchModule()
+        batch_browser = BatchBrowser()
+        controller = VideoPublishingController(storage=MemoryState(), module=batch_module, listing=Mock(),
+                                               reference_factory=Mock, image_factory=Mock, thumbnail_factory=lambda: batch_browser)
+        resolved = controller._resolve_schedules(CHANNEL, [
+            video(VIDEO, scheduled_publishing_details={"unknown": True}),
+            video(OTHER, scheduled_publishing_details={"unknown": True}),
+        ])
+        self.assertEqual(batch_module.calls, [(CHANNEL, [VIDEO, OTHER])])
+        self.assertEqual(batch_browser.calls, [(CHANNEL, [VIDEO, OTHER])])
+        self.assertTrue(all(schedule_timestamp(item) == STAMP for item in resolved))
+
+    def test_get_videos_info_and_read_videos_chunk_50_and_reject_foreign_channel(self):
+        module = VideoPublishingModule()
+        channel = self._channel()
+        ids = [f"v{index:010d}" for index in range(55)]
+        def fake_post(url=None, headers=None, json=None):
+            resp = Mock(status_code=200)
+            resp.json.return_value = {"videos": [{"videoId": vid, "channelId": CHANNEL} for vid in json["videoIds"]]}
+            return resp
+        with patch("src.module.base.get_channels_info", return_value=channel), \
+                patch.object(module, "_get_session_token", return_value="token"), \
+                patch("src.module.base.post_with_stop", side_effect=fake_post) as post:
+            result = module.read_videos(CHANNEL, ids)
+        self.assertEqual(len(result), 55)
+        self.assertEqual([len(call.kwargs["json"]["videoIds"]) for call in post.call_args_list], [50, 5])
+
+        def foreign_post(url=None, headers=None, json=None):
+            resp = Mock(status_code=200)
+            resp.json.return_value = {"videos": [{"videoId": VIDEO, "channelId": CHANNEL2}]}
+            return resp
+        with patch("src.module.base.get_channels_info", return_value=channel), \
+                patch.object(module, "_get_session_token", return_value="token"), \
+                patch("src.module.base.post_with_stop", side_effect=foreign_post):
+            with self.assertRaises(ValueError):
+                module.read_videos(CHANNEL, [VIDEO])
 
 
 if __name__ == "__main__":

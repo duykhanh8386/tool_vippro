@@ -28,7 +28,7 @@ PUBLISHING_SCAN_SCHEMA_VERSION = 2
 
 def studio_schedule_result(video):
     proof = getattr(video, "studio_schedule", None)
-    if (not isinstance(proof, dict) or proof.get("source") != "studio_ui"
+    if (not isinstance(proof, dict) or proof.get("source") not in {"studio_ui", "content_list"}
             or proof.get("video_id") != getattr(video, "id", None)
             or proof.get("channel_id") != getattr(video, "channel_id", None)
             or type(proof.get("scheduled")) is not bool):
@@ -49,8 +49,17 @@ def _schedule_sources(video):
             return any(meaningful(child) for key,child in value.items() if key not in {"privacy","targetPrivacy","newPrivacy"})
         if isinstance(value,list):
             return any(meaningful(child) for child in value)
+        if isinstance(value, str):
+            normalized = value.strip().upper()
+            return bool(normalized and normalized != "0" and not any(marker in normalized for marker in ("UNSPECIFIED", "_NONE", "NOT_SCHEDULED")))
         return value not in (None,False,0,"","0")
-    for value in (getattr(video, "scheduled_publishing_details", None), getattr(video, "scheduled_creator_visibility", None)):
+    candidates = [getattr(video, "scheduled_publishing_details", None), getattr(video, "scheduled_creator_visibility", None)]
+    visibility = getattr(video, "visibility", None)
+    if isinstance(visibility, dict):
+        for key in ("scheduledPublishingDetails", "scheduledCreatorVisibility", "scheduledPublishing", "scheduledVisibility", "schedule"):
+            if key in visibility:
+                candidates.append(visibility.get(key))
+    for value in candidates:
         if isinstance(value, dict) and any(value.get(key) is False for key in ("isScheduled", "scheduled")):
             continue
         if isinstance(value, str) and any(marker in value.upper() for marker in ("UNSPECIFIED", "_NONE")):
@@ -270,7 +279,7 @@ def schedule_timestamp(video) -> float | None:
         # Studio has returned both its publication object and the metadata
         # command shape for scheduledPublishingDetails across client versions.
         stamp = _timestamp(candidate)
-        nested = (candidate.get("scheduledPublishing") or candidate.get("set") or candidate.get("scheduledCreatorVisibility")) if isinstance(candidate, dict) else None
+        nested = (candidate.get("scheduledPublishing") or candidate.get("set") or candidate.get("scheduledCreatorVisibility") or candidate.get("scheduledVisibility")) if isinstance(candidate, dict) else None
         if isinstance(nested, dict):
             nested = nested.get("set", nested)
             stamp = stamp or _timestamp(nested.get("timeSec")) or _timestamp(nested)

@@ -1,7 +1,7 @@
 # RECOVERED: reconstructed from CPython 3.12 bytecode
 import requests
 from loguru import logger
-from src.module.base import IModule, _response_json_or_error
+from src.module.base import IModule, YouTubeRequestError, _response_json_or_error
 from src.module.model import Video, VideoType
 from src.utils import get_channels_info
 from src.task_runtime import check_stopped, post_with_stop
@@ -28,12 +28,13 @@ class ListVideosModule(IModule):
     pass
     pass
 
-    def list_all_videos(self, channel_id: str, limit: int=50, page_token: str | None=None, *, draft_only: bool=False, include_all_origins: bool=False) -> tuple[list[Video], str | None]:
+    def list_all_videos(self, channel_id: str, limit: int=50, page_token: str | None=None, *, draft_only: bool=False, scheduled_only: bool=False, public_only: bool=False, exclude_public: bool=False, include_all_origins: bool=False) -> tuple[list[Video], str | None]:
         """
         Fetch all uploaded videos for a channel regardless of privacy type.
 
         Uses a broader filter that omits any privacyIs constraint, returning
-        private, public, and unlisted videos together.
+        private, public, and unlisted videos together unless constrained by
+        status filters.
 
         Args:
             channel_id:  The YouTube channel ID.
@@ -41,6 +42,10 @@ class ListVideosModule(IModule):
             page_token:  Continuation token from a previous call for pagination.
             draft_only:  Ask Studio for draft rows explicitly. Draft uploads are
                          not consistently included in the unfiltered listing.
+            scheduled_only: Ask Studio for scheduled rows explicitly.
+            public_only: Ask Studio for live public rows explicitly.
+            exclude_public: Exclude live public rows server-side while keeping
+                            drafts, scheduled, private, and unlisted videos.
             include_all_origins: Include livestream archives as well as uploads.
                                  Existing audio scans keep their current default.
 
@@ -66,19 +71,61 @@ class ListVideosModule(IModule):
     "shorts": {"all": True}, "scheduledPublishingDetails": {"all": True}, "visibility": {"all": True}, "privateShare": {"all": True}, "sponsorsOnly": {"all": True}, "unlistedExpired": True, "videoTrailers": {"all": True}, "remix": {"isSource": True}, "isPaygated": True}, "context": {"client": {"clientName": 62, "clientVersion": "1.20260520.00.00", "hl": "vi", "gl": "VN", "experimentsToken": "", "utcOffsetMinutes": 420, "userInterfaceTheme": "USER_INTERFACE_THEME_DARK", "screenWidthPoints": 1920, "screenHeightPoints": 150, "screenPixelDensity": 1, "screenDensityFloat": 1}, "request": {"returnLogEntry": True, "internalExperimentFlags": [], "eats": self.EATS, "sessionInfo": {"token": session_token}, "consistencyTokenJars": []}, "user": {"onBehalfOfUser": channel_info.delegated_session_id, "delegationContext": {"externalChannelId": channel_info.id, "roleType": {"channelRoleType": channel_info.role}}, "serializedDelegationContext": ""}, "clickTracking": {"visualElement": {"veType": 31_402}}, "clientScreenNonce": self.CLIENT_SCREEN_NONCE}}
         payload["context"] = self._current_studio_context(channel_info, session_token, base_context=payload["context"])
         payload["mask"]["scheduledCreatorVisibility"] = {"all": True}
+        operands = payload["filter"]["and"]["operands"]
         if include_all_origins:
-            operands = payload["filter"]["and"]["operands"]
             operands[:] = [operand for operand in operands if "videoOriginIs" not in operand]
+        extra_status_filter = False
         if draft_only:
-            payload["filter"]["and"]["operands"].insert(1, {"isDraft": {}})
+            operands.insert(1, {"isDraft": {}})
+        elif scheduled_only:
+            operands.insert(1, {"isScheduledToBePublic": {}})
+            extra_status_filter = True
+        elif public_only:
+            operands.insert(
+                1,
+                {
+                    "and": {
+                        "operands": [
+                            {"privacyIs": {"value": "VIDEO_PRIVACY_PUBLIC"}},
+                            {"not": {"operand": {"isDraft": {}}}},
+                            {"not": {"operand": {"isScheduledToBePublic": {}}}},
+                        ]
+                    }
+                },
+            )
+            extra_status_filter = True
+        elif exclude_public:
+            operands.insert(
+                1,
+                {
+                    "or": {
+                        "operands": [
+                            {"isDraft": {}},
+                            {"isScheduledToBePublic": {}},
+                            {"privacyIs": {"value": "VIDEO_PRIVACY_PRIVATE"}},
+                            {"privacyIs": {"value": "VIDEO_PRIVACY_UNLISTED"}},
+                        ]
+                    }
+                },
+            )
+            extra_status_filter = True
         payload["mask"].update({"copyrightSummary": {"all": True}, "claimDetails": {"all": True}})
         headers = {"origin": "https://studio.youtube.com", "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36", "cookie": cookie_string, "content-type": "application/json", "authorization": studio_authorization_header(channel_info.cookies)}
         headers["user-agent"] = payload["context"]["client"].get("userAgent") or headers["user-agent"]
         if page_token:
             payload["pageToken"] = page_token
         url = "https://studio.youtube.com/youtubei/v1/creator/list_creator_videos?alt=json"
-        response = post_with_stop(url, headers=headers, json=payload)
-        res = _response_json_or_error(response, "channel video scan")
+        try:
+            response = post_with_stop(url, headers=headers, json=payload)
+            res = _response_json_or_error(response, "channel video scan")
+        except YouTubeRequestError as exc:
+            if extra_status_filter and exc.status_code == 400:
+                logger.warning("Retrying channel video scan without extra status filter after HTTP 400")
+                operands.pop(1)
+                response = post_with_stop(url, headers=headers, json=payload)
+                res = _response_json_or_error(response, "channel video scan")
+            else:
+                raise
         next_page_token = res.get("nextPageToken") or None
         videos = []
         for item in res.get("videos", []):
@@ -94,6 +141,10 @@ class ListVideosModule(IModule):
                 # preserving explicit false/NONE after a concurrent save.
                 if draft_only and (draft_status is None or draft_status == "" or draft_status == {}):
                     draft_status = {"isDraft": True}
+                scheduled_publishing_details = item.get("scheduledPublishingDetails", "")
+                scheduled_creator_visibility = item.get("scheduledCreatorVisibility", "")
+                if scheduled_only and not scheduled_publishing_details and not scheduled_creator_visibility:
+                    scheduled_publishing_details = {"isScheduled": True}
                 videos.append(
                     Video(
                         id=item.get("videoId", ""),
@@ -108,10 +159,8 @@ class ListVideosModule(IModule):
                         video_status=item.get("status", ""),
                         copyright_check_status=copyright_status,
                         draft_status=draft_status,
-                        scheduled_publishing_details=item.get(
-                            "scheduledPublishingDetails", ""
-                        ),
-                        scheduled_creator_visibility=item.get("scheduledCreatorVisibility", ""),
+                        scheduled_publishing_details=scheduled_publishing_details,
+                        scheduled_creator_visibility=scheduled_creator_visibility,
                         visibility=item.get("visibility", ""),
                         time_created_seconds=item.get("timeCreatedSeconds", ""),
                         time_published_seconds=item.get("timePublishedSeconds", ""),

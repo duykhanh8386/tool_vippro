@@ -55,6 +55,10 @@ def _fetch_channel_videos(
         list_kwargs = {"limit": page_size, "page_token": page_token}
         if normalized_scope == "draft":
             list_kwargs["draft_only"] = True
+        elif normalized_scope == "scheduled":
+            list_kwargs["scheduled_only"] = True
+        elif normalized_scope == "public":
+            list_kwargs["public_only"] = True
         page, next_token = list_videos_module.list_all_videos(channel_id, **list_kwargs)
         for video in page:
             if not video.id or video.id in seen_ids:

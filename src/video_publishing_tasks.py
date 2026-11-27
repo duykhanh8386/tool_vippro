@@ -29,7 +29,7 @@ from src.video_publishing import (
     publishing_row_disabled_reason, publishing_row_matches, publishing_row_selectable,
     publishing_video_type, schedule_timestamp, studio_schedule_result, thumbnail_file_stem,
 )
-from src.video_scan_dates import VIETNAM_TIMEZONE
+from src.video_scan_dates import VIETNAM_TIMEZONE, _status_indicates_draft
 from src.video_title_matching import parse_manual_title_ids
 
 STATE_KEY = "video_publishing"
@@ -426,21 +426,30 @@ class VideoPublishingController:
             raise ValueError("Link kênh phải là kênh đã đăng nhập trong mục Tài khoản & kênh.")
         manual = parse_manual_title_ids(settings["manual_ids"]) if settings["manual_ids"].strip() else []
         manual_set = set(manual)
+        skip_public = not manual and settings["scope"] not in {"all", "public"}
+        newest_limit = int(settings["limit"]) if (not manual and not settings["scan_all"] and settings["order"] == "newest") else None
         rows, occupied = [], {}
         for channel_id in dict.fromkeys(channels):
             self._progress(f"Đang quét kênh {channel_id}…")
-            seen, tokens, videos = {}, set(), []
+            seen, tokens, videos, draft_ids = {}, set(), [], set()
             # Include explicit draft listing; not every Studio account returns
-            # drafts in the unfiltered list. Always read every page for occupancy.
+            # drafts in the unfiltered list.
             for draft_only in (False, True):
                 token = None
                 tokens.clear()
+                pass_count = 0
                 while True:
                     check_stopped()
-                    page, next_token = self.listing.list_all_videos(channel_id, limit=100, page_token=token, draft_only=draft_only)
+                    list_kwargs = {"limit": 100, "page_token": token, "draft_only": draft_only}
+                    if not draft_only and skip_public:
+                        list_kwargs["exclude_public"] = True
+                    page, next_token = self.listing.list_all_videos(channel_id, **list_kwargs)
                     for video in page:
                         if not re.fullmatch(r"[A-Za-z0-9_-]{11}", video.id) or video.channel_id != channel_id:
                             raise ValueError("YouTube trả về video không thuộc kênh đang quét.")
+                        pass_count += 1
+                        if draft_only and _status_indicates_draft(video.draft_status):
+                            draft_ids.add(video.id)
                         if video.id not in seen:
                             seen[video.id] = video
                             videos.append(video)
@@ -454,13 +463,13 @@ class VideoPublishingController:
                             if video.privacy:
                                 previous.privacy = video.privacy
                     self._progress(f"Kênh {channel_id} · đã đọc {len(videos)} video…")
-                    if not next_token:
+                    if not next_token or (newest_limit is not None and pass_count >= newest_limit):
                         break
                     if next_token in tokens:
                         raise ValueError("YouTube trả về phân trang lặp; đã dừng quét.")
                     tokens.add(next_token)
                     token = next_token
-            videos = [self._resolve_schedule(video) for video in videos]
+            videos = self._resolve_schedules(channel_id, videos, draft_ids=draft_ids)
             occupied[channel_id] = [stamp for video in videos if (stamp := schedule_timestamp(video))]
             if manual:
                 videos = [video for video in videos if video.id in manual_set]
@@ -498,7 +507,8 @@ class VideoPublishingController:
                 raise ValueError("Không tìm thấy Video ID trong các kênh đã chọn: " + ", ".join(sorted(missing)))
         with self.lock:
             self.rows, self.occupied = rows, occupied
-            self.message = f"Đã quét {len(rows)} video · {sum(publishing_row_selectable(row) for row in rows)} có thể chọn lên lịch. Lọc loại video bên dưới rồi tích chọn."
+            suffix = " (Đã bỏ qua video Công khai để quét nhanh; chọn 'Tất cả loại video' hoặc 'Đã công khai' rồi quét lại nếu cần xem.)" if skip_public else ""
+            self.message = f"Đã quét {len(rows)} video · {sum(publishing_row_selectable(row) for row in rows)} có thể chọn lên lịch. Lọc loại video bên dưới rồi tích chọn." + suffix
             self._checkpoint()
 
     def _process(self, settings, reference, image, action):
@@ -626,34 +636,40 @@ class VideoPublishingController:
                                  visibility_type=kind, visibility_label=VIDEO_TYPE_LABELS[kind],
                                  detail="Đã đọc lại trạng thái lịch; có thể chọn video để xử lý.")
 
+    def _read_videos_batch(self, channel_id, video_ids):
+        if not video_ids or not callable(getattr(type(self.module), "read_videos", None)):
+            return {}
+        try:
+            fetched = self.module.read_videos(channel_id, video_ids)
+            return dict(fetched) if isinstance(fetched, dict) else {}
+        except TaskStopped:
+            raise
+        except Exception as exc:
+            if isinstance(exc, YouTubeRequestError) and exc.status_code in {401, 403}:
+                raise
+            return {}
+
     def _check_schedule_conflicts(self):
-        """Detect schedules added since the preview before any remote mutation."""
+        """Check only selected videos before publishing without re-scanning the whole channel."""
         selected = [row for row in self.rows if row.get("selected") and row.get("publish_at")]
         self.schedule_issues, self._schedule_cache = {}, {}
         occupied = copy.deepcopy(self.occupied)
         remote_pending = {}
         for channel_id in dict.fromkeys(row["channel_id"] for row in selected):
-            self._progress(f"Đang kiểm tra lại lịch hiện có trên kênh {channel_id}…")
-            token, tokens, seen = None, set(), {}
-            while True:
-                page, next_token = self.listing.list_all_videos(channel_id, limit=100, page_token=token)
-                for video in page:
-                    if video.channel_id != channel_id:
-                        raise ValueError("YouTube trả về lịch của kênh khác.")
-                    seen[video.id] = self._resolve_schedule(video)
-                if not next_token:
-                    break
-                if next_token in tokens:
-                    raise ValueError("YouTube trả về phân trang lịch bị lặp.")
-                tokens.add(next_token)
-                token = next_token
-            self._reconcile_schedule_rows(channel_id, seen)
-            for row in [item for item in selected if item["channel_id"] == channel_id and item.get("selected")]:
-                current = self.module.read_video(channel_id, row["video_id"])
+            selected_rows = [item for item in selected if item["channel_id"] == channel_id and item.get("selected")]
+            self._progress(f"Đang kiểm tra {len(selected_rows)} video đã chọn trên kênh {channel_id}…")
+            batch_selected = self._read_videos_batch(channel_id, [item["video_id"] for item in selected_rows])
+            current_videos = []
+            for row in selected_rows:
+                current = batch_selected.get(row["video_id"])
+                if current is None:
+                    current = self.module.read_video(channel_id, row["video_id"])
                 if current.id != row["video_id"] or current.channel_id != channel_id:
                     raise ValueError("Video đọc lại không thuộc đúng kênh; chưa đặt lịch.")
-                current = self._resolve_schedule(current)
-                seen[current.id] = current
+                current_videos.append(current)
+            resolved_selected = self._resolve_schedules(channel_id, current_videos)
+            newly_occupied = []
+            for row, current in zip(selected_rows, resolved_selected):
                 if (channel_id, current.id) in self.schedule_issues:
                     self._reconcile_schedule_rows(channel_id, {current.id:current})
                     continue
@@ -669,51 +685,152 @@ class VideoPublishingController:
                     continue
                 if kind in {"scheduled", "public"}:
                     changes = dict(selected=False, visibility_type=kind, visibility_label=VIDEO_TYPE_LABELS[kind], status="scheduled" if kind=="scheduled" else "skipped",
+                                   error_step="", error_type="",
                                    availability_reason="Video đã có lịch đăng; giữ lịch hiện tại." if kind=="scheduled" else "Video đã công khai; giữ trạng thái hiện tại.",
                                    detail="Đã đọc lại trạng thái trên YouTube; không đặt lại lịch video này.")
                     if stamp:
                         changes.update(publish_at=int(stamp),publish_label=datetime.fromtimestamp(stamp,VIETNAM_TIMEZONE).strftime("%d/%m/%Y %H:%M"))
+                        if kind == "scheduled":
+                            newly_occupied.append(int(stamp))
                     self._checkpoint(row,**changes)
                 elif stamp:
                     remote_pending[row["video_id"]] = int(stamp)
-            occupied[channel_id] = [stamp for video in seen.values() if (stamp:=schedule_timestamp(video))]
+            if newly_occupied:
+                occupied[channel_id] = list(dict.fromkeys([*occupied.get(channel_id, []), *newly_occupied]))
+                colliding_days = {datetime.fromtimestamp(stamp, VIETNAM_TIMEZONE).date() for stamp in newly_occupied}
+                for row in selected_rows:
+                    if row.get("selected") and row["video_id"] not in remote_pending and row.get("publish_at"):
+                        if datetime.fromtimestamp(row["publish_at"], VIETNAM_TIMEZONE).date() in colliding_days:
+                            row.pop("publish_at", None)
+                            row.pop("publish_label", None)
         with self.lock:
             self.occupied = occupied
             for row in selected:
-                if row.get("selected"):
-                    row.pop("publish_at",None)
-                    row.pop("publish_label",None)
-                    if row["video_id"] in remote_pending:
-                        row["publish_at"] = remote_pending[row["video_id"]]
+                if row.get("selected") and row["video_id"] in remote_pending:
+                    row["publish_at"] = remote_pending[row["video_id"]]
+                    row["publish_label"] = datetime.fromtimestamp(row["publish_at"], VIETNAM_TIMEZONE).strftime("%d/%m/%Y %H:%M")
             self._assign_plan()
 
-    def _resolve_schedule(self, video):
-        key = (video.channel_id, video.id)
-        if key in self._schedule_cache:
-            return self._schedule_cache[key]
-        if not has_schedule_info(video) or (schedule_timestamp(video) is not None and publishing_video_type(video) != "draft"):
-            return video
-        current = video
-        try:
-            current = self.module.read_video(video.channel_id, video.id)
-            if current.id != video.id or current.channel_id != video.channel_id:
-                raise ValueError("Video đọc lại không thuộc đúng kênh; chưa xác nhận lịch.")
-            if has_schedule_info(current) and (schedule_timestamp(current) is None or publishing_video_type(current) == "draft"):
-                proof = self.thumbnail_factory().inspect_schedule(video.channel_id, video.id)
-                current.studio_schedule = proof
-                if studio_schedule_result(current) is None:
-                    raise ValueError("Chưa nhận được kết quả đọc lịch của đúng video/kênh từ Studio.")
-            self._schedule_cache[key] = current
-            return current
-        except TaskStopped:
-            raise
-        except Exception as exc:
-            if isinstance(exc, YouTubeRequestError) and exc.status_code in {401,403}:
-                raise
-            self._log_error(exc, step="check_schedules", row={"channel_id":video.channel_id,"video_id":video.id})
+    def _resolve_schedules(self, channel_id, videos, *, draft_ids=None, scheduled_only=False):
+        def apply_content_list_resolution(video):
+            if not has_schedule_info(video):
+                return True
+            if draft_ids is not None and video.id in draft_ids:
+                video.studio_schedule = {
+                    "source": "content_list",
+                    "channel_id": video.channel_id,
+                    "video_id": video.id,
+                    "scheduled": False,
+                    "publish_at": None,
+                }
+                return True
+            stamp = schedule_timestamp(video)
+            if stamp is not None:
+                if publishing_video_type(video) != "draft":
+                    return True
+                if (draft_ids is not None and video.id not in draft_ids) or scheduled_only:
+                    video.studio_schedule = {
+                        "source": "content_list",
+                        "channel_id": video.channel_id,
+                        "video_id": video.id,
+                        "scheduled": True,
+                        "publish_at": int(stamp),
+                    }
+                    return True
+            return False
+
+        def record_issue(video, exc):
+            key = (video.channel_id, video.id)
+            self._log_error(exc, step="check_schedules", row={"channel_id": video.channel_id, "video_id": video.id})
             self.schedule_issues[key] = "Video " + video.id + " chưa đọc được ngày/giờ lịch. Giữ nguyên video này; các video khác vẫn được xử lý theo lịch đã đọc được."
             self._schedule_cache[key] = video
-            return video
+
+        resolved = {}
+        pending = []
+        for video in videos:
+            key = (video.channel_id, video.id)
+            if key in self._schedule_cache:
+                resolved[key] = self._schedule_cache[key]
+            elif apply_content_list_resolution(video):
+                resolved[key] = video
+            else:
+                pending.append(video)
+
+        if pending:
+            self._progress(f"Kênh {channel_id} · đang kiểm tra lịch của {len(pending)} video…")
+            batch = self._read_videos_batch(channel_id, [video.id for video in pending])
+            need_browser = []
+            for video in pending:
+                key = (video.channel_id, video.id)
+                try:
+                    current = batch.get(video.id)
+                    if current is None:
+                        current = self.module.read_video(video.channel_id, video.id)
+                    if current.id != video.id or current.channel_id != video.channel_id:
+                        raise ValueError("Video đọc lại không thuộc đúng kênh; chưa xác nhận lịch.")
+                    if apply_content_list_resolution(current):
+                        self._schedule_cache[key] = current
+                        resolved[key] = current
+                    else:
+                        need_browser.append((video, current))
+                except TaskStopped:
+                    raise
+                except Exception as exc:
+                    if isinstance(exc, YouTubeRequestError) and exc.status_code in {401, 403}:
+                        raise
+                    record_issue(video, exc)
+                    resolved[key] = video
+
+            if need_browser:
+                adapter = self.thumbnail_factory()
+                use_batch_browser = (
+                    len(need_browser) > 1
+                    and callable(getattr(type(adapter), "inspect_schedules", None))
+                )
+                proofs = {}
+                if use_batch_browser:
+                    try:
+                        proofs = adapter.inspect_schedules(
+                            channel_id,
+                            [current.id for _, current in need_browser],
+                            on_progress=lambda i, n, vid: self._progress(
+                                f"Kênh {channel_id} · đang kiểm tra lịch ({i}/{n}) · {vid}…"
+                            ),
+                        )
+                    except TaskStopped:
+                        raise
+                    except Exception as exc:
+                        if isinstance(exc, YouTubeRequestError) and exc.status_code in {401, 403}:
+                            raise
+                        proofs = {current.id: exc for _, current in need_browser}
+                for original, current in need_browser:
+                    key = (original.channel_id, original.id)
+                    try:
+                        if use_batch_browser:
+                            proof = proofs.get(current.id)
+                            if isinstance(proof, Exception):
+                                raise proof
+                        else:
+                            proof = adapter.inspect_schedule(current.channel_id, current.id)
+                        current.studio_schedule = proof
+                        if studio_schedule_result(current) is None:
+                            raise ValueError("Chưa nhận được kết quả đọc lịch của đúng video/kênh từ Studio.")
+                        self._schedule_cache[key] = current
+                        resolved[key] = current
+                    except TaskStopped:
+                        raise
+                    except Exception as exc:
+                        if isinstance(exc, YouTubeRequestError) and exc.status_code in {401, 403}:
+                            raise
+                        record_issue(original, exc)
+                        resolved[key] = original
+
+        return [resolved[(video.channel_id, video.id)] for video in videos]
+
+    def _resolve_schedule(self, video, *, draft_ids=None, scheduled_only=False):
+        return self._resolve_schedules(
+            video.channel_id, [video], draft_ids=draft_ids, scheduled_only=scheduled_only
+        )[0]
 
     def _worker(self, action, run):
         reference = image = None

@@ -173,10 +173,10 @@ class IModule(ABC):
         return videos
 
         cookie = None
-    def _get_video_info(self, video_id: str, channel_id: str, *, critical_read=False) -> Video:
+    def _build_get_creator_videos_request(self, video_ids: list[str], channel_id: str, *, critical_read: bool=False, fail_on_error: bool=True):
         channel_info = get_channels_info(channel_id); cookie_string = "; ".join([f"{cookie['name']}={cookie['value']}" for cookie in channel_info.cookies]); session_token = self._get_session_token(channel_info); url = "https://studio.youtube.com/youtubei/v1/creator/get_creator_videos?alt=json"; headers = {"origin": "https://studio.youtube.com", "user-agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36", "cookie": cookie_string, "content-type": "application/json", "authorization": studio_authorization_header(channel_info.cookies)}
 
-        payload = {"context": {"client": {"clientName": 62, "clientVersion": "1.20250905.02.00", "hl": "vi", "gl": "VN", "experimentsToken": "", "utcOffsetMinutes": 420, "userInterfaceTheme": "USER_INTERFACE_THEME_DARK", "screenWidthPoints": 2560, "screenHeightPoints": 544, "screenPixelDensity": 2, "screenDensityFloat": 1.5}, "request": {"returnLogEntry": True, "internalExperimentFlags": [], "eats": "AWSNWa2q-ubSn35ywNe6Myhvveym5w_4-S_D3p_lk689PZciFEJrTquCWvtc1PgiFObkpeU638J5M3CTcvCmegVUfkseMdAJaVgmOWE_S5SHQpzuXaZu1I7szwPPUQ==", "sessionInfo": {"token": session_token}, "consistencyTokenJars": []}, "user": {"onBehalfOfUser": channel_info.delegated_session_id, "delegationContext": {"externalChannelId": channel_info.id, "roleType": {"channelRoleType": channel_info.role}}, "serializedDelegationContext": ""}, "clickTracking": {"visualElement": {"veType": 74_615}}, "clientScreenNonce": "rQg33g-jDrOyosOi"}, "failOnError": True, "videoIds": [video_id], "mask": {"channelId": True, "downloadUrl": True, "origin": True, "premiere": {"all": True},
+        payload = {"context": {"client": {"clientName": 62, "clientVersion": "1.20250905.02.00", "hl": "vi", "gl": "VN", "experimentsToken": "", "utcOffsetMinutes": 420, "userInterfaceTheme": "USER_INTERFACE_THEME_DARK", "screenWidthPoints": 2560, "screenHeightPoints": 544, "screenPixelDensity": 2, "screenDensityFloat": 1.5}, "request": {"returnLogEntry": True, "internalExperimentFlags": [], "eats": "AWSNWa2q-ubSn35ywNe6Myhvveym5w_4-S_D3p_lk689PZciFEJrTquCWvtc1PgiFObkpeU638J5M3CTcvCmegVUfkseMdAJaVgmOWE_S5SHQpzuXaZu1I7szwPPUQ==", "sessionInfo": {"token": session_token}, "consistencyTokenJars": []}, "user": {"onBehalfOfUser": channel_info.delegated_session_id, "delegationContext": {"externalChannelId": channel_info.id, "roleType": {"channelRoleType": channel_info.role}}, "serializedDelegationContext": ""}, "clickTracking": {"visualElement": {"veType": 74_615}}, "clientScreenNonce": "rQg33g-jDrOyosOi"}, "failOnError": bool(fail_on_error), "videoIds": list(video_ids), "mask": {"channelId": True, "downloadUrl": True, "origin": True, "premiere": {"all": True},
 
     "privacy": True, "videoId": True, "title": True, "titleDetails": {"all": True},
 
@@ -204,6 +204,12 @@ class IModule(ABC):
             payload["context"] = self._current_studio_context(channel_info, session_token, base_context=payload["context"])
             payload["mask"]["scheduledCreatorVisibility"] = {"all": True}
             headers["user-agent"] = payload["context"]["client"].get("userAgent") or headers["user-agent"]
+        return url, headers, payload
+
+    def _get_video_info(self, video_id: str, channel_id: str, *, critical_read=False) -> Video:
+        url, headers, payload = self._build_get_creator_videos_request(
+            [video_id], channel_id, critical_read=critical_read, fail_on_error=True
+        )
         response = post_with_stop(url=url, headers=headers, json=payload)
         res = _response_json_or_error(response, "video status check")
         videos = res.get("videos")
@@ -214,6 +220,31 @@ class IModule(ABC):
                 response_excerpt=_safe_response_excerpt(response),
             )
         return studio_video_from_payload(videos[0])
+
+    def _get_videos_info(self, video_ids: list[str], channel_id: str, *, critical_read: bool=False) -> dict[str, Video]:
+        unique_ids = []
+        seen = set()
+        for raw_id in video_ids:
+            vid = str(raw_id or "").strip()
+            if vid and vid not in seen:
+                seen.add(vid)
+                unique_ids.append(vid)
+        if not unique_ids:
+            return {}
+        videos: dict[str, Video] = {}
+        for index in range(0, len(unique_ids), 50):
+            chunk = unique_ids[index:index + 50]
+            url, headers, payload = self._build_get_creator_videos_request(
+                chunk, channel_id, critical_read=critical_read, fail_on_error=len(chunk) == 1
+            )
+            response = post_with_stop(url=url, headers=headers, json=payload)
+            res = _response_json_or_error(response, "video status check")
+            for item in res.get("videos") or []:
+                if isinstance(item, dict):
+                    parsed = studio_video_from_payload(item)
+                    if parsed.id:
+                        videos[parsed.id] = parsed
+        return videos
 
         cookie = None
     def _current_studio_context(self, channel, token, *, base_context=None):

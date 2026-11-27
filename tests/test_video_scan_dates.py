@@ -219,6 +219,16 @@ class VideoScanDateTests(unittest.TestCase):
         for date_type in ("auto", "uploaded", "published", "scheduled"):
             self.assertTrue(video_matches_scan_dates(video("undated"), None, date_type=date_type))
 
+    def test_scheduled_and_public_scopes_pass_server_side_filters(self):
+        for scope, flag in (("scheduled", "scheduled_only"), ("public", "public_only")):
+            with (
+                self.subTest(scope=scope),
+                patch("src.video_scan_dates.scan_today", return_value=TODAY),
+                patch("src.audio_video_scan.list_videos_module.list_all_videos", return_value=([], None)) as fetch,
+            ):
+                _fetch_channel_videos("channel", scope=scope)
+                self.assertTrue(fetch.call_args.kwargs.get(flag))
+
 
 class DeleteVideoDateTests(unittest.IsolatedAsyncioTestCase):
     async def test_delete_video_calendar_persists_and_blocks_edits_while_running(self):
