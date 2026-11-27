@@ -78,6 +78,10 @@ def _new_driver(*, network_events=False, profile_dir=None):
     if profile_dir is not None:
         options["user_data_dir"] = profile_dir
     driver = create_driver(**options)
+    try:
+        driver.set_window_size(1440, 1000)
+    except WebDriverException:
+        pass
     driver.set_page_load_timeout(60)
     driver.set_script_timeout(60)
     return driver
@@ -758,7 +762,7 @@ class StudioThumbnailBrowser:
             if not node.is_enabled() or node.get_attribute("disabled") is not None or node.get_attribute("aria-disabled") == "true":
                 blocked[0] = "điều khiển đang bị khóa"
                 return False
-            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", node)
+            driver.execute_script("arguments[0].scrollIntoView({block:'center', inline:'center'});", node)
             try:
                 node.click()
             except ElementClickInterceptedException:

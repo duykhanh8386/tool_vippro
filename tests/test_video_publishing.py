@@ -1218,6 +1218,41 @@ class FastScanTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 module.read_videos(CHANNEL, [VIDEO])
 
+    def test_scheduled_publishings_list_is_parsed_without_chrome_and_ignores_cancelled(self):
+        details = {
+            "scheduledPublishings": [
+                {
+                    "scheduledTimeSeconds": str(STAMP),
+                    "action": "SCHEDULED_PUBLISHING_ACTION_SET_PUBLIC",
+                    "status": "SCHEDULED_PUBLISHING_STATUS_SCHEDULED",
+                }
+            ]
+        }
+        scheduled_video = video(VIDEO, scheduled_publishing_details=details)
+        self.assertTrue(has_schedule_info(scheduled_video))
+        self.assertEqual(schedule_timestamp(scheduled_video), STAMP)
+        self.assertEqual(publishing_video_type(scheduled_video), "scheduled")
+
+        storage = MemoryState()
+        listing, module, ref, img, thumb = Mock(), Mock(), Mock(), Mock(), Mock()
+        controller = VideoPublishingController(storage=storage, module=module, listing=listing,
+                                               reference_factory=lambda: ref, image_factory=lambda *_: img, thumbnail_factory=lambda: thumb)
+        controller.settings["channel_ids"] = [CHANNEL]
+        listing.list_all_videos.side_effect = [([scheduled_video], None), ([], None)]
+        with patch("src.video_publishing_tasks.get_channels_info", return_value=[SimpleNamespace(id=CHANNEL)]):
+            controller._scan(controller.settings, ref)
+        module.read_video.assert_not_called()
+        thumb.inspect_schedule.assert_not_called()
+        self.assertEqual(controller.occupied[CHANNEL], [STAMP])
+        self.assertEqual(controller.rows[0]["visibility_type"], "scheduled")
+        self.assertEqual(controller.rows[0]["publish_at"], STAMP)
+
+        empty_sched = video(OTHER, scheduled_publishing_details={"scheduledPublishings": []})
+        cancelled_sched = video(OTHER, scheduled_publishing_details={"scheduledPublishings": [{"scheduledTimeSeconds": str(STAMP), "status": "SCHEDULED_PUBLISHING_STATUS_CANCELLED"}]})
+        for item in (empty_sched, cancelled_sched):
+            self.assertFalse(has_schedule_info(item))
+            self.assertIsNone(schedule_timestamp(item))
+
 
 if __name__ == "__main__":
     unittest.main()

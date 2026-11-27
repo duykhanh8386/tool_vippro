@@ -16,9 +16,30 @@ from src.cookie_utils import inject_cookies_via_cdp
 from src.module.video_publishing_module import VideoPublishingModule
 from src.publishing_browser import PublishingBrowserError, _new_driver, close_driver, wait_for
 from src.publishing_thumbnails import ThumbnailReadback
-from src.task_runtime import check_stopped, wait_interruptibly
+from src.task_runtime import TaskStopped, check_stopped, wait_interruptibly
 from src.utils import get_channels_info
 from src.video_scan_dates import VIETNAM_TIMEZONE
+
+_BIDI_RE = re.compile(r"[\u200e\u200f\u202a-\u202e\u2066-\u2069]")
+_DIGIT_TRANS = str.maketrans("٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹−", "01234567890123456789-")
+_ASCII_TO_ARABIC_DIGITS = str.maketrans("0123456789", "٠١٢٣٤٥٦٧٨٩")
+
+
+def _normalize_locale_text(text) -> str:
+    return _BIDI_RE.sub("", str(text or "")).translate(_DIGIT_TRANS)
+
+
+def _parse_timezone_offset(note) -> int | None:
+    clean = _normalize_locale_text(note)
+    match = (
+        re.search(r"(?:GMT|UTC|غرينتش)\s*([+-])\s*(\d{1,2})(?::?(\d{2}))?\b", clean, re.I)
+        or re.search(r"([+-])\s*(\d{1,2}):(\d{2})\b", clean)
+        or re.search(r"([+-])\s*(\d{2})(\d{2})\b", clean)
+    )
+    if not match:
+        return None
+    sign = 1 if match[1] == "+" else -1
+    return (int(match[2]) * 60 + int(match[3] or 0)) * sign
 
 TITLE = "#title-textarea [contenteditable='true'], #title-textarea textarea"
 DESCRIPTION = "#description-textarea [contenteditable='true'], #description-textarea textarea"
@@ -184,7 +205,27 @@ class StudioPublishingEditor:
     def _visibility(self, driver):
         select = visible(driver, "ytcp-video-visibility-edit-popup ytcp-video-visibility-select")
         if select is None:
-            self.controls._click_control(driver, lambda: visible(driver, "ytcp-video-metadata-visibility #select-button"),
+            def locate_trigger():
+                for selector in (
+                    "ytcp-video-metadata-visibility #select-button",
+                    "ytcp-video-metadata-visibility ytcp-dropdown-trigger",
+                    "ytcp-video-metadata-visibility #container",
+                ):
+                    for node in driver.find_elements(By.CSS_SELECTOR, selector):
+                        if node.is_displayed():
+                            return node
+                        try:
+                            driver.execute_script(
+                                "arguments[0].scrollIntoView({block:'center', inline:'center'});",
+                                node,
+                            )
+                        except WebDriverException:
+                            continue
+                        if node.is_displayed():
+                            return node
+                return None
+
+            self.controls._click_control(driver, locate_trigger,
                                          message="Chưa mở được phần Chế độ hiển thị trong Studio.")
         return wait_for(lambda: visible(driver, "ytcp-video-visibility-edit-popup ytcp-video-visibility-select"),
                         timeout=30, message="Chưa tải được phần Lên lịch trong Studio.")
@@ -202,9 +243,8 @@ class StudioPublishingEditor:
               date:model?.date,seconds:model?.selectedTimeOfDayValue,timezoneIndex:model?.selectedTimezoneIndex,timezoneNote:note};
         """, select)
         state["timestamp"] = None
-        match = re.search(r"(?:GMT|UTC)\s*([+-])(\d{1,2}):?(\d{2})\b", state.get("timezoneNote") or "", re.I)
-        if state.get("timezoneIndex") == 0 and match and state.get("date") is not None and state.get("seconds") is not None:
-            offset = (int(match[2]) * 60 + int(match[3])) * (1 if match[1] == "+" else -1)
+        offset = _parse_timezone_offset(state.get("timezoneNote"))
+        if state.get("timezoneIndex") == 0 and offset is not None and state.get("date") is not None and state.get("seconds") is not None:
             try:
                 day = state["date"]
                 seconds = int(state["seconds"])
@@ -229,7 +269,11 @@ class StudioPublishingEditor:
                                      message="Chưa mở được danh sách múi giờ.")
         def local_option():
             for option in driver.find_elements(By.CSS_SELECTOR, 'ytcp-text-menu tp-yt-paper-item[test-id="0"]'):
-                if option.is_displayed() and re.search(r"GMT\+0?7:?00", option.text):
+                clean = _normalize_locale_text(option.text)
+                if option.is_displayed() and (
+                    re.search(r"(?:GMT|UTC|غرينتش)\s*\+\s*0?7(?::?00)?\b", clean, re.I)
+                    or re.search(r"\+\s*0?7:?00\b", clean)
+                ):
                     return option
             return None
         self.controls._click_control(driver, local_option, message="Không tìm thấy múi giờ địa phương UTC+7; chưa bấm Lưu.")
@@ -305,14 +349,18 @@ class StudioPublishingEditor:
                                          message="Chưa mở được ô ngày đăng.")
             field = wait_for(lambda:visible(driver, "ytcp-date-picker input"), timeout=15, message="Chưa tải được ô nhập ngày đăng.")
             date_text = driver.execute_script(r"""
-                const [field,target,current]=arguments, locale=document.documentElement.lang||'en-US';
-                const value=field.value.replace(/\s/g,''), date=new Date(Date.UTC(current.year,current.month,current.day,12));
-                for(const month of ['numeric','2-digit','short','long'])for(const day of ['numeric','2-digit']){
-                    const format=new Intl.DateTimeFormat(locale,{year:'numeric',month,day,timeZone:'UTC'});
-                    if(format.format(date).replace(/\s/g,'')===value)
-                        return format.format(new Date(Date.UTC(target.year,target.month,target.day,12)));
+                const [field,target,current]=arguments, baseLocale=document.documentElement.lang||'en-US';
+                const clean=v=>String(v||'').replace(/[\u200e\u200f\u202a-\u202e\u2066-\u2069\s]/g,'');
+                const value=clean(field.value), date=new Date(Date.UTC(current.year,current.month,current.day,12));
+                const locales=[baseLocale, baseLocale+'-u-nu-latn', baseLocale+'-u-nu-arab', 'en-US'];
+                for(const locale of locales)for(const month of ['numeric','2-digit','short','long'])for(const day of ['numeric','2-digit']){
+                    try{
+                        const format=new Intl.DateTimeFormat(locale,{year:'numeric',month,day,timeZone:'UTC'});
+                        if(clean(format.format(date))===value)
+                            return format.format(new Date(Date.UTC(target.year,target.month,target.day,12)));
+                    }catch{}
                 }
-                return new Intl.DateTimeFormat(locale,{year:'numeric',month:'short',day:'numeric',timeZone:'UTC'})
+                return new Intl.DateTimeFormat(baseLocale,{year:'numeric',month:'short',day:'numeric',timeZone:'UTC'})
                     .format(new Date(Date.UTC(target.year,target.month,target.day,12)));
             """, field, expected_date, state["date"])
             set_text(driver, field, date_text, commit=Keys.ENTER, force=True)
@@ -326,7 +374,19 @@ class StudioPublishingEditor:
             field = wait_for(lambda:visible(select, "ytcp-datetime-picker #time-of-day-container input"),
                              timeout=10, message="Chưa tìm thấy ô giờ đăng.")
             current_time = field_text(driver, field)
-            text = target.strftime("%I:%M %p").lstrip("0") if re.search(r"\b[AP]M\b", current_time, re.I) else target.strftime("%H:%M")
+            clean_time = _normalize_locale_text(current_time)
+            if re.search(r"\b[AP]M\b", clean_time, re.I):
+                text = target.strftime("%I:%M %p").lstrip("0")
+            elif any(marker in clean_time for marker in ("ص", "م")):
+                suffix = "ص" if target.hour < 12 else "م"
+                text = f"{target.strftime('%I:%M').lstrip('0')} {suffix}"
+            elif re.search(r"\b(?:SA|CH)\b", clean_time, re.I):
+                suffix = "SA" if target.hour < 12 else "CH"
+                text = f"{target.strftime('%I:%M').lstrip('0')} {suffix}"
+            else:
+                text = target.strftime("%H:%M")
+            if re.search(r"[\u0660-\u0669]", str(current_time)):
+                text = text.translate(_ASCII_TO_ARABIC_DIGITS)
             set_text(driver, field, text, commit=(Keys.ENTER, Keys.TAB), force=True)
             wait_for(lambda:self._state(driver, select).get("seconds")==expected_seconds, timeout=10,
                      message="Studio chưa nhận đúng giờ đăng; chưa bấm Lưu.")

@@ -17,7 +17,7 @@ from selenium.webdriver.common.keys import Keys
 from src.module.base import studio_video_from_payload
 from src.publishing_browser import PublishingBrowserError, StudioThumbnailBrowser
 from src.publishing_thumbnails import ThumbnailReadback
-from src.studio_publishing_editor import StudioPublishingEditor, set_text
+from src.studio_publishing_editor import StudioPublishingEditor, _parse_timezone_offset, set_text
 from tests.test_studio_publishing_integration import PAGE, CHANNEL, VIDEO, LocalStudioDriver
 
 STAMP = 4071034800  # 2099-01-02 18:00 UTC+7
@@ -242,6 +242,32 @@ class StudioEditorUnitTests(unittest.TestCase):
             proof = editor.inspect_schedule(CHANNEL, VIDEO)
         self.assertEqual(proof, {"source": "studio_ui", "channel_id": CHANNEL, "video_id": VIDEO, "scheduled": False, "publish_at": None})
 
+    def test_parse_timezone_offset_handles_bidi_arabic_and_short_gmt(self):
+        for note, expected in (
+            ("Local time (GMT+0700)", 420),
+            ("(غرينتش\u200e+07:00)", 420),
+            ("(GMT+7)", 420),
+            ("(GMT+٠٧:٠٠)", 420),
+            ("Pacific (GMT\u221208:00)", -480),
+        ):
+            with self.subTest(note=note):
+                self.assertEqual(_parse_timezone_offset(note), expected)
+
+    def test_inspect_schedules_records_per_video_error_without_name_error_and_continues(self):
+        driver = Mock()
+        driver.window_handles = ["h1"]
+        channel = SimpleNamespace(id=CHANNEL, cookies=[])
+        editor = StudioPublishingEditor(StudioThumbnailBrowser())
+        good = {"source": "studio_ui", "channel_id": CHANNEL, "video_id": "VideoTwo___", "scheduled": False, "publish_at": None}
+        with patch("src.studio_publishing_editor.get_channels_info", return_value=channel), \
+                patch("src.studio_publishing_editor._new_driver", return_value=driver), \
+                patch("src.studio_publishing_editor.inject_cookies_via_cdp"), \
+                patch("src.studio_publishing_editor.close_driver"), \
+                patch.object(editor, "_inspect_schedule_in_driver", side_effect=[PublishingBrowserError("missing control"), good]):
+            results = editor.inspect_schedules(CHANNEL, [VIDEO, "VideoTwo___"])
+        self.assertIsInstance(results[VIDEO], PublishingBrowserError)
+        self.assertEqual(results["VideoTwo___"], good)
+
 
 @unittest.skipUnless(os.environ.get('TV_PUBLISHING_BROWSER_TESTS')=='1','opt-in localhost Chrome test')
 class SingleSaveEditorTests(unittest.TestCase):
@@ -314,6 +340,37 @@ class SingleSaveEditorTests(unittest.TestCase):
                     self.assertEqual(len(server.saves),before+1);self.assertFalse(server.config['scheduled'])
             finally:
                 driver.quit();server.shutdown();server.server_close();worker.join(5)
+
+    def test_rtl_narrow_visibility_scrolls_select_button_and_opens_popup(self):
+        from urllib.parse import quote
+        options = webdriver.ChromeOptions()
+        options.add_argument("--headless=new")
+        options.add_argument("--window-size=945,1012")
+        driver = webdriver.Chrome(service=Service(os.environ["CHROMEDRIVER"]), options=options)
+        editor = StudioPublishingEditor(StudioThumbnailBrowser())
+        html = """<!doctype html><html dir="rtl"><body>
+        <div style="width:1200px;display:flex;justify-content:flex-end;">
+          <ytcp-video-metadata-visibility style="display:block;width:352px;margin-left:-191px;">
+            <div id="container" style="display:flex;justify-content:space-between;width:352px;">
+              <div>Visibility</div>
+              <ytcp-icon-button id="select-button" role="button" tabindex="0" aria-disabled="false"
+                style="display:inline-flex;width:40px;height:40px;"
+                onclick="document.getElementById('popup').style.display='block';">
+                <button style="width:40px;height:40px;">V</button>
+              </ytcp-icon-button>
+            </div>
+          </ytcp-video-metadata-visibility>
+        </div>
+        <ytcp-video-visibility-edit-popup id="popup" style="display:none;position:fixed;inset:40px;background:white;">
+          <ytcp-video-visibility-select style="display:block;width:300px;height:200px;"></ytcp-video-visibility-select>
+        </ytcp-video-visibility-edit-popup></body></html>"""
+        try:
+            driver.get("data:text/html;charset=utf-8," + quote(html))
+            select = editor._visibility(driver)
+            self.assertIsNotNone(select)
+            self.assertTrue(select.is_displayed())
+        finally:
+            driver.quit()
 
 
 if __name__=='__main__':

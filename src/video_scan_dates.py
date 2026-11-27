@@ -54,6 +54,18 @@ def _timestamp(value: object, *, depth: int = 0) -> float | None:
     if depth > 8 or isinstance(value, bool) or value is None:
         return None
     if isinstance(value, Mapping):
+        scheduled_items = value.get("scheduledPublishings")
+        if isinstance(scheduled_items, list):
+            inactive = ("CANCEL", "DELETE", "COMPLETE", "FAIL", "EXPIRE", "ABORT")
+            active = [
+                entry for entry in scheduled_items
+                if not (isinstance(entry, Mapping) and any(marker in str(entry.get("status") or "").upper() for marker in inactive))
+            ]
+            active.sort(key=lambda entry: 0 if isinstance(entry, Mapping) and "SCHEDULED" in str(entry.get("status") or "").upper() else 1)
+            for entry in active:
+                found = _timestamp(entry, depth=depth + 1)
+                if found is not None:
+                    return found
         for key in (
             "seconds", "secondsSinceEpoch", "timeSec", "timeSeconds", "timeMs", "publishTimeSeconds", "publishTimeSec", "publishTimeMs", "scheduledPublishTimeSeconds",
             "scheduledPublishTimeSec", "scheduledPublishTimeMs", "scheduledTimeSeconds", "scheduledTimeSec", "scheduledTimeMs",

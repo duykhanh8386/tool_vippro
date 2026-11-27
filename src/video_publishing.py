@@ -59,9 +59,23 @@ def _schedule_sources(video):
         for key in ("scheduledPublishingDetails", "scheduledCreatorVisibility", "scheduledPublishing", "scheduledVisibility", "schedule"):
             if key in visibility:
                 candidates.append(visibility.get(key))
+    inactive = ("CANCEL", "DELETE", "COMPLETE", "FAIL", "EXPIRE", "ABORT")
     for value in candidates:
         if isinstance(value, dict) and any(value.get(key) is False for key in ("isScheduled", "scheduled")):
             continue
+        if isinstance(value, dict) and isinstance(value.get("scheduledPublishings"), list):
+            active_entries = [
+                entry for entry in value["scheduledPublishings"]
+                if not (isinstance(entry, dict) and any(marker in str(entry.get("status") or "").upper() for marker in inactive))
+                and meaningful(entry)
+            ]
+            if active_entries:
+                active_entries.sort(key=lambda entry: 0 if isinstance(entry, dict) and "SCHEDULED" in str(entry.get("status") or "").upper() else 1)
+                yield active_entries[0]
+                continue
+            other_fields = {k: v for k, v in value.items() if k != "scheduledPublishings"}
+            if not meaningful(other_fields):
+                continue
         if isinstance(value, str) and any(marker in value.upper() for marker in ("UNSPECIFIED", "_NONE")):
             continue
         if meaningful(value):
