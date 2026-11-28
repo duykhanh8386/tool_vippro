@@ -192,6 +192,7 @@ class NativeSave:
 
 class StudioPublishingEditor:
     MONETIZATION_CONTROLS_GRACE_SECONDS = 3.0
+    DRAFT_FALLBACK_GRACE_SECONDS = 5.0
 
     def __init__(self, controls):
         self.controls = controls
@@ -294,43 +295,158 @@ class StudioPublishingEditor:
         wait_for(lambda:self._state(driver, select).get("offset")==420 and self._state(driver, select).get("timezoneIndex")==0,
                  timeout=10, message="Studio chưa nhận múi giờ UTC+7.")
 
-    def _draft_edit_button(self, driver):
-        return self.controls._button_control(driver, "ytcp-banner.entity-banner #action-1")
-
-    def _editor_mode(self, driver):
+    @staticmethod
+    def _visibility_host_visible(driver):
         if visible(driver, "ytcp-video-metadata-visibility #container") is not None:
-            return "standard"
-        if self._draft_edit_button(driver) is None:
-            return None
-        is_draft = driver.execute_script("""
-            if (document.querySelector('ytcp-video-metadata-visibility #container')) return false;
-            const editor = document.querySelector('ytcp-video-metadata-editor');
-            const draft = String(editor?.video?.draftStatus ?? editor?.isDraft ?? '').toUpperCase();
-            if (draft && !/UNSPECIFIED|NOT_DRAFT/.test(draft)) return true;
-            return !!document.querySelector('ytcp-video-metadata-editor-sidepanel ytcp-video-info');
-        """)
-        return "draft" if is_draft else None
+            return True
+        for selector in (
+            "ytcp-video-metadata-visibility #container",
+            "ytcp-video-metadata-visibility #select-button",
+            "ytcp-video-metadata-visibility ytcp-dropdown-trigger",
+        ):
+            for node in driver.find_elements(By.CSS_SELECTOR, selector):
+                if node.is_displayed():
+                    return True
+                try:
+                    driver.execute_script(
+                        "arguments[0].scrollIntoView({block:'center', inline:'center'});",
+                        node,
+                    )
+                except WebDriverException:
+                    continue
+                if node.is_displayed():
+                    return True
+        return False
 
-    def _wait_editor_mode(self, driver, timeout=30):
+    def _draft_edit_button(self, driver):
+        for selector in (
+            "ytcp-banner.entity-banner.opened #action-1",
+            "ytcp-banner.entity-banner #action-1",
+            "ytcp-top-banner ytcp-banner.opened #action-1",
+            "ytcp-banner.entity-banner.opened .action-button",
+        ):
+            button = self.controls._button_control(driver, selector)
+            if button is not None:
+                return button
+        return None
+
+    def _editor_mode(self, driver, *, allow_bannerless_draft=False):
+        if visible(driver, "ytcp-uploads-dialog") is not None:
+            return "draft"
+        if self._visibility_host_visible(driver):
+            return "standard"
+        state = driver.execute_script("""
+            if (document.querySelector('ytcp-video-metadata-visibility #container, ytcp-video-metadata-visibility #select-button')) {
+                return {hasVisibility: true, draftStatus: '', isDraft: false, hasSidepanel: false};
+            }
+            const editor = document.querySelector('ytcp-video-metadata-editor');
+            const draftStatus = String(editor?.video?.draftStatus ?? '').trim().toUpperCase();
+            const isDraft = editor?.isDraft === true;
+            const hasSidepanel = !!document.querySelector('ytcp-video-metadata-editor-sidepanel ytcp-video-info');
+            return {hasVisibility: false, draftStatus, isDraft, hasSidepanel};
+        """)
+        if not isinstance(state, dict) or state.get("hasVisibility"):
+            return None
+        draft_status = str(state.get("draftStatus") or "").upper()
+        explicit_non_draft = bool(draft_status) and bool(
+            re.search(r"UNSPECIFIED|NOT_DRAFT|DRAFT_STATUS_NONE|^NONE$", draft_status)
+        )
+        explicit_draft = bool(state.get("isDraft")) or (bool(draft_status) and not explicit_non_draft)
+        if explicit_draft:
+            return "draft"
+        if explicit_non_draft:
+            return None
+        if self._draft_edit_button(driver) is not None and state.get("hasSidepanel"):
+            return "draft"
+        if allow_bannerless_draft and state.get("hasSidepanel"):
+            return "draft"
+        return None
+
+    def _wait_editor_mode(self, driver, timeout=45):
+        started = time.monotonic()
         return wait_for(
-            lambda: self._editor_mode(driver),
+            lambda: self._editor_mode(
+                driver,
+                allow_bannerless_draft=(time.monotonic() - started >= self.DRAFT_FALLBACK_GRACE_SECONDS),
+            ),
             timeout=timeout,
             message="Chưa tải được trạng thái hiển thị video trong Studio.",
         )
 
-    def _open_draft_dialog(self, driver, video_id):
-        self.controls._click_control(
-            driver,
-            lambda: self._draft_edit_button(driver),
-            timeout=30,
-            message="Chưa mở được hộp thoại Chỉnh sửa bản nháp trong Studio.",
-        )
-        dialog = wait_for(
-            lambda: visible(driver, "ytcp-uploads-dialog"),
-            timeout=30,
+    @staticmethod
+    def _draft_dialog_video_id(driver, dialog):
+        dialog_video = str(dialog.get_attribute("video-id") or "").strip()
+        if dialog_video:
+            return dialog_video
+        resolved = driver.execute_script("""
+            const dlg = arguments[0];
+            if (!dlg) return '';
+            const direct = dlg.videoId || dlg.video?.videoId || dlg.video?.encryptedVideoId;
+            if (direct) return String(direct);
+            const link = dlg.querySelector('a#video-link[href]');
+            const m = link ? String(link.href || '').match(/(?:youtu\\.be\\/|v=)([A-Za-z0-9_-]{11})/) : null;
+            return m ? m[1] : '';
+        """, dialog)
+        return str(resolved or "").strip()
+
+    @staticmethod
+    def _draft_dialog_ready(driver):
+        dialog = visible(driver, "ytcp-uploads-dialog")
+        if dialog is None:
+            return None
+        if any(
+            visible(dialog, selector) is not None
+            for selector in (
+                TITLE,
+                "[test-id='DETAILS']",
+                "#step-badge-0",
+                "ytcp-uploads-review",
+                "ytcp-video-visibility-select",
+            )
+        ):
+            return dialog
+        return None
+
+    def _open_draft_dialog_via_url(self, driver, channel_id, video_id):
+        if not channel_id:
+            return None
+        try:
+            driver.get(f"https://studio.youtube.com/channel/{channel_id}/videos/upload?d=ud&udvid={video_id}&hl=en")
+        except TimeoutException:
+            pass
+        if urlparse(driver.current_url).hostname != "studio.youtube.com":
+            raise PublishingBrowserError("Studio không mở đúng trang bản nháp; chưa bấm Lưu.")
+        return wait_for(
+            lambda: self._draft_dialog_ready(driver),
+            timeout=45,
             message="Chưa tải được hộp thoại Chỉnh sửa bản nháp trong Studio.",
         )
-        dialog_video = dialog.get_attribute("video-id")
+
+    def _open_draft_dialog(self, driver, video_id, *, channel_id=None):
+        dialog = self._draft_dialog_ready(driver)
+        if dialog is None and self._draft_edit_button(driver) is not None:
+            try:
+                click_timeout = 15 if channel_id else 30
+                self.controls._click_control(
+                    driver,
+                    lambda: self._draft_edit_button(driver),
+                    timeout=click_timeout,
+                    message="Chưa mở được hộp thoại Chỉnh sửa bản nháp trong Studio.",
+                )
+                dialog = wait_for(
+                    lambda: self._draft_dialog_ready(driver),
+                    timeout=click_timeout,
+                    message="Chưa tải được hộp thoại Chỉnh sửa bản nháp trong Studio.",
+                )
+            except PublishingBrowserError:
+                if not channel_id:
+                    raise
+                dialog = None
+        if dialog is None:
+            dialog = self._open_draft_dialog_via_url(driver, channel_id, video_id)
+        if dialog is None:
+            raise PublishingBrowserError("Chưa mở được hộp thoại Chỉnh sửa bản nháp trong Studio.")
+        dialog_video = self._draft_dialog_video_id(driver, dialog)
         if dialog_video and dialog_video != video_id:
             raise PublishingBrowserError("Hộp thoại bản nháp Studio không khớp đúng video; chưa bấm Lưu.")
         if visible(dialog, TITLE) is None or visible(dialog, DESCRIPTION) is None:
@@ -1060,7 +1176,7 @@ class StudioPublishingEditor:
             inject_cookies_via_cdp(driver, channel.cookies)
             self._open(driver, video_id)
             mode = self._wait_editor_mode(driver)
-            scope = self._open_draft_dialog(driver, video_id) if mode == "draft" else driver
+            scope = self._open_draft_dialog(driver, video_id, channel_id=channel_id) if mode == "draft" else driver
             title, description = visible(scope, TITLE), visible(scope, DESCRIPTION)
             validate_metadata(field_text(driver, title), field_text(driver, description), reference, expected_title, expected_description)
             pre_observer = NativeSave(driver, channel_id, video_id, verify)

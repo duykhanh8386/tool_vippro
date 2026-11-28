@@ -1,13 +1,16 @@
 """Exercise browser save acknowledgements with synthetic DOM/network events."""
 import base64
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from selenium.common.exceptions import ElementClickInterceptedException, ElementNotInteractableException, WebDriverException
+from selenium import webdriver
+from selenium.common.exceptions import ElementClickInterceptedException, ElementNotInteractableException, TimeoutException, WebDriverException
+from selenium.webdriver.chrome.service import Service
 
 from src.publishing_browser import ChatGPTImageBrowser, PublishingBrowserError, StudioThumbnailBrowser, YouTubeReferenceBrowser, loaded_search_results, search_result_duration, wait_for
 from src.task_runtime import TaskStopped
@@ -206,6 +209,159 @@ class ReferencePriorityTests(unittest.TestCase):
                                    ({"lengthSeconds": "61.234"}, 61.234), ({"lengthText": {"simpleText": "LIVE"}}, None),
                                    ({"lengthText": {"simpleText": "01:99"}}, None), ({}, None)):
             self.assertEqual(search_result_duration(renderer), expected)
+
+    def test_lockup_view_model_video_results_extract_id_and_duration_while_skipping_playlists(self):
+        self.driver.execute_script.return_value = {
+            "contents": [
+                {
+                    "lockupViewModel": {
+                        "contentId": "PL1234567890",
+                        "contentType": "LOCKUP_CONTENT_TYPE_PLAYLIST",
+                        "contentImage": {
+                            "collectionThumbnailViewModel": {
+                                "primaryThumbnail": {"thumbnailViewModel": {}}
+                            }
+                        },
+                    }
+                },
+                {
+                    "lockupViewModel": {
+                        "contentId": VIDEO,
+                        "contentType": "LOCKUP_CONTENT_TYPE_VIDEO",
+                        "contentImage": {
+                            "thumbnailViewModel": {
+                                "overlays": [
+                                    {
+                                        "thumbnailBottomOverlayViewModel": {
+                                            "badges": [
+                                                {"thumbnailBadgeViewModel": {"text": "1:01:56"}}
+                                            ]
+                                        }
+                                    }
+                                ]
+                            }
+                        },
+                    }
+                },
+                {
+                    "lockupViewModel": {
+                        "contentId": "",
+                        "contentType": "LOCKUP_CONTENT_TYPE_VIDEO",
+                        "rendererContext": {
+                            "commandContext": {
+                                "onTap": {
+                                    "innertubeCommand": {
+                                        "watchEndpoint": {"videoId": "Def123_-XYZ"}
+                                    }
+                                }
+                            }
+                        },
+                        "contentImage": {
+                            "thumbnailViewModel": {
+                                "overlays": [
+                                    {
+                                        "thumbnailOverlayBadgeViewModel": {
+                                            "thumbnailBadges": [
+                                                {"thumbnailBadgeViewModel": {"text": "1:00"}}
+                                            ]
+                                        }
+                                    }
+                                ]
+                            }
+                        },
+                    }
+                },
+            ]
+        }
+        with patch.object(self.browser, "_read_reference", return_value=source("Def123_-XYZ", 60)) as read:
+            found = self.browser.find("Song", duration_seconds=60)
+        self.assertEqual(found["video_id"], "Def123_-XYZ")
+        self.assertEqual(found["selection"], "duration")
+        read.assert_called_once_with("Def123_-XYZ", "Song")
+
+    def test_search_navigation_timeout_still_reads_loaded_results_and_encodes_slash(self):
+        self.driver.get.side_effect = TimeoutException("timed out loading subresources")
+        self.driver.execute_script.return_value = {"contents": [result(VIDEO, 60)]}
+        with patch.object(self.browser, "_read_reference", return_value=source(VIDEO, 60)):
+            found = self.browser.find("AC/DC", duration_seconds=60)
+        self.assertEqual(found["video_id"], VIDEO)
+        self.driver.get.assert_called_once_with("https://www.youtube.com/results?search_query=AC%2FDC")
+
+
+@unittest.skipUnless(os.environ.get("TV_PUBLISHING_BROWSER_TESTS") == "1", "opt-in localhost Chrome test")
+class SearchDomIntegrationTests(unittest.TestCase):
+    def test_dom_lockup_results_background_promo_and_consent_detection(self):
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        lockup_html = f"""<!doctype html><html><body>
+        <ytd-search>
+          <yt-lockup-view-model>
+            <yt-collection-thumbnail-view-model></yt-collection-thumbnail-view-model>
+            <a href="https://example.com/watch?v=PL123456789&list=PLabc">Playlist</a>
+          </yt-lockup-view-model>
+          <yt-lockup-view-model>
+            <a href="/watch?v={VIDEO}">
+              <yt-thumbnail-badge-view-model><span class="badge-shape-wiz__text">1:01:56</span></yt-thumbnail-badge-view-model>
+            </a>
+          </yt-lockup-view-model>
+          <ytd-video-renderer>
+            <a id="video-title" href="/watch?v=Def123_-XYZ">Song 2</a>
+            <ytd-thumbnail-overlay-time-status-renderer>1:00</ytd-thumbnail-overlay-time-status-renderer>
+          </ytd-video-renderer>
+        </ytd-search></body></html>"""
+        empty_html = """<!doctype html><html><body>
+        <ytd-search><ytd-background-promo-renderer>No results found</ytd-background-promo-renderer></ytd-search>
+        </body></html>"""
+        consent_html = """<!doctype html><html><body>
+        <ytd-search></ytd-search>
+        <ytd-consent-bump-v2-lightbox style="display:block;width:200px;height:200px;">Consent</ytd-consent-bump-v2-lightbox>
+        </body></html>"""
+        pages = {"/lockup": lockup_html, "/empty": empty_html, "/consent": consent_html}
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                body = pages.get(self.path, "").encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *_args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        worker = threading.Thread(target=server.serve_forever, daemon=True)
+        worker.start()
+        options = webdriver.ChromeOptions()
+        options.add_argument("--headless=new")
+        driver = webdriver.Chrome(service=Service(os.environ["CHROMEDRIVER"]), options=options)
+        base = f"http://127.0.0.1:{server.server_port}"
+        try:
+            driver.get(base + "/lockup")
+            res = loaded_search_results(driver)
+            self.assertEqual(
+                res,
+                {
+                    "candidates": [
+                        {"videoId": VIDEO, "lengthText": {"simpleText": "1:01:56"}},
+                        {"videoId": "Def123_-XYZ", "lengthText": {"simpleText": "1:00"}},
+                    ]
+                },
+            )
+
+            driver.get(base + "/empty")
+            self.assertEqual(loaded_search_results(driver), {"candidates": []})
+
+            driver.get(base + "/consent")
+            with self.assertRaisesRegex(PublishingBrowserError, "đồng ý cookie hoặc xác minh"):
+                loaded_search_results(driver)
+        finally:
+            driver.quit()
+            server.shutdown()
+            server.server_close()
+            worker.join(5)
 
 
 class StudioControlTests(unittest.TestCase):

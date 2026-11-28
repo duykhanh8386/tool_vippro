@@ -166,7 +166,7 @@ const visibilityHost=document.querySelector('ytcp-video-metadata-visibility');
 const draftBanner=document.querySelector('ytcp-banner.entity-banner');
 if(isDraft){
  visibilityHost.remove();
- draftBanner.style.display='block';
+ if(!config.hide_draft_banner){draftBanner.style.display='block';}
  uploadsDialog.querySelector('input[type="file"]').addEventListener('change',async()=>{
   thumbnailDirty=true;actions.push('thumbnail');
   await fetch('/youtubei/v1/video_manager/metadata_update',{method:'POST',headers:{'Content-Type':'application/json'},
@@ -376,6 +376,7 @@ if(!isDraft){
   };
  }
  syncStepper();
+ if(config.auto_open_draft){uploadsDialog.style.display='block';goStep('REVIEW');}
  uploadsDialog.querySelector('ytcp-video-metadata-playlists ytcp-dropdown-trigger').onclick=()=>{panel.style.display='block';};
 }
 select.querySelector('[name=PUBLIC]').onclick=()=>actions.push('PUBLIC_NOW');
@@ -419,6 +420,8 @@ class EditorFixture(BaseHTTPRequestHandler):
             config=copy.deepcopy(self.server.config)
         page=PAGE.replace('<ytcp-video-metadata-editor><ytcp-thumbnail-editor>', '<ytcp-video-metadata-editor>'+FIELDS+'<ytcp-thumbnail-editor>')
         page=('<!doctype html><html lang="'+config['locale']+'">'+page.replace('<!doctype html>','')+EDITOR+'</html>')
+        if '/videos/upload' in self.path and 'd=ud' in self.path and f'udvid={VIDEO}' in self.path:
+            config['auto_open_draft']=True
         page=page.replace('__PLAYLISTS__',json.dumps(config['playlists'])).replace('__CONFIG__',json.dumps(config).replace('<','\\u003c'))
         data=page.encode()
         self.send_response(200);self.send_header('Content-Type','text/html; charset=utf-8');self.send_header('Content-Length',str(len(data)));self.end_headers();self.wfile.write(data)
@@ -630,6 +633,67 @@ class StudioEditorUnitTests(unittest.TestCase):
             editor._complete_monetization(driver, dialog)
         controls._click_control.assert_not_called()
 
+    def test_editor_mode_detects_draft_without_banner_via_draft_status(self):
+        driver = Mock()
+        driver.find_elements.return_value = []
+        driver.execute_script.return_value = {
+            "hasVisibility": False,
+            "draftStatus": "DRAFT_STATUS_PUBLIC",
+            "isDraft": False,
+            "hasSidepanel": True,
+        }
+        editor = StudioPublishingEditor(StudioThumbnailBrowser())
+        with patch("src.studio_publishing_editor.visible", return_value=None):
+            self.assertEqual(editor._editor_mode(driver), "draft")
+
+    def test_editor_mode_does_not_treat_draft_status_none_as_draft(self):
+        driver = Mock()
+        driver.find_elements.return_value = []
+        driver.execute_script.return_value = {
+            "hasVisibility": False,
+            "draftStatus": "DRAFT_STATUS_NONE",
+            "isDraft": False,
+            "hasSidepanel": True,
+        }
+        editor = StudioPublishingEditor(StudioThumbnailBrowser())
+        with patch("src.studio_publishing_editor.visible", return_value=None):
+            self.assertIsNone(editor._editor_mode(driver, allow_bannerless_draft=True))
+
+    def test_editor_mode_scrolls_visibility_container_into_view(self):
+        driver = Mock()
+        vis_node = Mock()
+        vis_node.is_displayed.side_effect = [False, True]
+        driver.find_elements.side_effect = lambda _by, sel: [vis_node] if sel == "ytcp-video-metadata-visibility #container" else []
+        editor = StudioPublishingEditor(StudioThumbnailBrowser())
+        with patch("src.studio_publishing_editor.visible", return_value=None):
+            self.assertEqual(editor._editor_mode(driver), "standard")
+        driver.execute_script.assert_called_once()
+
+    def test_open_draft_dialog_falls_back_to_direct_upload_popup_url(self):
+        driver = Mock()
+        driver.current_url = f"https://studio.youtube.com/channel/{CHANNEL}/videos/upload?d=ud&udvid={VIDEO}&hl=en"
+        dialog = Mock()
+        title_node = Mock()
+        desc_node = Mock()
+        dialog.get_attribute.side_effect = lambda attr: VIDEO if attr == "video-id" else None
+        controls = StudioThumbnailBrowser()
+        controls._button_control = Mock(return_value=None)
+        editor = StudioPublishingEditor(controls)
+
+        def fake_visible(scope, selector):
+            if scope is driver and selector == "ytcp-uploads-dialog":
+                return dialog if driver.get.called else None
+            if scope is dialog:
+                return title_node if selector else None
+            return None
+
+        with patch("src.studio_publishing_editor.visible", side_effect=fake_visible):
+            result = editor._open_draft_dialog(driver, VIDEO, channel_id=CHANNEL)
+        self.assertIs(result, dialog)
+        driver.get.assert_called_once_with(
+            f"https://studio.youtube.com/channel/{CHANNEL}/videos/upload?d=ud&udvid={VIDEO}&hl=en"
+        )
+
 
 @unittest.skipUnless(os.environ.get('TV_PUBLISHING_BROWSER_TESTS')=='1','opt-in localhost Chrome test')
 class SingleSaveEditorTests(unittest.TestCase):
@@ -648,8 +712,8 @@ class SingleSaveEditorTests(unittest.TestCase):
             channel=SimpleNamespace(id=CHANNEL,cookies=[])
             baseline={'videoId':VIDEO,'channelId':CHANNEL,'title':'Original','description':'Old description','privacy':'VIDEO_PRIVACY_PRIVATE','draftStatus':'DRAFT_STATUS_PUBLIC',
                       'thumbnailEditorState':{'customThumbnail':{'externalImageId':'IM-old'},'defaultStill':False},'thumbnailDetails':{'thumbnails':[]}}
-            def reset(locale, timezone_index=0, draft=False, draft_mode='basic', made_for_kids='VIDEO_MADE_FOR_KIDS_NOT_MFK'):
-                server.config={'locale':locale,'video':copy.deepcopy(baseline),'scheduled':False,'draft':draft,'draft_mode':draft_mode,'made_for_kids':made_for_kids,'playlists':['PL-existing'],
+            def reset(locale, timezone_index=0, draft=False, draft_mode='basic', made_for_kids='VIDEO_MADE_FOR_KIDS_NOT_MFK', hide_draft_banner=False):
+                server.config={'locale':locale,'video':copy.deepcopy(baseline),'scheduled':False,'draft':draft,'draft_mode':draft_mode,'made_for_kids':made_for_kids,'hide_draft_banner':hide_draft_banner,'playlists':['PL-existing'],
                                'model':{'date':{'year':2099,'month':0,'day':3},'selectedTimeOfDayValue':0,'selectedTimezoneIndex':timezone_index}}
             try:
                 with patch('src.studio_publishing_editor._new_driver',return_value=adapter), \
@@ -657,19 +721,20 @@ class SingleSaveEditorTests(unittest.TestCase):
                      patch('src.studio_publishing_editor.inject_cookies_via_cdp'), \
                      patch('src.studio_publishing_editor.close_driver'), \
                      patch('src.publishing_thumbnails.thumbnail_pixels',return_value=bytes([42])*43200):
-                    for label,locale,timezone_index,draft,draft_mode,made_for_kids,reference in [
-                        ('vi-standard','vi-VN',0,False,'basic','VIDEO_MADE_FOR_KIDS_NOT_MFK',REFERENCE),
-                        ('vi-standard-unanswered-mfk','vi-VN',0,False,'basic','',REFERENCE),
-                        ('de-empty','de-DE',1,False,'basic','VIDEO_MADE_FOR_KIDS_NOT_MFK',{**REFERENCE,'description':''}),
-                        ('vi-multiline-no-trailing-nl','vi-VN',0,False,'basic','VIDEO_MADE_FOR_KIDS_NOT_MFK',MULTILINE_NO_TRAILING_NL),
-                        ('de-draft-dialog','de-DE',1,True,'basic','VIDEO_MADE_FOR_KIDS_NOT_MFK',MULTILINE_NO_TRAILING_NL),
-                        ('vi-draft-preserves-existing-mfk','vi-VN',0,True,'basic','VIDEO_MADE_FOR_KIDS_MFK',REFERENCE),
-                        ('vi-ypp-monetized-draft','vi-VN',0,True,'monetized','VIDEO_MADE_FOR_KIDS_NOT_MFK',MULTILINE_NO_TRAILING_NL),
-                        ('vi-claimed-unanswered-mfk-draft','vi-VN',0,True,'monetized_ineligible','',MULTILINE_NO_TRAILING_NL),
-                        ('vi-cms-rights-draft','vi-VN',0,True,'cms','VIDEO_MADE_FOR_KIDS_NOT_MFK',MULTILINE_NO_TRAILING_NL),
+                    for label,locale,timezone_index,draft,draft_mode,made_for_kids,hide_draft_banner,reference in [
+                        ('vi-standard','vi-VN',0,False,'basic','VIDEO_MADE_FOR_KIDS_NOT_MFK',False,REFERENCE),
+                        ('vi-standard-unanswered-mfk','vi-VN',0,False,'basic','',False,REFERENCE),
+                        ('de-empty','de-DE',1,False,'basic','VIDEO_MADE_FOR_KIDS_NOT_MFK',False,{**REFERENCE,'description':''}),
+                        ('vi-multiline-no-trailing-nl','vi-VN',0,False,'basic','VIDEO_MADE_FOR_KIDS_NOT_MFK',False,MULTILINE_NO_TRAILING_NL),
+                        ('de-draft-dialog','de-DE',1,True,'basic','VIDEO_MADE_FOR_KIDS_NOT_MFK',False,MULTILINE_NO_TRAILING_NL),
+                        ('vi-draft-preserves-existing-mfk','vi-VN',0,True,'basic','VIDEO_MADE_FOR_KIDS_MFK',False,REFERENCE),
+                        ('vi-ypp-monetized-draft','vi-VN',0,True,'monetized','VIDEO_MADE_FOR_KIDS_NOT_MFK',False,MULTILINE_NO_TRAILING_NL),
+                        ('vi-claimed-unanswered-mfk-draft','vi-VN',0,True,'monetized_ineligible','',False,MULTILINE_NO_TRAILING_NL),
+                        ('vi-cms-rights-draft','vi-VN',0,True,'cms','VIDEO_MADE_FOR_KIDS_NOT_MFK',False,MULTILINE_NO_TRAILING_NL),
+                        ('vi-draft-direct-popup-fallback','vi-VN',0,True,'monetized_ineligible','',True,MULTILINE_NO_TRAILING_NL),
                     ]:
                         with self.subTest(case=label):
-                            reset(locale,timezone_index,draft=draft,draft_mode=draft_mode,made_for_kids=made_for_kids)
+                            reset(locale,timezone_index,draft=draft,draft_mode=draft_mode,made_for_kids=made_for_kids,hide_draft_banner=hide_draft_banner)
                             verifier=ThumbnailReadback(CHANNEL,VIDEO,image,reader=lambda *_:studio_video_from_payload(server.config['video']))
                             controls=StudioThumbnailBrowser(verify_saved=verifier)
                             before=len(server.saves)
@@ -689,6 +754,8 @@ class SingleSaveEditorTests(unittest.TestCase):
                                 self.assertNotIn('audience_not_mfk', saved['actions'])
                             if draft_mode=='monetized':
                                 expected_order=['open_draft','thumbnail','title','description','playlist','playlist_done','monetization_open','monetization_on','monetization_done','content_ratings_none','content_ratings_submit','schedule','save']
+                            elif draft_mode=='monetized_ineligible' and hide_draft_banner:
+                                expected_order=['thumbnail','title','description','playlist','playlist_done','audience_not_mfk','schedule','save']
                             elif draft_mode=='monetized_ineligible':
                                 expected_order=['open_draft','thumbnail','title','description','playlist','playlist_done','audience_not_mfk','schedule','save']
                             elif draft_mode=='cms':

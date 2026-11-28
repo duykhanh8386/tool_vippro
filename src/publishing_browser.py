@@ -21,7 +21,7 @@ from urllib.parse import quote, urlparse
 
 from selenium.common.exceptions import (
     ElementClickInterceptedException, ElementNotInteractableException,
-    StaleElementReferenceException, WebDriverException,
+    StaleElementReferenceException, TimeoutException, WebDriverException,
 )
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
@@ -87,17 +87,64 @@ def _new_driver(*, network_events=False, profile_dir=None):
     return driver
 
 
+def _lockup_duration_text(value):
+    if isinstance(value, dict):
+        badge = value.get("thumbnailBadgeViewModel")
+        if isinstance(badge, dict):
+            text = str(badge.get("text") or "").strip()
+            if re.fullmatch(r"\d+(?::[0-5]\d){1,2}", text):
+                return text
+        for child in value.values():
+            if isinstance(child, (dict, list)):
+                found = _lockup_duration_text(child)
+                if found:
+                    return found
+    elif isinstance(value, list):
+        for child in value:
+            found = _lockup_duration_text(child)
+            if found:
+                return found
+    return ""
+
+
 def video_search_candidates(data):
     """Read ordinary search results in display order; exclude ads and Shorts."""
     if isinstance(data, dict):
         if "videoRenderer" in data:
             renderer = data["videoRenderer"]
-            identifier = renderer.get("videoId", "")
-            if re.fullmatch(r"[A-Za-z0-9_-]{11}", identifier):
-                yield renderer
+            if isinstance(renderer, dict):
+                identifier = renderer.get("videoId", "")
+                if re.fullmatch(r"[A-Za-z0-9_-]{11}", str(identifier)):
+                    yield renderer
+            return
+        if "lockupViewModel" in data:
+            lockup = data["lockupViewModel"]
+            if isinstance(lockup, dict):
+                content_type = str(lockup.get("contentType") or "").upper()
+                if content_type and content_type != "LOCKUP_CONTENT_TYPE_VIDEO":
+                    return
+                content_image = lockup.get("contentImage")
+                if isinstance(content_image, dict) and "collectionThumbnailViewModel" in content_image:
+                    return
+                watch = (
+                    ((lockup.get("rendererContext") or {}).get("commandContext") or {})
+                    .get("onTap") or {}
+                ).get("innertubeCommand", {}).get("watchEndpoint") or {}
+                if not content_type and watch.get("playlistId"):
+                    return
+                identifier = str(lockup.get("contentId") or watch.get("videoId") or "")
+                if re.fullmatch(r"[A-Za-z0-9_-]{11}", identifier):
+                    duration = _lockup_duration_text(content_image)
+                    candidate = {"videoId": identifier}
+                    if duration:
+                        candidate["lengthText"] = {"simpleText": duration}
+                    yield candidate
             return
         for key, child in data.items():
-            if key not in {"adSlotRenderer", "adPlacements", "promotedSparklesWebRenderer", "reelShelfRenderer", "shortsLockupViewModel"}:
+            if key not in {
+                "adSlotRenderer", "adPlacements", "inFeedAdLayoutRenderer",
+                "promotedSparklesWebRenderer", "reelShelfRenderer", "shortsLockupViewModel",
+            }:
                 yield from video_search_candidates(child)
     elif isinstance(data, list):
         for child in data:
@@ -134,21 +181,34 @@ def loaded_search_results(driver):
     # when the visible UI is available but the initial response is incomplete.
     page = driver.execute_script("""
         const videos = [];
-        for (const row of document.querySelectorAll('ytd-search ytd-video-renderer')) {
-            if (row.closest('ytd-ad-slot-renderer, ytd-in-feed-ad-layout-renderer, ytd-promoted-sparkles-web-renderer, ytd-reel-shelf-renderer')) continue;
-            const anchor = row.querySelector('a#video-title[href], a#thumbnail[href]');
+        for (const row of document.querySelectorAll('ytd-search ytd-video-renderer, ytd-search yt-lockup-view-model')) {
+            if (row.closest('ytd-ad-slot-renderer, ytd-in-feed-ad-layout-renderer, ytd-promoted-sparkles-web-renderer, ytd-reel-shelf-renderer, ytm-shorts-lockup-view-model, ytm-shorts-lockup-view-model-v2')) continue;
+            const isLockup = row.tagName === 'YT-LOCKUP-VIEW-MODEL';
+            if (isLockup && row.querySelector('yt-collections-stack, yt-collection-thumbnail-view-model')) continue;
+            const anchor = isLockup
+                ? row.querySelector('a[href*="/watch?"]')
+                : row.querySelector('a#video-title[href], a#thumbnail[href]');
             if (!anchor) continue;
-            const url = new URL(anchor.href, location.href);
+            let url;
+            try { url = new URL(anchor.href, location.href); } catch { continue; }
             if (url.origin !== location.origin || url.pathname !== '/watch') continue;
+            if (isLockup && url.searchParams.has('list')) continue;
             const videoId = url.searchParams.get('v');
             if (!/^[A-Za-z0-9_-]{11}$/.test(videoId || '')) continue;
-            const badge = row.querySelector('ytd-thumbnail-overlay-time-status-renderer');
-            videos.push({videoId, lengthText: {simpleText: badge?.textContent?.trim() || ''}});
+            let duration = '';
+            for (const badge of row.querySelectorAll('ytd-thumbnail-overlay-time-status-renderer, yt-thumbnail-badge-view-model .badge-shape-wiz__text, badge-shape .yt-badge-shape__text, .yt-badge-shape__text')) {
+                const match = (badge.textContent || '').trim().match(/^\\d+(?::[0-5]\\d){1,2}$/);
+                if (match) {
+                    duration = match[0];
+                    break;
+                }
+            }
+            videos.push({videoId, lengthText: {simpleText: duration}});
         }
-        const empty = Array.from(document.querySelectorAll('ytd-search ytd-message-renderer'))
+        const empty = Array.from(document.querySelectorAll('ytd-search ytd-message-renderer, ytd-search ytd-background-promo-renderer'))
             .some(node => node.getClientRects().length && node.textContent.trim());
         const blocked = location.hostname === 'consent.youtube.com' || location.pathname.startsWith('/sorry')
-            || Array.from(document.querySelectorAll('form[action*="consent.youtube.com"], iframe[src*="recaptcha"]'))
+            || Array.from(document.querySelectorAll('form[action*="consent.youtube.com"], iframe[src*="recaptcha"], ytd-consent-bump-v2-lightbox'))
                 .some(node => node.getClientRects().length && getComputedStyle(node).visibility !== 'hidden');
         return {candidates: videos, empty, blocked};
     """)
@@ -202,7 +262,10 @@ class YouTubeReferenceBrowser:
 
     def _read_reference(self, identifier, query):
         driver = self._browser()
-        driver.get("https://www.youtube.com/watch?v=" + identifier)
+        try:
+            driver.get("https://www.youtube.com/watch?v=" + identifier)
+        except TimeoutException:
+            pass
         player = wait_for(lambda: driver.execute_script("return window.ytInitialPlayerResponse"),
                           message="Không đọc được title/description của video tham chiếu.")
         data = player.get("videoDetails") or {}
@@ -252,7 +315,10 @@ class YouTubeReferenceBrowser:
         if not query:
             raise PublishingBrowserError("Không có tên bài nhạc để tìm kiếm sau khi đọc ID cuối tên.")
         driver = self._browser()
-        driver.get("https://www.youtube.com/results?search_query=" + quote(query))
+        try:
+            driver.get("https://www.youtube.com/results?search_query=" + quote(query, safe=""))
+        except TimeoutException:
+            pass
         results = wait_for(lambda: loaded_search_results(driver), timeout=45,
                            message="YouTube chưa tải xong danh sách kết quả tìm kiếm. Chưa thể kết luận không có video; kiểm tra cửa sổ YouTube rồi tìm lại tham chiếu.")
         candidates, seen = [], set(excluded)
