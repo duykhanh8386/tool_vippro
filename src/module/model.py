@@ -77,6 +77,7 @@ class Video:
     scheduled_creator_visibility: object = ""
     # Read-only Studio UI evidence can resolve stale/incomplete API schedules.
     studio_schedule: dict = field(default_factory=dict)
+    video_stream_url: str = ""
 
 
 class AuthSignal(Enum):

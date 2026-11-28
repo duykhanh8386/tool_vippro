@@ -163,6 +163,29 @@ class PublishingPageSelectionTests(unittest.TestCase):
         self.assertFalse(self.button("Dừng").enabled)
         self.assertIsNone(self.table.selection)
 
+    def test_audio_scan_mode_toggle_switches_setting_updates_hint_and_clears_rows(self):
+        audio_toggle = next(
+            element
+            for element in self.client.elements.values()
+            if isinstance(element, ui.toggle) and "complete_audio" in (getattr(element, "options", {}) or {})
+        )
+        self.assertEqual(audio_toggle.value, "normal")
+        self.assertEqual(self.controller.settings["audio_scan_mode"], "normal")
+        with self.client:
+            audio_toggle.set_value("complete_audio")
+        self.assertEqual(self.controller.settings["audio_scan_mode"], "complete_audio")
+        self.assertEqual(self.controller.rows, [])
+        hints = [
+            element.text
+            for element in self.client.elements.values()
+            if isinstance(element, ui.label) and "3s nghe / 7s mất tiếng" in (element.text or "")
+        ]
+        self.assertTrue(hints)
+        self.controller.busy = True
+        with self.client:
+            self.refresh()
+        self.assertFalse(audio_toggle.enabled)
+
 
 if __name__ == "__main__":
     unittest.main()

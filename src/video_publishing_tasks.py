@@ -13,6 +13,7 @@ from loguru import logger
 from selenium.common import exceptions as browser_errors
 from urllib3.exceptions import HTTPError as TransportError
 
+from src.audio_integrity import inspect_channel_videos_audio
 from src.module.base import YouTubeRequestError
 from src.module.list_videos_module import list_videos_module
 from src.module.video_publishing_module import video_publishing_module
@@ -36,7 +37,7 @@ STATE_KEY = "video_publishing"
 STATUS_LABELS = {"scanned": "Đã quét", "ready": "Đã tìm tham chiếu", "processing": "Đang xử lý", "successful": "Đã lên lịch",
                  "scheduled": "Đã có lịch", "skipped": "Bỏ qua", "error": "Lỗi", "stopped": "Đã dừng", "waiting_session": "Chờ phiên ChatGPT"}
 STEP_LABELS = {
-    "scan": "Quét video", "check_schedules": "Kiểm tra lịch hiện có",
+    "scan": "Quét video", "check_audio": "Kiểm tra âm thanh gốc", "check_schedules": "Kiểm tra lịch hiện có",
     "validate_video": "Kiểm tra video", "find_reference": "Tìm video tham chiếu",
     "image_session": "Kiểm tra phiên tạo ảnh", "prepare_image": "Chuẩn bị tệp ảnh",
     "download_reference": "Tải ảnh tham chiếu", "generate_image": "Tạo và tải ảnh GPT",
@@ -53,19 +54,21 @@ STEP_LABELS = {
 
 def default_settings():
     return {"channel_source": "selected", "channel_ids": [], "channel_links": "", "manual_ids": "", "categories": ["clear"], "scope": "unpublished",
-            "scan_all": True, "limit": 100, "start_date": (datetime.now(VIETNAM_TIMEZONE).date() + timedelta(days=1)).isoformat(),
+            "scan_all": True, "limit": 100, "audio_scan_mode": "normal",
+            "start_date": (datetime.now(VIETNAM_TIMEZONE).date() + timedelta(days=1)).isoformat(),
             "hour": "18:00", "order": "oldest", "image_prompt": "Vẽ lại thumbnail dựa trên ảnh tham chiếu, bố cục rõ ràng, chữ dễ đọc, phù hợp nội dung bài nhạc; tỷ lệ 16:9.",
             "output_folder": "", "image_model": "gpt-image-2", "image_cleanup": False}
 
 
 class VideoPublishingController:
-    def __init__(self, *, storage=None, module=None, listing=None, reference_factory=None, image_factory=None, thumbnail_factory=None):
+    def __init__(self, *, storage=None, module=None, listing=None, reference_factory=None, image_factory=None, thumbnail_factory=None, audio_checker=None):
         self.storage = storage or state_manager
         self.module = module or video_publishing_module
         self.listing = listing or list_videos_module
         self.reference_factory = reference_factory or YouTubeReferenceBrowser
         self.image_factory = image_factory or PhomaImageGenerator
         self.thumbnail_factory = thumbnail_factory or StudioThumbnailBrowser
+        self.audio_checker = audio_checker or inspect_channel_videos_audio
         self.lock = threading.RLock()
         saved = self.storage.load_state(STATE_KEY) or {}
         self.settings = {**default_settings(), **saved.get("settings", {})}
@@ -208,6 +211,8 @@ class VideoPublishingController:
                     raise ValueError("Số video mỗi kênh phải là số nguyên từ 1 đến 10000.") from None
             if "scope" in changes and changes["scope"] not in VIDEO_SCOPE_LABELS:
                 raise ValueError("Phạm vi quét không hợp lệ.")
+            if "audio_scan_mode" in changes and changes["audio_scan_mode"] not in {"normal", "complete_audio"}:
+                raise ValueError("Chế độ quét âm thanh không hợp lệ.")
             if "channel_source" in changes and changes["channel_source"] not in {"selected", "links"}:
                 raise ValueError("Chọn nguồn kênh từ thẻ đã chọn hoặc từ link.")
             if "categories" in changes and (not isinstance(changes["categories"], list) or not set(changes["categories"]) <= set(COPYRIGHT_LABELS)):
@@ -219,7 +224,7 @@ class VideoPublishingController:
             if "image_cleanup" in changes and not isinstance(changes["image_cleanup"], bool):
                 raise ValueError("Tùy chọn ẩn hội thoại không hợp lệ.")
             self.settings.update(changes)
-            if changed & {"channel_source", "channel_ids", "channel_links", "manual_ids", "scan_all", "limit", "order"}:
+            if changed & {"channel_source", "channel_ids", "channel_links", "manual_ids", "scan_all", "limit", "order", "audio_scan_mode"}:
                 self.rows = []
                 self.occupied = {}
                 self.message = "Phạm vi đã đổi. Quét lại video."
@@ -432,7 +437,11 @@ class VideoPublishingController:
         manual_set = set(manual)
         skip_public = not manual and settings["scope"] not in {"all", "public"}
         newest_limit = int(settings["limit"]) if (not manual and not settings["scan_all"] and settings["order"] == "newest") else None
+        audio_mode = settings.get("audio_scan_mode", "normal")
         rows, occupied = [], {}
+        excluded_audio_ids = set()
+        excluded_audio_count = 0
+        checked_audio_count = 0
         for channel_id in dict.fromkeys(channels):
             self._progress(f"Đang quét kênh {channel_id}…")
             seen, tokens, videos, draft_ids = {}, set(), [], set()
@@ -466,6 +475,8 @@ class VideoPublishingController:
                                 previous.draft_status = copy.deepcopy(video.draft_status)
                             if video.privacy:
                                 previous.privacy = video.privacy
+                            if getattr(video, "video_stream_url", "") and not getattr(previous, "video_stream_url", ""):
+                                previous.video_stream_url = video.video_stream_url
                     self._progress(f"Kênh {channel_id} · đã đọc {len(videos)} video…")
                     if not next_token or (newest_limit is not None and pass_count >= newest_limit):
                         break
@@ -484,7 +495,36 @@ class VideoPublishingController:
                 videos.sort(key=lambda video: _timestamp(video.time_created_seconds) or 0, reverse=settings["order"] == "newest")
             if not manual and not settings["scan_all"]:
                 videos = videos[:int(settings["limit"])]
+            audio_results = {}
+            if audio_mode == "complete_audio":
+                inspect_all_types = bool(manual) or settings["scope"] in {"all", "scheduled", "public"}
+                audio_targets = [
+                    video for video in videos
+                    if inspect_all_types or publishing_video_type(video) in {"draft", "private", "unlisted"}
+                ]
+                if audio_targets:
+                    missing_urls = [video.id for video in audio_targets if not getattr(video, "video_stream_url", "")]
+                    if missing_urls:
+                        fetched = self._read_videos_batch(channel_id, missing_urls)
+                        for video in audio_targets:
+                            detailed = fetched.get(video.id)
+                            if detailed is not None and getattr(detailed, "video_stream_url", ""):
+                                video.video_stream_url = detailed.video_stream_url
+                    self._progress(f"Kênh {channel_id} · đang kiểm tra âm thanh gốc của {len(audio_targets)} video…")
+                    audio_results = self.audio_checker(
+                        channel_id,
+                        audio_targets,
+                        on_progress=lambda done, total, vid, ch=channel_id: self._progress(
+                            f"Kênh {ch} · kiểm tra âm thanh gốc ({done}/{total}) · {vid}…"
+                        ),
+                    )
+                    checked_audio_count += len(audio_targets)
             for video in videos:
+                audio_result = audio_results.get(video.id)
+                if audio_result is not None and audio_result.status in {"intermittent", "silent"}:
+                    excluded_audio_ids.add(video.id)
+                    excluded_audio_count += 1
+                    continue
                 category = copyright_category(video)
                 kind = publishing_video_type(video)
                 row = {"video_id": video.id, "channel_id": channel_id, "old_title": video.title,
@@ -493,6 +533,8 @@ class VideoPublishingController:
                        "copyright": category, "copyright_label": COPYRIGHT_LABELS[category],
                        "classification_version": PUBLISHING_SCAN_SCHEMA_VERSION, "draft_status": copy.deepcopy(video.draft_status),
                        "visibility_type": kind, "visibility_label": VIDEO_TYPE_LABELS[kind], "selected": False, "status": "scanned"}
+                if audio_result is not None:
+                    row["audio_status"] = audio_result.status
                 if stamp := schedule_timestamp(video):
                     row.update(publish_at=int(stamp),publish_label=datetime.fromtimestamp(stamp,VIETNAM_TIMEZONE).strftime("%d/%m/%Y %H:%M"))
                 reason = publishing_row_disabled_reason(row)
@@ -501,18 +543,26 @@ class VideoPublishingController:
                     reason = issue
                     row["schedule_unreadable"] = True
                     row.update(publish_at=None, publish_label="")
+                if audio_result is not None and audio_result.status == "unreadable" and not reason:
+                    reason = audio_result.reason or "Chưa kiểm tra được âm thanh gốc của video; quét lại để kiểm tra."
                 row.update(availability_reason=reason, status="skipped" if reason else "scanned",
                            detail=reason or "Tích chọn dòng này hoặc chọn hàng loạt theo bộ lọc để xử lý.")
                 rows.append(row)
         if manual:
             found = {row["video_id"] for row in rows}
-            missing = manual_set - found
+            missing = manual_set - found - excluded_audio_ids
             if missing:
                 raise ValueError("Không tìm thấy Video ID trong các kênh đã chọn: " + ", ".join(sorted(missing)))
         with self.lock:
             self.rows, self.occupied = rows, occupied
             suffix = " (Đã bỏ qua video Công khai để quét nhanh; chọn 'Tất cả loại video' hoặc 'Đã công khai' rồi quét lại nếu cần xem.)" if skip_public else ""
-            self.message = f"Đã quét {len(rows)} video · {sum(publishing_row_selectable(row) for row in rows)} có thể chọn lên lịch. Lọc loại video bên dưới rồi tích chọn." + suffix
+            audio_note = ""
+            if audio_mode == "complete_audio":
+                if excluded_audio_count:
+                    audio_note = f" · Đã lọc bỏ {excluded_audio_count} video âm thanh ngắt quãng/mất tiếng (kiểu 3s/7s)."
+                elif checked_audio_count:
+                    audio_note = " · Đã kiểm tra âm thanh gốc: tất cả video kiểm tra đều đạt."
+            self.message = f"Đã quét {len(rows)} video · {sum(publishing_row_selectable(row) for row in rows)} có thể chọn lên lịch. Lọc loại video bên dưới rồi tích chọn." + audio_note + suffix
             self._checkpoint()
 
     def _process(self, settings, reference, image, action):

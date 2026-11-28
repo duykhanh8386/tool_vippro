@@ -205,6 +205,11 @@ def create_video_publishing_page():
                     field.set_value(config[key])
                 field.set_enabled(not busy)
             fields["limit"].set_enabled(not busy and not config["scan_all"])
+            audio_mode_hint.set_text(
+                "Đang bật lọc âm thanh gốc: kiểm tra ~25 giây đầu luồng âm thanh gốc của video và bỏ qua các video có âm thanh ngắt quãng 3s nghe / 7s mất tiếng (0 dB)."
+                if config.get("audio_scan_mode") == "complete_audio"
+                else "Chế độ quét bình thường: chỉ đọc danh sách video từ Studio (nhanh nhất, không kiểm tra sóng âm)."
+            )
             from_links = config["channel_source"] == "links"
             fields["channel_links"].set_visibility(from_links)
             channel_picker.set_visibility(not from_links)
@@ -278,6 +283,14 @@ def create_video_publishing_page():
                 fields["scan_all"] = ui.switch("Quét hết video", value=settings["scan_all"], on_change=lambda e: change("scan_all", e.value))
                 fields["limit"] = ui.number("Số video mỗi kênh", value=settings["limit"], min=1, max=10000, step=1,
                                             on_change=lambda e: change("limit", e.value)).props("outlined").classes("w-44")
+            with ui.row().classes("w-full gap-3 items-center flex-wrap"):
+                ui.label("Chế độ quét âm thanh gốc:").classes("text-body-s text-muted")
+                fields["audio_scan_mode"] = ui.toggle(
+                    {"normal": "Quét bình thường", "complete_audio": "Chỉ quét âm thanh gốc hoàn chỉnh (lọc 3s/7s)"},
+                    value=settings["audio_scan_mode"],
+                    on_change=lambda e: change("audio_scan_mode", e.value),
+                )
+            audio_mode_hint = ui.label().classes("text-label-m text-muted")
             ui.label("Sau khi quét, lọc theo loại video và trạng thái bản quyền trong Danh sách xử lý để chọn video lên lịch.").classes("text-label-m text-muted")
         with app_card():
             with section_header("ChatGPT vẽ thumbnail", "Tạo ảnh bằng backend phoma ngay trong quy trình SEO."):

@@ -165,6 +165,7 @@ class ListVideosModule(IModule):
                         time_created_seconds=item.get("timeCreatedSeconds", ""),
                         time_published_seconds=item.get("timePublishedSeconds", ""),
                         restriction_details=restriction_details(item),
+                        video_stream_url=str(item.get("videoStreamUrl") or ""),
                     )
                 )
             except Exception as exc:

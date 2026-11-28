@@ -12,6 +12,7 @@ from unittest.mock import Mock, patch
 import requests
 from selenium.common.exceptions import ElementClickInterceptedException, InvalidSessionIdException, TimeoutException
 
+from src.audio_integrity import AudioIntegrityResult
 from src.module.base import IModule
 from src.module.list_videos_module import ListVideosModule
 from src.module.model import Video
@@ -1252,6 +1253,83 @@ class FastScanTests(unittest.TestCase):
         for item in (empty_sched, cancelled_sched):
             self.assertFalse(has_schedule_info(item))
             self.assertIsNone(schedule_timestamp(item))
+
+    def test_audio_scan_mode_toggle_filters_intermittent_and_silent_and_preserves_occupied(self):
+        class StubModule:
+            def __init__(self):
+                self.calls = []
+                self.mapping = {}
+
+            def read_videos(self, channel_id, video_ids):
+                self.calls.append((channel_id, list(video_ids)))
+                return dict(self.mapping)
+
+        storage = MemoryState()
+        listing, ref, img, thumb = Mock(), Mock(), Mock(), Mock()
+        module = StubModule()
+        checker = Mock()
+        controller = VideoPublishingController(
+            storage=storage, module=module, listing=listing,
+            reference_factory=lambda: ref, image_factory=lambda *_: img,
+            thumbnail_factory=lambda: thumb, audio_checker=checker,
+        )
+        self.assertEqual(controller.settings["audio_scan_mode"], "normal")
+        with self.assertRaises(ValueError):
+            controller.change_settings(audio_scan_mode="invalid")
+
+        controller.settings.update(channel_ids=[CHANNEL], scope="unpublished")
+        good_vid = video(VIDEO, video_stream_url="https://rr1.c.youtube.com/videoplayback")
+        intermittent_vid = video(OTHER)
+        silent_vid = video("Silent00001", video_stream_url="https://rr3.c.youtube.com/videoplayback")
+        unread_vid = video("Unread00001", video_stream_url="https://rr4.c.youtube.com/videoplayback")
+        sched_vid = video("Sched000001", scheduled_publishing_details={"publishTimeSeconds": str(STAMP)})
+
+        # Normal mode never invokes audio checker.
+        listing.list_all_videos.side_effect = [([good_vid, intermittent_vid], None), ([], None)]
+        with patch("src.video_publishing_tasks.get_channels_info", return_value=[SimpleNamespace(id=CHANNEL)]):
+            controller._scan(controller.settings, ref)
+        checker.assert_not_called()
+        self.assertEqual(len(controller.rows), 2)
+
+        # Switching mode resets rows/occupied cleanly.
+        controller.change_settings(audio_scan_mode="complete_audio")
+        self.assertEqual(controller.rows, [])
+        self.assertEqual(controller.occupied, {})
+
+        # Backfill missing video_stream_url for OTHER via read_videos, keep scheduled untouched.
+        module.mapping = {OTHER: video(OTHER, video_stream_url="https://rr2.c.youtube.com/videoplayback")}
+        checker.return_value = {
+            VIDEO: AudioIntegrityResult(status="complete"),
+            OTHER: AudioIntegrityResult(status="intermittent", reason="Ngắt quãng 3s/7s"),
+            "Silent00001": AudioIntegrityResult(status="silent", reason="Mất tiếng"),
+            "Unread00001": AudioIntegrityResult(status="unreadable", reason="Không đọc được âm thanh gốc"),
+        }
+        listing.list_all_videos.side_effect = [
+            ([good_vid, intermittent_vid, silent_vid, unread_vid, sched_vid], None),
+            ([], None),
+        ]
+        with patch("src.video_publishing_tasks.get_channels_info", return_value=[SimpleNamespace(id=CHANNEL)]):
+            controller._scan(controller.settings, ref)
+
+        self.assertEqual(module.calls, [(CHANNEL, [OTHER])])
+        checked_ids = [item.id for item in checker.call_args.args[1]]
+        self.assertEqual(checked_ids, [VIDEO, OTHER, "Silent00001", "Unread00001"])
+        self.assertNotIn("Sched000001", checked_ids)
+        self.assertEqual(controller.occupied[CHANNEL], [STAMP])
+        self.assertEqual([item["video_id"] for item in controller.rows], [VIDEO, "Unread00001", "Sched000001"])
+        self.assertEqual(controller.rows[0]["audio_status"], "complete")
+        self.assertTrue(publishing_row_selectable(controller.rows[0]))
+        self.assertEqual(controller.rows[1]["status"], "skipped")
+        self.assertFalse(publishing_row_selectable(controller.rows[1]))
+        self.assertIn("Đã lọc bỏ 2 video âm thanh ngắt quãng/mất tiếng", controller.message)
+
+        # Manual IDs excluded due to intermittent audio do not raise a missing-ID error.
+        controller.settings["manual_ids"] = VIDEO
+        checker.return_value = {VIDEO: AudioIntegrityResult(status="intermittent", reason="3s/7s")}
+        listing.list_all_videos.side_effect = [([good_vid], None), ([], None)]
+        with patch("src.video_publishing_tasks.get_channels_info", return_value=[SimpleNamespace(id=CHANNEL)]):
+            controller._scan(controller.settings, ref)
+        self.assertEqual(controller.rows, [])
 
 
 if __name__ == "__main__":

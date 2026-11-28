@@ -86,6 +86,7 @@ def studio_video_from_payload(video):
         visibility=video.get("visibility", ""), time_created_seconds=video.get("timeCreatedSeconds", ""),
         time_published_seconds=video.get("timePublishedSeconds", ""),
         restriction_details=restriction_details(video), copyright_check_status=copyright_check_status(video),
+        video_stream_url=str(video.get("videoStreamUrl") or ""),
     )
 
 
