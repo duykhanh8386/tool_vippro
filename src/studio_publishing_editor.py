@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
 import re
+import time
 from urllib.parse import urlparse
 
 from selenium.common.exceptions import TimeoutException, WebDriverException
@@ -43,6 +44,9 @@ def _parse_timezone_offset(note) -> int | None:
 
 TITLE = "#title-textarea [contenteditable='true'], #title-textarea textarea"
 DESCRIPTION = "#description-textarea [contenteditable='true'], #description-textarea textarea"
+RIGHTS_POLICY_NAME = "Monetize in all countries"
+DEFAULT_RIGHTS_ARTIST = "1"
+PRE_REVIEW_DRAFT_STEPS = ("RIGHTS_MANAGEMENT", "MONETIZATION", "CONTENT_RATINGS")
 
 
 def visible(scope, selector):
@@ -187,8 +191,18 @@ class NativeSave:
 
 
 class StudioPublishingEditor:
+    MONETIZATION_CONTROLS_GRACE_SECONDS = 3.0
+
     def __init__(self, controls):
         self.controls = controls
+
+    @staticmethod
+    def _is_control_disabled(node):
+        return (
+            not node.is_enabled()
+            or node.get_attribute("disabled") is not None
+            or node.get_attribute("aria-disabled") == "true"
+        )
 
     def _open(self, driver, video_id):
         try:
@@ -322,7 +336,7 @@ class StudioPublishingEditor:
         if visible(dialog, TITLE) is None or visible(dialog, DESCRIPTION) is None:
             self.controls._click_control(
                 driver,
-                lambda: visible(dialog, "#step-badge-0, [test-id='DETAILS']"),
+                lambda: visible(dialog, "[test-id='DETAILS']") or visible(dialog, "#step-badge-0"),
                 timeout=30,
                 message="Chưa mở được bước Chi tiết trong hộp thoại bản nháp Studio.",
             )
@@ -332,6 +346,521 @@ class StudioPublishingEditor:
                 message="Chưa tải được ô title/description trong hộp thoại bản nháp Studio.",
             )
         return dialog
+
+    @staticmethod
+    def _draft_step_tab(dialog, test_id):
+        return visible(dialog, f"ytcp-stepper [test-id='{test_id}'], [role='tab'][test-id='{test_id}'], [test-id='{test_id}']")
+
+    @classmethod
+    def _draft_step_state(cls, dialog, test_id):
+        tab = cls._draft_step_tab(dialog, test_id)
+        if tab is None:
+            return ""
+        return str(tab.get_attribute("state") or "").strip().lower()
+
+    @staticmethod
+    def _active_draft_step(dialog):
+        for tab in dialog.find_elements(By.CSS_SELECTOR, "ytcp-stepper [test-id], [role='tab'][test-id]"):
+            if not tab.is_displayed():
+                continue
+            if tab.get_attribute("aria-selected") == "true" or tab.get_attribute("active") is not None:
+                step_id = str(tab.get_attribute("test-id") or "").strip()
+                if step_id:
+                    return step_id
+        for selector, step_id in (
+            ("ytcp-video-visibility-select", "REVIEW"),
+            ("ytcms-video-rights-management-settings", "RIGHTS_MANAGEMENT"),
+            ("ytcp-uploads-monetization", "MONETIZATION"),
+            ("ytcp-uploads-content-ratings, ytpp-self-certification-questionnaire", "CONTENT_RATINGS"),
+            (TITLE, "DETAILS"),
+        ):
+            if visible(dialog, selector) is not None:
+                return step_id
+        return ""
+
+    @staticmethod
+    def _wait_draft_idle(dialog, timeout=15):
+        wait_for(
+            lambda: visible(dialog, "tp-yt-paper-progress") is None,
+            timeout=timeout,
+            message="Hộp thoại bản nháp Studio vẫn đang tải; chưa tiếp tục.",
+        )
+
+    def _click_draft_next(self, driver, dialog, previous_step):
+        self.controls._click_control(
+            driver,
+            lambda: self.controls._button_control(dialog, "#next-button"),
+            timeout=30,
+            message="Studio chưa bật nút Tiếp trong hộp thoại bản nháp.",
+        )
+        wait_for(
+            lambda: (
+                (self._active_draft_step(dialog) not in {"", previous_step})
+                or visible(dialog, "ytcp-video-visibility-select") is not None
+            ),
+            timeout=20,
+            message="Studio chưa chuyển sang bước tiếp theo trong hộp thoại bản nháp.",
+        )
+
+    def _complete_rights_management(self, driver, dialog, reference):
+        panel = wait_for(
+            lambda: visible(dialog, "ytcms-video-rights-management-settings"),
+            timeout=20,
+            message="Chưa tải được phần Quản lý quyền trong hộp thoại bản nháp Studio.",
+        )
+
+        def current_policy_text():
+            node = (
+                visible(panel, "ytcms-policy-select.upload-policy-select .dropdown-trigger-text")
+                or visible(panel, "ytcms-policy-select .dropdown-trigger-text")
+            )
+            return " ".join(field_text(driver, node).split()) if node is not None else ""
+
+        if current_policy_text().casefold() != RIGHTS_POLICY_NAME.casefold():
+            self.controls._click_control(
+                driver,
+                lambda: (
+                    visible(panel, "ytcms-policy-select.upload-policy-select ytcp-dropdown-trigger")
+                    or visible(panel, "ytcms-policy-select ytcp-dropdown-trigger")
+                ),
+                timeout=20,
+                message="Chưa mở được danh sách chính sách tải lên trong Quản lý quyền.",
+            )
+            policy_dialog = wait_for(
+                lambda: visible(driver, "tp-yt-paper-dialog[aria-label='policy-dialog']"),
+                timeout=20,
+                message="Chưa tải được hộp thoại chọn chính sách trong Quản lý quyền.",
+            )
+            filter_input = visible(policy_dialog, "input#policy-filter-input")
+            if filter_input is not None:
+                set_text(driver, filter_input, RIGHTS_POLICY_NAME, commit=None, force=True)
+
+            def matching_policy_option():
+                for item in policy_dialog.find_elements(By.CSS_SELECTOR, "tp-yt-paper-item[role='option'], tp-yt-paper-item"):
+                    if not item.is_displayed():
+                        continue
+                    title_el = next(iter(item.find_elements(By.CSS_SELECTOR, ".title")), None)
+                    label = " ".join((title_el.text if title_el is not None else item.text).split())
+                    if label.casefold() == RIGHTS_POLICY_NAME.casefold():
+                        return item
+                return None
+
+            option = wait_for(
+                matching_policy_option,
+                timeout=15,
+                message=f"Không tìm thấy chính sách '{RIGHTS_POLICY_NAME}' trong Quản lý quyền.",
+            )
+            self.controls._click_control(
+                driver,
+                lambda option=option: option,
+                selected=lambda el: el.get_attribute("aria-selected") == "true" or el.get_attribute("selected") is not None,
+                timeout=15,
+                message=f"Chưa chọn được chính sách '{RIGHTS_POLICY_NAME}' trong Quản lý quyền.",
+            )
+            self.controls._click_control(
+                driver,
+                lambda: self.controls._button_control(policy_dialog, "#apply-policy"),
+                timeout=15,
+                message="Chưa bấm được nút Áp dụng chính sách trong Quản lý quyền.",
+            )
+            wait_for(
+                lambda: (
+                    visible(driver, "tp-yt-paper-dialog[aria-label='policy-dialog']") is None
+                    and current_policy_text().casefold() == RIGHTS_POLICY_NAME.casefold()
+                ),
+                timeout=20,
+                message=f"Studio chưa áp dụng chính sách '{RIGHTS_POLICY_NAME}' trong Quản lý quyền.",
+            )
+
+        global_radio = (
+            visible(panel, "ytcms-asset-ownership-territory #global-radio-button")
+            or visible(panel, "ytcms-asset-ownership-territory tp-yt-paper-radio-button[name='GLOBAL']")
+        )
+        if global_radio is not None and global_radio.get_attribute("aria-checked") != "true":
+            self.controls._click_control(
+                driver,
+                lambda: (
+                    visible(panel, "ytcms-asset-ownership-territory #global-radio-button")
+                    or visible(panel, "ytcms-asset-ownership-territory tp-yt-paper-radio-button[name='GLOBAL']")
+                ),
+                selected=lambda el: el.get_attribute("aria-checked") == "true",
+                timeout=15,
+                message="Chưa chọn được quyền sở hữu Toàn cầu trong Quản lý quyền.",
+            )
+            wait_for(
+                lambda: (
+                    (node := (
+                        visible(panel, "ytcms-asset-ownership-territory #global-radio-button")
+                        or visible(panel, "ytcms-asset-ownership-territory tp-yt-paper-radio-button[name='GLOBAL']")
+                    )) is not None
+                    and node.get_attribute("aria-checked") == "true"
+                ),
+                timeout=10,
+                message="Studio chưa xác nhận quyền sở hữu Toàn cầu trong Quản lý quyền.",
+            )
+
+        song_field = visible(panel, "#metadata-music-video-song-input textarea")
+        if song_field is not None and not field_text(driver, song_field).strip():
+            set_text(driver, song_field, reference["title"])
+
+        artist_editor = visible(panel, "ytcms-identified-people-editor")
+        if artist_editor is not None:
+            def has_artist_chip():
+                return any(
+                    chip.is_displayed()
+                    for chip in artist_editor.find_elements(By.CSS_SELECTOR, "ytcp-chip")
+                )
+
+            def find_artist_dialog():
+                return (
+                    visible(driver, "tp-yt-paper-dialog[aria-labelledby='cms-identified-people-edit-dialog-title']")
+                    or visible(driver, "ytcp-dialog[aria-labelledby='cms-identified-people-edit-dialog-title']")
+                )
+
+            if not has_artist_chip():
+                artist_input = wait_for(
+                    lambda: visible(artist_editor, "ytcp-chip-bar input#text-input, input#text-input"),
+                    timeout=15,
+                    message="Không tìm thấy ô nhập Nghệ sĩ trong Quản lý quyền.",
+                )
+                set_text(driver, artist_input, DEFAULT_RIGHTS_ARTIST, commit=Keys.ENTER, force=True)
+                wait_for(
+                    lambda: find_artist_dialog() is not None or has_artist_chip(),
+                    timeout=15,
+                    message="Studio không mở hộp thoại nghệ sĩ hoặc không thêm được nghệ sĩ.",
+                )
+                artist_dialog = find_artist_dialog()
+                if artist_dialog is not None:
+                    name_area = visible(artist_dialog, "#name-input textarea")
+                    if name_area is not None and field_text(driver, name_area).strip() != DEFAULT_RIGHTS_ARTIST:
+                        set_text(driver, name_area, DEFAULT_RIGHTS_ARTIST, commit=None, force=True)
+                    self.controls._click_control(
+                        driver,
+                        lambda: self.controls._button_control(find_artist_dialog() or driver, "#save"),
+                        timeout=15,
+                        message="Chưa bấm được nút Lưu thông tin nghệ sĩ trong Quản lý quyền.",
+                    )
+                    wait_for(
+                        lambda: find_artist_dialog() is None,
+                        timeout=15,
+                        message="Hộp thoại chỉnh sửa nghệ sĩ chưa đóng sau khi bấm Lưu.",
+                    )
+                wait_for(
+                    has_artist_chip,
+                    timeout=15,
+                    message="Studio chưa lưu thẻ Nghệ sĩ trong Quản lý quyền.",
+                )
+
+        self._wait_draft_idle(dialog)
+
+    def _ensure_audience_selected(self, driver, scope, *, on_progress=lambda step, message: None):
+        host = visible(scope, "ytkc-made-for-kids-select")
+        if host is None:
+            for candidate in scope.find_elements(By.CSS_SELECTOR, "ytkc-made-for-kids-select"):
+                try:
+                    driver.execute_script(
+                        "arguments[0].scrollIntoView({block:'center', inline:'center'});",
+                        candidate,
+                    )
+                except WebDriverException:
+                    continue
+                if candidate.is_displayed():
+                    host = candidate
+                    break
+        if host is None:
+            return False
+        radios = [r for r in host.find_elements(By.CSS_SELECTOR, "tp-yt-paper-radio-button") if r.is_displayed()]
+        if not radios:
+            return False
+        if any(r.get_attribute("aria-checked") == "true" for r in radios):
+            return False
+        on_progress("audience", "Đang chọn 'Không, nội dung này không dành cho trẻ em' trong mục Đối tượng người xem…")
+
+        def locate_not_mfk():
+            return visible(
+                scope,
+                "ytkc-made-for-kids-select tp-yt-paper-radio-button[name='VIDEO_MADE_FOR_KIDS_NOT_MFK']",
+            )
+
+        self.controls._click_control(
+            driver,
+            locate_not_mfk,
+            selected=lambda el: el.get_attribute("aria-checked") == "true",
+            timeout=15,
+            message="Chưa chọn được 'Không, nội dung này không dành cho trẻ em' trong mục Đối tượng người xem.",
+        )
+        wait_for(
+            lambda: (node := locate_not_mfk()) is not None and node.get_attribute("aria-checked") == "true",
+            timeout=10,
+            message="Studio chưa xác nhận lựa chọn 'Không, nội dung này không dành cho trẻ em'.",
+        )
+        return True
+
+    def _complete_monetization(self, driver, dialog):
+        panel = wait_for(
+            lambda: visible(dialog, "ytcp-uploads-monetization"),
+            timeout=20,
+            message="Chưa tải được bước Kiếm tiền trong hộp thoại bản nháp Studio.",
+        )
+        self._wait_draft_idle(dialog)
+        started = time.monotonic()
+        wait_for(
+            lambda: (
+                visible(driver, "ytcp-video-monetization-edit-dialog") is not None
+                or visible(panel, "ytcp-dropdown-trigger") is not None
+                or visible(panel, "ytpp-ad-options-settings, ytpp-ad-breaks-settings") is not None
+                or (
+                    time.monotonic() - started >= self.MONETIZATION_CONTROLS_GRACE_SECONDS
+                    and visible(dialog, "tp-yt-paper-progress") is None
+                    and self.controls._button_control(dialog, "#next-button") is not None
+                    and bool((panel.text or "").strip())
+                )
+            ),
+            timeout=15,
+            message="Chưa tải được điều khiển Kiếm tiền trong Studio.",
+        )
+
+        edit_dialog = visible(driver, "ytcp-video-monetization-edit-dialog")
+        if edit_dialog is None:
+            trigger = visible(panel, "ytcp-dropdown-trigger")
+            trigger_enabled = trigger is not None and not self._is_control_disabled(trigger)
+            ad_options_ready = visible(panel, "ytpp-ad-options-settings, ytpp-ad-breaks-settings") is not None
+            next_ready = self.controls._button_control(dialog, "#next-button") is not None
+            if trigger_enabled and (not ad_options_ready or not next_ready):
+                self.controls._click_control(
+                    driver,
+                    lambda: visible(panel, "ytcp-dropdown-trigger"),
+                    timeout=15,
+                    message="Chưa mở được hộp thoại bật Kiếm tiền trong Studio.",
+                )
+                edit_dialog = wait_for(
+                    lambda: visible(driver, "ytcp-video-monetization-edit-dialog"),
+                    timeout=15,
+                    message="Chưa tải được hộp thoại chọn Bật/Tắt kiếm tiền.",
+                )
+
+        if edit_dialog is not None:
+            radio_on = wait_for(
+                lambda: (
+                    visible(edit_dialog, "tp-yt-paper-radio-button#radio-on")
+                    or visible(edit_dialog, "tp-yt-paper-radio-button[name='ON']")
+                ),
+                timeout=15,
+                message="Chưa tìm thấy tùy chọn Bật kiếm tiền.",
+            )
+            if radio_on.get_attribute("aria-checked") != "true":
+                self.controls._click_control(
+                    driver,
+                    lambda: (
+                        visible(edit_dialog, "tp-yt-paper-radio-button#radio-on")
+                        or visible(edit_dialog, "tp-yt-paper-radio-button[name='ON']")
+                    ),
+                    selected=lambda el: el.get_attribute("aria-checked") == "true",
+                    timeout=15,
+                    message="Chưa chọn được Bật trong hộp thoại Kiếm tiền.",
+                )
+                wait_for(
+                    lambda: (
+                        (node := (
+                            visible(edit_dialog, "tp-yt-paper-radio-button#radio-on")
+                            or visible(edit_dialog, "tp-yt-paper-radio-button[name='ON']")
+                        )) is not None
+                        and node.get_attribute("aria-checked") == "true"
+                    ),
+                    timeout=10,
+                    message="Studio chưa xác nhận chọn Bật kiếm tiền.",
+                )
+            self.controls._click_control(
+                driver,
+                lambda: self.controls._button_control(edit_dialog, "#save-button"),
+                timeout=15,
+                message="Chưa bấm được nút Xong khi bật Kiếm tiền.",
+            )
+            wait_for(
+                lambda: visible(driver, "ytcp-video-monetization-edit-dialog") is None,
+                timeout=15,
+                message="Hộp thoại Kiếm tiền chưa đóng sau khi bấm Xong.",
+            )
+
+        self._wait_draft_idle(dialog)
+        wait_for(
+            lambda: (
+                visible(panel, "ytpp-ad-options-settings, ytpp-ad-breaks-settings") is not None
+                or self.controls._button_control(dialog, "#next-button") is not None
+            ),
+            timeout=15,
+            message="Studio chưa sẵn sàng chuyển tiếp sau khi bật Kiếm tiền.",
+        )
+
+    def _complete_content_ratings(self, driver, dialog):
+        if self._draft_step_state(dialog, "CONTENT_RATINGS") == "completed":
+            return
+        panel = wait_for(
+            lambda: visible(dialog, "ytcp-uploads-content-ratings, ytpp-self-certification-questionnaire"),
+            timeout=20,
+            message="Chưa tải được bước Mức độ phù hợp với quảng cáo trong Studio.",
+        )
+
+        def find_none_checkbox():
+            direct = visible(panel, "ytcp-checkbox-lit.all-none-checkbox, ytcp-checkbox-lit#all-none-checkbox")
+            if direct is not None:
+                return direct
+            outside_question = driver.execute_script("""
+                const panel = arguments[0];
+                for (const box of panel.querySelectorAll('ytcp-checkbox-lit')) {
+                    if (!box.getClientRects().length || getComputedStyle(box).visibility === 'hidden') continue;
+                    if (!box.closest('ytpp-self-certification-question')) return box;
+                }
+                return null;
+            """, panel)
+            if outside_question is not None:
+                return outside_question
+            for box in panel.find_elements(By.CSS_SELECTOR, "ytcp-checkbox-lit"):
+                if not box.is_displayed():
+                    continue
+                if re.search(r"none of the above|không có nội dung nào ở trên|không có mục nào ở trên", box.text or "", re.I):
+                    return box
+            return None
+
+        def checkbox_checked(host):
+            role = next(iter(host.find_elements(By.CSS_SELECTOR, "[role='checkbox']")), None)
+            target = role or host
+            return target.get_attribute("aria-checked") == "true" or host.get_attribute("checked") is not None
+
+        checkbox = wait_for(
+            find_none_checkbox,
+            timeout=20,
+            message="Không tìm thấy ô 'Không có nội dung nào ở trên' trong bước Đánh giá quảng cáo.",
+        )
+        if not checkbox_checked(checkbox):
+            self.controls._click_control(
+                driver,
+                find_none_checkbox,
+                selected=checkbox_checked,
+                timeout=15,
+                message="Chưa tích được 'Không có nội dung nào ở trên' trong bước Đánh giá quảng cáo.",
+            )
+            wait_for(
+                lambda: (box := find_none_checkbox()) is not None and checkbox_checked(box),
+                timeout=10,
+                message="Studio chưa xác nhận tích 'Không có nội dung nào ở trên'.",
+            )
+
+        def find_submit_button():
+            explicit = self.controls._button_control(panel, "#submit-questionnaire-button")
+            if explicit is not None:
+                return explicit
+            return driver.execute_script("""
+                const panel = arguments[0];
+                const re = /submit\\s*rating|gửi\\s*đánh\\s*giá|\\bsubmit\\b|^gửi\\b/i;
+                for (const host of panel.querySelectorAll('ytcp-button')) {
+                    if (host.closest('ytcp-banner')) continue;
+                    if (host.getAttribute('aria-disabled') === 'true') continue;
+                    const btn = host.querySelector('button');
+                    if (!btn || btn.disabled || btn.getAttribute('aria-disabled') === 'true') continue;
+                    if (!btn.getClientRects().length || getComputedStyle(btn).visibility === 'hidden') continue;
+                    const label = ((btn.innerText || '') + ' ' + (btn.getAttribute('aria-label') || '')).trim();
+                    if (re.test(label)) return btn;
+                }
+                return null;
+            """, panel)
+
+        submit_btn = wait_for(
+            find_submit_button,
+            timeout=15,
+            message="Chưa tìm thấy nút Gửi đánh giá trong bước Mức độ phù hợp với quảng cáo.",
+        )
+        if submit_btn is not None:
+            self.controls._click_control(
+                driver,
+                find_submit_button,
+                timeout=15,
+                message="Chưa bấm được nút Gửi đánh giá quảng cáo.",
+            )
+            wait_for(
+                lambda: (
+                    self._draft_step_state(dialog, "CONTENT_RATINGS") == "completed"
+                    or (find_submit_button() is None and self.controls._button_control(dialog, "#next-button") is not None)
+                ),
+                timeout=30,
+                message="Studio chưa xác nhận Gửi đánh giá mức độ phù hợp với quảng cáo.",
+            )
+
+        self._wait_draft_idle(dialog)
+
+    def _open_review_step(self, driver, dialog):
+        self.controls._click_control(
+            driver,
+            lambda: visible(dialog, "[test-id='REVIEW']") or visible(dialog, "#step-badge-3"),
+            timeout=30,
+            message="Chưa mở được bước Chế độ hiển thị trong hộp thoại bản nháp Studio.",
+        )
+
+    def _advance_draft_to_review(self, driver, dialog, *, reference, on_progress):
+        handled_steps = set()
+
+        def next_unhandled_pre_review():
+            for step_id in PRE_REVIEW_DRAFT_STEPS:
+                if self._draft_step_tab(dialog, step_id) is None:
+                    continue
+                if step_id not in handled_steps and self._draft_step_state(dialog, step_id) != "completed":
+                    return step_id
+            return None
+
+        for _ in range(12):
+            check_stopped()
+            step = self._active_draft_step(dialog)
+            if step == "REVIEW" and visible(dialog, "ytcp-video-visibility-select") is not None:
+                pending = next_unhandled_pre_review()
+                if pending is None:
+                    return
+                self.controls._click_control(
+                    driver,
+                    lambda pending=pending: self._draft_step_tab(dialog, pending),
+                    timeout=15,
+                    message=f"Chưa chuyển được tới bước {pending} trong hộp thoại bản nháp Studio.",
+                )
+                wait_for(
+                    lambda pending=pending: self._active_draft_step(dialog) == pending,
+                    timeout=15,
+                    message=f"Studio chưa mở bước {pending}.",
+                )
+                continue
+
+            if step == "RIGHTS_MANAGEMENT":
+                on_progress("rights_management", "Đang thiết lập Quản lý quyền (chính sách, quyền sở hữu, nghệ sĩ)…")
+                self._complete_rights_management(driver, dialog, reference)
+                handled_steps.add("RIGHTS_MANAGEMENT")
+                self._click_draft_next(driver, dialog, "RIGHTS_MANAGEMENT")
+            elif step == "MONETIZATION":
+                on_progress("monetization", "Đang bật Kiếm tiền trong hộp thoại bản nháp Studio…")
+                self._complete_monetization(driver, dialog)
+                handled_steps.add("MONETIZATION")
+                self._click_draft_next(driver, dialog, "MONETIZATION")
+            elif step == "CONTENT_RATINGS":
+                on_progress("content_ratings", "Đang xác nhận Mức độ phù hợp với quảng cáo…")
+                self._complete_content_ratings(driver, dialog)
+                handled_steps.add("CONTENT_RATINGS")
+                self._click_draft_next(driver, dialog, "CONTENT_RATINGS")
+            elif step == "DETAILS":
+                has_mandatory_pre_review = any(
+                    self._draft_step_tab(dialog, step_id) is not None
+                    for step_id in PRE_REVIEW_DRAFT_STEPS
+                )
+                if has_mandatory_pre_review:
+                    self._click_draft_next(driver, dialog, "DETAILS")
+                else:
+                    self._open_review_step(driver, dialog)
+                    return
+            else:
+                if self.controls._button_control(dialog, "#next-button") is not None:
+                    self._click_draft_next(driver, dialog, step)
+                else:
+                    self._open_review_step(driver, dialog)
+                    return
+
+        if visible(dialog, "ytcp-video-visibility-select") is None:
+            raise PublishingBrowserError("Chưa chuyển được tới bước Chế độ hiển thị trong hộp thoại bản nháp Studio.")
 
     def _fill_schedule(self, driver, select, publish_at, *, original=None):
         current_state = original if original is not None else self._state(driver, select)
@@ -412,13 +941,8 @@ class StudioPublishingEditor:
             self._close_visibility(driver)
         return not was_scheduled or original.get("timestamp") != publish_at
 
-    def _stage_draft_schedule(self, driver, dialog, publish_at):
-        self.controls._click_control(
-            driver,
-            lambda: visible(dialog, "#step-badge-3, [test-id='REVIEW']"),
-            timeout=30,
-            message="Chưa mở được bước Chế độ hiển thị trong hộp thoại bản nháp Studio.",
-        )
+    def _stage_draft_schedule(self, driver, dialog, publish_at, *, reference, on_progress=lambda step, message: None):
+        self._advance_draft_to_review(driver, dialog, reference=reference, on_progress=on_progress)
         select = wait_for(
             lambda: visible(dialog, "ytcp-video-visibility-select"),
             timeout=30,
@@ -556,9 +1080,10 @@ class StudioPublishingEditor:
             on_progress("assign_playlist", "Đang chọn playlist đầu tiên và bấm Xong; chưa bấm Lưu trang…")
             playlist, playlist_changed = self.controls._stage_first_playlist(driver, scope=scope)
             changed = changed or playlist_changed
+            changed = self._ensure_audience_selected(driver, scope, on_progress=on_progress) or changed
             on_progress("schedule_video", "Đang chọn Lên lịch công khai và nhập ngày/giờ UTC+7…")
             if mode == "draft":
-                changed = self._stage_draft_schedule(driver, scope, publish_at) or changed
+                changed = self._stage_draft_schedule(driver, scope, publish_at, reference=reference, on_progress=on_progress) or changed
             else:
                 changed = self._stage_schedule(driver, publish_at) or changed
             if changed:

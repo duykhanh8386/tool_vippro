@@ -42,6 +42,10 @@ STEP_LABELS = {
     "download_reference": "Tải ảnh tham chiếu", "generate_image": "Tạo và tải ảnh GPT",
     "normalize_thumbnail": "Chuẩn hóa thumbnail", "upload_thumbnail": "Lưu thumbnail và danh sách phát",
     "assign_playlist": "Lưu danh sách phát", "copy_metadata": "Lưu title/description",
+    "audience": "Chọn đối tượng người xem",
+    "rights_management": "Thiết lập Quản lý quyền",
+    "monetization": "Bật Kiếm tiền",
+    "content_ratings": "Đánh giá mức độ phù hợp quảng cáo",
     "schedule_video": "Lưu lịch đăng", "process": "Xử lý video",
     "final_save": "Lưu toàn bộ video", "verify_saved": "Kiểm tra video đã lưu",
 }
