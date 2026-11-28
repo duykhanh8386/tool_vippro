@@ -20,6 +20,12 @@ from web.theme import app_card, page_header, page_shell, section_header
 def create_video_publishing_page():
     controller = get_video_publishing_controller()
     client = context.client
+    connected_channels = get_channels_info() or []
+    channel_names = {
+        ch.id: str(getattr(ch, "name", "") or "").strip()
+        for ch in connected_channels
+        if getattr(ch, "id", "")
+    }
     settings = controller.snapshot()["settings"]
     fields, buttons = {}, {}
     syncing = {"active": False, "revision": -1}
@@ -190,10 +196,45 @@ def create_video_publishing_page():
             job_busy = data["busy"]
             busy = job_busy or data["session_busy"]
             config = data["settings"]
-            copyright_counts = Counter(row["copyright"] for row in data["rows"] if publishing_row_matches(row, scope=config["scope"]))
-            type_counts = Counter(row.get("visibility_type", "unknown") for row in data["rows"])
-            scope_counts = {**type_counts, "all": len(data["rows"]),
-                            "unpublished": sum(type_counts[key] for key in ("draft", "private", "unlisted"))}
+            scanned_channels = list(dict.fromkeys(row["channel_id"] for row in data["rows"] if row.get("channel_id")))
+            total_chosen = sum(bool(row.get("selected")) and publishing_row_selectable(row) for row in data["rows"])
+            all_label = (
+                f"Tất cả kênh đã quét ({len(data['rows'])} · đã chọn {total_chosen})"
+                if total_chosen
+                else f"Tất cả kênh đã quét ({len(data['rows'])})"
+            )
+            channel_options = {"all": all_label}
+            for ch_id in scanned_channels:
+                ch_total = sum(1 for row in data["rows"] if row.get("channel_id") == ch_id)
+                ch_chosen = sum(
+                    1
+                    for row in data["rows"]
+                    if row.get("channel_id") == ch_id and row.get("selected") and publishing_row_selectable(row)
+                )
+                ch_name = channel_names.get(ch_id, "")
+                prefix = f"{ch_name} · {ch_id}" if ch_name else ch_id
+                channel_options[ch_id] = (
+                    f"{prefix} ({ch_total} · đã chọn {ch_chosen})" if ch_chosen else f"{prefix} ({ch_total})"
+                )
+            effective_channel_filter = config.get("channel_filter", "all")
+            if effective_channel_filter not in channel_options:
+                effective_channel_filter = "all"
+            channel_rows = [
+                row
+                for row in data["rows"]
+                if effective_channel_filter == "all" or row.get("channel_id") == effective_channel_filter
+            ]
+            copyright_counts = Counter(
+                row["copyright"] for row in channel_rows if publishing_row_matches(row, scope=config["scope"])
+            )
+            type_counts = Counter(row.get("visibility_type", "unknown") for row in channel_rows)
+            scope_counts = {
+                **type_counts,
+                "all": len(channel_rows),
+                "unpublished": sum(type_counts[key] for key in ("draft", "private", "unlisted")),
+            }
+            if fields["channel_filter"].options != channel_options:
+                fields["channel_filter"].set_options(channel_options, value=effective_channel_filter)
             for key, options in (
                 ("categories", {kind: f"{label} ({copyright_counts[kind]})" for kind, label in COPYRIGHT_LABELS.items()}),
                 ("scope", {kind: f"{label} ({scope_counts.get(kind, 0)})" for kind, label in VIDEO_SCOPE_LABELS.items()}),
@@ -201,8 +242,9 @@ def create_video_publishing_page():
                 if fields[key].options != options:
                     fields[key].set_options(options)
             for key, field in fields.items():
-                if field.value != config[key]:
-                    field.set_value(config[key])
+                target = effective_channel_filter if key == "channel_filter" else config[key]
+                if field.value != target:
+                    field.set_value(target)
                 field.set_enabled(not busy)
             fields["limit"].set_enabled(not busy and not config["scan_all"])
             audio_mode_hint.set_text(
@@ -220,7 +262,16 @@ def create_video_publishing_page():
                 button.set_enabled(not busy)
             buttons["stop"].set_enabled(job_busy)
             chosen = sum(bool(row.get("selected")) and publishing_row_selectable(row) for row in data["rows"])
-            filtered = [row for row in data["rows"] if publishing_row_matches(row, scope=config["scope"], categories=config["categories"])]
+            filtered = [
+                row
+                for row in data["rows"]
+                if publishing_row_matches(
+                    row,
+                    scope=config["scope"],
+                    categories=config["categories"],
+                    channel_filter=effective_channel_filter,
+                )
+            ]
             selectable_count = sum(publishing_row_selectable(row) for row in filtered)
             shown_selected = sum(bool(row.get("selected")) for row in filtered)
             buttons["scan"].set_enabled(not busy and bool(config["channel_links"].strip() if from_links else config["channel_ids"]))
@@ -265,7 +316,7 @@ def create_video_publishing_page():
                                                   on_change=lambda e: change("channel_source", e.value))
             source_status = ui.label().classes("text-body-s text-brand")
         with ui.column().classes("w-full") as channel_picker:
-            create_channel_selection(get_channels_info() or [], choose_channels, multi_select=True,
+            create_channel_selection(connected_channels, choose_channels, multi_select=True,
                                      initial_selected_ids=settings["channel_ids"],
                                      can_change_selection=lambda: not (controller.snapshot()["busy"] or controller.snapshot()["session_busy"]) and controller.snapshot()["settings"]["channel_source"] == "selected")
         with app_card():
@@ -335,11 +386,17 @@ def create_video_publishing_page():
                 buttons["run"] = ui.button("Tự động SEO, tạo thumbnail & lên lịch", icon="play_arrow", on_click=lambda: invoke(lambda: controller.start("run")))
                 buttons["stop"] = ui.button("Dừng", icon="stop", on_click=lambda: invoke(controller.stop)).props("outline color=negative")
             with ui.row().classes("w-full gap-3 items-end flex-wrap"):
+                fields["channel_filter"] = ui.select(
+                    {"all": "Tất cả kênh đã quét (0)"},
+                    label="Lọc theo kênh đã quét",
+                    value=settings.get("channel_filter", "all"),
+                    on_change=lambda e: change("channel_filter", e.value or "all"),
+                ).props("outlined").classes("w-80 max-w-full")
                 fields["scope"] = ui.select(VIDEO_SCOPE_LABELS, label="Lọc loại video đã quét", value=settings["scope"],
                                             on_change=lambda e: change("scope", e.value)).props("outlined").classes("w-96 max-w-full")
                 fields["categories"] = ui.select(COPYRIGHT_LABELS, multiple=True, clearable=True, label="Lọc trạng thái bản quyền (trống = tất cả)",
                                                  value=settings["categories"], on_change=lambda e: change("categories", list(e.value or []))).props("outlined use-chips").classes("flex-1 min-w-64")
-            ui.label("Bảng áp dụng đồng thời loại video và bản quyền. Xóa bộ lọc bản quyền để thấy đủ video thuộc loại đã chọn. Đổi bộ lọc vẫn giữ các video đã chọn; video bị khóa checkbox có lý do tại từng dòng.").classes("text-label-m text-muted")
+            ui.label("Bảng áp dụng đồng thời bộ lọc kênh, loại video và bản quyền. Xóa bộ lọc bản quyền để thấy đủ video thuộc loại đã chọn. Đổi bộ lọc (kể cả chuyển sang kênh khác) vẫn giữ nguyên các video đã chọn; video bị khóa checkbox có lý do tại từng dòng.").classes("text-label-m text-muted")
             rescan_hint = ui.label("Danh sách cũ chưa được kiểm tra bằng cách nhận diện bản nháp mới. Bấm Quét video lại một lần để cập nhật đúng loại video.").classes("text-body-s text-warn")
             message = ui.label().classes("text-body-s text-ok break-words")
             summary = ui.label().classes("text-label-m text-muted")

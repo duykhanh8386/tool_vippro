@@ -101,10 +101,11 @@ def publishing_video_type(video) -> str:
     return "unknown"
 
 
-def publishing_row_matches(row, *, scope="all", categories=()) -> bool:
+def publishing_row_matches(row, *, scope="all", categories=(), channel_filter="all") -> bool:
     kind = row.get("visibility_type", "unknown")
     in_scope = scope == "all" or (scope == "unpublished" and kind in {"draft", "private", "unlisted"}) or scope == kind
-    return in_scope and (not categories or row.get("copyright") in categories)
+    in_channel = not channel_filter or channel_filter == "all" or row.get("channel_id") == channel_filter
+    return in_scope and in_channel and (not categories or row.get("copyright") in categories)
 
 
 def publishing_row_disabled_reason(row) -> str:

@@ -1,5 +1,6 @@
 """Exercise real NiceGUI table selection callbacks without external accounts."""
 import copy
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -24,8 +25,8 @@ class MemoryState:
         return True
 
 
-def row(index, kind="private", copyright="clear"):
-    item = {"video_id": f"v{index:010d}", "channel_id": "UC" + "a" * 22, "old_title": f"Song {index}",
+def row(index, kind="private", copyright="clear", channel_id="UC" + "a" * 22):
+    item = {"video_id": f"v{index:010d}", "channel_id": channel_id, "old_title": f"Song {index}",
             "old_description": "", "song": f"Song {index}", "copyright": copyright,
             "copyright_label": COPYRIGHT_LABELS[copyright], "visibility_type": kind, "visibility_label": VIDEO_TYPE_LABELS[kind],
             "selected": False, "status": "scanned", "detail": "", "duration_seconds": 60}
@@ -185,6 +186,76 @@ class PublishingPageSelectionTests(unittest.TestCase):
         with self.client:
             self.refresh()
         self.assertFalse(audio_toggle.enabled)
+
+    def test_channel_filter_preserves_selection_across_channels_and_shows_counts(self):
+        ch1 = "UC" + "a" * 22
+        ch2 = "UC" + "b" * 22
+        client = Client(page("/test-publishing-multi-channel"), request=None)
+        self.addCleanup(client.delete)
+        controller = VideoPublishingController(storage=MemoryState())
+        controller.rows = [
+            row(1, kind="private", copyright="clear", channel_id=ch1),
+            row(2, kind="draft", copyright="clear", channel_id=ch1),
+            row(3, kind="private", copyright="clear", channel_id=ch2),
+        ]
+        channels = [
+            SimpleNamespace(id=ch1, name="Kênh 1", img_src=""),
+            SimpleNamespace(id=ch2, name="Kênh 2", img_src=""),
+        ]
+        with patch.object(publishing_page, "get_video_publishing_controller", return_value=controller), \
+                patch.object(publishing_page, "get_channels_info", return_value=channels), \
+                patch.object(publishing_page.ui, "timer"), client:
+            publishing_page.create_video_publishing_page()
+
+        table = next(el for el in client.elements.values() if isinstance(el, ui.table))
+        channel_select = next(el for el in client.elements.values() if isinstance(el, ui.select) and el.label == "Lọc theo kênh đã quét")
+        run_button = next(el for el in client.elements.values() if isinstance(el, ui.button) and el.text == "Tự động SEO, tạo thumbnail & lên lịch")
+        deselect_button = next(el for el in client.elements.values() if isinstance(el, ui.button) and el.text == "Bỏ chọn trong bộ lọc")
+
+        self.assertIn("Kênh 1", channel_select.options[ch1])
+        self.assertIn("Kênh 2", channel_select.options[ch2])
+        self.assertEqual([r["video_id"] for r in table.rows], ["v0000000001", "v0000000002", "v0000000003"])
+
+        with client:
+            channel_select.set_value(ch1)
+        self.assertEqual([r["video_id"] for r in table.rows], ["v0000000001", "v0000000002"])
+
+        sel_listener = next(l for l in table._event_listeners.values() if l.type == "selection")
+        with client:
+            sel_listener.handler(GenericEventArguments(
+                sender=table, client=client, args={"added": True, "rows": [table.rows[0]], "keys": ["v0000000001"]},
+            ))
+        self.assertTrue(controller.rows[0]["selected"])
+
+        with client:
+            channel_select.set_value(ch2)
+        self.assertEqual([r["video_id"] for r in table.rows], ["v0000000003"])
+        self.assertTrue(controller.rows[0]["selected"])
+        self.assertIn("đã chọn 1", channel_select.options[ch1])
+
+        with client:
+            sel_listener.handler(GenericEventArguments(
+                sender=table, client=client, args={"added": True, "rows": [table.rows[0]], "keys": ["v0000000003"]},
+            ))
+        self.assertTrue(controller.rows[0]["selected"])
+        self.assertTrue(controller.rows[2]["selected"])
+        self.assertTrue(run_button.enabled)
+        summary_labels = [
+            el.text for el in client.elements.values()
+            if isinstance(el, ui.label) and "2 đã chọn toàn bộ (1 ngoài bộ lọc)" in (el.text or "")
+        ]
+        self.assertTrue(summary_labels)
+
+        deselect_listener = next(l for l in deselect_button._event_listeners.values() if l.type == "click")
+        with client:
+            handle_event(deselect_listener.handler, GenericEventArguments(sender=deselect_button, client=client, args={}))
+        self.assertTrue(controller.rows[0]["selected"])
+        self.assertFalse(controller.rows[2]["selected"])
+
+        with client:
+            channel_select.set_value("all")
+        self.assertEqual([r["video_id"] for r in table.rows], ["v0000000001", "v0000000002", "v0000000003"])
+        self.assertEqual([r["video_id"] for r in table.selected], ["v0000000001"])
 
 
 if __name__ == "__main__":

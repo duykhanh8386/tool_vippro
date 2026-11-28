@@ -1331,6 +1331,48 @@ class FastScanTests(unittest.TestCase):
             controller._scan(controller.settings, ref)
         self.assertEqual(controller.rows, [])
 
+    def test_channel_filter_matches_and_preserves_multi_channel_selections(self):
+        ch1_a = row(VIDEO, channel_id=CHANNEL, visibility_type="private", selected=False)
+        ch1_b = row(OTHER, channel_id=CHANNEL, visibility_type="draft", selected=False)
+        ch2_a = row("Ghi123_-XYZ", channel_id=CHANNEL2, visibility_type="private", selected=False)
+        self.assertTrue(publishing_row_matches(ch1_a, scope="unpublished", categories=["clear"], channel_filter="all"))
+        self.assertTrue(publishing_row_matches(ch1_a, scope="unpublished", categories=["clear"], channel_filter=CHANNEL))
+        self.assertFalse(publishing_row_matches(ch1_a, scope="unpublished", categories=["clear"], channel_filter=CHANNEL2))
+
+        storage = MemoryState()
+        controller = VideoPublishingController(storage=storage, module=Mock(), listing=Mock())
+        controller.rows = [ch1_a, ch1_b, ch2_a]
+        controller.settings.update(scope="unpublished", categories=["clear"], start_date="2099-01-02", hour="18:00")
+
+        controller.change_settings(channel_filter=CHANNEL)
+        self.assertEqual(len(controller.rows), 3)
+        controller.select_filtered(selected=True)
+        self.assertTrue(controller.rows[0]["selected"])
+        self.assertTrue(controller.rows[1]["selected"])
+        self.assertFalse(controller.rows[2]["selected"])
+
+        controller.change_settings(channel_filter=CHANNEL2)
+        self.assertTrue(controller.rows[0]["selected"])
+        self.assertTrue(controller.rows[1]["selected"])
+        controller.select_filtered(selected=True)
+        self.assertTrue(all(item["selected"] for item in controller.rows))
+
+        controller.select_filtered(selected=False)
+        self.assertTrue(controller.rows[0]["selected"])
+        self.assertTrue(controller.rows[1]["selected"])
+        self.assertFalse(controller.rows[2]["selected"])
+
+        controller.select([VIDEO, "Ghi123_-XYZ"], within_ids=[VIDEO, "Ghi123_-XYZ"])
+        controller.rows[1]["selected"] = False
+        plan = plan_daily(controller.rows, "2099-01-02", "18:00", now=NOW)
+        self.assertEqual(
+            [(item["channel_id"], item["video_id"], item["publish_at"]) for item in plan],
+            [(CHANNEL, VIDEO, STAMP), (CHANNEL2, "Ghi123_-XYZ", STAMP)],
+        )
+
+        controller.change_settings(channel_ids=[CHANNEL, CHANNEL2])
+        self.assertEqual(controller.settings["channel_filter"], "all")
+
 
 if __name__ == "__main__":
     unittest.main()

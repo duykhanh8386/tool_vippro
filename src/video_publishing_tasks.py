@@ -54,6 +54,7 @@ STEP_LABELS = {
 
 def default_settings():
     return {"channel_source": "selected", "channel_ids": [], "channel_links": "", "manual_ids": "", "categories": ["clear"], "scope": "unpublished",
+            "channel_filter": "all",
             "scan_all": True, "limit": 100, "audio_scan_mode": "normal",
             "start_date": (datetime.now(VIETNAM_TIMEZONE).date() + timedelta(days=1)).isoformat(),
             "hour": "18:00", "order": "oldest", "image_prompt": "Vẽ lại thumbnail dựa trên ảnh tham chiếu, bố cục rõ ràng, chữ dễ đọc, phù hợp nội dung bài nhạc; tỷ lệ 16:9.",
@@ -211,6 +212,12 @@ class VideoPublishingController:
                     raise ValueError("Số video mỗi kênh phải là số nguyên từ 1 đến 10000.") from None
             if "scope" in changes and changes["scope"] not in VIDEO_SCOPE_LABELS:
                 raise ValueError("Phạm vi quét không hợp lệ.")
+            if "channel_filter" in changes:
+                value = str(changes["channel_filter"] or "").strip() or "all"
+                scanned_channels = {row.get("channel_id") for row in self.rows}
+                if value != "all" and value not in scanned_channels and not re.fullmatch(r"UC[A-Za-z0-9_-]{22}", value):
+                    raise ValueError("Bộ lọc kênh không hợp lệ.")
+                changes["channel_filter"] = value
             if "audio_scan_mode" in changes and changes["audio_scan_mode"] not in {"normal", "complete_audio"}:
                 raise ValueError("Chế độ quét âm thanh không hợp lệ.")
             if "channel_source" in changes and changes["channel_source"] not in {"selected", "links"}:
@@ -227,8 +234,9 @@ class VideoPublishingController:
             if changed & {"channel_source", "channel_ids", "channel_links", "manual_ids", "scan_all", "limit", "order", "audio_scan_mode"}:
                 self.rows = []
                 self.occupied = {}
+                self.settings["channel_filter"] = "all"
                 self.message = "Phạm vi đã đổi. Quét lại video."
-            elif changed & {"categories", "scope"}:
+            elif changed & {"categories", "scope", "channel_filter"}:
                 self.message = "Đã đổi bộ lọc hiển thị; các video đã chọn được giữ nguyên."
             elif changed & {"start_date", "hour"}:
                 for row in self.rows:
@@ -269,7 +277,15 @@ class VideoPublishingController:
 
     def select_filtered(self, *, selected=True):
         with self.lock:
-            visible = [row for row in self.rows if publishing_row_matches(row, scope=self.settings["scope"], categories=self.settings["categories"])]
+            visible = [
+                row for row in self.rows
+                if publishing_row_matches(
+                    row,
+                    scope=self.settings["scope"],
+                    categories=self.settings["categories"],
+                    channel_filter=self.settings.get("channel_filter", "all"),
+                )
+            ]
             self.select((row["video_id"] for row in visible if selected), within_ids=[row["video_id"] for row in visible])
 
     def set_song(self, video_id, query):
@@ -555,6 +571,7 @@ class VideoPublishingController:
                 raise ValueError("Không tìm thấy Video ID trong các kênh đã chọn: " + ", ".join(sorted(missing)))
         with self.lock:
             self.rows, self.occupied = rows, occupied
+            self.settings["channel_filter"] = "all"
             suffix = " (Đã bỏ qua video Công khai để quét nhanh; chọn 'Tất cả loại video' hoặc 'Đã công khai' rồi quét lại nếu cần xem.)" if skip_public else ""
             audio_note = ""
             if audio_mode == "complete_audio":
